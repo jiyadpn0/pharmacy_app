@@ -210,8 +210,6 @@ class DotMatrixFormatter {
       buffer.writeln(sigStr.padLeft(columns));
     }
 
-    buffer.writeln("\n\n\n\n");
-
-    return buffer.toString();
+    return buffer.toString().trimRight();
   }
 }

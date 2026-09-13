@@ -46,6 +46,12 @@ class PrinterService {
       }
     }
 
+    // Calculate exact dynamic page height based on line count to prevent 12cm blank paper feeding!
+    final List<String> textLines = rawText.trim().split('\n');
+    final int lineCount = textLines.length;
+    final double lineMultiplier = columns == 136 ? 3.8 : 4.0;
+    final double dynamicHeightMm = (lineCount * lineMultiplier) + 10.0;
+
     // Windows / Desktop Platform Spooler Fallback
     await Printing.layoutPdf(
       onLayout: (PdfPageFormat format) async {
@@ -54,19 +60,19 @@ class PrinterService {
           pw.Page(
             pageFormat: PdfPageFormat(
               columns == 136 ? 300 * PdfPageFormat.mm : 210 * PdfPageFormat.mm,
-              double.infinity,
-              marginLeft: 8,
-              marginTop: 8,
-              marginRight: 8,
-              marginBottom: 8,
+              dynamicHeightMm * PdfPageFormat.mm, // Dynamic height stops printer immediately at Pharmacist Signature!
+              marginLeft: 6,
+              marginTop: 4,
+              marginRight: 6,
+              marginBottom: 4,
             ),
             build: (pw.Context context) {
               return pw.Text(
-                rawText,
+                rawText.trim(),
                 style: pw.TextStyle(
                   font: pw.Font.courier(),
                   fontSize: columns == 136 ? 8 : 9.5,
-                  lineSpacing: 1.1,
+                  lineSpacing: 1.0,
                 ),
               );
             },
