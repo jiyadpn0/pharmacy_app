@@ -322,14 +322,14 @@ $line
 INV NO: 1042                     DATE: 31/07/2026
 PATIENT: Jiyad                   DOCTOR: Dr. General
 $line
-SL ITEM NAME / MFR          BATCH    EXP   QTY   DISC   MRP    TOTAL
+SL HSN    PRODUCT / MFR           BATCH   EXP   QTY   MRP     DISC    RATE    TOTAL
 $line
-1  PARACETAMOL 650MG        B124     08/28 10   10.00  20.00  190.00
-   [MFR: CIPLA LTD]
-2  AMOXICILLIN 500CAP       AX99     12/27 2     0.00 150.00  300.00
-   [MFR: GSK PHARMA]
-3  PAN-D CAPSULES           P202     04/28 5   110.00 220.00  990.00
-   [MFR: SUN PHARMA]
+1  3004   PARACETAMOL 650MG       B124    08/28 10    20.00   10.00   19.00   190.00
+          [MFR: CIPLA LTD]
+2  3004   AMOXICILLIN 500CAP      AX99    12/27 2    150.00    0.00  150.00   300.00
+          [MFR: GSK PHARMA]
+3  3004   PAN-D CAPSULES          P202    04/28 5    220.00  110.00  198.00   990.00
+          [MFR: SUN PHARMA]
 $line
                                  SUBTOTAL:    1480.00
                                  TOTAL DISC:   120.00
@@ -338,7 +338,9 @@ $line
 $line
          THANK YOU! VISIT AGAIN - COMPUTERIZED BILLING
 $line
-\n\n[PERFORATION / FORM FEED BREAK]
+TIME: 08:55 PM                                             PHARMACIST SIGNATURE
+
+[PERFORATION / FORM FEED BREAK]
 """;
   }
 }

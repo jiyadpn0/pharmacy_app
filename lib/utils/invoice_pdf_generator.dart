@@ -58,17 +58,31 @@ class InvoicePdfGenerator {
         build: (context) => [
           pw.Table(
             border: pw.TableBorder.all(color: PdfColors.grey300),
+            columnWidths: const {
+              0: pw.FixedColumnWidth(20),  // Sl
+              1: pw.FixedColumnWidth(40),  // HSN
+              2: pw.FlexColumnWidth(3),    // Product
+              3: pw.FixedColumnWidth(45),  // Batch
+              4: pw.FixedColumnWidth(35),  // Exp
+              5: pw.FixedColumnWidth(25),  // Qty
+              6: pw.FixedColumnWidth(40),  // MRP
+              7: pw.FixedColumnWidth(40),  // Disc
+              8: pw.FixedColumnWidth(40),  // Rate
+              9: pw.FixedColumnWidth(50),  // Total
+            },
             children: [
               pw.TableRow(
                 decoration: const pw.BoxDecoration(color: PdfColors.grey200),
                 children: [
                   _th("Sl"),
-                  _th("Product Description"),
+                  _th("HSN"),
+                  _th("Product Description / MFR"),
                   _th("Batch"),
                   _th("Exp"),
                   _th("Qty"),
                   _th("M.R.P"),
                   _th("Disc"),
+                  _th("Rate"),
                   _th("Total"),
                 ],
               ),
@@ -78,9 +92,15 @@ class InvoicePdfGenerator {
                 final double itemDisc = item.discAmt > 0
                     ? item.discAmt
                     : ((item.mrp * item.qty * item.discPercent) / 100.0);
+                final String hsnStr = item.product.hsnCode.isNotEmpty ? item.product.hsnCode : "3004";
+                final double packSize = item.product.packSize > 0 ? item.product.packSize.toDouble() : 1.0;
+                final double stripMrp = item.mrp > 0 ? item.mrp : (item.product.mrp * packSize);
+                final double rate = item.sRate > 0 ? item.sRate : item.product.salePrice;
+
                 return pw.TableRow(
                   children: [
                     _td("$i"),
+                    _td(hsnStr),
                     pw.Padding(
                       padding: const pw.EdgeInsets.all(5),
                       child: pw.Column(
@@ -95,8 +115,9 @@ class InvoicePdfGenerator {
                     _td(item.product.batch),
                     _td(item.product.expiry),
                     _td("${item.qty}"),
-                    _td(item.mrp.toStringAsFixed(2)),
+                    _td(stripMrp.toStringAsFixed(2)),
                     _td(itemDisc.toStringAsFixed(2)),
+                    _td(rate.toStringAsFixed(2)),
                     _td(item.total.toStringAsFixed(2)),
                   ],
                 );
@@ -105,8 +126,17 @@ class InvoicePdfGenerator {
           ),
           pw.SizedBox(height: 12),
           pw.Row(
-            mainAxisAlignment: pw.MainAxisAlignment.end,
+            mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+            crossAxisAlignment: pw.CrossAxisAlignment.end,
             children: [
+              pw.Column(
+                crossAxisAlignment: pw.CrossAxisAlignment.start,
+                children: [
+                  pw.Text("TIME: ${DateFormat('hh:mm a').format(invoice.date)}", style: pw.TextStyle(fontSize: 10, fontWeight: pw.FontWeight.bold)),
+                  pw.SizedBox(height: 4),
+                  pw.Text("Medicines once sold will not be taken back", style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey700)),
+                ],
+              ),
               pw.Column(
                 crossAxisAlignment: pw.CrossAxisAlignment.end,
                 children: [
@@ -116,6 +146,8 @@ class InvoicePdfGenerator {
                   pw.Divider(),
                   pw.Text("Grand Total: ₹${invoice.grandTotal.toStringAsFixed(2)}", 
                     style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold, color: PdfColors.blue900)),
+                  pw.SizedBox(height: 20),
+                  pw.Text("PHARMACIST SIGNATURE: ____________________", style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold)),
                 ],
               ),
             ],

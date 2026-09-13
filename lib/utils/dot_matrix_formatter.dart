@@ -78,22 +78,27 @@ class DotMatrixFormatter {
     buffer.writeln(divider);
 
     // 3. TABLE COLUMN SIZING
-    int wSl = 3;
-    int wBatch = 9;
+    int wSl = 2;
+    int wHsn = 6;
+    int wBatch = 7;
     int wExp = 5;
-    int wQty = 4;
-    int wDisc = 6;
+    int wQty = 3;
     int wMrp = 7;
-    int wTot = 9;
-    int wItem = columns - (wSl + wBatch + wExp + wQty + wDisc + wMrp + wTot + 7);
+    int wDisc = 6;
+    int wRate = 7;
+    int wTot = 8;
+    int wItem = columns - (wSl + wHsn + wBatch + wExp + wQty + wMrp + wDisc + wRate + wTot + 9);
+    if (wItem < 12) wItem = 12;
 
     String th = "${"SL".padRight(wSl)} "
-        "${"ITEM NAME / MFR".padRight(wItem)} "
+        "${"HSN".padRight(wHsn)} "
+        "${"PRODUCT / MFR".padRight(wItem)} "
         "${"BATCH".padRight(wBatch)} "
         "${"EXP".padRight(wExp)} "
         "${"QTY".padLeft(wQty)} "
-        "${"DISC".padLeft(wDisc)} "
         "${"MRP".padLeft(wMrp)} "
+        "${"DISC".padLeft(wDisc)} "
+        "${"RATE".padLeft(wRate)} "
         "${"TOTAL".padLeft(wTot)}";
 
     buffer.writeln(th);
@@ -109,6 +114,9 @@ class DotMatrixFormatter {
       }
 
       String sl = (i + 1).toString().padRight(wSl);
+      String hsn = (item.product.hsnCode.isNotEmpty ? item.product.hsnCode : "3004").padRight(wHsn);
+      if (hsn.length > wHsn) hsn = hsn.substring(0, wHsn);
+
       String nameChunk = nameLines[0].padRight(wItem);
 
       String batch = item.product.batch.toUpperCase();
@@ -126,23 +134,27 @@ class DotMatrixFormatter {
       }
 
       String qty = item.qty.toString().padLeft(wQty);
-      double itemDisc = item.discAmt > 0
-          ? item.discAmt
-          : ((item.mrp * item.qty * item.discPercent) / 100.0);
-      String disc = itemDisc.toStringAsFixed(2).padLeft(wDisc);
 
       double packSize = item.product.packSize > 0 ? item.product.packSize.toDouble() : 1.0;
-      double unitMrp = item.product.mrp / packSize;
+      double stripMrp = item.mrp > 0 ? item.mrp : (item.product.mrp * packSize);
 
-      String mrpStr = unitMrp.toStringAsFixed(2).padLeft(wMrp);
-      String totStr = item.total.toStringAsFixed(2).padLeft(wTot); // item.total is already inclusive!
+      double itemDisc = item.discAmt > 0
+          ? item.discAmt
+          : ((stripMrp * item.qty * item.discPercent) / 100.0);
 
-      buffer.writeln("$sl $nameChunk $batch $exp $qty $disc $mrpStr $totStr");
+      double rate = item.sRate > 0 ? item.sRate : item.product.salePrice;
+
+      String mrpStr = stripMrp.toStringAsFixed(2).padLeft(wMrp);
+      String discStr = itemDisc.toStringAsFixed(2).padLeft(wDisc);
+      String rateStr = rate.toStringAsFixed(2).padLeft(wRate);
+      String totStr = item.total.toStringAsFixed(2).padLeft(wTot);
+
+      buffer.writeln("$sl $hsn $nameChunk $batch $exp $qty $mrpStr $discStr $rateStr $totStr");
 
       for (int lineIdx = 1; lineIdx < nameLines.length; lineIdx++) {
-        String emptySl = "".padRight(wSl);
+        String emptyPrefix = "${"".padRight(wSl)} ${"".padRight(wHsn)}";
         String spilledName = nameLines[lineIdx].padRight(wItem);
-        buffer.writeln("$emptySl $spilledName");
+        buffer.writeln("$emptyPrefix $spilledName");
       }
     }
     buffer.writeln(divider);
@@ -186,6 +198,18 @@ class DotMatrixFormatter {
     buffer.writeln(centerText("THANK YOU! VISIT AGAIN - COMPUTERIZED BILLING"));
     buffer.writeln(centerText("Medicines once sold will not be taken back"));
     buffer.writeln(divider);
+
+    // 6. TIME (LEFT) AND PHARMACIST SIGNATURE (RIGHT)
+    String timeStr = "TIME: ${DateFormat('hh:mm a').format(invoice.date)}";
+    String sigStr = "PHARMACIST SIGNATURE";
+    int footerPad = columns - timeStr.length - sigStr.length;
+    if (footerPad > 0) {
+      buffer.writeln(timeStr + "".padLeft(footerPad) + sigStr);
+    } else {
+      buffer.writeln(timeStr);
+      buffer.writeln(sigStr.padLeft(columns));
+    }
+
     buffer.writeln("\n\n\n\n");
 
     return buffer.toString();
