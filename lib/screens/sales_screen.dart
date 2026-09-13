@@ -1067,12 +1067,20 @@ class _SalesScreenState extends State<SalesScreen> {
         return true;
       }
 
+      if (event.logicalKey == LogicalKeyboardKey.f1) {
+        _resetPage();
+        return true;
+      }
       if (event.logicalKey == LogicalKeyboardKey.f2) {
         _resetPage();
         return true;
       }
       if (event.logicalKey == LogicalKeyboardKey.f3) {
         _openGenericSearchDialog();
+        return true;
+      }
+      if (event.logicalKey == LogicalKeyboardKey.f5) {
+        _saveAndPrintBill();
         return true;
       }
       if (event.logicalKey == LogicalKeyboardKey.f7) {

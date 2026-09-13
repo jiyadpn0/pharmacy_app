@@ -101,6 +101,8 @@ class PurchaseItemData {
   double discAmt = 0.0;
   double net = 0.0;
   double gstPercent = 0.0;
+  double? masterGstPercent; // Stores default GST rate from Product Master
+  bool updateMasterGst = false; // Option B: Toggle to update Product Master GST
   double gstAmt = 0.0;
   double cgstAmt = 0.0;
   double sgstAmt = 0.0;
@@ -109,6 +111,11 @@ class PurchaseItemData {
   double sDiscAmt = 0.0;
   double sRate = 0.0;
   double lCost = 0.0;
+
+  bool get hasGstMismatch {
+    if (masterGstPercent == null || productId.isEmpty) return false;
+    return (gstPercent - masterGstPercent!).abs() > 0.01;
+  }
 
   final Map<int, TextEditingController> controllers = {};
   final Map<int, FocusNode> focusNodes = {};
@@ -2363,6 +2370,11 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
               textColor = style.textColor;
             }
           }
+        } else if (col == 15 && row < _items.length) {
+          if (_items[row].hasGstMismatch) {
+            customCellBg = Colors.amber.shade300;
+            textColor = Colors.amber.shade900;
+          }
         }
 
         Widget cellChild;
@@ -2647,6 +2659,11 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
         }
 
         for (var item in validItems) {
+          final matchedPm = p.productMaster.cast<Product?>().firstWhere(
+            (pm) => pm != null && (pm.id == item.id || pm.name.trim().toLowerCase() == item.productName.trim().toLowerCase()),
+            orElse: () => null,
+          );
+
           final it = PurchaseItemData()
             ..productId = item.id
             ..productName = item.productName
@@ -2661,6 +2678,7 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
             ..pRate = item.pRate
             ..discPercent = item.discPercent
             ..gstPercent = item.gstPercent
+            ..masterGstPercent = matchedPm?.gstPercent
             ..sDiscPercent = item.sDiscPercent;
 
           it.recalculate(isGstMode: _gstMode == 1);
@@ -3127,6 +3145,166 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
     return diffSpans;
   }
 
+  bool _hasResolvedGstMismatches = false;
+
+  Future<bool?> _showGstMismatchDialog(List<PurchaseItemData> mismatchedItems) async {
+    return showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              title: Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(color: Colors.amber.shade100, shape: BoxShape.circle),
+                    child: Icon(Icons.warning_amber_rounded, color: Colors.amber.shade800, size: 28),
+                  ),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Text("⚠️ Purchase GST Rate Mismatch", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                  ),
+                ],
+              ),
+              content: SizedBox(
+                width: 580,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      "The GST rate on the imported/entered purchase invoice differs from your Product Master default GST rate for the following items:",
+                      style: TextStyle(fontSize: 12, color: Colors.blueGrey, height: 1.4),
+                    ),
+                    const SizedBox(height: 16),
+                    Container(
+                      constraints: const BoxConstraints(maxHeight: 260),
+                      child: SingleChildScrollView(
+                        child: Column(
+                          children: mismatchedItems.map((item) {
+                            return Container(
+                              margin: const EdgeInsets.only(bottom: 12),
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: Colors.amber.shade50,
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(color: Colors.amber.shade300, width: 1),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    item.productName,
+                                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF0F172A)),
+                                  ),
+                                  const SizedBox(height: 6),
+                                  Row(
+                                    children: [
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                        decoration: BoxDecoration(color: Colors.amber.shade200, borderRadius: BorderRadius.circular(6)),
+                                        child: Text("Invoice GST: ${item.gstPercent.toStringAsFixed(1)}%", style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black87)),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      const Icon(Icons.compare_arrows_rounded, size: 16, color: Colors.grey),
+                                      const SizedBox(width: 8),
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                        decoration: BoxDecoration(color: Colors.grey.shade200, borderRadius: BorderRadius.circular(6)),
+                                        child: Text("Master GST: ${(item.masterGstPercent ?? 0.0).toStringAsFixed(1)}%", style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black87)),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 10),
+                                  Row(
+                                    children: [
+                                      InkWell(
+                                        onTap: () {
+                                          setDialogState(() => item.updateMasterGst = false);
+                                          setState(() {});
+                                        },
+                                        child: Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                          decoration: BoxDecoration(
+                                            color: !item.updateMasterGst ? Colors.blue.shade800 : Colors.white,
+                                            borderRadius: BorderRadius.circular(6),
+                                            border: Border.all(color: !item.updateMasterGst ? Colors.blue.shade800 : Colors.grey.shade400),
+                                          ),
+                                          child: Text(
+                                            "Option A: Keep Invoice GST Only",
+                                            style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: !item.updateMasterGst ? Colors.white : Colors.black87),
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      InkWell(
+                                        onTap: () {
+                                          setDialogState(() => item.updateMasterGst = true);
+                                          setState(() {});
+                                        },
+                                        child: Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                          decoration: BoxDecoration(
+                                            color: item.updateMasterGst ? Colors.teal.shade700 : Colors.white,
+                                            borderRadius: BorderRadius.circular(6),
+                                            border: Border.all(color: item.updateMasterGst ? Colors.teal.shade700 : Colors.grey.shade400),
+                                          ),
+                                          child: Text(
+                                            "Option B: Update Product Master",
+                                            style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: item.updateMasterGst ? Colors.white : Colors.black87),
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            );
+                          }).toList(),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                OutlinedButton(
+                  onPressed: () {
+                    for (var item in mismatchedItems) {
+                      item.updateMasterGst = false; // Option A for all
+                    }
+                    setState(() {});
+                    Navigator.pop(ctx, true);
+                  },
+                  child: const Text("Keep All Invoice GST Only (Option A)", style: TextStyle(fontSize: 11)),
+                ),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.teal.shade700, foregroundColor: Colors.white),
+                  onPressed: () {
+                    for (var item in mismatchedItems) {
+                      item.updateMasterGst = true; // Option B for all
+                    }
+                    setState(() {});
+                    Navigator.pop(ctx, true);
+                  },
+                  child: const Text("Update All Product Masters (Option B)", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                ),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.blue.shade800, foregroundColor: Colors.white),
+                  onPressed: () => Navigator.pop(ctx, true),
+                  child: const Text("Apply & Continue", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
   void _savePurchase({bool isEdit = false}) async {
     if (_isSaving || _isLoading) return;
     _isSaving = true;
@@ -3253,6 +3431,35 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
           content: validationErrors.join("\n")
         );
         return;
+      }
+
+      // --- GST MISMATCH WORKFLOW CHECK ---
+      final mismatchedItems = _items.where((it) => it.hasGstMismatch).toList();
+      if (mismatchedItems.isNotEmpty && !_hasResolvedGstMismatches) {
+        _isSaving = false;
+        final bool? resolved = await _showGstMismatchDialog(mismatchedItems);
+        if (resolved != true) return;
+        _hasResolvedGstMismatches = true;
+        _isSaving = true;
+      }
+
+      // --- OPTION B: UPDATE PRODUCT MASTER DEFAULT GST RATES ---
+      final db = await p.database;
+      for (var it in _items) {
+        if (it.updateMasterGst && it.productId.isNotEmpty && it.gstPercent > 0) {
+          try {
+            await db.rawUpdate(
+              "UPDATE product_master SET gst_percent = ? WHERE id = ?",
+              [it.gstPercent, it.productId],
+            );
+            final pmList = p.productMaster.where((prod) => prod.id == it.productId);
+            for (var pm in pmList) {
+              pm.gstPercent = it.gstPercent;
+            }
+          } catch (e) {
+            debugPrint("Failed to update Product Master GST for ${it.productName}: $e");
+          }
+        }
       }
 
       // --- COMMERCIAL EDIT AUDIT LOG (SILENT) ---
@@ -4675,6 +4882,7 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
         _isExistingEntry = false;
         _isDeleted = false;
         _isDirty = false; // Reset dirty flag
+        _hasResolvedGstMismatches = false;
         _isAutoGeneratedSupInv = false;
         _originalLoadedEntry = null; // Clear audit snapshot
         

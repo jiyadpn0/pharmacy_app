@@ -231,6 +231,8 @@ class DbHelper {
         await txn.execute('CREATE INDEX IF NOT EXISTS idx_pm_name_nocase ON product_master(name COLLATE NOCASE);');
         await txn.execute('CREATE INDEX IF NOT EXISTS idx_pm_generic_nocase ON product_master(generic_name COLLATE NOCASE);');
         await txn.execute('CREATE INDEX IF NOT EXISTS idx_pm_hsn ON product_master(hsn_code);');
+        await txn.execute('CREATE INDEX IF NOT EXISTS idx_pm_barcode ON product_master(barcode);');
+        await txn.execute('CREATE INDEX IF NOT EXISTS idx_pm_schedule_h1 ON product_master(schedule_h1);');
         await txn.execute('CREATE INDEX IF NOT EXISTS idx_sb_prod_stock ON stock_batches(product_id, current_stock);');
         await txn.execute('CREATE INDEX IF NOT EXISTS idx_sb_batch_nocase ON stock_batches(batch_number COLLATE NOCASE);');
         await txn.execute('CREATE INDEX IF NOT EXISTS idx_sales_items_inv_prod ON sales_items(invoice_no, product_id);');
