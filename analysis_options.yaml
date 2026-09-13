@@ -1,0 +1,15 @@
+# This file configures the analyzer for pharmacy_app.
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  errors:
+    # Ensure critical safety and cleanliness lints are enabled:
+    use_build_context_synchronously: warning
+    unused_import: warning
+    unnecessary_import: info
+    deprecated_member_use: info
+
+linter:
+  rules:
+    avoid_print: false
+    prefer_single_quotes: false
