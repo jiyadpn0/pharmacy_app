@@ -627,8 +627,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
             }
           }
         }
+        if (directZipUrl.isEmpty && releaseData['zipball_url'] != null) {
+          directZipUrl = releaseData['zipball_url'].toString();
+        }
         if (directZipUrl.isEmpty) {
-          directZipUrl = 'https://github.com/$repoPath/releases/download/$tagName/PharmaPro_ERP_${tagName}_Windows.zip';
+          directZipUrl = 'https://github.com/$repoPath/archive/refs/tags/$tagName.zip';
         }
 
         if (_isVersionNewer(tagName, _currentAppVersion)) {
@@ -862,12 +865,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     try {
       final client = http.Client();
-      final request = http.Request('GET', Uri.parse(zipUrl));
-      request.headers['User-Agent'] = 'PharmacyERP-Updater';
-      final response = await client.send(request);
+      Uri targetUri = Uri.parse(zipUrl);
+      http.StreamedResponse? response;
 
-      if (response.statusCode != 200) {
-        throw Exception("Download failed with HTTP status code ${response.statusCode}");
+      // Follow HTTP 301/302/307/308 redirects automatically up to 5 hops
+      int redirectCount = 0;
+      while (redirectCount < 5) {
+        final request = http.Request('GET', targetUri);
+        request.headers['User-Agent'] = 'PharmacyERP-Updater';
+        request.headers['Accept'] = 'application/octet-stream, application/zip, */*';
+
+        response = await client.send(request);
+
+        if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.containsKey('location')) {
+          targetUri = Uri.parse(response.headers['location']!);
+          redirectCount++;
+        } else {
+          break;
+        }
+      }
+
+      if (response == null || response.statusCode != 200) {
+        throw Exception("Download failed with HTTP status code ${response?.statusCode ?? 404}");
       }
 
       final contentLength = response.contentLength ?? 0;
@@ -901,9 +920,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       statusNotifier.value = "Unpacking update files...";
       progressNotifier.value = 0.95;
 
-      final appExePath = Platform.resolvedExecutable;
-      final appDir = File(appExePath).parent.path;
-
       final extractResult = await Process.run('powershell', [
         '-Command',
         'Expand-Archive -Path "${zipFile.path}" -DestinationPath "${extractDir.path}" -Force'
@@ -913,14 +929,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
         throw Exception("Failed to extract update package: ${extractResult.stderr}");
       }
 
+      // Check if extracted ZIP contains an inner root folder
+      String sourceFolderPath = extractDir.path;
+      final extractedItems = extractDir.listSync();
+      if (extractedItems.length == 1 && extractedItems.first is Directory) {
+        sourceFolderPath = extractedItems.first.path;
+      }
+
       statusNotifier.value = "Applying update and restarting application...";
       progressNotifier.value = 1.0;
+
+      final appExePath = Platform.resolvedExecutable;
+      final appDir = File(appExePath).parent.path;
 
       final scriptFile = File('${tempDir.path}${Platform.pathSeparator}apply_pharmacy_update.bat');
       final scriptContent = '''
 @echo off
 timeout /t 2 /nobreak > nul
-xcopy /E /Y /I "${extractDir.path}\\*" "$appDir\\"
+xcopy /E /Y /I "$sourceFolderPath\\*" "$appDir\\"
 start "" "$appExePath"
 del "%~f0"
 ''';
