@@ -139,7 +139,7 @@ class _SalesScreenState extends State<SalesScreen> {
 
   final Map<int, double> _colWidths = {
     0: 35, 1: 75, 2: 280, 3: 90, 4: 140, 5: 60, 6: 60, 7: 60, 8: 60,
-    9: 80, 10: 80, 11: 60, 12: 80, 13: 50, 14: 100, 15: 80, 16: 40,
+    9: 80, 10: 80, 11: 60, 12: 80, 13: 50, 14: 100, 15: 80, 16: 48,
   };
 
   // --- PART 5: OBJECT-MAPPED CONTROLLERS (FIXES MEMORY LEAKS) ---
@@ -4390,6 +4390,7 @@ class _SalesScreenState extends State<SalesScreen> {
                     ),
                     _topActionBtn(Icons.search_rounded, "Find", const Color(0xFF3F51B5), onTap: _showFindDialog),
                     _topActionBtn(Icons.print_rounded, "Print", const Color(0xFF607D8B), onTap: _printSale),
+                    _topActionBtn(Icons.info_outline_rounded, "Manual", Colors.indigo, onTap: _showSalesManualAndLegendDialog),
                     _topActionBtn(
                       Icons.delete_forever_rounded,
                       "Del",
@@ -4938,6 +4939,152 @@ class _SalesScreenState extends State<SalesScreen> {
   }
 
 
+
+  void _showSalesManualAndLegendDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(color: Colors.blue.shade100, shape: BoxShape.circle),
+              child: const Icon(Icons.info_outline_rounded, color: Colors.blue, size: 24),
+            ),
+            const SizedBox(width: 12),
+            const Text("ℹ️ Sales Indicator Legend & Calculation Manual", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+          ],
+        ),
+        content: SizedBox(
+          width: 580,
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text("COLOR INDICATORS LEGEND", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.blueGrey, letterSpacing: 1.2)),
+                const SizedBox(height: 10),
+                _legendTile(Colors.amber.shade100, Colors.orange.shade900, "Orange / Amber Text", "Low Margin Alert (< 24.9% pure profit margin)"),
+                _legendTile(Colors.red.shade100, Colors.red.shade900, "Red Highlight", "Expired Batch or Render/Validation Warning"),
+                const SizedBox(height: 20),
+                const Divider(),
+                const SizedBox(height: 12),
+                const Text("CALCULATION FORMULAS", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.blueGrey, letterSpacing: 1.2)),
+                const SizedBox(height: 10),
+                _formulaTile("Retail Selling Price (S.Rate)", "Base Price or (MRP - Special Discount)"),
+                _formulaTile("Line Total Amount", "Qty × Selling Rate - Item Discount + Tax"),
+                _formulaTile("Retail Profit Margin %", "((MRP - Purchase Rate) / Purchase Rate) × 100"),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text("CLOSE", style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _legendTile(Color bg, Color fg, String title, String desc) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(8), border: Border.all(color: Colors.grey.shade300)),
+      child: Row(
+        children: [
+          Text(title, style: TextStyle(fontWeight: FontWeight.bold, color: fg, fontSize: 12)),
+          const SizedBox(width: 12),
+          Expanded(child: Text(desc, style: const TextStyle(fontSize: 11, color: Colors.black87))),
+        ],
+      ),
+    );
+  }
+
+  Widget _formulaTile(String title, String formula) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(color: Colors.grey.shade50, borderRadius: BorderRadius.circular(8), border: Border.all(color: Colors.grey.shade200)),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.blueGrey)),
+          const SizedBox(height: 4),
+          SelectableText(formula, style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, fontFamily: 'monospace', color: Colors.blue.shade900)),
+        ],
+      ),
+    );
+  }
+
+  void _showSaleItemMathBreakdown(SaleItem item) {
+    double mrp = item.mrp;
+    double sRate = item.sRate;
+    double discPct = item.discPercent;
+    double discAmt = item.discAmt;
+    double netAmt = (sRate * item.qty) - discAmt;
+    double gstPct = item.gstPercent;
+    double gstAmt = item.gstAmt;
+    double totalAmt = item.total;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(color: Colors.teal.shade100, shape: BoxShape.circle),
+              child: const Icon(Icons.calculate_rounded, color: Colors.teal, size: 24),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text("Retail Sale Breakdown: ${item.product.name}", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+            ),
+          ],
+        ),
+        content: SizedBox(
+          width: 480,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _mathRow("Maximum Retail Price (MRP)", "₹${mrp.toStringAsFixed(2)}", isBold: true),
+              _mathRow("Selling Rate (S.Rate)", "₹${sRate.toStringAsFixed(2)}", isBold: true, color: Colors.blue.shade900),
+              _mathRow("- Discount ($discPct%)", "-₹${discAmt.toStringAsFixed(2)}", color: Colors.red.shade700),
+              const Divider(),
+              _mathRow("Net Amount (before tax)", "₹${netAmt.toStringAsFixed(2)}"),
+              _mathRow("+ GST Tax ($gstPct%)", "+₹${gstAmt.toStringAsFixed(2)}", color: Colors.teal.shade800),
+              const Divider(),
+              _mathRow("Line Total Amount", "₹${totalAmt.toStringAsFixed(2)}", isBold: true, color: Colors.teal.shade900),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text("CLOSE", style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _mathRow(String label, String value, {bool isBold = false, Color? color}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          Text(label, style: TextStyle(fontSize: 12, fontWeight: isBold ? FontWeight.bold : FontWeight.normal, color: color ?? Colors.black87)),
+          const Spacer(),
+          Text(value, style: TextStyle(fontSize: 12, fontWeight: isBold ? FontWeight.bold : FontWeight.w600, color: color ?? Colors.black87)),
+        ],
+      ),
+    );
+  }
 
   Widget _entryNavBtn(String txt, {VoidCallback? onTap}) => InkWell(
     onTap: onTap,
@@ -6544,11 +6691,24 @@ class _SalesScreenState extends State<SalesScreen> {
               _isDeleted ? SizedBox(width: _colWidths[16]!) : Container(
                 width: _colWidths[16]!,
                 alignment: Alignment.center,
-                child: IconButton(
-                  icon: const Icon(Icons.close, color: Colors.red, size: 16),
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(),
-                  onPressed: () => _safeDeleteRow(row),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      icon: const Icon(Icons.info_outline_rounded, color: Colors.blueGrey, size: 14),
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                      tooltip: "Line Math Breakdown",
+                      onPressed: () => _showSaleItemMathBreakdown(it),
+                    ),
+                    const SizedBox(width: 4),
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.red, size: 16),
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                      onPressed: () => _safeDeleteRow(row),
+                    ),
+                  ],
                 ),
               ),
             ],

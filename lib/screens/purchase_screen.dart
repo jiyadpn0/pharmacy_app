@@ -452,7 +452,7 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
 
   final Map<int, double> _colWidths = {
     0: 30, 1: 220, 2: 90, 3: 40, 4: 70, 5: 50, 6: 35, 7: 55, 8: 55, 9: 65, 10: 65,
-    11: 75, 12: 38, 13: 65, 14: 75, 15: 38, 16: 54, 17: 85, 18: 42, 19: 52, 20: 75, 21: 75, 22: 30,
+    11: 75, 12: 38, 13: 65, 14: 75, 15: 38, 16: 54, 17: 85, 18: 42, 19: 52, 20: 75, 21: 75, 22: 48,
   };
   double _totalWidth = 0;
 
@@ -2352,17 +2352,30 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
               Container(
                 width: _colWidths[22],
                 alignment: Alignment.center,
-                child: isNewRow ? null : IconButton(
-                  icon: const Icon(Icons.close, size: 14, color: Colors.red),
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(),
-                  onPressed: () {
-                    _saveUndoState();
-                    setState(() {
-                      _items.removeAt(row).dispose();
-                      _calculateFooter();
-                    });
-                  },
+                child: isNewRow ? null : Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      icon: const Icon(Icons.info_outline_rounded, size: 14, color: Colors.blueGrey),
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                      tooltip: "Live Math Breakdown",
+                      onPressed: () => _showPurchaseItemMathBreakdown(it),
+                    ),
+                    const SizedBox(width: 4),
+                    IconButton(
+                      icon: const Icon(Icons.close, size: 14, color: Colors.red),
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                      onPressed: () {
+                        _saveUndoState();
+                        setState(() {
+                          _items.removeAt(row).dispose();
+                          _calculateFooter();
+                        });
+                      },
+                    ),
+                  ],
                 ),
               ),
             ],
@@ -5537,6 +5550,185 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
     }
   }
 
+  void _showManualAndLegendDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(color: Colors.blue.shade100, shape: BoxShape.circle),
+              child: const Icon(Icons.info_outline_rounded, color: Colors.blue, size: 24),
+            ),
+            const SizedBox(width: 12),
+            const Text("ℹ️ Indicator Legend & Calculation Manual", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+          ],
+        ),
+        content: SizedBox(
+          width: 580,
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text("COLOR INDICATORS LEGEND", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.blueGrey, letterSpacing: 1.2)),
+                const SizedBox(height: 10),
+                _legendTile(Colors.amber.shade100, Colors.orange.shade900, "Orange / Amber Text", "Low Margin Alert (< 24.9% pure profit margin)"),
+                _legendTile(Colors.white, Colors.blue.shade800, "Blue Text with ▲ / ▼", "Price / MRP Changed compared to Product Master"),
+                _legendTile(Colors.amber.shade300, Colors.amber.shade900, "Yellow Highlight", "GST Rate Mismatch between Invoice and Product Master"),
+                _legendTile(Colors.red.shade100, Colors.red.shade900, "Red Highlight", "Expired Batch or Mandatory Data Validation Error"),
+                const SizedBox(height: 20),
+                const Divider(),
+                const SizedBox(height: 12),
+                const Text("CALCULATION FORMULAS", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.blueGrey, letterSpacing: 1.2)),
+                const SizedBox(height: 10),
+                _formulaTile("Pure Margin % (No Discount)", "((MRP - Purchase Rate) / Purchase Rate) × 100"),
+                _formulaTile("Net Margin % (With L.Cost)", "((MRP - Landed Cost) / Landed Cost) × 100"),
+                _formulaTile("Net Landed Cost", "(Purchase Rate - Discount) + GST Tax Amount"),
+                _formulaTile("GST Tax Amount", "Net Amount × (GST % / 100)"),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text("CLOSE", style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _legendTile(Color bg, Color fg, String title, String desc) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(8), border: Border.all(color: Colors.grey.shade300)),
+      child: Row(
+        children: [
+          Text(title, style: TextStyle(fontWeight: FontWeight.bold, color: fg, fontSize: 12)),
+          const SizedBox(width: 12),
+          Expanded(child: Text(desc, style: const TextStyle(fontSize: 11, color: Colors.black87))),
+        ],
+      ),
+    );
+  }
+
+  Widget _formulaTile(String title, String formula) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(color: Colors.grey.shade50, borderRadius: BorderRadius.circular(8), border: Border.all(color: Colors.grey.shade200)),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.blueGrey)),
+          const SizedBox(height: 4),
+          SelectableText(formula, style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, fontFamily: 'monospace', color: Colors.blue.shade900)),
+        ],
+      ),
+    );
+  }
+
+  void _showPurchaseItemMathBreakdown(PurchaseItemData item) {
+    double baseRate = item.pRate;
+    double discPct = item.discPercent;
+    double discAmt = item.discAmt;
+    double netAmt = item.net;
+    double gstPct = item.gstPercent;
+    double gstAmt = item.gstAmt;
+    double lCost = item.lCost > 0 ? item.lCost : ((netAmt + gstAmt) / (item.qty > 0 ? item.qty : 1));
+    double mrp = item.mrp;
+    double pureMargin = item.profitPctNoDisc;
+    double netMargin = lCost > 0 ? ((mrp - lCost) / lCost) * 100.0 : 0.0;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(color: Colors.teal.shade100, shape: BoxShape.circle),
+              child: const Icon(Icons.calculate_rounded, color: Colors.teal, size: 24),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text("Line Calculation: ${item.productName}", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+            ),
+          ],
+        ),
+        content: SizedBox(
+          width: 480,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _mathRow("Base Purchase Rate (P.Rate)", "₹${baseRate.toStringAsFixed(2)}", isBold: true),
+              _mathRow("- Discount ($discPct%)", "-₹${discAmt.toStringAsFixed(2)}", color: Colors.red.shade700),
+              const Divider(),
+              _mathRow("Net Amount (before tax)", "₹${netAmt.toStringAsFixed(2)}"),
+              _mathRow("+ GST Tax ($gstPct%)", "+₹${gstAmt.toStringAsFixed(2)}", color: Colors.teal.shade800),
+              const Divider(),
+              _mathRow("Landed Cost per Unit (L.Cost)", "₹${lCost.toStringAsFixed(2)}", isBold: true, color: Colors.blue.shade900),
+              _mathRow("Maximum Retail Price (MRP)", "₹${mrp.toStringAsFixed(2)}", isBold: true),
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: item.isLowMargin ? Colors.amber.shade100 : Colors.teal.shade50,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: item.isLowMargin ? Colors.amber.shade400 : Colors.teal.shade200),
+                ),
+                child: Column(
+                  children: [
+                    Row(
+                      children: [
+                        const Text("Pure Margin % (no disc):", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                        const Spacer(),
+                        Text("${pureMargin.toStringAsFixed(2)}%", style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: item.isLowMargin ? Colors.orange.shade900 : Colors.teal.shade800)),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Row(
+                      children: [
+                        const Text("Net Margin % (with L.Cost):", style: TextStyle(fontSize: 12, color: Colors.blueGrey)),
+                        const Spacer(),
+                        Text("${netMargin.toStringAsFixed(2)}%", style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.blueGrey)),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text("CLOSE", style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _mathRow(String label, String value, {bool isBold = false, Color? color}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          Text(label, style: TextStyle(fontSize: 12, fontWeight: isBold ? FontWeight.bold : FontWeight.normal, color: color ?? Colors.black87)),
+          const Spacer(),
+          Text(value, style: TextStyle(fontSize: 12, fontWeight: isBold ? FontWeight.bold : FontWeight.w600, color: color ?? Colors.black87)),
+        ],
+      ),
+    );
+  }
+
   // ---> NEW: DIRTY STATE INTERCEPTOR <---
   Future<bool?> _promptDiscardChanges() async {
     if (!_isExistingEntry) {
@@ -5603,6 +5795,7 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
                     _topActionBtn(Icons.print_rounded, "Print", const Color(0xFF607D8B), onTap: _printPurchase),
                     _topActionBtn(Icons.picture_as_pdf_rounded, "PDF", const Color(0xFFE53935), onTap: _exportToPdf),
                     _topActionBtn(Icons.file_download_outlined, "Export", const Color(0xFF2E7D32), onTap: _exportToExcel),
+                    _topActionBtn(Icons.info_outline_rounded, "Manual", Colors.indigo, onTap: _showManualAndLegendDialog),
                     _topActionBtn(Icons.delete_forever_rounded, "Del", canEdit ? const Color(0xFFD32F2F) : Colors.grey.shade400, textColor: canEdit ? null : Colors.grey.shade400, onTap: canEdit ? _showDeleteConfirm : null),
                     const SizedBox(width: 8),
                     PopupMenuButton<String>(
