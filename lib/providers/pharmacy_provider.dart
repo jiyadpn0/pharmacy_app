@@ -58,6 +58,14 @@ class PharmacyProvider extends ChangeNotifier {
     return _productBatchesMap[key] ?? const [];
   }
 
+  final Map<String, int> _totalStockByProductName = {};
+
+  int getTotalStockForProduct(String cleanName) {
+    final key = Product.cleanProductName(cleanName).toLowerCase();
+    if (key.isEmpty) return 0;
+    return _totalStockByProductName[key] ?? 0;
+  }
+
   void invalidateSearchProductsCache() {
     _searchCache.clear();
   }
@@ -66,10 +74,14 @@ class PharmacyProvider extends ChangeNotifier {
     _stockVersion++;
     _searchCache.clear();
     _productBatchesMap.clear();
+    _totalStockByProductName.clear();
     for (var p in _products) {
-      final key = p.name.trim().toLowerCase();
+      final key = Product.cleanProductName(p.name).toLowerCase();
       if (key.isNotEmpty) {
         _productBatchesMap.putIfAbsent(key, () => []).add(p);
+        if (p.stock > 0) {
+          _totalStockByProductName[key] = (_totalStockByProductName[key] ?? 0) + p.stock;
+        }
       }
     }
   }
@@ -11742,11 +11754,17 @@ class PharmacyProvider extends ChangeNotifier {
       if (isStart) {
         startsMatches.add(p);
       } else {
-        final bool isContain = nameLower.contains(q) ||
-            (includeGenerics && p.genericName.trim().toLowerCase().contains(q));
-        if (isContain) {
-          containsMatches.add(p);
+        if (containsMatches.length < 50) {
+          final bool isContain = nameLower.contains(q) ||
+              (includeGenerics && p.genericName.trim().toLowerCase().contains(q));
+          if (isContain) {
+            containsMatches.add(p);
+          }
         }
+      }
+
+      if (startsMatches.length >= 50 && containsMatches.length >= 50) {
+        break; // Stop scanning thousands of extra items once top 100 matches are collected
       }
     }
 

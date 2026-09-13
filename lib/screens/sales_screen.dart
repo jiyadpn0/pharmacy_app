@@ -6550,14 +6550,10 @@ class _SalesScreenState extends State<SalesScreen> {
 
     final provider = Provider.of<PharmacyProvider>(context, listen: false);
 
-    // 1. Sum stock across ALL batches of this medicine in database/provider
-    int totalAllBatchesStock = 0;
-    for (int i = 0; i < provider.products.length; i++) {
-      final p = provider.products[i];
-      final pCleanName = Product.cleanProductName(p.name).toLowerCase();
-      if ((it.product.id.isNotEmpty && p.id == it.product.id) || pCleanName == cleanName) {
-        totalAllBatchesStock += p.stock;
-      }
+    // 1. Instant O(1) Map Lookup for Total Stock Across All Batches
+    int totalAllBatchesStock = provider.getTotalStockForProduct(cleanName);
+    if (totalAllBatchesStock <= 0 && it.product.stock > 0) {
+      totalAllBatchesStock = it.product.stock;
     }
 
     // 2. Sum total quantity of this medicine added across ALL rows in current bill
