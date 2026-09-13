@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:intl/intl.dart';
 import 'package:file_picker/file_picker.dart';
 import 'dart:async';
+import '../database/db_helper.dart';
 import '../providers/pharmacy_provider.dart';
 import '../providers/mdi_controller.dart';
 import '../utils/app_dialogs.dart';
@@ -3638,8 +3639,6 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
         _hasConfirmedNearExpiry = true;
         _isSaving = true;
       }
-        return;
-      }
 
       // --- GST MISMATCH WORKFLOW CHECK ---
       final mismatchedItems = _items.where((it) => it.hasGstMismatch).toList();
@@ -3652,7 +3651,7 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
       }
 
       // --- OPTION B: UPDATE PRODUCT MASTER DEFAULT GST RATES ---
-      final db = await p.database;
+      final db = await DbHelper.instance.database;
       for (var it in _items) {
         if (it.updateMasterGst && it.productId.isNotEmpty && it.gstPercent > 0) {
           try {
