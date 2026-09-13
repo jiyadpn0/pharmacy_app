@@ -4390,7 +4390,7 @@ class _SalesScreenState extends State<SalesScreen> {
                     ),
                     _topActionBtn(Icons.search_rounded, "Find", const Color(0xFF3F51B5), onTap: _showFindDialog),
                     _topActionBtn(Icons.print_rounded, "Print", const Color(0xFF607D8B), onTap: _printSale),
-                    _topActionBtn(Icons.info_outline_rounded, "Manual", Colors.indigo, onTap: _showSalesManualAndLegendDialog),
+                    _topActionBtn(Icons.info_outline_rounded, "Info & Guide", Colors.indigo, onTap: _showSalesManualAndLegendDialog),
                     _topActionBtn(
                       Icons.delete_forever_rounded,
                       "Del",

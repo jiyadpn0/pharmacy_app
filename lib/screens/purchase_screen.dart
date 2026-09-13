@@ -5930,7 +5930,7 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
                     _topActionBtn(Icons.print_rounded, "Print", const Color(0xFF607D8B), onTap: _printPurchase),
                     _topActionBtn(Icons.picture_as_pdf_rounded, "PDF", const Color(0xFFE53935), onTap: _exportToPdf),
                     _topActionBtn(Icons.file_download_outlined, "Export", const Color(0xFF2E7D32), onTap: _exportToExcel),
-                    _topActionBtn(Icons.info_outline_rounded, "Manual", Colors.indigo, onTap: _showManualAndLegendDialog),
+                    _topActionBtn(Icons.info_outline_rounded, "Info & Guide", Colors.indigo, onTap: _showManualAndLegendDialog),
                     _topActionBtn(Icons.delete_forever_rounded, "Del", canEdit ? const Color(0xFFD32F2F) : Colors.grey.shade400, textColor: canEdit ? null : Colors.grey.shade400, onTap: canEdit ? _showDeleteConfirm : null),
                     const SizedBox(width: 8),
                     PopupMenuButton<String>(
