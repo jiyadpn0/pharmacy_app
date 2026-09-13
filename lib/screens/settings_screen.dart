@@ -32,6 +32,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late TextEditingController _gstCtrl;
   late TextEditingController _githubRepoCtrl;
   late TextEditingController _githubTokenCtrl;
+  int _minExpiryMonths = 6;
   String _activeTab = "Pharmacy Profile";
   String? _salesFy = "All Years";
   String? _purchaseFy = "All Years";
@@ -59,6 +60,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final prefs = await SharedPreferences.getInstance();
     final savedRepo = prefs.getString('github_repo_path');
     final savedToken = prefs.getString('github_token');
+    final savedExpiryMonths = prefs.getInt('min_purchase_expiry_months') ?? 6;
     if (mounted) {
       setState(() {
         if (savedRepo != null && savedRepo.isNotEmpty) {
@@ -67,6 +69,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         if (savedToken != null && savedToken.isNotEmpty) {
           _githubTokenCtrl.text = savedToken;
         }
+        _minExpiryMonths = savedExpiryMonths;
       });
     }
   }
@@ -538,10 +541,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           final prefs = await SharedPreferences.getInstance();
                           await prefs.setString('github_repo_path', _githubRepoCtrl.text.trim());
                           await prefs.setString('github_token', _githubTokenCtrl.text.trim());
+                          await prefs.setInt('min_purchase_expiry_months', _minExpiryMonths);
                           if (mounted) {
                             ScaffoldMessenger.of(context).showSnackBar(
                               const SnackBar(
-                                content: Text("GitHub repository and access token credentials saved successfully!"),
+                                content: Text("System settings & credentials saved successfully!"),
                                 backgroundColor: Colors.green,
                                 behavior: SnackBarBehavior.floating,
                               ),
@@ -549,6 +553,33 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           }
                         },
                       ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      const Icon(Icons.timer_rounded, size: 18, color: Colors.blueGrey),
+                      const SizedBox(width: 8),
+                      const Text("Min Purchase Expiry Threshold:", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.blueGrey)),
+                      const SizedBox(width: 10),
+                      DropdownButton<int>(
+                        value: _minExpiryMonths,
+                        items: const [
+                          DropdownMenuItem(value: 3, child: Text("3 Months")),
+                          DropdownMenuItem(value: 6, child: Text("6 Months (Recommended)")),
+                          DropdownMenuItem(value: 9, child: Text("9 Months")),
+                          DropdownMenuItem(value: 12, child: Text("12 Months")),
+                        ],
+                        onChanged: (val) async {
+                          if (val != null) {
+                            setState(() => _minExpiryMonths = val);
+                            final prefs = await SharedPreferences.getInstance();
+                            await prefs.setInt('min_purchase_expiry_months', val);
+                          }
+                        },
+                      ),
+                      const SizedBox(width: 12),
+                      const Text("(Triggers Distributor Return Warning during purchase)", style: TextStyle(fontSize: 11, color: Colors.grey)),
                     ],
                   ),
                 ],

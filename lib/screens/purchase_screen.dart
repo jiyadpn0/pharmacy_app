@@ -114,14 +114,26 @@ class PurchaseItemData {
   double sRate = 0.0;
   double lCost = 0.0;
 
+  double get effectivePRate {
+    int totalUnits = qty + fQty;
+    if (totalUnits <= 0) return pRate;
+    return (pRate * qty) / totalUnits;
+  }
+
   double get profitPctNoDisc {
-    if (mrp <= 0 || pRate <= 0) return 0.0;
-    return ((mrp - pRate) / pRate) * 100.0;
+    if (mrp <= 0) return 0.0;
+    double effRate = effectivePRate;
+    return ((mrp - effRate) / mrp) * 100.0;
   }
 
   bool get isLowMargin {
-    if (mrp <= 0 || pRate <= 0) return false;
+    if (mrp <= 0) return false;
     return profitPctNoDisc < 24.9;
+  }
+
+  bool get isNegativeMargin {
+    if (mrp <= 0 || pRate <= 0) return false;
+    return effectivePRate >= mrp;
   }
 
   bool get hasMrpChanged {
@@ -1085,28 +1097,29 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
     DateTime now = DateTime.now();
     DateTime today = DateTime(now.year, now.month, now.day);
 
-    if (expDate.isBefore(today)) {
-      // EXPIRED ITEM -> Red background, White text
-      return ExpiryStyle(Colors.red.shade700, Colors.white);
-    }
-
     int months = (expDate.year - now.year) * 12 + (expDate.month - now.month);
 
-    if (months <= 3) {
-      // UP TO 3 MONTHS NEAR EXPIRY -> Orange background, White text
-      return ExpiryStyle(Colors.orange.shade800, Colors.white);
+    if (expDate.isBefore(today) || months <= 3) {
+      // 1. Up to 3 Months / Expired ➜ Dark Red 🔴
+      return ExpiryStyle(Colors.red.shade900, Colors.white);
     } else if (months <= 6) {
-      // 6 MONTHS FOR EXPIRY -> Light Orange background, Black text
-      return ExpiryStyle(Colors.orange.shade300, Colors.black);
+      // 2. Up to 6 Months ➜ Red 🔴
+      return ExpiryStyle(Colors.red.shade700, Colors.white);
     } else if (months <= 12) {
-      // 1 YEAR -> Yellow background, Black text
-      return ExpiryStyle(Colors.yellow.shade600, Colors.black);
+      // 3. Up to 1 Year (12 Months) ➜ Orange 🟧
+      return ExpiryStyle(Colors.orange.shade800, Colors.white);
     } else if (months <= 18) {
-      // 1.5 YEAR -> Light Green background, Black text
-      return ExpiryStyle(Colors.lightGreen.shade400, Colors.black);
+      // 4. Up to 1.5 Years (18 Months) ➜ Yellow 🟨
+      return ExpiryStyle(Colors.amber.shade700, Colors.white);
+    } else if (months <= 24) {
+      // 5. Up to 2 Years (24 Months) ➜ Light Green 🟢
+      return ExpiryStyle(Colors.lightGreen.shade700, Colors.white);
+    } else if (months <= 36) {
+      // 6. Up to 3 Years (36 Months) ➜ Green 🟢
+      return ExpiryStyle(Colors.green.shade700, Colors.white);
     } else {
-      // 2 YEARS AND ABOVE -> Dark Green background, White text
-      return ExpiryStyle(Colors.green.shade800, Colors.white);
+      // 7. More than 3 Years (> 36 Months) ➜ Dark Green 🟢
+      return ExpiryStyle(Colors.teal.shade800, Colors.white);
     }
   }
 
@@ -2314,6 +2327,11 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
         bool isFocused = focus?.row == row;
         Color rowBg = isFocused ? const Color(0xFFE3F2FD) : (row % 2 == 0 ? Colors.white : const Color(0xFFF5F7F9));
         
+        // Highlight row in RED if Negative Margin (Purchase Rate >= MRP)
+        if (row < _items.length && _items[row].isNegativeMargin) {
+          rowBg = Colors.red.shade100;
+        }
+
         // Highlight background colors for read-only / calculated locked cells
         const Color lockedBg = Color(0xFFF1F5F9);
         const Color totalLockedBg = Color(0xFFEFF6FF);
@@ -3236,6 +3254,7 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
   }
 
   bool _hasResolvedGstMismatches = false;
+  bool _hasConfirmedNearExpiry = false;
 
   Future<bool?> _showGstMismatchDialog(List<PurchaseItemData> mismatchedItems) async {
     return showDialog<bool>(
@@ -3500,6 +3519,14 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
           if (month == null || month < 1 || month > 12 || year == null) {
             _errorCells.putIfAbsent(i, () => {}).add(5); // Column 5: Expiry
             validationErrors.add("Row ${i + 1}: Invalid expiry month ($exp). Must be between 01 and 12.");
+          } else {
+            DateTime expDate = _parseExpiry(exp);
+            DateTime now = DateTime.now();
+            DateTime today = DateTime(now.year, now.month, now.day);
+            if (expDate.isBefore(today)) {
+              _errorCells.putIfAbsent(i, () => {}).add(5); // Column 5: Expiry
+              validationErrors.add("🚫 Row ${i + 1}: Batch '${it.batch}' for '${it.productName}' is ALREADY EXPIRED ($exp). Cannot purchase or save expired stock.");
+            }
           }
         }
 
@@ -3517,9 +3544,98 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
         setState(() {});
         AppDialogs.showFastDialog(
           context: context, 
-          title: "Save Blocked: Incomplete Data", 
+          title: "Save Blocked: Incomplete / Expired Data", 
           content: validationErrors.join("\n")
         );
+        return;
+      }
+
+      // --- DISTRIBUTOR RETURN WARNING ALERT (< CONFIGURABLE MONTHS) ---
+      final prefs = await SharedPreferences.getInstance();
+      int minAcceptableMonths = prefs.getInt('min_purchase_expiry_months') ?? 6;
+      List<String> nearExpiryAlerts = [];
+
+      for (int i = 0; i < _items.length; i++) {
+        final it = _items[i];
+        if (it.productName.trim().isEmpty) continue;
+        DateTime expDate = _parseExpiry(it.expiry);
+        DateTime now = DateTime.now();
+        DateTime today = DateTime(now.year, now.month, now.day);
+        int monthsRemaining = (expDate.year - now.year) * 12 + (expDate.month - now.month);
+
+        if (!expDate.isBefore(today) && monthsRemaining < minAcceptableMonths) {
+          nearExpiryAlerts.add("• ${it.productName} (Batch: ${it.batch}, Exp: ${it.expiry} - $monthsRemaining months left)");
+        }
+      }
+
+      if (nearExpiryAlerts.isNotEmpty && !_hasConfirmedNearExpiry) {
+        _isSaving = false;
+        final bool? confirmNearExpiry = await showDialog<bool>(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) => AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            title: Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(color: Colors.orange.shade100, shape: BoxShape.circle),
+                  child: Icon(Icons.warning_amber_rounded, color: Colors.orange.shade900, size: 28),
+                ),
+                const SizedBox(width: 12),
+                const Expanded(
+                  child: Text("⚠️ Distributor Return Warning", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                ),
+              ],
+            ),
+            content: SizedBox(
+              width: 520,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    "The following stock items expire in under $minAcceptableMonths months:\n",
+                    style: const TextStyle(fontSize: 13, color: Colors.black87),
+                  ),
+                  Container(
+                    constraints: const BoxConstraints(maxHeight: 180),
+                    child: SingleChildScrollView(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: nearExpiryAlerts.map((e) => Padding(
+                          padding: const EdgeInsets.only(bottom: 6),
+                          child: Text(e, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.deepOrange)),
+                        )).toList(),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    "Distributors / Suppliers may NOT accept returns for near-expiry stock. Do you want to accept and proceed anyway?",
+                    style: TextStyle(fontSize: 12, color: Colors.blueGrey, height: 1.4),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              OutlinedButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text("CANCEL & REVIEW", style: TextStyle(fontWeight: FontWeight.bold)),
+              ),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.orange.shade800, foregroundColor: Colors.white),
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text("ACCEPT & PROCEED", style: TextStyle(fontWeight: FontWeight.bold)),
+              ),
+            ],
+          ),
+        );
+
+        if (confirmNearExpiry != true) return;
+        _hasConfirmedNearExpiry = true;
+        _isSaving = true;
+      }
         return;
       }
 
@@ -5577,13 +5693,24 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
                 _legendTile(Colors.amber.shade100, Colors.orange.shade900, "Orange / Amber Text", "Low Margin Alert (< 24.9% pure profit margin)"),
                 _legendTile(Colors.white, Colors.blue.shade800, "Blue Text with ▲ / ▼", "Price / MRP Changed compared to Product Master"),
                 _legendTile(Colors.amber.shade300, Colors.amber.shade900, "Yellow Highlight", "GST Rate Mismatch between Invoice and Product Master"),
-                _legendTile(Colors.red.shade100, Colors.red.shade900, "Red Highlight", "Expired Batch or Mandatory Data Validation Error"),
+                _legendTile(Colors.red.shade100, Colors.red.shade900, "Red Row Highlight", "Negative Margin (P.Rate >= MRP) or Expired Stock"),
+                const SizedBox(height: 12),
+                const Text("EXPIRY COLOR SLABS", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.blueGrey)),
+                const SizedBox(height: 6),
+                _legendTile(Colors.red.shade900, Colors.white, "Dark Red 🔴", "Expired or ≤ 3 Months Shelf Life"),
+                _legendTile(Colors.red.shade700, Colors.white, "Red 🔴", "≤ 6 Months Shelf Life (Distributor Return Warning)"),
+                _legendTile(Colors.orange.shade800, Colors.white, "Orange 🟧", "≤ 1 Year / 12 Months Shelf Life"),
+                _legendTile(Colors.amber.shade700, Colors.white, "Yellow 🟨", "≤ 1.5 Years / 18 Months Shelf Life"),
+                _legendTile(Colors.lightGreen.shade700, Colors.white, "Light Green 🟢", "≤ 2 Years / 24 Months Shelf Life"),
+                _legendTile(Colors.green.shade700, Colors.white, "Green 🟢", "≤ 3 Years / 36 Months Shelf Life"),
+                _legendTile(Colors.teal.shade800, Colors.white, "Dark Green 🟢", "> 3 Years / > 36 Months Shelf Life"),
                 const SizedBox(height: 20),
                 const Divider(),
                 const SizedBox(height: 12),
                 const Text("CALCULATION FORMULAS", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.blueGrey, letterSpacing: 1.2)),
                 const SizedBox(height: 10),
-                _formulaTile("Pure Margin % (No Discount)", "((MRP - Purchase Rate) / Purchase Rate) × 100"),
+                _formulaTile("Effective Purchase Rate (with FQTY)", "(Purchase Rate × Paid Qty) / (Paid Qty + Free Qty)"),
+                _formulaTile("Pure Margin % (No Discount)", "((MRP - Effective P.Rate) / MRP) × 100"),
                 _formulaTile("Net Margin % (With L.Cost)", "((MRP - Landed Cost) / Landed Cost) × 100"),
                 _formulaTile("Net Landed Cost", "(Purchase Rate - Discount) + GST Tax Amount"),
                 _formulaTile("GST Tax Amount", "Net Amount × (GST % / 100)"),
@@ -5634,12 +5761,16 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
 
   void _showPurchaseItemMathBreakdown(PurchaseItemData item) {
     double baseRate = item.pRate;
+    int qty = item.qty;
+    int fQty = item.fQty;
+    double effRate = item.effectivePRate;
     double discPct = item.discPercent;
     double discAmt = item.discAmt;
     double netAmt = item.net;
     double gstPct = item.gstPercent;
     double gstAmt = item.gstAmt;
-    double lCost = item.lCost > 0 ? item.lCost : ((netAmt + gstAmt) / (item.qty > 0 ? item.qty : 1));
+    int totalUnits = qty + fQty;
+    double lCost = item.lCost > 0 ? item.lCost : ((netAmt + gstAmt) / (totalUnits > 0 ? totalUnits : 1));
     double mrp = item.mrp;
     double pureMargin = item.profitPctNoDisc;
     double netMargin = lCost > 0 ? ((mrp - lCost) / lCost) * 100.0 : 0.0;
@@ -5662,12 +5793,15 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
           ],
         ),
         content: SizedBox(
-          width: 480,
+          width: 500,
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _mathRow("Base Purchase Rate (P.Rate)", "₹${baseRate.toStringAsFixed(2)}", isBold: true),
+              _mathRow("Entered Purchase Rate (P.Rate)", "₹${baseRate.toStringAsFixed(2)}", isBold: true),
+              _mathRow("Paid Qty: $qty | Free Qty (FQTY): $fQty", "Total Units: $totalUnits"),
+              if (fQty > 0)
+                _mathRow("Effective Purchase Rate (with FQTY)", "₹${effRate.toStringAsFixed(2)}", isBold: true, color: Colors.teal.shade900),
               _mathRow("- Discount ($discPct%)", "-₹${discAmt.toStringAsFixed(2)}", color: Colors.red.shade700),
               const Divider(),
               _mathRow("Net Amount (before tax)", "₹${netAmt.toStringAsFixed(2)}"),
@@ -5679,9 +5813,9 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
               Container(
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
-                  color: item.isLowMargin ? Colors.amber.shade100 : Colors.teal.shade50,
+                  color: item.isNegativeMargin ? Colors.red.shade100 : (item.isLowMargin ? Colors.amber.shade100 : Colors.teal.shade50),
                   borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: item.isLowMargin ? Colors.amber.shade400 : Colors.teal.shade200),
+                  border: Border.all(color: item.isNegativeMargin ? Colors.red.shade400 : (item.isLowMargin ? Colors.amber.shade400 : Colors.teal.shade200)),
                 ),
                 child: Column(
                   children: [
@@ -5689,7 +5823,7 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
                       children: [
                         const Text("Pure Margin % (no disc):", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
                         const Spacer(),
-                        Text("${pureMargin.toStringAsFixed(2)}%", style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: item.isLowMargin ? Colors.orange.shade900 : Colors.teal.shade800)),
+                        Text("${pureMargin.toStringAsFixed(2)}%", style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: item.isNegativeMargin ? Colors.red.shade900 : (item.isLowMargin ? Colors.orange.shade900 : Colors.teal.shade800))),
                       ],
                     ),
                     const SizedBox(height: 4),
