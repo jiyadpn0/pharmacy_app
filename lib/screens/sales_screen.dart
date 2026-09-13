@@ -6447,20 +6447,22 @@ class _SalesScreenState extends State<SalesScreen> {
   Widget _headerInp(int col, {double? width, double? height, LayerLink? link, Function(String)? onChanged, Function(String)? onSubmitted}) {
     const bool isLocked = false;
     final bool readOnly = _isDeleted || isLocked;
+    final bool isNumeric = (col == 1 || col == 3);
 
     Widget field = TextField(
         readOnly: readOnly,
         controller: _getHeaderCtrl(col), focusNode: _getHeaderFocus(col),
         style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
         textAlignVertical: TextAlignVertical.center,
+        keyboardType: isNumeric ? TextInputType.number : TextInputType.text,
         onChanged: (v) {
           _markDirty();
           if (onChanged != null) onChanged(v);
           _syncToGlobalSession();
         },
         onSubmitted: readOnly ? null : onSubmitted,
-        textCapitalization: TextCapitalization.characters,
-        inputFormatters: [UpperCaseTextFormatter()],
+        textCapitalization: isNumeric ? TextCapitalization.none : TextCapitalization.characters,
+        inputFormatters: isNumeric ? [FilteringTextInputFormatter.digitsOnly] : [UpperCaseTextFormatter()],
         decoration: const InputDecoration(border: InputBorder.none, isDense: true, contentPadding: EdgeInsets.symmetric(horizontal: 6, vertical: 8))
     );
 
@@ -6527,8 +6529,11 @@ class _SalesScreenState extends State<SalesScreen> {
     child: ListView.builder(
         controller: _verticalGridScrollCtrl,
         padding: EdgeInsets.zero,
+        itemExtent: 30.0,
         itemCount: _items.length + (_isDeleted ? 0 : 1),
-        itemBuilder: (ctx, i) => i < _items.length ? _buildRow(i) : _buildEmptyRow(i)
+        itemBuilder: (ctx, i) => RepaintBoundary(
+          child: i < _items.length ? _buildRow(i) : _buildEmptyRow(i),
+        ),
     ),
   );
 
@@ -7333,6 +7338,39 @@ class _SalesScreenState extends State<SalesScreen> {
     _buildQuickActions()
   ]));
 
+  void _onGenericAltSelected(Product p) {
+    int row = _focusedRowIndex;
+    if (row < 0 || row >= _items.length) {
+      if (_items.isEmpty) {
+        _items.add(SaleItem(product: p));
+        row = 0;
+      } else if (_items.last.product.name.isNotEmpty) {
+        _items.add(SaleItem(product: p));
+        row = _items.length - 1;
+      } else {
+        row = _items.length - 1;
+      }
+    }
+
+    final item = _items[row];
+    item.product = p;
+    item.extra = p.name;
+    item.mrp = p.mrp;
+    item.taxableSP = p.salePrice;
+    item.sRate = p.salePrice;
+    item.gstPercent = p.gstPercent;
+
+    final ctrl = _getGridCtrl(row, 2, p.name);
+    ctrl.text = p.name;
+
+    _onProductSelected(p);
+
+    setState(() {});
+
+    // Focus cursor directly on Batch section (Col 4) and auto-open batch dropdown
+    _moveFocus(row, 4, autoOpen: true);
+  }
+
   Widget _buildAlternativesList() {
     if (_footerAlts.isEmpty) {
        return Container(
@@ -7356,17 +7394,20 @@ class _SalesScreenState extends State<SalesScreen> {
           bool isEven = i % 2 == 0;
           final genDisplay = p.genericName.isNotEmpty ? p.genericName : _activeGenericName;
 
-          return Container(
-            height: 24,
-            decoration: BoxDecoration(
-              color: isEven ? Colors.white : const Color(0xFFF8F9FA),
-              border: Border(bottom: BorderSide(color: Colors.grey.shade200))
+          return InkWell(
+            onTap: () => _onGenericAltSelected(p),
+            child: Container(
+              height: 24,
+              decoration: BoxDecoration(
+                color: isEven ? Colors.white : const Color(0xFFF8F9FA),
+                border: Border(bottom: BorderSide(color: Colors.grey.shade200))
+              ),
+              child: Row(children: [
+                Expanded(flex: 4, child: Padding(padding: const EdgeInsets.only(left: 8), child: Text(p.name.toUpperCase(), style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.blue.shade900), overflow: TextOverflow.ellipsis))),
+                Expanded(flex: 4, child: Text(genDisplay.toUpperCase(), style: TextStyle(fontSize: 10, color: Colors.blue.shade700), overflow: TextOverflow.ellipsis)),
+                Expanded(flex: 1, child: Container(padding: const EdgeInsets.only(right: 8), alignment: Alignment.centerRight, child: Text(p.stock.toString(), style: const TextStyle(fontSize: 11, color: Colors.blue, fontWeight: FontWeight.bold))))
+              ]),
             ),
-            child: Row(children: [
-              Expanded(flex: 4, child: Padding(padding: const EdgeInsets.only(left: 8), child: Text(p.name.toUpperCase(), style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.black54), overflow: TextOverflow.ellipsis))),
-              Expanded(flex: 4, child: Text(genDisplay.toUpperCase(), style: TextStyle(fontSize: 10, color: Colors.blue.shade700), overflow: TextOverflow.ellipsis)),
-              Expanded(flex: 1, child: Container(padding: const EdgeInsets.only(right: 8), alignment: Alignment.centerRight, child: Text(p.stock.toString(), style: const TextStyle(fontSize: 11, color: Colors.blue, fontWeight: FontWeight.bold))))
-            ])
           );
         }
       )
@@ -7482,6 +7523,8 @@ class _SalesScreenState extends State<SalesScreen> {
                       controller: _rcvdAmtCtrl,
                       readOnly: readOnly,
                       focusNode: _rcvdAmtFocus,
+                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                      inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))],
                       onChanged: (_) {
                         _markDirty();
                         _calculateFooter();
@@ -7552,6 +7595,8 @@ class _SalesScreenState extends State<SalesScreen> {
                     width: 45, height: 20, decoration: BoxDecoration(color: isReadOnly ? Colors.grey.shade100 : Colors.white, border: Border.all(color: Colors.grey.shade300)),
                     child: TextField(
                         controller: pctCtrl, readOnly: isReadOnly, textAlign: TextAlign.center, cursorColor: Colors.black,
+                        keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                        inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))],
                         onChanged: (_) {
                           _markDirty();
                           _calculateFooter();
@@ -7566,6 +7611,8 @@ class _SalesScreenState extends State<SalesScreen> {
                   width: 70, height: 20, decoration: BoxDecoration(color: isReadOnly ? Colors.grey.shade100 : Colors.white, border: Border.all(color: Colors.grey.shade300)),
                   child: TextField(
                       controller: ctrl, readOnly: isReadOnly, cursorColor: Colors.black,
+                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                      inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))],
                       onChanged: (_) {
                         _markDirty();
                         _calculateFooter();
@@ -7902,10 +7949,107 @@ class _SalesScreenState extends State<SalesScreen> {
     final TextEditingController searchCtrl = TextEditingController();
     final FocusNode searchFocusNode = FocusNode();
     final ScrollController listScrollCtrl = ScrollController();
+    final SearchDebouncer searchDebouncer = SearchDebouncer(milliseconds: 80);
+
+    final provider = Provider.of<PharmacyProvider>(context, listen: false);
+
+    // Master map for fast generic fallback lookup built ONCE per dialog open
+    final Map<String, String> masterGenMap = {};
+    for (var m in provider.productMaster) {
+      final gen = m.genericName.trim();
+      if (gen.isNotEmpty) {
+        masterGenMap[m.id] = gen;
+        masterGenMap[m.name.trim().toLowerCase()] = gen;
+      }
+    }
+    for (var g in provider.genericMaster) {
+      if (g.name.trim().isNotEmpty) {
+        masterGenMap[g.id] = g.name.trim();
+      }
+    }
 
     int selectedIdx = 0;
     List<Product> results = [];
     Offset dialogOffset = Offset.zero;
+
+    // Filter and Sort states
+    bool showZeroStock = false;
+    String selectedCategory = "ALL";
+    String sortColumn = ""; // "name", "generic", "category", "cutStrip", "rack", "batch", "expiry", "stock", "mrp", "rate"
+    bool sortAscending = true;
+
+    // Helper functions for segment matching, content count & expiry
+    List<String> getGenericSegments(String genName) {
+      if (genName.trim().isEmpty) return [];
+      return genName
+          .split(RegExp(r'[-+/,]'))
+          .map((s) => s.trim())
+          .where((s) => s.isNotEmpty)
+          .toList();
+    }
+
+    int getGenericContentCount(String genName) {
+      final segs = getGenericSegments(genName);
+      return segs.isEmpty ? 1 : segs.length;
+    }
+
+    bool matchesGenericSegments(String genName, String query) {
+      final segs = getGenericSegments(genName);
+      if (segs.isEmpty) return false;
+      for (var seg in segs) {
+        if (seg.toLowerCase().startsWith(query)) return true;
+      }
+      return false;
+    }
+
+    bool matchesWordStart(String text, String q) {
+      if (text.trim().isEmpty || q.isEmpty) return false;
+      final clean = text.trim().toLowerCase();
+      if (clean.startsWith(q)) return true;
+      final words = clean.split(RegExp(r'\s+'));
+      for (var w in words) {
+        if (w.startsWith(q)) return true;
+      }
+      return false;
+    }
+
+    bool matchesBatchStart(String batch, String q) {
+      if (batch.trim().isEmpty || q.isEmpty) return false;
+      return batch.trim().toLowerCase().startsWith(q);
+    }
+
+    bool isNearExpiry(String expiryStr) {
+      if (expiryStr.trim().isEmpty) return false;
+      try {
+        final exp = expiryStr.trim();
+        DateTime expDate;
+        if (exp.contains('/')) {
+          final parts = exp.split('/');
+          if (parts.length == 2) {
+            int month = int.tryParse(parts[0]) ?? 1;
+            int year = int.tryParse(parts[1]) ?? DateTime.now().year;
+            if (year < 100) year += 2000;
+            expDate = DateTime(year, month + 1, 0);
+          } else {
+            return false;
+          }
+        } else if (exp.contains('-')) {
+          expDate = DateTime.tryParse(exp) ?? DateTime.now().add(const Duration(days: 365));
+        } else {
+          return false;
+        }
+        final threshold = DateTime.now().add(const Duration(days: 180));
+        return expDate.isBefore(threshold);
+      } catch (_) {
+        return false;
+      }
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (searchFocusNode.canRequestFocus) {
+        searchFocusNode.requestFocus();
+      }
+    });
 
     showGeneralDialog(
       context: context,
@@ -7926,38 +8070,34 @@ class _SalesScreenState extends State<SalesScreen> {
                 return;
               }
 
-              final provider = Provider.of<PharmacyProvider>(context, listen: false);
-
-              // Master map for fast generic fallback lookup
-              final Map<String, String> masterGenMap = {};
-              for (var m in provider.productMaster) {
-                if (m.genericName.trim().isNotEmpty) {
-                  masterGenMap[m.id] = m.genericName.trim();
-                  masterGenMap[m.name.trim().toLowerCase()] = m.genericName.trim();
-                }
-              }
-
               final List<Product> matched = [];
               final Set<String> seenKeys = {};
+              final Set<String> matchedStockIds = {};
+              final Set<String> matchedStockNames = {};
 
-              // 1. Search live stock batches first (products with stock > 0 or in batch registry)
+              // 1. Search live stock batches first
               for (var p in provider.products) {
+                if (!showZeroStock && p.stock <= 0) continue;
+
                 final nameLower = p.name.trim().toLowerCase();
                 String genLower = p.genericName.trim().toLowerCase();
                 if (genLower.isEmpty) {
                   genLower = (masterGenMap[p.id] ?? masterGenMap[nameLower] ?? "").toLowerCase();
                 }
 
-                final bool matchesName = nameLower.contains(query);
-                final bool matchesGen = genLower.contains(query);
-                final bool matchesBatch = p.batch.trim().toLowerCase().contains(query);
+                final bool matchesName = matchesWordStart(nameLower, query);
+                final bool matchesGenSegment = matchesGenericSegments(genLower, query);
+                final bool matchesBatch = matchesBatchStart(p.batch, query);
 
-                if (matchesName || matchesGen || matchesBatch) {
+                if (matchesName || matchesGenSegment || matchesBatch) {
                   final key = "${p.id}_${p.batch}_${p.expiry}_${p.mrp}_${p.salePrice}";
                   if (!seenKeys.contains(key)) {
                     seenKeys.add(key);
-                    final resolvedGen = p.genericName.isNotEmpty
-                        ? p.genericName
+                    matchedStockIds.add(p.id);
+                    matchedStockNames.add(nameLower);
+
+                    final resolvedGen = p.genericName.trim().isNotEmpty
+                        ? p.genericName.trim()
                         : (masterGenMap[p.id] ?? masterGenMap[nameLower] ?? "");
 
                     matched.add(Product(
@@ -7972,7 +8112,7 @@ class _SalesScreenState extends State<SalesScreen> {
                       landingCost: p.landingCost,
                       gstPercent: p.gstPercent,
                       rack: p.rack,
-                      category: p.category,
+                      category: p.category.trim().isNotEmpty ? p.category.trim() : "General",
                       manufacturer: p.manufacturer,
                       genericName: resolvedGen,
                       stock: p.stock,
@@ -7981,13 +8121,18 @@ class _SalesScreenState extends State<SalesScreen> {
                 }
               }
 
-              // 2. Also search product master (for items with 0 stock or unbatched)
+              // 2. Also search product master (for zero stock or unbatched)
               for (var m in provider.productMaster) {
+                if (!showZeroStock && m.stock <= 0) continue;
+
                 final nameLower = m.name.trim().toLowerCase();
                 final genLower = m.genericName.trim().toLowerCase();
 
-                if (nameLower.contains(query) || genLower.contains(query)) {
-                  bool alreadyHasStockRow = matched.any((p) => p.id == m.id || p.name.trim().toLowerCase() == nameLower);
+                final bool matchesName = matchesWordStart(nameLower, query);
+                final bool matchesGenSegment = matchesGenericSegments(genLower, query);
+
+                if (matchesName || matchesGenSegment) {
+                  final bool alreadyHasStockRow = matchedStockIds.contains(m.id) || matchedStockNames.contains(nameLower);
                   if (!alreadyHasStockRow) {
                     final key = "MASTER_${m.id}";
                     if (!seenKeys.contains(key)) {
@@ -7998,23 +8143,100 @@ class _SalesScreenState extends State<SalesScreen> {
                 }
               }
 
-              // Sort results: Items with stock > 0 and generic composition matches first
-              matched.sort((a, b) {
-                bool aHasStock = a.stock > 0;
-                bool bHasStock = b.stock > 0;
-                if (aHasStock != bHasStock) return aHasStock ? -1 : 1;
+              // Apply Category Filter if selected Category != "ALL"
+              List<Product> filtered = matched;
+              if (selectedCategory != "ALL") {
+                filtered = matched.where((p) {
+                  final catUpper = p.category.trim().toUpperCase();
+                  if (selectedCategory == "GENERIC") {
+                    return catUpper.contains("GEN");
+                  } else if (selectedCategory == "BRAND") {
+                    return !catUpper.contains("GEN");
+                  } else {
+                    return catUpper.contains(selectedCategory.toUpperCase());
+                  }
+                }).toList();
+              }
 
-                bool aGenMatch = a.genericName.trim().toLowerCase().contains(query);
-                bool bGenMatch = b.genericName.trim().toLowerCase().contains(query);
-                if (aGenMatch != bGenMatch) return aGenMatch ? -1 : 1;
+              // Sorting
+              if (sortColumn.isNotEmpty) {
+                filtered.sort((a, b) {
+                  int cmp = 0;
+                  switch (sortColumn) {
+                    case "name":
+                      cmp = a.name.toLowerCase().compareTo(b.name.toLowerCase());
+                      break;
+                    case "generic":
+                      cmp = a.genericName.toLowerCase().compareTo(b.genericName.toLowerCase());
+                      break;
+                    case "category":
+                      cmp = a.category.toLowerCase().compareTo(b.category.toLowerCase());
+                      break;
+                    case "cutStrip":
+                      bool cutA = a.packSize > 1 && a.stock > 0 && (a.stock % a.packSize > 0);
+                      bool cutB = b.packSize > 1 && b.stock > 0 && (b.stock % b.packSize > 0);
+                      cmp = (cutA == cutB) ? 0 : (cutA ? -1 : 1);
+                      break;
+                    case "rack":
+                      cmp = a.rack.toLowerCase().compareTo(b.rack.toLowerCase());
+                      break;
+                    case "batch":
+                      cmp = a.batch.toLowerCase().compareTo(b.batch.toLowerCase());
+                      break;
+                    case "expiry":
+                      cmp = a.expiry.compareTo(b.expiry);
+                      break;
+                    case "stock":
+                      cmp = a.stock.compareTo(b.stock);
+                      break;
+                    case "mrp":
+                      cmp = a.mrp.compareTo(b.mrp);
+                      break;
+                    case "rate":
+                      cmp = a.salePrice.compareTo(b.salePrice);
+                      break;
+                  }
+                  return sortAscending ? cmp : -cmp;
+                });
+              } else {
+                // Priority Default Sorting Rules:
+                // 1. Stock available (stock > 0 first)
+                // 2. Generic product priority (category contains GEN / GENERIC first)
+                // 3. Salt content count (1 salt -> 2 salts -> 3 salts)
+                // 4. Stock quantity descending
+                filtered.sort((a, b) {
+                  bool aHasStock = a.stock > 0;
+                  bool bHasStock = b.stock > 0;
+                  if (aHasStock != bHasStock) return aHasStock ? -1 : 1;
 
-                return b.stock.compareTo(a.stock);
-              });
+                  bool aIsGen = a.category.trim().toUpperCase().contains("GEN");
+                  bool bIsGen = b.category.trim().toUpperCase().contains("GEN");
+                  if (aIsGen != bIsGen) return aIsGen ? -1 : 1;
+
+                  int aCount = getGenericContentCount(a.genericName);
+                  int bCount = getGenericContentCount(b.genericName);
+                  if (aCount != bCount) return aCount.compareTo(bCount);
+
+                  return b.stock.compareTo(a.stock);
+                });
+              }
 
               setDialogState(() {
-                results = matched.take(100).toList();
+                results = filtered.take(150).toList();
                 selectedIdx = 0;
               });
+            }
+
+            void toggleSort(String col) {
+              setDialogState(() {
+                if (sortColumn == col) {
+                  sortAscending = !sortAscending;
+                } else {
+                  sortColumn = col;
+                  sortAscending = true;
+                }
+              });
+              performSearch(searchCtrl.text);
             }
 
             void selectItemAndClose(Product p) {
@@ -8047,6 +8269,77 @@ class _SalesScreenState extends State<SalesScreen> {
               }
             }
 
+            Widget buildHeaderCell(String label, String col, {int flex = 1, TextAlign align = TextAlign.left, Color textColor = Colors.white}) {
+              final bool isActive = sortColumn == col;
+              MainAxisAlignment mainAlign = MainAxisAlignment.start;
+              if (align == TextAlign.right) {
+                mainAlign = MainAxisAlignment.end;
+              } else if (align == TextAlign.center) {
+                mainAlign = MainAxisAlignment.center;
+              }
+
+              return Expanded(
+                flex: flex,
+                child: InkWell(
+                  onTap: () => toggleSort(col),
+                  child: Row(
+                    mainAxisAlignment: mainAlign,
+                    children: [
+                      Flexible(
+                        child: Text(
+                          label,
+                          textAlign: align,
+                          style: TextStyle(color: textColor, fontWeight: FontWeight.bold, fontSize: 11),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      if (isActive)
+                        Icon(
+                          sortAscending ? Icons.arrow_drop_up : Icons.arrow_drop_down,
+                          color: Colors.amber,
+                          size: 16,
+                        ),
+                    ],
+                  ),
+                ),
+              );
+            }
+
+            Widget buildCutStripCell(Product p) {
+              if (p.packSize <= 1) {
+                return const Center(
+                  child: Text("-", textAlign: TextAlign.center, style: TextStyle(fontSize: 10, color: Colors.black87)),
+                );
+              }
+              final int fullStrips = p.stock > 0 ? (p.stock ~/ p.packSize) : 0;
+              final int looseUnits = p.stock > 0 ? (p.stock % p.packSize) : 0;
+
+              return Center(
+                child: RichText(
+                  textAlign: TextAlign.center,
+                  text: TextSpan(
+                    style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, fontFamily: 'monospace'),
+                    children: [
+                      TextSpan(
+                        text: "$fullStrips ",
+                        style: const TextStyle(color: Colors.black87),
+                      ),
+                      const TextSpan(
+                        text: "/ ",
+                        style: TextStyle(color: Colors.black87),
+                      ),
+                      TextSpan(
+                        text: "$looseUnits",
+                        style: TextStyle(
+                          color: looseUnits > 0 ? Colors.red.shade700 : Colors.black87,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }
+
             return Transform.translate(
               offset: dialogOffset,
               child: Dialog(
@@ -8054,7 +8347,6 @@ class _SalesScreenState extends State<SalesScreen> {
                 clipBehavior: Clip.antiAlias,
                 elevation: 16,
                 child: Focus(
-                  autofocus: true,
                   onKeyEvent: (node, event) {
                     if (event is KeyDownEvent) {
                       if (event.logicalKey == LogicalKeyboardKey.escape) {
@@ -8089,8 +8381,8 @@ class _SalesScreenState extends State<SalesScreen> {
                     return KeyEventResult.ignored;
                   },
                   child: Container(
-                    width: 960,
-                    height: 520,
+                    width: 1060,
+                    height: 540,
                     color: Colors.white,
                     child: Column(
                       children: [
@@ -8121,6 +8413,28 @@ class _SalesScreenState extends State<SalesScreen> {
                                     fontSize: 14,
                                   ),
                                 ),
+                                const SizedBox(width: 16),
+                                Row(
+                                  children: [
+                                    SizedBox(
+                                      height: 24,
+                                      width: 24,
+                                      child: Checkbox(
+                                        value: showZeroStock,
+                                        activeColor: Colors.amber,
+                                        checkColor: Colors.black,
+                                        onChanged: (val) {
+                                          setDialogState(() {
+                                            showZeroStock = val ?? false;
+                                          });
+                                          performSearch(searchCtrl.text);
+                                        },
+                                      ),
+                                    ),
+                                    const SizedBox(width: 4),
+                                    const Text("Show Zero Stock", style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold)),
+                                  ],
+                                ),
                                 const SizedBox(width: 12),
                                 Container(
                                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
@@ -8147,12 +8461,14 @@ class _SalesScreenState extends State<SalesScreen> {
 
                         // Search Input Field
                         Padding(
-                          padding: const EdgeInsets.all(10),
+                          padding: const EdgeInsets.all(8),
                           child: TextField(
                             controller: searchCtrl,
                             focusNode: searchFocusNode,
                             autofocus: true,
-                            onChanged: (val) => performSearch(val),
+                            onChanged: (val) {
+                              searchDebouncer.run(() => performSearch(val));
+                            },
                             decoration: InputDecoration(
                               hintText: "Type Generic Composition / Salt (e.g. Paracetamol, Cefixime, Pantoprazole) or Brand Name...",
                               prefixIcon: const Icon(Icons.search, color: Colors.blue),
@@ -8166,7 +8482,7 @@ class _SalesScreenState extends State<SalesScreen> {
                                     )
                                   : null,
                               isDense: true,
-                              contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                              contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                               border: OutlineInputBorder(borderRadius: BorderRadius.circular(6)),
                               focusedBorder: OutlineInputBorder(
                                 borderRadius: BorderRadius.circular(6),
@@ -8176,21 +8492,65 @@ class _SalesScreenState extends State<SalesScreen> {
                           ),
                         ),
 
+                        // Category Filter Bar
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                          color: const Color(0xFFEBF3FA),
+                          child: Row(
+                            children: [
+                              const Text("Category: ", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black87)),
+                              const SizedBox(width: 6),
+                              ...["ALL", "GENERIC", "BRAND", "COUNTER", "TABLETS", "SYRUPS"].map((cat) {
+                                final bool isSel = selectedCategory == cat;
+                                return Padding(
+                                  padding: const EdgeInsets.only(right: 6),
+                                  child: InkWell(
+                                    onTap: () {
+                                      setDialogState(() {
+                                        selectedCategory = cat;
+                                      });
+                                      performSearch(searchCtrl.text);
+                                    },
+                                    child: Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                      decoration: BoxDecoration(
+                                        color: isSel ? Colors.blue.shade700 : Colors.white,
+                                        borderRadius: BorderRadius.circular(4),
+                                        border: Border.all(color: isSel ? Colors.blue.shade800 : Colors.grey.shade300),
+                                      ),
+                                      child: Text(
+                                        cat,
+                                        style: TextStyle(
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.bold,
+                                          color: isSel ? Colors.white : Colors.black87,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                );
+                              }),
+                            ],
+                          ),
+                        ),
+
                         // Results Header Table
                         Container(
                           height: 28,
                           color: const Color(0xFF1565C0),
                           padding: const EdgeInsets.symmetric(horizontal: 8),
                           child: Row(
-                            children: const [
-                              Expanded(flex: 4, child: Text("Medicine Name (Brand)", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
-                              Expanded(flex: 4, child: Text("Generic Composition (Salt)", style: TextStyle(color: Colors.amber, fontWeight: FontWeight.bold, fontSize: 11))),
-                              Expanded(flex: 1, child: Text("Rack", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
-                              Expanded(flex: 2, child: Text("Batch No", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
-                              Expanded(flex: 1, child: Text("Expiry", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
-                              Expanded(flex: 1, child: Text("Stock", textAlign: TextAlign.right, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
-                              Expanded(flex: 1, child: Text("MRP", textAlign: TextAlign.right, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
-                              Expanded(flex: 1, child: Text("Rate", textAlign: TextAlign.right, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
+                            children: [
+                              buildHeaderCell("Medicine Name (Brand)", "name", flex: 3),
+                              buildHeaderCell("Generic Composition (Salt)", "generic", flex: 3, textColor: Colors.white),
+                              buildHeaderCell("Category", "category", flex: 1),
+                              buildHeaderCell("Cut Strip", "cutStrip", flex: 1, align: TextAlign.center),
+                              buildHeaderCell("Rack", "rack", flex: 1),
+                              buildHeaderCell("Batch No", "batch", flex: 2),
+                              buildHeaderCell("Expiry", "expiry", flex: 1),
+                              buildHeaderCell("Stock", "stock", flex: 1, align: TextAlign.right),
+                              buildHeaderCell("MRP", "mrp", flex: 1, align: TextAlign.right),
+                              buildHeaderCell("Rate", "rate", flex: 1, align: TextAlign.right),
                             ],
                           ),
                         ),
@@ -8222,6 +8582,8 @@ class _SalesScreenState extends State<SalesScreen> {
                                     final p = results[idx];
                                     final bool isSelected = idx == selectedIdx;
                                     final bool hasStock = p.stock > 0;
+                                    final bool nearExp = isNearExpiry(p.expiry);
+                                    final bool isGenCategory = p.category.trim().toUpperCase().contains("GEN");
 
                                     return InkWell(
                                       onTap: () {
@@ -8245,7 +8607,7 @@ class _SalesScreenState extends State<SalesScreen> {
                                         child: Row(
                                           children: [
                                             Expanded(
-                                              flex: 4,
+                                              flex: 3,
                                               child: Text(
                                                 p.name.toUpperCase(),
                                                 style: TextStyle(
@@ -8257,13 +8619,13 @@ class _SalesScreenState extends State<SalesScreen> {
                                               ),
                                             ),
                                             Expanded(
-                                              flex: 4,
+                                              flex: 3,
                                               child: Text(
                                                 p.genericName.isNotEmpty ? p.genericName.toUpperCase() : "-",
-                                                style: TextStyle(
+                                                style: const TextStyle(
                                                   fontWeight: FontWeight.bold,
                                                   fontSize: 11,
-                                                  color: Colors.blue.shade800,
+                                                  color: Colors.black87,
                                                 ),
                                                 overflow: TextOverflow.ellipsis,
                                               ),
@@ -8271,22 +8633,42 @@ class _SalesScreenState extends State<SalesScreen> {
                                             Expanded(
                                               flex: 1,
                                               child: Text(
+                                                p.category.toUpperCase(),
+                                                style: TextStyle(
+                                                  fontSize: 10,
+                                                  fontWeight: FontWeight.w600,
+                                                  color: isGenCategory ? Colors.green.shade700 : Colors.black87,
+                                                ),
+                                                overflow: TextOverflow.ellipsis,
+                                              ),
+                                            ),
+                                            Expanded(
+                                              flex: 1,
+                                              child: buildCutStripCell(p),
+                                            ),
+                                            Expanded(
+                                              flex: 1,
+                                              child: Text(
                                                 p.rack.isNotEmpty ? p.rack : "-",
-                                                style: const TextStyle(fontSize: 10, color: Colors.black54),
+                                                style: const TextStyle(fontSize: 10, color: Colors.black87),
                                               ),
                                             ),
                                             Expanded(
                                               flex: 2,
                                               child: Text(
                                                 p.batch.isNotEmpty ? _cleanBatch(p.batch) : "-",
-                                                style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold),
+                                                style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.black87),
                                               ),
                                             ),
                                             Expanded(
                                               flex: 1,
                                               child: Text(
                                                 p.expiry.isNotEmpty ? p.expiry : "-",
-                                                style: const TextStyle(fontSize: 10),
+                                                style: TextStyle(
+                                                  fontSize: 10,
+                                                  fontWeight: nearExp ? FontWeight.bold : FontWeight.normal,
+                                                  color: nearExp ? Colors.red.shade700 : Colors.black87,
+                                                ),
                                               ),
                                             ),
                                             Expanded(
@@ -8294,10 +8676,10 @@ class _SalesScreenState extends State<SalesScreen> {
                                               child: Text(
                                                 p.stock.toString(),
                                                 textAlign: TextAlign.right,
-                                                style: TextStyle(
+                                                style: const TextStyle(
                                                   fontWeight: FontWeight.bold,
                                                   fontSize: 11,
-                                                  color: hasStock ? Colors.green.shade700 : Colors.red,
+                                                  color: Colors.black87,
                                                 ),
                                               ),
                                             ),
@@ -8306,7 +8688,7 @@ class _SalesScreenState extends State<SalesScreen> {
                                               child: Text(
                                                 p.mrp > 0 ? p.mrp.toStringAsFixed(2) : "-",
                                                 textAlign: TextAlign.right,
-                                                style: const TextStyle(fontSize: 10),
+                                                style: const TextStyle(fontSize: 10, color: Colors.black87),
                                               ),
                                             ),
                                             Expanded(
@@ -8314,7 +8696,7 @@ class _SalesScreenState extends State<SalesScreen> {
                                               child: Text(
                                                 p.salePrice > 0 ? p.salePrice.toStringAsFixed(2) : (p.mrp > 0 ? p.mrp.toStringAsFixed(2) : "-"),
                                                 textAlign: TextAlign.right,
-                                                style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.blue),
+                                                style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black87),
                                               ),
                                             ),
                                           ],
@@ -8369,6 +8751,10 @@ class _SalesScreenState extends State<SalesScreen> {
         );
       },
     ).then((_) {
+      searchDebouncer.dispose();
+      searchFocusNode.dispose();
+      searchCtrl.dispose();
+      listScrollCtrl.dispose();
       _isDialogOpen = false;
     });
   }
