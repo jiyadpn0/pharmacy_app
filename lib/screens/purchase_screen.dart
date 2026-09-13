@@ -96,6 +96,8 @@ class PurchaseItemData {
 
   double mrp = 0.0;
   double pRate = 0.0;
+  double? masterMrp; // Last stored MRP in Product Master
+  double? masterPRate; // Last stored Purchase Rate in Product Master
   double gross = 0.0;
   double discPercent = 0.0;
   double discAmt = 0.0;
@@ -111,6 +113,32 @@ class PurchaseItemData {
   double sDiscAmt = 0.0;
   double sRate = 0.0;
   double lCost = 0.0;
+
+  double get profitPctNoDisc {
+    if (mrp <= 0 || pRate <= 0) return 0.0;
+    return ((mrp - pRate) / pRate) * 100.0;
+  }
+
+  bool get isLowMargin {
+    if (mrp <= 0 || pRate <= 0) return false;
+    return profitPctNoDisc < 24.9;
+  }
+
+  bool get hasMrpChanged {
+    if (masterMrp == null || masterMrp! <= 0 || mrp <= 0) return false;
+    return (mrp - masterMrp!).abs() > 0.01;
+  }
+
+  bool get isMrpIncreased => masterMrp != null && mrp > masterMrp! + 0.01;
+  bool get isMrpDecreased => masterMrp != null && mrp < masterMrp! - 0.01;
+
+  bool get hasPRateChanged {
+    if (masterPRate == null || masterPRate! <= 0 || pRate <= 0) return false;
+    return (pRate - masterPRate!).abs() > 0.01;
+  }
+
+  bool get isPRateIncreased => masterPRate != null && pRate > masterPRate! + 0.01;
+  bool get isPRateDecreased => masterPRate != null && pRate < masterPRate! - 0.01;
 
   bool get hasGstMismatch {
     if (masterGstPercent == null || productId.isEmpty) return false;
@@ -2016,6 +2044,9 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
         it.packin = p.packSize;
         it.mrp = p.mrp;
         it.pRate = p.purchaseRate;
+        it.masterMrp = p.mrp;
+        it.masterPRate = p.purchaseRate;
+        it.masterGstPercent = p.gstPercent;
         it.hsncode = p.hsnCode;
         it.gstPercent = p.gstPercent;
         it.rack = p.rack;
@@ -2029,6 +2060,9 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
         it.productId = p.id;
         it.productName = p.name;
         it.lastPulledName = p.name;
+        it.masterMrp = p.mrp;
+        it.masterPRate = p.purchaseRate;
+        it.masterGstPercent = p.gstPercent;
         it.hsncode = p.hsnCode;
         it.rack = p.rack;
         it.sDiscPercent = p.sDiscPercent;
@@ -2370,6 +2404,17 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
               textColor = style.textColor;
             }
           }
+        } else if (col == 9 && row < _items.length) {
+          if (_items[row].hasMrpChanged) {
+            textColor = Colors.blue.shade800;
+          }
+        } else if (col == 10 && row < _items.length) {
+          if (_items[row].isLowMargin) {
+            customCellBg = Colors.amber.shade100;
+            textColor = Colors.orange.shade900;
+          } else if (_items[row].hasPRateChanged) {
+            textColor = Colors.blue.shade800;
+          }
         } else if (col == 15 && row < _items.length) {
           if (_items[row].hasGstMismatch) {
             customCellBg = Colors.amber.shade300;
@@ -2439,6 +2484,45 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
           final String displayText = ctrl.text.isEmpty && col == 1 && row == _items.length ? "Search Product..." : ctrl.text;
           final bool isHint = ctrl.text.isEmpty && col == 1 && row == _items.length;
 
+          String extraSuffix = "";
+          String? cellTooltip;
+
+          if (row < _items.length) {
+            final item = _items[row];
+            if (col == 9 && item.hasMrpChanged) {
+              extraSuffix = item.isMrpIncreased ? " ▲" : " ▼";
+              cellTooltip = "MRP Changed! Old Master MRP: ₹${item.masterMrp!.toStringAsFixed(2)}";
+            } else if (col == 10) {
+              if (item.hasPRateChanged) {
+                extraSuffix = item.isPRateIncreased ? " ▲" : " ▼";
+                cellTooltip = "P.Rate Changed! Old Master Rate: ₹${item.masterPRate!.toStringAsFixed(2)}";
+              }
+              if (item.isLowMargin) {
+                cellTooltip = "${cellTooltip != null ? '$cellTooltip | ' : ''}⚠️ Low Margin: ${item.profitPctNoDisc.toStringAsFixed(1)}% (< 24.9%)";
+              }
+            } else if (col == 15 && item.hasGstMismatch) {
+              cellTooltip = "Invoice GST: ${item.gstPercent.toStringAsFixed(1)}% (Master GST: ${item.masterGstPercent?.toStringAsFixed(1)}%)";
+            }
+          }
+
+          Widget textWidget = Text(
+            "$displayText$extraSuffix",
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.bold,
+              color: isHint ? Colors.grey : textColor,
+            ),
+            overflow: TextOverflow.ellipsis,
+            maxLines: 1,
+          );
+
+          if (cellTooltip != null) {
+            textWidget = Tooltip(
+              message: cellTooltip,
+              child: textWidget,
+            );
+          }
+
           cellChild = InkWell(
             onTap: () {
               _moveFocus(row, col, autoOpen: col == 2 || ctrl.text.trim().isEmpty);
@@ -2446,16 +2530,7 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
             child: Container(
               alignment: isNumeric ? Alignment.centerRight : (col == 5 ? Alignment.center : Alignment.centerLeft),
               padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
-              child: Text(
-                displayText,
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.bold,
-                  color: isHint ? Colors.grey : (customCellBg != null ? textColor : const Color(0xFF0F172A)),
-                ),
-                overflow: TextOverflow.ellipsis,
-                maxLines: 1,
-              ),
+              child: textWidget,
             ),
           );
         }
@@ -2676,6 +2751,8 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
             ..fQty = item.fQty
             ..mrp = item.mrp
             ..pRate = item.pRate
+            ..masterMrp = matchedPm?.mrp
+            ..masterPRate = matchedPm?.purchaseRate
             ..discPercent = item.discPercent
             ..gstPercent = item.gstPercent
             ..masterGstPercent = matchedPm?.gstPercent

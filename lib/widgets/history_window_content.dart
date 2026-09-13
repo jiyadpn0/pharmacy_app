@@ -76,7 +76,8 @@ class _HistoryWindowContentState extends State<HistoryWindowContent> {
                     context,
                     "Entry No", "Date", "Batch", "Expiry", "Qty", "MRP", 
                     "Rate", widget.isSales ? "Doctor" : "Supplier", 
-                    widget.isSales ? "Patient" : "L.Cost", 
+                    widget.isSales ? "Patient" : "L.Cost",
+                    widget.isSales ? "" : "Profit%(Rate)", 
                     isHeader: true
                   ),
                 );
@@ -88,7 +89,9 @@ class _HistoryWindowContentState extends State<HistoryWindowContent> {
               
               double mrp = double.tryParse(item['mrp']?.toString() ?? "0") ?? 0.0;
               double rate = double.tryParse(item['s_rate']?.toString() ?? item['p_rate']?.toString() ?? "0") ?? 0.0;
+              double pRate = double.tryParse(item['p_rate']?.toString() ?? "0") ?? 0.0;
               double lCost = double.tryParse(item['l_cost']?.toString() ?? "0") ?? 0.0;
+              double profitRatePct = pRate > 0 ? ((mrp - pRate) / pRate) * 100.0 : 0.0;
 
               return Container(
                 height: 35,
@@ -107,6 +110,7 @@ class _HistoryWindowContentState extends State<HistoryWindowContent> {
                   rate.toStringAsFixed(2),
                   widget.isSales ? (item['doctor']?.toString() ?? "N/A") : (item['supplier_name']?.toString() ?? "N/A"),
                   widget.isSales ? (item['patient']?.toString() ?? "N/A") : lCost.toStringAsFixed(2),
+                  widget.isSales ? "" : "${profitRatePct.toStringAsFixed(1)}%",
                 ),
               );
             },
@@ -116,7 +120,7 @@ class _HistoryWindowContentState extends State<HistoryWindowContent> {
     );
   }
 
-  Widget _buildRow(BuildContext context, String c1, String c2, String c3, String c4, String c5, String c6, String c7, String c8, String c9, {bool isHeader = false}) {
+  Widget _buildRow(BuildContext context, String c1, String c2, String c3, String c4, String c5, String c6, String c7, String c8, String c9, String c10, {bool isHeader = false}) {
     final c = AppColors.of(context);
     final style = TextStyle(fontSize: 12, fontWeight: isHeader ? FontWeight.bold : FontWeight.normal, color: isHeader ? c.primaryText : c.primaryText.withValues(alpha: 0.9));
     return Row(
@@ -130,6 +134,8 @@ class _HistoryWindowContentState extends State<HistoryWindowContent> {
         Expanded(flex: 2, child: Text(c7, style: style, textAlign: TextAlign.right)),
         Expanded(flex: 4, child: Padding(padding: const EdgeInsets.only(left: 16), child: Text(c8, style: style, overflow: TextOverflow.ellipsis))),
         Expanded(flex: 3, child: Text(c9, style: style, overflow: TextOverflow.ellipsis)),
+        if (c10.isNotEmpty)
+          Expanded(flex: 2, child: Text(c10, style: TextStyle(fontSize: 12, fontWeight: isHeader ? FontWeight.bold : FontWeight.bold, color: isHeader ? c.primaryText : Colors.teal.shade700), textAlign: TextAlign.right)),
       ],
     );
   }
