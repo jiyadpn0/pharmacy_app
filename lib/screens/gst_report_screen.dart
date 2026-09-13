@@ -8,6 +8,7 @@ import '../providers/pharmacy_provider.dart';
 import '../widgets/pin_unlock_dialog.dart';
 import '../widgets/app_date_picker.dart';
 import '../utils/app_formatters.dart';
+import '../utils/app_dialogs.dart';
 import '../services/gst_export_service.dart';
 import '../utils/theme_constants.dart';
 
@@ -261,8 +262,13 @@ class _GstReportScreenState extends State<GstReportScreen> {
       if (bytes != null) {
         await File(outputFile).writeAsBytes(bytes);
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text("Statutory GSTR Report Exported to Excel!"), backgroundColor: Colors.green),
+          AppDialogs.showPathDialog(
+            context: context,
+            title: "Export Complete",
+            message: "Statutory GSTR Report exported to Excel successfully:",
+            path: outputFile,
+            icon: Icons.table_chart_rounded,
+            iconColor: Colors.green,
           );
         }
       }
@@ -282,8 +288,13 @@ class _GstReportScreenState extends State<GstReportScreen> {
       final p = Provider.of<PharmacyProvider>(context, listen: false);
       await GstExportService.exportGstr1JsonFile(_fromDate, _toDate, outputFile, provider: p);
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Official GSTR-1 Govt JSON Exported successfully!"), backgroundColor: Colors.green),
+        AppDialogs.showPathDialog(
+          context: context,
+          title: "Export Complete",
+          message: "Official GSTR-1 Govt JSON exported successfully:",
+          path: outputFile,
+          icon: Icons.code_rounded,
+          iconColor: Colors.blue,
         );
       }
     }
@@ -320,8 +331,13 @@ class _GstReportScreenState extends State<GstReportScreen> {
 
       await File(outputFile).writeAsString(sb.toString());
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("CSV Exported successfully for Tax Audit!"), backgroundColor: Colors.green),
+        AppDialogs.showPathDialog(
+          context: context,
+          title: "Export Complete",
+          message: "CSV Exported successfully for Tax Audit:",
+          path: outputFile,
+          icon: Icons.description_rounded,
+          iconColor: Colors.orange,
         );
       }
     }

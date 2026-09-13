@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 import 'package:file_picker/file_picker.dart';
 import '../../providers/pharmacy_provider.dart';
 import '../../utils/theme_constants.dart';
+import '../../utils/app_dialogs.dart';
 
 
 class GenericRegistrationScreen extends StatefulWidget {
@@ -154,7 +155,14 @@ class _GenericRegistrationScreenState extends State<GenericRegistrationScreen> {
       try {
         await provider.exportGenericsToExcel(outputFile);
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(backgroundColor: Colors.green, content: Text("Generics exported successfully!")));
+          AppDialogs.showPathDialog(
+            context: context,
+            title: "Export Complete",
+            message: "Generics exported to Excel successfully:",
+            path: outputFile,
+            icon: Icons.table_chart_rounded,
+            iconColor: Colors.green,
+          );
         }
       } catch (e) {
         if (mounted) {

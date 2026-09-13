@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:file_picker/file_picker.dart';
@@ -616,11 +617,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
         final String body = releaseData['body'] ?? 'No release notes provided.';
         final String publishedAt = releaseData['published_at'] ?? '';
 
+        String directZipUrl = '';
+        if (releaseData['assets'] is List && (releaseData['assets'] as List).isNotEmpty) {
+          for (var asset in (releaseData['assets'] as List)) {
+            final String downloadUrl = asset['browser_download_url'] ?? '';
+            if (downloadUrl.toLowerCase().endsWith('.zip')) {
+              directZipUrl = downloadUrl;
+              break;
+            }
+          }
+        }
+        if (directZipUrl.isEmpty) {
+          directZipUrl = 'https://github.com/$repoPath/releases/download/$tagName/PharmaPro_ERP_${tagName}_Windows.zip';
+        }
+
         if (_isVersionNewer(tagName, _currentAppVersion)) {
           _showUpdateAvailableDialog(
             latestVersion: tagName,
             releaseName: releaseName,
             htmlUrl: htmlUrl,
+            directZipUrl: directZipUrl,
             body: body,
             publishedAt: publishedAt,
           );
@@ -679,6 +695,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     required String latestVersion,
     required String releaseName,
     required String htmlUrl,
+    required String directZipUrl,
     required String body,
     required String publishedAt,
   }) {
@@ -708,7 +725,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ],
         ),
         content: SizedBox(
-          width: 500,
+          width: 520,
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -768,15 +785,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
             onPressed: () => Navigator.pop(ctx),
             child: const Text("LATER", style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold)),
           ),
-          ElevatedButton.icon(
+          OutlinedButton.icon(
             onPressed: () {
               Navigator.pop(ctx);
               if (htmlUrl.isNotEmpty) {
                 _openUrl(htmlUrl);
               }
             },
-            icon: const Icon(Icons.open_in_new_rounded, size: 16),
-            label: const Text("DOWNLOAD UPDATE", style: TextStyle(fontWeight: FontWeight.bold)),
+            icon: const Icon(Icons.open_in_new_rounded, size: 14),
+            label: const Text("Open in Browser", style: TextStyle(fontSize: 12)),
+          ),
+          ElevatedButton.icon(
+            onPressed: () {
+              Navigator.pop(ctx);
+              _performDirectInAppUpdate(directZipUrl);
+            },
+            icon: const Icon(Icons.download_rounded, size: 16),
+            label: const Text("UPDATE DIRECTLY IN APP", style: TextStyle(fontWeight: FontWeight.bold)),
             style: ElevatedButton.styleFrom(
               backgroundColor: Colors.blue.shade800,
               foregroundColor: Colors.white,
@@ -787,6 +812,129 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ],
       ),
     );
+  }
+
+  Future<void> _performDirectInAppUpdate(String zipUrl) async {
+    final progressNotifier = ValueNotifier<double>(0.0);
+    final statusNotifier = ValueNotifier<String>("Connecting to update server...");
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Row(
+          children: [
+            Icon(Icons.system_update_rounded, color: Colors.blue, size: 28),
+            SizedBox(width: 12),
+            Text("Updating PharmaPro ERP", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+          ],
+        ),
+        content: SizedBox(
+          width: 420,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              ValueListenableBuilder<String>(
+                valueListenable: statusNotifier,
+                builder: (context, statusText, _) => Text(statusText, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+              ),
+              const SizedBox(height: 16),
+              ValueListenableBuilder<double>(
+                valueListenable: progressNotifier,
+                builder: (context, progress, _) => Column(
+                  children: [
+                    LinearProgressIndicator(value: progress > 0 ? progress : null, minHeight: 8, borderRadius: BorderRadius.circular(4)),
+                    const SizedBox(height: 8),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: Text("${(progress * 100).toStringAsFixed(0)}%", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.blueGrey, fontSize: 11)),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    try {
+      final client = http.Client();
+      final request = http.Request('GET', Uri.parse(zipUrl));
+      request.headers['User-Agent'] = 'PharmacyERP-Updater';
+      final response = await client.send(request);
+
+      if (response.statusCode != 200) {
+        throw Exception("Download failed with HTTP status code ${response.statusCode}");
+      }
+
+      final contentLength = response.contentLength ?? 0;
+      final tempDir = Directory.systemTemp;
+      final zipFile = File('${tempDir.path}${Platform.pathSeparator}PharmaPro_Update.zip');
+      final extractDir = Directory('${tempDir.path}${Platform.pathSeparator}PharmaPro_Extracted');
+
+      if (await extractDir.exists()) {
+        await extractDir.delete(recursive: true);
+      }
+      await extractDir.create(recursive: true);
+
+      final sink = zipFile.openWrite();
+      int downloaded = 0;
+
+      await response.stream.forEach((chunk) {
+        sink.add(chunk);
+        downloaded += chunk.length;
+        if (contentLength > 0) {
+          progressNotifier.value = (downloaded / contentLength).toDouble();
+          statusNotifier.value = "Downloading update (${(downloaded / (1024 * 1024)).toStringAsFixed(1)} MB / ${(contentLength / (1024 * 1024)).toStringAsFixed(1)} MB)...";
+        } else {
+          statusNotifier.value = "Downloading update (${(downloaded / (1024 * 1024)).toStringAsFixed(1)} MB)...";
+        }
+      });
+
+      await sink.flush();
+      await sink.close();
+      client.close();
+
+      statusNotifier.value = "Unpacking update files...";
+      progressNotifier.value = 0.95;
+
+      final appExePath = Platform.resolvedExecutable;
+      final appDir = File(appExePath).parent.path;
+
+      final extractResult = await Process.run('powershell', [
+        '-Command',
+        'Expand-Archive -Path "${zipFile.path}" -DestinationPath "${extractDir.path}" -Force'
+      ]);
+
+      if (extractResult.exitCode != 0) {
+        throw Exception("Failed to extract update package: ${extractResult.stderr}");
+      }
+
+      statusNotifier.value = "Applying update and restarting application...";
+      progressNotifier.value = 1.0;
+
+      final scriptFile = File('${tempDir.path}${Platform.pathSeparator}apply_pharmacy_update.bat');
+      final scriptContent = '''
+@echo off
+timeout /t 2 /nobreak > nul
+xcopy /E /Y /I "${extractDir.path}\\*" "$appDir\\"
+start "" "$appExePath"
+del "%~f0"
+''';
+      await scriptFile.writeAsString(scriptContent);
+
+      await Process.start('cmd.exe', ['/c', scriptFile.path], mode: ProcessStartMode.detached);
+      exit(0);
+
+    } catch (e) {
+      if (mounted && Navigator.canPop(context)) {
+        Navigator.pop(context); // Close download dialog
+      }
+      _showUpdateErrorDialog("Direct Update Failed", "Unable to download or apply update directly.\n\nError: $e");
+    }
   }
 
   void _showUpdateErrorDialog(String title, String message) {
@@ -2647,24 +2795,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) return;
       Navigator.pop(context); // Close loader
 
-      showDialog(
+      AppDialogs.showPathDialog(
         context: context,
-        builder: (ctx) => AlertDialog(
-          title: const Row(
-            children: [
-              Icon(Icons.check_circle, color: Colors.teal),
-              SizedBox(width: 8),
-              Text("Backup Complete"),
-            ],
-          ),
-          content: Text("A timestamped database backup was created successfully:\n\n$path"),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text("OK", style: TextStyle(fontWeight: FontWeight.bold)),
-            ),
-          ],
-        ),
+        title: "Backup Complete",
+        message: "A timestamped database backup was created successfully:",
+        path: path,
+        icon: Icons.check_circle,
+        iconColor: Colors.teal,
       );
     } catch (e) {
       if (mounted && Navigator.canPop(context)) Navigator.pop(context);
@@ -2711,30 +2848,49 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             "${DateFormat('dd/MM/yyyy hh:mm a').format(dt)} • ${sizeMb.toStringAsFixed(2)} MB",
                             style: const TextStyle(fontSize: 11),
                           ),
-                          trailing: ElevatedButton(
-                            style: ElevatedButton.styleFrom(backgroundColor: Colors.deepOrange, foregroundColor: Colors.white),
-                            child: const Text("RESTORE", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
-                            onPressed: () async {
-                              final confirm = await AppDialogs.showConfirmDialog(
-                                context: ctx,
-                                title: "Confirm Restore?",
-                                content: "Restoring from '${b['name']}' will replace your active database. The app will reload instantly.",
-                              );
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                icon: const Icon(Icons.copy_rounded, size: 18, color: Colors.blueGrey),
+                                tooltip: "Copy File Path",
+                                onPressed: () {
+                                  Clipboard.setData(ClipboardData(text: file.path));
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text("Copied backup path: ${file.path}"),
+                                      backgroundColor: Colors.teal,
+                                      behavior: SnackBarBehavior.floating,
+                                    ),
+                                  );
+                                },
+                              ),
+                              ElevatedButton(
+                                style: ElevatedButton.styleFrom(backgroundColor: Colors.deepOrange, foregroundColor: Colors.white),
+                                child: const Text("RESTORE", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                                onPressed: () async {
+                                  final confirm = await AppDialogs.showConfirmDialog(
+                                    context: ctx,
+                                    title: "Confirm Restore?",
+                                    content: "Restoring from '${b['name']}' will replace your active database. The app will reload instantly.",
+                                  );
 
-                              if (confirm == true) {
-                                Navigator.pop(ctx);
-                                try {
-                                  await provider.restoreFromBackup(file);
-                                  if (mounted) {
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(content: Text("Database Restored Successfully!"), backgroundColor: Colors.green),
-                                    );
+                                  if (confirm == true) {
+                                    Navigator.pop(ctx);
+                                    try {
+                                      await provider.restoreFromBackup(file);
+                                      if (mounted) {
+                                        ScaffoldMessenger.of(context).showSnackBar(
+                                          const SnackBar(content: Text("Database Restored Successfully!"), backgroundColor: Colors.green),
+                                        );
+                                      }
+                                    } catch (e) {
+                                      _showErrorDialog("Restore Error", e.toString());
+                                    }
                                   }
-                                } catch (e) {
-                                  _showErrorDialog("Restore Error", e.toString());
-                                }
-                              }
-                            },
+                                },
+                              ),
+                            ],
                           ),
                         ),
                       );

@@ -81,7 +81,14 @@ class _RackRegistrationScreenState extends State<RackRegistrationScreen> {
       try {
         await provider.exportRacksToExcel(outputFile);
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(backgroundColor: Colors.green, content: Text("Racks exported successfully!")));
+          AppDialogs.showPathDialog(
+            context: context,
+            title: "Export Complete",
+            message: "Racks exported to Excel successfully:",
+            path: outputFile,
+            icon: Icons.table_chart_rounded,
+            iconColor: Colors.green,
+          );
         }
       } catch (e) {
         if (mounted) {
@@ -195,8 +202,13 @@ class _RackRegistrationScreenState extends State<RackRegistrationScreen> {
           savePath: outputFile,
         );
         if (mounted && success) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(backgroundColor: Colors.green, content: Text("Rack Box Labels exported to Excel successfully!")),
+          AppDialogs.showPathDialog(
+            context: context,
+            title: "Export Complete",
+            message: "Rack Box Labels exported to Excel successfully:",
+            path: outputFile,
+            icon: Icons.table_chart_rounded,
+            iconColor: Colors.green,
           );
         }
       } catch (e) {
