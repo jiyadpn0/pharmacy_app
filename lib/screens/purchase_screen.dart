@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:intl/intl.dart';
 import 'package:file_picker/file_picker.dart';
 import 'dart:async';
@@ -2690,6 +2691,7 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
   }
 
   void _finalizeImportAfterMapping(List<PurchaseItem>? mappedItems, List<PurchaseItem> importedItems, List<PurchaseItem> validItems) {
+    final p = Provider.of<PharmacyProvider>(context, listen: false);
     if (mappedItems != null && mappedItems.isNotEmpty) {
       String norm(String s) => s.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
 
