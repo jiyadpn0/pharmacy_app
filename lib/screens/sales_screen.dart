@@ -1034,11 +1034,15 @@ class _SalesScreenState extends State<SalesScreen> {
           } else if (_specialSearchList.value.isNotEmpty) {
             _onSpecialProductSelected(list[_searchIdx.value] as Product);
           } else {
-            // ---> FIX: Explicitly commit the selected batch and jump to Qty (Col 6) <---
-            final selectedProduct = list[_searchIdx.value] as Product;
-            _handleBatchSelection(row: _focusedRowIndex, product: selectedProduct);
+            // ---> FIX: Explicitly commit the selected batch/product and STOP propagation <---
+            final selectedItem = list[_searchIdx.value];
+            if (_searchList.value.isNotEmpty && selectedItem is Product) {
+              _onProductSelected(selectedItem);
+            } else if (_batchList.value.isNotEmpty && selectedItem is Product) {
+              _handleBatchSelection(row: _focusedRowIndex, product: selectedItem);
+            }
           }
-          return true;
+          return true; // <--- CRITICAL: Stops event from leaking to grid submission
         }
       }
     }
