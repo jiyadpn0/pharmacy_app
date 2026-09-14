@@ -718,12 +718,7 @@ class _SalesScreenState extends State<SalesScreen> {
     }
     
     _searchIdx.value = 0;
-    
-    // ---> THE FIX: MUST BE IN SETSTATE TO SWITCH DROPDOWN OVERLAYS <---
-    setState(() {
-      _isSelectingBatch = (safeCol == 4);
-    });
-
+    _isSelectingBatch = (safeCol == 4);
     _focusNotifier.value = IntPair(safeRow, safeCol);
 
     // ---> SYNC FOOTER IMMEDIATELY ON ROW FOCUS MOVE <---
@@ -2043,6 +2038,10 @@ class _SalesScreenState extends State<SalesScreen> {
   }
 
   void _commitSelection(int row, Product p, {bool stayOnProduct = false}) {
+    if (p.id == "NEW") {
+      _promptCreateNewProduct(p.name);
+      return;
+    }
     _isSelectingFromDropdown = true; // LOCKS FOCUS
     _saveUndoState();
 
@@ -2405,7 +2404,7 @@ class _SalesScreenState extends State<SalesScreen> {
           _gridFocusNodes.clear();
           _isExistingEntry = true;
           _isDirty = false; // Reset dirty flag on load
-          _isDeleted = false; // Mark as active
+          _isDeleted = (data['is_deleted'] == 1 || data['is_deleted'] == true || data['is_deleted'] == '1'); // Check if deleted
           _orderType = 0;
           _showSpecialOrderSidebar = false;
           _isSpecialOrderMinimized = false;
@@ -2580,6 +2579,16 @@ class _SalesScreenState extends State<SalesScreen> {
             isPaid: (data['is_paid'] as int?) == 1,
           );
         });
+
+        if (_isDeleted && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text("🗑️ DELETED ENTRY: Sales Invoice #$_entryNo is marked as DELETED."),
+              backgroundColor: Colors.red.shade900,
+              duration: const Duration(seconds: 4),
+            ),
+          );
+        }
 
         // Remove focus so nothing is highlighted when viewing history
         _focusNotifier.value = null;

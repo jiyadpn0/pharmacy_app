@@ -10487,7 +10487,7 @@ class PharmacyProvider extends ChangeNotifier {
 
     String replaceStr = "CASE WHEN instr(entry_no, '_') > 0 THEN substr(entry_no, instr(entry_no, '_') + 1) ELSE ${prefix.isNotEmpty ? "REPLACE(entry_no, '$prefix', '')" : "entry_no"} END";
     String fyFilter = "(financial_year = ? OR financial_year IS NULL OR financial_year = '')";
-    String isDelFilter = 'AND is_deleted = 0';
+    String isDelFilter = '';
 
     if (direction == 'find') {
       // Step 1: Fast exact primary key or invoice_no match (O(1) indexed lookup)
