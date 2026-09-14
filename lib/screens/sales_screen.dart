@@ -686,6 +686,7 @@ class _SalesScreenState extends State<SalesScreen> {
 
   // ---> NEW: Master function to instantly kill all dropdowns <---
   void _closeAllDropdowns() {
+    _productSearchDebouncer.cancel();
     _searchList.value = [];
     _batchList.value = [];
     _specialSearchList.value = [];
@@ -1933,6 +1934,8 @@ class _SalesScreenState extends State<SalesScreen> {
   }
 
   void _onProductSelected(Product p) {
+    _productSearchDebouncer.cancel();
+    _searchList.value = [];
     if (p.id == "NEW") {
       _promptCreateNewProduct(p.name);
       return;
@@ -2038,6 +2041,8 @@ class _SalesScreenState extends State<SalesScreen> {
   }
 
   void _commitSelection(int row, Product p, {bool stayOnProduct = false}) {
+    _productSearchDebouncer.cancel();
+    _searchList.value = [];
     if (p.id == "NEW") {
       _promptCreateNewProduct(p.name);
       return;
@@ -6958,12 +6963,15 @@ class _SalesScreenState extends State<SalesScreen> {
         _buildNameOverlay(_specialCustomerLayer, _patientSearchList, _specialCustomerNameCtrl, _specialCustomerPhoneFocus),
 
         ListenableBuilder(
-          listenable: Listenable.merge([_searchList, _batchList]),
+          listenable: Listenable.merge([_searchList, _batchList, _focusNotifier]),
           builder: (ctx, _) {
-            // Auto-fallback prevents stale boolean states from hiding the dropdown
-            final bool isBatch = _isSelectingBatch && _batchList.value.isNotEmpty;
+            final int focusedCol = _focusedColIndex;
+            final bool isBatch = (focusedCol == 4 || _isSelectingBatch) && _batchList.value.isNotEmpty;
+            final bool isProduct = (focusedCol == 2 || focusedCol == -1) && _searchList.value.isNotEmpty;
+
+            if (!isBatch && !isProduct) return const SizedBox();
+
             final list = isBatch ? _batchList.value : _searchList.value;
-            
             if (list.isEmpty) return const SizedBox();
             
             final link = isBatch ? _batchLayer : _searchLayer;
