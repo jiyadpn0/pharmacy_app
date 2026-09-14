@@ -208,6 +208,7 @@ class _SalesScreenState extends State<SalesScreen> {
   final SearchDebouncer _productSearchDebouncer = SearchDebouncer(milliseconds: 100);
   final SearchDebouncer _historyDebouncer = SearchDebouncer(milliseconds: 200);
   final SearchDebouncer _footerDebouncer = SearchDebouncer(milliseconds: 50);
+  final SearchDebouncer _footerUpdateDebouncer = SearchDebouncer(milliseconds: 200);
   final SearchDebouncer _barcodeDebouncer = SearchDebouncer(milliseconds: 80);
   String _timeString = "";
 
@@ -341,6 +342,7 @@ class _SalesScreenState extends State<SalesScreen> {
     _productSearchDebouncer.dispose();
     _historyDebouncer.dispose();
     _footerDebouncer.dispose();
+    _footerUpdateDebouncer.dispose();
     _barcodeDebouncer.dispose();
     _gridScrollCtrl.dispose();
     _verticalGridScrollCtrl.dispose();
@@ -797,106 +799,108 @@ class _SalesScreenState extends State<SalesScreen> {
 
   void _updateFooter(Product p) {
     if (!mounted) return;
-    final provider = Provider.of<PharmacyProvider>(context, listen: false);
 
-    // 1. Resolve Generic Name
-    String genName = p.genericName.trim();
-    if (genName.isEmpty && p.name.trim().isNotEmpty) {
-      final pNameLower = p.name.trim().toLowerCase();
-      for (var m in provider.productMaster) {
-        if ((m.id == p.id || m.name.trim().toLowerCase() == pNameLower) && m.genericName.trim().isNotEmpty) {
-          genName = m.genericName.trim();
-          break;
-        }
-      }
-      // If still empty, check if product name matches any registered generic in provider.generics
-      if (genName.isEmpty) {
-        final pNameUpper = p.name.toUpperCase();
-        for (var g in provider.generics) {
-          if (g.isNotEmpty && g.length >= 3 && pNameUpper.contains(g.toUpperCase())) {
-            genName = g;
+    // DEBOUNCE THE FOOTER WORK TO PREVENT THRASHING THE MAIN THREAD
+    _footerUpdateDebouncer.run(() {
+      if (!mounted) return;
+      final provider = Provider.of<PharmacyProvider>(context, listen: false);
+
+      String genName = p.genericName.trim();
+      if (genName.isEmpty && p.name.trim().isNotEmpty) {
+        final pNameLower = p.name.trim().toLowerCase();
+        for (var m in provider.productMaster) {
+          if ((m.id == p.id || m.name.trim().toLowerCase() == pNameLower) && m.genericName.trim().isNotEmpty) {
+            genName = m.genericName.trim();
             break;
           }
         }
-      }
-      if (genName.isNotEmpty) {
-        p.genericName = genName;
-      }
-    }
-
-    _activeGenericName = genName;
-
-    // 2. Sync Previous Sales History (already debounced)
-    if (p.name.trim().isNotEmpty && p.name != _lastSyncedProdName) {
-      _lastSyncedProdName = p.name;
-      _updateHistory(p.name);
-    } else if (p.name.trim().isEmpty) {
-      _lastSyncedProdName = "";
-      setState(() => _productHistory = []);
-    }
-
-    // 3. Fast Generic Substitutes Lookup (Early exit if blank)
-    if (p.name.trim().isEmpty || genName.isEmpty) {
-      if (_footerAlts.isNotEmpty) {
-        setState(() => _footerAlts = []);
-      }
-      return;
-    }
-
-    final String searchGen = genName.toLowerCase();
-    final String currentCleanName = Product.cleanProductName(p.name).toLowerCase();
-
-    final Set<String> existingNamesInBill = _items
-        .map((it) => Product.cleanProductName(it.product.name).toLowerCase())
-        .where((name) => name.isNotEmpty)
-        .toSet();
-
-    final Map<String, Product> subMap = {};
-
-    // Check active inventory batches first (what is actually on the shelf right now)
-    for (int i = 0; i < provider.products.length; i++) {
-      final bp = provider.products[i];
-      if (bp.stock <= 0) continue;
-
-      final bpCleanName = Product.cleanProductName(bp.name).toLowerCase();
-      if (bpCleanName == currentCleanName || existingNamesInBill.contains(bpCleanName)) continue;
-
-      String bpGen = bp.genericName.trim().toLowerCase();
-      if (bpGen.isEmpty) {
-        final mMatch = provider.productMaster.firstWhere(
-          (m) => m.id == bp.id || m.name.trim().toLowerCase() == bpCleanName,
-          orElse: () => Product(id: "", name: bp.name),
-        );
-        bpGen = mMatch.genericName.trim().toLowerCase();
-      }
-
-      if (bpGen.isNotEmpty && (bpGen == searchGen || bpGen.contains(searchGen) || searchGen.contains(bpGen))) {
-        if (!subMap.containsKey(bpCleanName)) {
-          subMap[bpCleanName] = Product(
-            id: bp.id,
-            name: bp.name,
-            genericName: bp.genericName.isNotEmpty ? bp.genericName : (bpGen.isNotEmpty ? bpGen.toUpperCase() : genName),
-            stock: bp.stock,
-            mrp: bp.mrp,
-            salePrice: bp.salePrice,
-            packSize: bp.packSize,
-            category: bp.category,
-            rack: bp.rack,
-            manufacturer: bp.manufacturer,
-          );
-        } else {
-          subMap[bpCleanName]!.stock += bp.stock;
+        if (genName.isEmpty) {
+          final pNameUpper = p.name.toUpperCase();
+          for (var g in provider.generics) {
+            if (g.isNotEmpty && g.length >= 3 && pNameUpper.contains(g.toUpperCase())) {
+              genName = g;
+              break;
+            }
+          }
+        }
+        if (genName.isNotEmpty) {
+          p.genericName = genName;
         }
       }
 
-      if (subMap.length >= 20) break; // Cap at top 20 shelf alternatives
-    }
+      _activeGenericName = genName;
 
-    final substitutes = subMap.values.toList()
-      ..sort((a, b) => b.stock.compareTo(a.stock));
+      if (p.name.trim().isNotEmpty && p.name != _lastSyncedProdName) {
+        _lastSyncedProdName = p.name;
+        _updateHistory(p.name);
+      } else if (p.name.trim().isEmpty) {
+        _lastSyncedProdName = "";
+        if (mounted) setState(() => _productHistory = []);
+      }
 
-    setState(() {
-      _footerAlts = substitutes;
+      if (p.name.trim().isEmpty || genName.isEmpty) {
+        if (_footerAlts.isNotEmpty) {
+          if (mounted) setState(() => _footerAlts = []);
+        }
+        return;
+      }
+
+      final String searchGen = genName.toLowerCase();
+      final String currentCleanName = Product.cleanProductName(p.name).toLowerCase();
+
+      final Set<String> existingNamesInBill = _items
+          .map((it) => Product.cleanProductName(it.product.name).toLowerCase())
+          .where((name) => name.isNotEmpty)
+          .toSet();
+
+      final Map<String, Product> subMap = {};
+
+      for (int i = 0; i < provider.products.length; i++) {
+        final bp = provider.products[i];
+        if (bp.stock <= 0) continue;
+
+        final bpCleanName = Product.cleanProductName(bp.name).toLowerCase();
+        if (bpCleanName == currentCleanName || existingNamesInBill.contains(bpCleanName)) continue;
+
+        String bpGen = bp.genericName.trim().toLowerCase();
+        if (bpGen.isEmpty) {
+          final mMatch = provider.productMaster.firstWhere(
+            (m) => m.id == bp.id || m.name.trim().toLowerCase() == bpCleanName,
+            orElse: () => Product(id: "", name: bp.name),
+          );
+          bpGen = mMatch.genericName.trim().toLowerCase();
+        }
+
+        if (bpGen.isNotEmpty && (bpGen == searchGen || bpGen.contains(searchGen) || searchGen.contains(bpGen))) {
+          if (!subMap.containsKey(bpCleanName)) {
+            subMap[bpCleanName] = Product(
+              id: bp.id,
+              name: bp.name,
+              genericName: bp.genericName.isNotEmpty ? bp.genericName : (bpGen.isNotEmpty ? bpGen.toUpperCase() : genName),
+              stock: bp.stock,
+              mrp: bp.mrp,
+              salePrice: bp.salePrice,
+              packSize: bp.packSize,
+              category: bp.category,
+              rack: bp.rack,
+              manufacturer: bp.manufacturer,
+            );
+          } else {
+            subMap[bpCleanName]!.stock += bp.stock;
+          }
+        }
+
+        if (subMap.length >= 20) break;
+      }
+
+      final substitutes = subMap.values.toList()
+        ..sort((a, b) => b.stock.compareTo(a.stock));
+
+      if (mounted) {
+        setState(() {
+          _footerAlts = substitutes;
+        });
+      }
     });
   }
 
@@ -1525,8 +1529,7 @@ class _SalesScreenState extends State<SalesScreen> {
     });
   }
 
-  void _onFieldSubmitted(int row, int col) async {
-    // ---> THE FIX: Master Catch for Empty Row <---
+  void _onFieldSubmitted(int row, int col) {
     // If on the blank row and Product is empty, ANY 'Enter' or 'Tab' jumps to Rcvd Amt
     if (row == _items.length && _getGridCtrl(row, 2).text.trim().isEmpty) {
       _closeAllDropdowns();
@@ -1536,6 +1539,7 @@ class _SalesScreenState extends State<SalesScreen> {
       return;
     }
 
+    // Handle product name field submission
     if (col == 2) {
       String typedText = _getGridCtrl(row, 2).text.trim();
       final p = Provider.of<PharmacyProvider>(context, listen: false);
@@ -1569,99 +1573,11 @@ class _SalesScreenState extends State<SalesScreen> {
         _moveFocus(row, 4, autoOpen: true);
       }
     }
-    else if (col == 4) {
-      String typed = _getGridCtrl(row, 4).text.trim().toUpperCase();
-
-      if (_batchList.value.isNotEmpty) {
-        final selected = _batchList.value[_searchIdx.value];
-        final exactIdx = _batchList.value.indexWhere((b) => _cleanBatch(b.batch).toUpperCase() == typed);
-        _handleBatchSelection(row: row, product: exactIdx != -1 ? _batchList.value[exactIdx] : selected);
-      } else {
-        final p = Provider.of<PharmacyProvider>(context, listen: false);
-        String prodName = row < _items.length ? _items[row].product.name : _getGridCtrl(row, 2).text;
-        final availableBatches = p.products.where((it) => it.name.toLowerCase() == prodName.toLowerCase() && it.stock > 0).toList();
-        final match = availableBatches.where((b) => _cleanBatch(b.batch).toUpperCase() == typed).toList();
-
-        if (match.isNotEmpty) {
-          _handleBatchSelection(row: row, product: match.first);
-        } else if (availableBatches.isNotEmpty) {
-          // ---> THE FIX: AUTO-SELECT BEST BATCH IF SKIPPED OR MISMATCHED <---
-          availableBatches.sort((a, b) => _parseExpiry(a.expiry).compareTo(_parseExpiry(b.expiry)));
-          _commitSelection(row, availableBatches.first, stayOnProduct: false);
-        } else {
-          _moveFocus(row, 7);
-        }
-      }
-    } else if (col == 7) {
-      if (_getGridCtrl(row, 7).text.isEmpty) _getGridCtrl(row, 7).text = "0";
-
-      int requestedQty = int.tryParse(_getGridCtrl(row, 7).text) ?? 0;
-      final currentItem = _items[row];
-      int stockAlreadyUsed = _getCrossRowStockUsed(currentItem, row);
-      int originalQtyInThisInvoice = _originalInvoiceBatchQtys["${currentItem.product.id}|${currentItem.product.batch.trim().toUpperCase()}"] ?? 0;
-      int actualAvailableForThisRow = currentItem.product.stock + originalQtyInThisInvoice - stockAlreadyUsed;
-
-      if (requestedQty > actualAvailableForThisRow) {
-        final String currentBatchKey = _getBatchUniqueKey(currentItem.product);
-        final otherBatches = Provider.of<PharmacyProvider>(context, listen: false).products.where((it) =>
-        it.name.toLowerCase() == currentItem.product.name.toLowerCase() &&
-            it.stock > 0 && _getBatchUniqueKey(it) != currentBatchKey &&
-            !_parseExpiry(it.expiry).isBefore(DateTime.now())
-        ).toList();
-
-        if (otherBatches.isEmpty) {
-          int safeQty = actualAvailableForThisRow < 0 ? 0 : actualAvailableForThisRow;
-          int shortage = requestedQty - safeQty;
-          bool? addToSpecial = await _showFastDialog(
-            title: "Stock Shortage",
-            content: "",
-            contentWidget: RichText(
-              text: TextSpan(
-                style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: Colors.black, fontFamily: 'Roboto'),
-                children: [
-                  TextSpan(text: "Only $safeQty available. Add $shortage to "),
-                  const TextSpan(text: "Special Orders", style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold)),
-                  const TextSpan(text: "?"),
-                ]
-              )
-            ),
-            isYesNo: true,
-            initialFocusIdx: 2
-          );
-          setState(() {
-            _items[row].qty = safeQty;
-            _getGridCtrl(row, 7, safeQty.toString()).text = safeQty.toString();
-            _calculateItem(row);
-          });
-          if (addToSpecial == true) {
-            _triggerSpecialOrderFocus(currentItem.product.name, shortage);
-          } else {
-            _moveFocus(row, 11);
-          }
-        } else {
-          bool? wantsSplit = await _showFastDialog(title: "Split Batch?", content: "Only $actualAvailableForThisRow available. Add another batch?", isYesNo: true, initialFocusIdx: 1);
-          if (wantsSplit == true) {
-            _handleAutoSplit(row, requestedQty, actualAvailableForThisRow);
-          } else {
-            setState(() {
-              int safeQty = actualAvailableForThisRow < 0 ? 0 : actualAvailableForThisRow;
-              _items[row].qty = safeQty;
-              _getGridCtrl(row, 7, safeQty.toString()).text = safeQty.toString();
-              _calculateItem(row);
-            });
-            _moveFocus(row, 11);
-          }
-        }
-      } else {
-        _moveFocus(row, 11);
-      }
-    } else if (col == 11) {
-      if (_getGridCtrl(row, 11).text.isEmpty) _getGridCtrl(row, 11).text = "0";
-      _moveFocus(_items.length, 2, autoOpen: true);
-    } else {
+    else {
+      // Standard column navigation step
       int curIdx = _navCols.indexOf(col);
       if (curIdx != -1 && curIdx < _navCols.length - 1) {
-        _moveFocus(row, _navCols[curIdx + 1], autoOpen: _navCols[curIdx + 1] == 3);
+        _moveFocus(row, _navCols[curIdx + 1], autoOpen: _navCols[curIdx + 1] == 4);
       } else {
         _moveFocus(_items.length, 2, autoOpen: true);
       }
