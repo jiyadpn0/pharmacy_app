@@ -2027,7 +2027,9 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
     controller: _verticalGridScrollCtrl,
     itemExtent: 30.0,
     itemCount: _items.length + (_isDeleted ? 0 : 1),
-    itemBuilder: (ctx, i) => i < _items.length ? _buildRow(i) : _buildActiveRow(),
+    itemBuilder: (ctx, i) => RepaintBoundary(
+      child: i < _items.length ? _buildRow(i) : _buildActiveRow(),
+    ),
   );
 
   Widget _buildRow(int row) {

@@ -778,8 +778,9 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
           Expanded(
             child: ListView.builder(
               controller: _scrollController,
+              itemExtent: 32.0,
               itemCount: _rows.length,
-              itemBuilder: (context, i) => _buildRow(i, _rows[i]),
+              itemBuilder: (context, i) => RepaintBoundary(child: _buildRow(i, _rows[i])),
             ),
           ),
           _buildGridFooter(),

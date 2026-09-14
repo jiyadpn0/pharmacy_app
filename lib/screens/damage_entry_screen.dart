@@ -833,7 +833,7 @@ class _DamageEntryScreenState extends State<DamageEntryScreen> {
               controller: _scrollController,
               itemExtent: 30.0,
               itemCount: filteredIndices.length,
-              itemBuilder: (ctx, i) => _buildTableRow(filteredIndices[i]),
+              itemBuilder: (ctx, i) => RepaintBoundary(child: _buildTableRow(filteredIndices[i])),
             ),
           ),
         ],

@@ -2068,7 +2068,9 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> {
       controller: _verticalGridScrollCtrl,
       itemExtent: 24.0,
       itemCount: _items.length + (_isDeleted ? 0 : 1),
-      itemBuilder: (ctx, i) => i < _items.length ? _buildRow(i, dynamicWidth) : _buildActiveRow(dynamicWidth),
+      itemBuilder: (ctx, i) => RepaintBoundary(
+        child: i < _items.length ? _buildRow(i, dynamicWidth) : _buildActiveRow(dynamicWidth),
+      ),
     ),
   );
 

@@ -59,6 +59,19 @@ class PharmacyProvider extends ChangeNotifier {
   }
 
   final Map<String, int> _totalStockByProductName = {};
+  final Map<String, Product> _productByIdMap = {};
+  final Map<String, Product> _productMasterByNameMap = {};
+
+  Product? getProductById(String id) {
+    if (id.isEmpty) return null;
+    return _productByIdMap[id];
+  }
+
+  Product? getProductMasterByName(String name) {
+    final key = Product.cleanProductName(name).toLowerCase();
+    if (key.isEmpty) return null;
+    return _productMasterByNameMap[key];
+  }
 
   int getTotalStockForProduct(String cleanName) {
     final key = Product.cleanProductName(cleanName).toLowerCase();
@@ -75,7 +88,19 @@ class PharmacyProvider extends ChangeNotifier {
     _searchCache.clear();
     _productBatchesMap.clear();
     _totalStockByProductName.clear();
+    _productByIdMap.clear();
+    _productMasterByNameMap.clear();
+
+    for (var p in _productMaster) {
+      if (p.id.isNotEmpty) _productByIdMap[p.id] = p;
+      final key = Product.cleanProductName(p.name).toLowerCase();
+      if (key.isNotEmpty) _productMasterByNameMap[key] = p;
+    }
+
     for (var p in _products) {
+      if (p.id.isNotEmpty && !_productByIdMap.containsKey(p.id)) {
+        _productByIdMap[p.id] = p;
+      }
       final key = Product.cleanProductName(p.name).toLowerCase();
       if (key.isNotEmpty) {
         _productBatchesMap.putIfAbsent(key, () => []).add(p);
