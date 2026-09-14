@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
@@ -6,10 +7,12 @@ import 'package:url_launcher/url_launcher.dart';
 class UpdateCheckerService {
   static const String _repoOwner = 'jiyadpn0';
   static const String _repoName = 'pharmacy_app';
-  static const String currentVersion = '2.4.1';
+  static const String currentVersion = '2.4.3';
 
   /// Checks GitHub Releases for a newer version tag.
   static Future<void> checkForUpdates(BuildContext context, {bool silent = false}) async {
+    // Skip automatic startup update popup when running in Debug Mode inside Android Studio
+    if (kDebugMode && silent) return;
     try {
       final Uri url = Uri.parse('https://api.github.com/repos/$_repoOwner/$_repoName/releases/latest');
       final response = await http.get(url, headers: {'Accept': 'application/vnd.github+json'});
