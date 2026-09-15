@@ -655,7 +655,7 @@ class _DamageEntryScreenState extends State<DamageEntryScreen> {
       child: Focus(
         autofocus: true,
         onKeyEvent: (node, event) {
-          if (event is KeyDownEvent) {
+          if (event is KeyDownEvent || event is KeyRepeatEvent) {
             final isCtrl = HardwareKeyboard.instance.isControlPressed;
             if (isCtrl && event.logicalKey == LogicalKeyboardKey.delete) {
               _handleCtrlDelete();
@@ -1221,7 +1221,7 @@ class _ProductSearchCellState extends State<_ProductSearchCell> {
         padding: const EdgeInsets.symmetric(horizontal: 2),
         child: Focus(
           onKeyEvent: (node, event) {
-            if (event is KeyDownEvent) {
+            if (event is KeyDownEvent || event is KeyRepeatEvent) {
               if (event.logicalKey == LogicalKeyboardKey.arrowDown && _overlayEntry != null) {
                 setState(() { _selectedIndex = (_selectedIndex + 1) % _results.length; _overlayEntry?.markNeedsBuild(); });
                 return KeyEventResult.handled;

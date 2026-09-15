@@ -406,6 +406,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
             _MenuAction("Order Book", () => app.openOrderBook()),
             _MenuAction("Order Confirmation", () => app.openOrderConfirmation()),
             _MenuAction("Special Orders", () => app.openSpecialOrders()),
+            _MenuAction("Stock Enquiries", () => app.openStockEnquiries()),
             _MenuAction("Product Ranking", () => app.openProductRanking()),
           ]),
           _CompactDropdownMenu(title: "REPORTS", actions: [
@@ -558,6 +559,36 @@ class _MainShellState extends State<MainShell> with WindowListener {
     );
   }
 
+  void _showTabContextMenu(BuildContext context, AppProvider app, Offset position) async {
+    final RenderBox? overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
+
+    final result = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        position & const Size(40, 40),
+        Offset.zero & overlay.size,
+      ),
+      items: [
+        PopupMenuItem<String>(
+          value: 'recover',
+          enabled: app.closedTabsHistory.isNotEmpty,
+          child: Row(
+            children: const [
+              Icon(Icons.restore_page_rounded, size: 16),
+              SizedBox(width: 8),
+              Text("Recover last closed tab"),
+            ],
+          ),
+        ),
+      ],
+    );
+
+    if (result == 'recover') {
+      app.recoverLastClosedTab();
+    }
+  }
+
   Widget _buildWindowDock(BuildContext context, AppProvider app) {
     final mdi = Provider.of<MdiController>(context);
     final bool isDark = app.isDarkMode;
@@ -580,12 +611,16 @@ class _MainShellState extends State<MainShell> with WindowListener {
 
     if (allItems.isEmpty) return const SizedBox.shrink();
 
-    return Container(
-      height: 32,
-      width: double.infinity,
-      color: const Color(0xFF0F172A),
-      padding: const EdgeInsets.symmetric(horizontal: 4),
-      child: Row(
+    return GestureDetector(
+      onSecondaryTapDown: (details) {
+        _showTabContextMenu(context, app, details.globalPosition);
+      },
+      child: Container(
+        height: 32,
+        width: double.infinity,
+        color: const Color(0xFF0F172A),
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Row(
         children: [
           Expanded(
             child: ListView.builder(
@@ -621,9 +656,9 @@ class _MainShellState extends State<MainShell> with WindowListener {
                       }
                     },
                     child: Container(
-                      constraints: const BoxConstraints(minWidth: 70, maxWidth: 160),
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                      margin: const EdgeInsets.only(right: 3, top: 2),
+                      constraints: const BoxConstraints(minWidth: 50, maxWidth: 140),
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      margin: const EdgeInsets.only(right: 1, top: 1),
                       decoration: BoxDecoration(
                         color: tabBg,
                         borderRadius: const BorderRadius.vertical(top: Radius.circular(5)),
@@ -661,7 +696,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
                               Material(
                                 color: Colors.transparent,
                                 child: InkWell(
-                                  onTap: () => app.closeTab(item['index'] as int),
+                                  onTap: () => confirmCloseTab(context, () => app.closeTab(item['index'] as int)),
                                   borderRadius: BorderRadius.circular(4),
                                   hoverColor: Colors.red.withValues(alpha: 0.2),
                                   child: Padding(
@@ -695,6 +730,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
           ),
         ],
       ),
+    ),
     );
   }
 
@@ -979,7 +1015,7 @@ class MdiArea extends StatelessWidget {
                       isMaximized: isMax,
                       isActive: isActive,
                       showHeader: !isHome && !tab.isMaximized, 
-                      onClose: tab.closable ? () => app.closeTab(i) : null,
+                      onClose: tab.closable ? () => confirmCloseTab(context, () => app.closeTab(i)) : null,
                       onMaximize: isHome ? null : () => app.toggleWindowMaximize(i),
                       onFocus: () => app.focusTab(i),
                       onDragFinished: (newPos) => app.updateWindowPosition(i, newPos),
@@ -1268,4 +1304,37 @@ class _ResizeHandlePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+void confirmCloseTab(BuildContext context, VoidCallback onConfirm) {
+  final FocusNode noFocusNode = FocusNode();
+
+  showDialog(
+    context: context,
+    builder: (ctx) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        noFocusNode.requestFocus();
+      });
+
+      return AlertDialog(
+        title: const Text("Unsaved Changes", style: TextStyle(fontWeight: FontWeight.bold)),
+        content: const Text("Some data are not saved, are you sure to delete?"),
+        actions: [
+          TextButton(
+            focusNode: noFocusNode,
+            onPressed: () => Navigator.of(ctx).pop(), // No (default focused)
+            child: const Text("No", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blue)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              onConfirm(); // Yes
+            },
+            child: const Text("Yes"),
+          ),
+        ],
+      );
+    },
+  );
 }

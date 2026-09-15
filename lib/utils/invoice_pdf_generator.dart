@@ -2,6 +2,7 @@ import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import 'package:intl/intl.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../providers/pharmacy_provider.dart';
 import '../models/erp_models.dart';
 import 'app_formatters.dart';
@@ -13,6 +14,10 @@ class InvoicePdfGenerator {
   }
 
   static Future<pw.Document> buildPdfDocument(SaleInvoice invoice, CompanyProfile company) async {
+    final prefs = await SharedPreferences.getInstance();
+    final String returnPolicy = prefs.getString('return_policy_text') ?? "Medicines once sold will not be taken back";
+    final bool showReturnPolicy = prefs.getBool('show_return_policy') ?? true;
+
     final doc = pw.Document();
 
     doc.addPage(
@@ -107,8 +112,8 @@ class InvoicePdfGenerator {
                         crossAxisAlignment: pw.CrossAxisAlignment.start,
                         children: [
                           pw.Text(item.product.name, style: const pw.TextStyle(fontSize: 9)),
-                          if (item.product.manufacturer.isNotEmpty)
-                            pw.Text("MFR: ${item.product.manufacturer}", style: pw.TextStyle(fontSize: 7, color: PdfColors.grey700)),
+                          if (item.product.manufacturer.isNotEmpty || item.product.rack.isNotEmpty)
+                            pw.Text("MFR: ${item.product.manufacturer}${item.product.rack.isNotEmpty ? ' | Rack: ${item.product.rack}' : ''}", style: const pw.TextStyle(fontSize: 7, color: PdfColors.grey700)),
                         ],
                       ),
                     ),
@@ -133,8 +138,10 @@ class InvoicePdfGenerator {
                 crossAxisAlignment: pw.CrossAxisAlignment.start,
                 children: [
                   pw.Text("TIME: ${DateFormat('hh:mm a').format(invoice.date)}", style: pw.TextStyle(fontSize: 10, fontWeight: pw.FontWeight.bold)),
-                  pw.SizedBox(height: 4),
-                  pw.Text("Medicines once sold will not be taken back", style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey700)),
+                  if (showReturnPolicy && returnPolicy.isNotEmpty) ...[
+                    pw.SizedBox(height: 4),
+                    pw.Text(returnPolicy, style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey700)),
+                  ],
                 ],
               ),
               pw.Column(
@@ -144,7 +151,7 @@ class InvoicePdfGenerator {
                   if (invoice.discount > 0) _totalRow("Discount:", invoice.discount),
                   if (invoice.roundOff != 0) _totalRow("Round Off:", invoice.roundOff),
                   pw.Divider(),
-                  pw.Text("Grand Total: ₹${invoice.grandTotal.toStringAsFixed(2)}", 
+                  pw.Text("Grand Total: Rs. ${invoice.grandTotal.toStringAsFixed(2)}", 
                     style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold, color: PdfColors.blue900)),
                   pw.SizedBox(height: 20),
                   pw.Text("PHARMACIST SIGNATURE: ____________________", style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold)),

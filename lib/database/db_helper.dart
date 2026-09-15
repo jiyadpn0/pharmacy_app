@@ -868,6 +868,7 @@ class DbHelper {
     await db.execute('CREATE TABLE IF NOT EXISTS voucher_sequences (voucher_type TEXT, financial_year TEXT, last_sequence INTEGER DEFAULT 0, PRIMARY KEY (voucher_type, financial_year))');
     await db.execute('CREATE TABLE IF NOT EXISTS monthly_closing_balances (id INTEGER PRIMARY KEY AUTOINCREMENT, closing_month_year TEXT NOT NULL, product_id TEXT NOT NULL, batch_number TEXT NOT NULL, closing_stock INTEGER NOT NULL, landing_cost REAL NOT NULL, mrp REAL NOT NULL, UNIQUE(closing_month_year, product_id, batch_number))');
     await db.execute('CREATE TABLE IF NOT EXISTS rack_history (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT, product_name TEXT, old_rack TEXT, new_rack TEXT, change_date TEXT)');
+    await db.execute('CREATE TABLE IF NOT EXISTS stock_enquiries (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT, product_name TEXT NOT NULL, requested_qty INTEGER DEFAULT 1, enquiry_date TEXT NOT NULL, agent TEXT DEFAULT "", customer_name TEXT DEFAULT "")');
 
     // Performance Indexes
     await db.execute('CREATE INDEX idx_product_name ON product_master(name)');
@@ -878,6 +879,8 @@ class DbHelper {
     await db.execute('CREATE INDEX idx_sales_items_invoice ON sales_items(invoice_no)');
     await db.execute('CREATE INDEX idx_purchase_items_entry ON purchase_items(entry_no)');
     await db.execute('CREATE INDEX idx_sales_patient ON sales_invoices(patient)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_enquiries_date ON stock_enquiries(enquiry_date)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_enquiries_prod ON stock_enquiries(product_name)');
     await db.execute('CREATE INDEX idx_purchase_supplier ON purchase_entries(supplier_name)');
     await db.execute('CREATE INDEX idx_sales_date_fy ON sales_invoices(date, financial_year, is_deleted)');
     await db.execute('CREATE INDEX idx_pur_date_fy ON purchase_entries(date, financial_year, is_deleted)');

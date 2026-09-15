@@ -25,7 +25,7 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  static const String _currentAppVersion = "2.4.3";
+  static const String _currentAppVersion = "2.4.4";
   late TextEditingController _nameCtrl;
   late TextEditingController _addressCtrl;
   late TextEditingController _phoneCtrl;

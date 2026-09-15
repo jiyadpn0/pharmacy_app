@@ -613,7 +613,7 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
         focusNode: _globalFocus,
         autofocus: true,
         onKeyEvent: (node, event) {
-          if (event is KeyDownEvent) {
+          if (event is KeyDownEvent || event is KeyRepeatEvent) {
             if (event.logicalKey == LogicalKeyboardKey.f10) {
               _saveAdjustments(isEdit: _isExistingEntry);
               return KeyEventResult.handled;
@@ -1298,7 +1298,7 @@ class _ProductSearchCellState extends State<_ProductSearchCell> {
         padding: const EdgeInsets.symmetric(horizontal: 2),
         child: Focus(
           onKeyEvent: (node, event) {
-            if (event is KeyDownEvent) {
+            if (event is KeyDownEvent || event is KeyRepeatEvent) {
               if (event.logicalKey == LogicalKeyboardKey.arrowDown && _overlayEntry != null) {
                 setState(() { _selectedIndex = (_selectedIndex + 1) % _results.length; _overlayEntry?.markNeedsBuild(); });
                 return KeyEventResult.handled;
@@ -1559,7 +1559,7 @@ class _BatchSearchCellState extends State<_BatchSearchCell> {
         padding: const EdgeInsets.symmetric(horizontal: 2),
         child: Focus(
           onKeyEvent: (node, event) {
-            if (event is KeyDownEvent) {
+            if (event is KeyDownEvent || event is KeyRepeatEvent) {
               if (event.logicalKey == LogicalKeyboardKey.arrowDown && _overlayEntry != null) {
                 setState(() { _selectedIndex = (_selectedIndex + 1) % _results.length; _overlayEntry?.markNeedsBuild(); });
                 return KeyEventResult.handled;

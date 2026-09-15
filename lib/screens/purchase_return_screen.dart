@@ -2408,7 +2408,7 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
                                               _GridCell(p.rack, width: 60),
                                               _GridCell(p.category, width: 50),
                                               _GridCell(p.manufacturer, width: 120),
-                                              _GridCell(p.genericName.isNotEmpty ? p.genericName : (Provider.of<PharmacyProvider>(context, listen: false).productMaster.firstWhere((m) => m.id == p.id || m.name.toLowerCase().trim() == p.name.toLowerCase().trim(), orElse: () => Product(id: "", name: p.name)).genericName), width: 150),
+                                              _GridCell(p.genericName.isNotEmpty ? p.genericName : (Provider.of<PharmacyProvider>(context, listen: false).getProductById(p.id)?.genericName ?? Provider.of<PharmacyProvider>(context, listen: false).getProductMasterByName(p.name)?.genericName ?? ""), width: 150),
                                               const _GridCell("", flex: 1),
                                             ],
                                     ),

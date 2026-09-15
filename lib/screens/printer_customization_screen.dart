@@ -21,6 +21,9 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
   final TextEditingController _storeNameCtrl = TextEditingController(text: "SAHAKAR MEDICALS & SURGICALS");
   final TextEditingController _storeAddressCtrl = TextEditingController(text: "KALPETTA TOWN, WAYANAD");
   final TextEditingController _headerTitleCtrl = TextEditingController(text: "TAX INVOICE / CASH MEMO");
+  final TextEditingController _returnPolicyCtrl = TextEditingController(text: "Medicines once sold will not be taken back");
+  bool _showReturnPolicy = true;
+  String _printMode = "dialog";
 
   DotMatrixPaperSize _paperSize = DotMatrixPaperSize.inch_8x11_standard;
   String _selectedPrinterName = "TVS MSP 250 (80 Col)";
@@ -47,6 +50,9 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
       _storeNameCtrl.text = prefs.getString('store_name') ?? "SAHAKAR MEDICALS & SURGICALS";
       _storeAddressCtrl.text = prefs.getString('store_address') ?? "KALPETTA TOWN, WAYANAD";
       _headerTitleCtrl.text = prefs.getString('header_title') ?? "TAX INVOICE / CASH MEMO";
+      _returnPolicyCtrl.text = prefs.getString('return_policy_text') ?? "Medicines once sold will not be taken back";
+      _showReturnPolicy = prefs.getBool('show_return_policy') ?? true;
+      _printMode = prefs.getString('printer_mode') ?? "dialog";
     });
   }
 
@@ -59,6 +65,9 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
     await prefs.setString('store_name', _storeNameCtrl.text);
     await prefs.setString('store_address', _storeAddressCtrl.text);
     await prefs.setString('header_title', _headerTitleCtrl.text);
+    await prefs.setString('return_policy_text', _returnPolicyCtrl.text);
+    await prefs.setBool('show_return_policy', _showReturnPolicy);
+    await prefs.setString('printer_mode', _printMode);
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -110,6 +119,7 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
     _storeNameCtrl.dispose();
     _storeAddressCtrl.dispose();
     _headerTitleCtrl.dispose();
+    _returnPolicyCtrl.dispose();
     super.dispose();
   }
 
@@ -155,6 +165,35 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
                 controller: _headerTitleCtrl,
                 onChanged: (v) => setState(() {}),
                 decoration: _inputDecoration("Invoice Title (e.g. Tax Invoice)"),
+              ),
+              const SizedBox(height: 16),
+              _sectionTitle("Invoice Footer Notice / Return Policy"),
+              SwitchListTile(
+                title: const Text("Show Return Policy Notice on Bill", style: TextStyle(fontSize: 12)),
+                value: _showReturnPolicy,
+                onChanged: (v) => setState(() => _showReturnPolicy = v),
+              ),
+              if (_showReturnPolicy) ...[
+                const SizedBox(height: 8),
+                TextFormField(
+                  controller: _returnPolicyCtrl,
+                  onChanged: (v) => setState(() {}),
+                  decoration: _inputDecoration("Return Policy Text"),
+                ),
+              ],
+              const SizedBox(height: 24),
+
+              _sectionTitle("Default Print Mode (Auto-Print Behavior)"),
+              DropdownButtonFormField<String>(
+                initialValue: _printMode,
+                decoration: _inputDecoration("Print Behavior on Print Button Click"),
+                items: const [
+                  DropdownMenuItem(value: "dialog", child: Text("Ask Every Time (Show Format Dialog)", style: TextStyle(fontSize: 12))),
+                  DropdownMenuItem(value: "thermal", child: Text("Auto-Print Thermal Receipt (80mm)", style: TextStyle(fontSize: 12))),
+                  DropdownMenuItem(value: "a4", child: Text("Auto-Print A4 Graphical Invoice", style: TextStyle(fontSize: 12))),
+                  DropdownMenuItem(value: "dot_matrix", child: Text("Auto-Print Dot Matrix Bill", style: TextStyle(fontSize: 12))),
+                ],
+                onChanged: (v) => setState(() => _printMode = v ?? "dialog"),
               ),
               const SizedBox(height: 24),
 

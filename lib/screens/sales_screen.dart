@@ -210,7 +210,8 @@ class _SalesScreenState extends State<SalesScreen> {
   final SearchDebouncer _footerDebouncer = SearchDebouncer(milliseconds: 50);
   final SearchDebouncer _footerUpdateDebouncer = SearchDebouncer(milliseconds: 200);
   final SearchDebouncer _barcodeDebouncer = SearchDebouncer(milliseconds: 80);
-  String _timeString = "";
+  final ValueNotifier<String> _timeNotifier = ValueNotifier<String>("");
+  bool _lastDraftSavedStateDirty = true;
 
   bool _isLoading = false;
   bool _isSaving = false; // ---> Hard guard against rapid double-clicks & hotkey spam
@@ -252,6 +253,7 @@ class _SalesScreenState extends State<SalesScreen> {
 
   // ---> NEW: Instantly unlocks the Edit button when a change happens <---
   void _markDirty() {
+    _lastDraftSavedStateDirty = true;
     if (_isLoading) return; // Don't trigger while the invoice is still loading!
     if (_isExistingEntry && !_isDirty) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -301,12 +303,10 @@ class _SalesScreenState extends State<SalesScreen> {
       if (mounted) _triggerAutoSaveDraft();
     });
 
-    _timeString = DateFormat('hh:mm a').format(DateTime.now());
+    _timeNotifier.value = DateFormat('hh:mm a').format(DateTime.now());
     _timeTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
       if (mounted) {
-        setState(() {
-          _timeString = DateFormat('hh:mm a').format(DateTime.now());
-        });
+        _timeNotifier.value = DateFormat('hh:mm a').format(DateTime.now());
       }
     });
 
@@ -363,6 +363,7 @@ class _SalesScreenState extends State<SalesScreen> {
     _saveSpecialOrderFocus.dispose();
     _rcvdAmtFocus.dispose();
     _focusNotifier.dispose();
+    _timeNotifier.dispose();
     _searchList.dispose();
     _batchList.dispose();
     _searchIdx.dispose();
@@ -493,7 +494,10 @@ class _SalesScreenState extends State<SalesScreen> {
 
           Timer.run(() {
             if (fn.hasFocus && ctrl.text.isNotEmpty) {
-              ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
+              final sel = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
+              if (ctrl.selection != sel) {
+                ctrl.selection = sel;
+              }
             }
           });
         } else {
@@ -624,9 +628,9 @@ class _SalesScreenState extends State<SalesScreen> {
           final p = Provider.of<PharmacyProvider>(context, listen: false);
           final now = DateTime.now();
 
-          // Only auto-fill unexpired batches with stock
-          final availableBatches = p.products.where((prod) =>
-              prod.name.toLowerCase().trim() == it.product.name.toLowerCase().trim() &&
+          // Only auto-fill unexpired batches with stock (O(1) Fast Lookup)
+          final candidateBatches = p.getBatchesForProduct(it.product.id, it.product.name);
+          final availableBatches = candidateBatches.where((prod) =>
               prod.stock > 0 &&
               !_parseExpiry(prod.expiry).isBefore(now)
           ).toList();
@@ -663,9 +667,23 @@ class _SalesScreenState extends State<SalesScreen> {
       if (col == 7 || col == 11 || col == 12) {
         String val = value.trim().isEmpty ? "0" : value;
         if (col == 7) {
-          it.qty = int.tryParse(val) ?? 0;
-          if (!_getGridFocusNode(row, 7).hasFocus) {
-            _getGridCtrl(row, 7).text = it.qty.toString();
+          int typedQty = int.tryParse(val) ?? 0;
+          if (typedQty > 0) {
+            int bLoose = it.product.stock;
+            int stockAlreadyUsed = _getCrossRowStockUsed(it.product, row);
+            int originalQtyInThisInvoice = _originalInvoiceBatchQtys["${it.product.id}|${it.product.batch.trim().toUpperCase()}"] ?? 0;
+            int trueAvailableInCurrent = bLoose + originalQtyInThisInvoice - stockAlreadyUsed;
+
+            if (typedQty > trueAvailableInCurrent) {
+              _handleAutoSplit(row, typedQty, trueAvailableInCurrent);
+            } else {
+              it.qty = typedQty;
+              if (!_getGridFocusNode(row, 7).hasFocus) {
+                _getGridCtrl(row, 7).text = it.qty.toString();
+              }
+            }
+          } else {
+            it.qty = 0;
           }
         } else if (col == 11) {
           it.discPercent = double.tryParse(val) ?? 0.0;
@@ -710,11 +728,6 @@ class _SalesScreenState extends State<SalesScreen> {
       }
     }
 
-    // Capture undo snapshot once upon entering an editable cell
-    if (_editableCols.contains(safeCol) && (_focusNotifier.value?.row != safeRow || _focusNotifier.value?.col != safeCol)) {
-      _saveUndoState();
-    }
-
     // Only close dropdowns if switching away from search columns
     if (safeCol != 2 && safeCol != 4) {
       _closeAllDropdowns();
@@ -739,38 +752,36 @@ class _SalesScreenState extends State<SalesScreen> {
       setState(() => _isSpecialOrderMinimized = true);
     }
 
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      if (safeRow == -1) {
-        final fn = _getHeaderFocus(safeCol < 4 ? safeCol : 3);
-        final ctrl = _getHeaderCtrl(safeCol < 4 ? safeCol : 3);
+    // ---> EXECUTE IMMEDIATELY INSTEAD OF WAITING FOR POST-FRAME <---
+    if (safeRow == -1) {
+      final fn = _getHeaderFocus(safeCol < 4 ? safeCol : 3);
+      final ctrl = _getHeaderCtrl(safeCol < 4 ? safeCol : 3);
 
-        bool wasFocused = fn.hasFocus;
-        if (!wasFocused) {
-          fn.requestFocus();
-          ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
-        }
-      } else {
-        final fn = _getGridFocusNode(safeRow, safeCol);
-        final ctrl = _getGridCtrl(safeRow, safeCol);
-        final initialText = ctrl.text;
-
+      bool wasFocused = fn.hasFocus;
+      if (!wasFocused) {
         fn.requestFocus();
-        
-        if (initialText.isNotEmpty) {
-          ctrl.selection = TextSelection(baseOffset: 0, extentOffset: initialText.length);
-        }
+        ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
+      }
+    } else {
+      final fn = _getGridFocusNode(safeRow, safeCol);
+      final ctrl = _getGridCtrl(safeRow, safeCol);
+      final initialText = ctrl.text;
 
-        // Open the dropdown table upon focus if autoOpen is true
-        if (autoOpen || safeCol == 4) {
-          if (safeCol == 2 && initialText.trim().isEmpty) {
-            _startProductSearch("");
-          } else if (safeCol == 4) {
-            _startBatchSearch(safeRow, "");
-          }
+      fn.requestFocus();
+      
+      if (initialText.isNotEmpty) {
+        ctrl.selection = TextSelection(baseOffset: 0, extentOffset: initialText.length);
+      }
+
+      // Open the dropdown table upon focus if autoOpen is true
+      if (autoOpen || safeCol == 4) {
+        if (safeCol == 2 && initialText.trim().isEmpty) {
+          _startProductSearch("");
+        } else if (safeCol == 4) {
+          _startBatchSearch(safeRow, "");
         }
       }
-    });
+    }
   }
 
   Product _cloneProduct(Product p) {
@@ -800,34 +811,11 @@ class _SalesScreenState extends State<SalesScreen> {
   void _updateFooter(Product p) {
     if (!mounted) return;
 
-    // DEBOUNCE THE FOOTER WORK TO PREVENT THRASHING THE MAIN THREAD
+    // LIGHTWEIGHT SYNC ONLY: Skip heavy substitute loops on every keystroke
     _footerUpdateDebouncer.run(() {
       if (!mounted) return;
-      final provider = Provider.of<PharmacyProvider>(context, listen: false);
-
+      
       String genName = p.genericName.trim();
-      if (genName.isEmpty && p.name.trim().isNotEmpty) {
-        final pNameLower = p.name.trim().toLowerCase();
-        for (var m in provider.productMaster) {
-          if ((m.id == p.id || m.name.trim().toLowerCase() == pNameLower) && m.genericName.trim().isNotEmpty) {
-            genName = m.genericName.trim();
-            break;
-          }
-        }
-        if (genName.isEmpty) {
-          final pNameUpper = p.name.toUpperCase();
-          for (var g in provider.generics) {
-            if (g.isNotEmpty && g.length >= 3 && pNameUpper.contains(g.toUpperCase())) {
-              genName = g;
-              break;
-            }
-          }
-        }
-        if (genName.isNotEmpty) {
-          p.genericName = genName;
-        }
-      }
-
       _activeGenericName = genName;
 
       if (p.name.trim().isNotEmpty && p.name != _lastSyncedProdName) {
@@ -838,71 +826,14 @@ class _SalesScreenState extends State<SalesScreen> {
         if (mounted) setState(() => _productHistory = []);
       }
 
-      if (p.name.trim().isEmpty || genName.isEmpty) {
-        if (_footerAlts.isNotEmpty) {
-          if (mounted) setState(() => _footerAlts = []);
-        }
-        return;
-      }
-
-      final String searchGen = genName.toLowerCase();
-      final String currentCleanName = Product.cleanProductName(p.name).toLowerCase();
-
-      final Set<String> existingNamesInBill = _items
-          .map((it) => Product.cleanProductName(it.product.name).toLowerCase())
-          .where((name) => name.isNotEmpty)
-          .toSet();
-
-      final Map<String, Product> subMap = {};
-
-      for (int i = 0; i < provider.products.length; i++) {
-        final bp = provider.products[i];
-        if (bp.stock <= 0) continue;
-
-        final bpCleanName = Product.cleanProductName(bp.name).toLowerCase();
-        if (bpCleanName == currentCleanName || existingNamesInBill.contains(bpCleanName)) continue;
-
-        String bpGen = bp.genericName.trim().toLowerCase();
-        if (bpGen.isEmpty) {
-          final mMatch = provider.productMaster.firstWhere(
-            (m) => m.id == bp.id || m.name.trim().toLowerCase() == bpCleanName,
-            orElse: () => Product(id: "", name: bp.name),
-          );
-          bpGen = mMatch.genericName.trim().toLowerCase();
-        }
-
-        if (bpGen.isNotEmpty && (bpGen == searchGen || bpGen.contains(searchGen) || searchGen.contains(bpGen))) {
-          if (!subMap.containsKey(bpCleanName)) {
-            subMap[bpCleanName] = Product(
-              id: bp.id,
-              name: bp.name,
-              genericName: bp.genericName.isNotEmpty ? bp.genericName : (bpGen.isNotEmpty ? bpGen.toUpperCase() : genName),
-              stock: bp.stock,
-              mrp: bp.mrp,
-              salePrice: bp.salePrice,
-              packSize: bp.packSize,
-              category: bp.category,
-              rack: bp.rack,
-              manufacturer: bp.manufacturer,
-            );
-          } else {
-            subMap[bpCleanName]!.stock += bp.stock;
-          }
-        }
-
-        if (subMap.length >= 20) break;
-      }
-
-      final substitutes = subMap.values.toList()
-        ..sort((a, b) => b.stock.compareTo(a.stock));
-
-      if (mounted) {
-        setState(() {
-          _footerAlts = substitutes;
-        });
+      // Clear heavy alternatives list to free up the main thread
+      if (_footerAlts.isNotEmpty) {
+        if (mounted) setState(() => _footerAlts = []);
       }
     });
   }
+
+  bool existingNamesInByPass(String name, Set<String> set) => set.contains(name);
 
   void _updateHistory(String productName) {
     _historyDebouncer.run(() async {
@@ -1072,15 +1003,15 @@ class _SalesScreenState extends State<SalesScreen> {
       }
 
       if (event.logicalKey == LogicalKeyboardKey.f1) {
-        _resetPage();
+        _resetPage(); // F1: New Entry
         return true;
       }
       if (event.logicalKey == LogicalKeyboardKey.f2) {
-        _resetPage();
+        _openGenericSearchDialog(); // F2: Generic Search
         return true;
       }
       if (event.logicalKey == LogicalKeyboardKey.f3) {
-        _openGenericSearchDialog();
+        _showFindDialog(); // F3: Find
         return true;
       }
       if (event.logicalKey == LogicalKeyboardKey.f5) {
@@ -1381,7 +1312,17 @@ class _SalesScreenState extends State<SalesScreen> {
 
   // FORCEFUL HARDWARE ENTER KEY LISTENER
 
-  Future<dynamic> _showFastDialog({required String title, required String content, Widget? contentWidget, bool isYesNo = false, bool isSuccess = false, bool showSpecialOrder = false, int initialFocusIdx = 1}) {
+  Future<dynamic> _showFastDialog({
+    required String title,
+    required String content,
+    Widget? contentWidget,
+    bool isYesNo = false,
+    bool isSuccess = false,
+    bool showSpecialOrder = false,
+    int initialFocusIdx = 1,
+    String? confirmText,
+    String? cancelText,
+  }) {
     if (!isSuccess) AppSounds.playError();
     _isDialogOpen = true;
     int focusedIdx = initialFocusIdx; // 0: Special Order, 1: OK/Yes, 2: No
@@ -1490,27 +1431,27 @@ class _SalesScreenState extends State<SalesScreen> {
                                       if (isYesNo) ...[
                                         ElevatedButton(
                                             style: ElevatedButton.styleFrom(
-                                              backgroundColor: focusedIdx == 2 ? Colors.blue : Colors.grey.shade100,
+                                              backgroundColor: focusedIdx == 2 ? Colors.blue.shade800 : Colors.grey.shade100,
                                               foregroundColor: focusedIdx == 2 ? Colors.white : Colors.black87,
                                               side: focusedIdx == 2 ? const BorderSide(color: Colors.black26, width: 2) : null,
                                               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
                                               padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
                                             ),
                                             onPressed: () => Navigator.pop(ctx, false),
-                                            child: const Text("No", style: TextStyle(fontWeight: FontWeight.bold))
+                                            child: Text(cancelText ?? "NO", style: const TextStyle(fontWeight: FontWeight.bold))
                                         ),
                                         const SizedBox(width: 8),
                                       ],
                                       ElevatedButton(
                                           style: ElevatedButton.styleFrom(
-                                            backgroundColor: focusedIdx == 1 ? Colors.blue : Colors.grey.shade300,
+                                            backgroundColor: focusedIdx == 1 ? Colors.blue.shade800 : Colors.grey.shade300,
                                             foregroundColor: focusedIdx == 1 ? Colors.white : Colors.black87,
                                             side: focusedIdx == 1 ? const BorderSide(color: Colors.black26, width: 2) : null,
                                             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
                                             padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
                                           ),
-                                          onPressed: () => Navigator.pop(ctx, isYesNo ? true : true),
-                                          child: Text(isYesNo ? "Yes" : "OK", style: const TextStyle(fontWeight: FontWeight.bold))
+                                          onPressed: () => Navigator.pop(ctx, true),
+                                          child: Text(confirmText ?? (isYesNo ? "YES" : "OK"), style: const TextStyle(fontWeight: FontWeight.bold))
                                       )
                                     ]),
                               )
@@ -1542,27 +1483,20 @@ class _SalesScreenState extends State<SalesScreen> {
     // Handle product name field submission
     if (col == 2) {
       String typedText = _getGridCtrl(row, 2).text.trim();
-      final p = Provider.of<PharmacyProvider>(context, listen: false);
 
       if (_searchList.value.isNotEmpty) {
-        final selected = _searchList.value[_searchIdx.value];
+        int safeIdx = _searchIdx.value.clamp(0, _searchList.value.length - 1);
+        final selected = _searchList.value[safeIdx];
         if (selected.id == "NEW") {
           _promptCreateNewProduct(selected.name);
           return;
         }
+        _onProductSelected(selected);
+        return;
+      }
 
-        final bool isExactMatch = Product.cleanProductName(selected.name).toLowerCase() == Product.cleanProductName(typedText).toLowerCase();
-        if (isExactMatch || _searchIdx.value > 0) {
-          _onProductSelected(selected);
-        } else {
-          final matches = p.searchProducts(typedText, includeGenerics: false);
-          if (matches.isNotEmpty) {
-            _onProductSelected(matches.first);
-          } else {
-            _promptCreateNewProduct(typedText);
-          }
-        }
-      } else if (typedText.isNotEmpty) {
+      if (typedText.isNotEmpty) {
+        final p = Provider.of<PharmacyProvider>(context, listen: false);
         final matches = p.searchProducts(typedText, includeGenerics: false);
         if (matches.isNotEmpty) {
           _onProductSelected(matches.first);
@@ -1572,8 +1506,24 @@ class _SalesScreenState extends State<SalesScreen> {
       } else {
         _moveFocus(row, 4, autoOpen: true);
       }
-    }
-    else {
+    } else {
+      if (col == 7 && row < _items.length) {
+        final it = _items[row];
+        final val = _getGridCtrl(row, 7).text.trim();
+        int typedQty = int.tryParse(val) ?? 0;
+        if (typedQty > 0) {
+          int bLoose = it.product.stock;
+          int stockAlreadyUsed = _getCrossRowStockUsed(it.product, row);
+          int originalQtyInThisInvoice = _originalInvoiceBatchQtys["${it.product.id}|${it.product.batch.trim().toUpperCase()}"] ?? 0;
+          int trueAvailableInCurrent = bLoose + originalQtyInThisInvoice - stockAlreadyUsed;
+
+          if (typedQty > trueAvailableInCurrent) {
+            _handleAutoSplit(row, typedQty, trueAvailableInCurrent);
+            return;
+          }
+        }
+      }
+
       // Standard column navigation step
       int curIdx = _navCols.indexOf(col);
       if (curIdx != -1 && curIdx < _navCols.length - 1) {
@@ -1595,9 +1545,10 @@ class _SalesScreenState extends State<SalesScreen> {
 
     final p = Provider.of<PharmacyProvider>(context, listen: false);
     String prodName = _items[startRow].product.name;
+    String prodId = _items[startRow].product.id;
     final String currentBatchKey = _getBatchUniqueKey(_items[startRow].product);
-    final otherBatches = p.products.where((it) =>
-    it.name.toLowerCase() == prodName.toLowerCase() &&
+    final candidateBatches = p.getBatchesForProduct(prodId, prodName);
+    final otherBatches = candidateBatches.where((it) =>
         it.stock > 0 && _getBatchUniqueKey(it) != currentBatchKey &&
         !_parseExpiry(it.expiry).isBefore(DateTime.now())
     ).toList();
@@ -1650,28 +1601,20 @@ class _SalesScreenState extends State<SalesScreen> {
     });
 
     if (remaining > 0) {
-      // THE DEEP SHORTAGE FIX
-      bool? addToSpecial = await _showFastDialog(
+      final res = await _showFastDialog(
           title: "Stock Shortage",
-          content: "",
-          contentWidget: RichText(
-            text: TextSpan(
-              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: Colors.black, fontFamily: 'Roboto'),
-              children: [
-                TextSpan(text: "$remaining Qty is short across all valid batches. Add this $remaining to "),
-                const TextSpan(text: "Special Orders", style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold)),
-                const TextSpan(text: "?"),
-              ]
-            )
-          ),
-          isYesNo: true,
-          initialFocusIdx: 2
+          content: "This item currently has no available stock.\n$remaining Qty is short across all valid batches.",
+          showSpecialOrder: true,
+          initialFocusIdx: 1, // Auto-select right option ("OK")
+          confirmText: "OK",
       );
 
-      if (addToSpecial == true && mounted) {
+      if (res == "special" && mounted) {
         // ROUTE DIRECTLY TO THE SIDEBAR
         _triggerSpecialOrderFocus(_items[startRow].product.name, remaining);
       } else {
+        final pharma = Provider.of<PharmacyProvider>(context, listen: false);
+        pharma.logStockEnquiry(productName: _items[startRow].product.name, productId: _items[startRow].product.id, requestedQty: remaining, agent: _agentCtrl.text);
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted) _moveFocus(_items.length, 2, autoOpen: true);
         });
@@ -1748,7 +1691,9 @@ class _SalesScreenState extends State<SalesScreen> {
   }
 
   void _startBatchSearch(int row, String q) {
-    setState(() => _isSelectingBatch = true);
+    if (!_isSelectingBatch) {
+      _isSelectingBatch = true;
+    }
     final p = Provider.of<PharmacyProvider>(context, listen: false);
     String prodName = row < _items.length ? _items[row].product.name : _getGridCtrl(row, 1).text;
     String prodId = row < _items.length ? _items[row].product.id : "";
@@ -1759,32 +1704,17 @@ class _SalesScreenState extends State<SalesScreen> {
 
     final String query = q.trim().toUpperCase();
 
-    // Find all stock batches for this product
-    final rawMatches = p.products.where((prod) {
-      bool isSameProduct = (prodId.isNotEmpty && prod.id == prodId) ||
-          prod.name.trim().toLowerCase() == prodName.trim().toLowerCase();
-      
-      if (!isSameProduct) return false;
+    // Instant O(1) hashmap lookup returning pre-consolidated & pre-sorted FEFO batches
+    final candidateBatches = p.getBatchesForProduct(prodId, prodName);
 
-      if (query.isNotEmpty && !_cleanBatch(prod.batch).toUpperCase().contains(query)) {
-        return false;
-      }
+    if (query.isEmpty) {
+      _batchList.value = candidateBatches;
+      return;
+    }
 
-      bool isCurrentRowBatch = row < _items.length &&
-          prod.batch.trim().toLowerCase() == _items[row].product.batch.trim().toLowerCase();
-
-      return prod.stock > 0 || isCurrentRowBatch;
+    _batchList.value = candidateBatches.where((prod) {
+      return _cleanBatch(prod.batch).toUpperCase().contains(query);
     }).toList();
-
-    // Consolidate identical batch rows into 1 row with combined stock
-    final matches = p.consolidateBatches(rawMatches);
-
-    matches.sort((a, b) {
-      int expComp = _parseExpiry(a.expiry).compareTo(_parseExpiry(b.expiry));
-      if (expComp != 0) return expComp;
-      return b.stock.compareTo(a.stock);
-    });
-    _batchList.value = matches;
   }
 
   void _startSpecialProductSearch(String q) {
@@ -1814,48 +1744,27 @@ class _SalesScreenState extends State<SalesScreen> {
     final String cleanName = productName.trim();
     if (cleanName.isEmpty) return;
 
-    final bool? create = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-        title: Row(
-          children: const [
-            Icon(Icons.add_circle_outline, color: Colors.blue, size: 24),
-            SizedBox(width: 8),
-            Text("Create New Product?", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-          ],
-        ),
-        content: Text(
-          "Product '$cleanName' was not found in Product Master.\n\nWould you like to register this as a new product?",
-          style: const TextStyle(fontSize: 14),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text("NO", style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold)),
-          ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.blue.shade800,
-              foregroundColor: Colors.white,
-            ),
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text("YES, CREATE", style: TextStyle(fontWeight: FontWeight.bold)),
-          ),
-        ],
-      ),
+    final dynamic res = await _showFastDialog(
+      title: "Create New Product?",
+      content: "Product '$cleanName' was not found in Product Master.\n\nWould you like to register this as a new product?",
+      isYesNo: true,
+      initialFocusIdx: 1, // Auto-select right option ("YES, CREATE")
+      confirmText: "YES, CREATE",
+      cancelText: "NO",
     );
 
-    if (create == true && mounted) {
+    if (res == true && mounted) {
       final appProvider = Provider.of<AppProvider>(context, listen: false);
       appProvider.openProductRegistration(initialName: cleanName);
     }
   }
 
-  void _onProductSelected(Product p) {
+  void _onProductSelected(Product p) async {
     _productSearchDebouncer.cancel();
     _searchList.value = [];
+    if (_itemSearchFocusNode.hasFocus) {
+      _itemSearchFocusNode.unfocus();
+    }
     if (p.id == "NEW") {
       _promptCreateNewProduct(p.name);
       return;
@@ -1869,12 +1778,40 @@ class _SalesScreenState extends State<SalesScreen> {
       row = _items.length;
     }
 
+    if (p.stock <= 0) {
+      final res = await _showFastDialog(
+        title: "Zero Stock",
+        content: "This item currently has no available stock.",
+        showSpecialOrder: true,
+        initialFocusIdx: 1, 
+      );
+
+      if (res == "special") {
+        setState(() {
+          _getGridCtrl(row, 1).clear();
+          if (row < _items.length) {
+            _items.removeAt(row);
+          }
+          _orderType = 1;
+          _showSpecialOrderSidebar = true;
+          _isSpecialOrderMinimized = false;
+          _activeNotificationTab = "special";
+        });
+        _triggerSpecialOrderFocus(p.name, 1);
+      } else {
+        final pharma = Provider.of<PharmacyProvider>(context, listen: false);
+        pharma.logStockEnquiry(productName: p.name, productId: p.id, requestedQty: 1, agent: _agentCtrl.text);
+        if (res == true) {
+          _commitSelection(row, p, stayOnProduct: true);
+        }
+      }
+      _isSelectingFromDropdown = false;
+      return;
+    }
+
     // Use the verified _commitSelection which correctly creates SaleItem and updates controllers
     _commitSelection(row, p);
-
-    Future.delayed(const Duration(milliseconds: 150), () {
-      if (mounted) _isSelectingFromDropdown = false;
-    });
+    _isSelectingFromDropdown = false;
   }
 
   void _handleBatchSelection({required int row, required Product product}) async {
@@ -1924,7 +1861,36 @@ class _SalesScreenState extends State<SalesScreen> {
     }
   }
 
-  void _finalizeBatchSelection(Product p) {
+  void _finalizeBatchSelection(Product p) async {
+    // ---> RESTORE ZERO STOCK BLOCKING FOR BATCHES <---
+    if (p.stock <= 0) {
+      final res = await _showFastDialog(
+        title: "Zero Stock",
+        content: "This batch currently has no available stock.",
+        showSpecialOrder: true,
+        initialFocusIdx: 1, 
+      );
+
+      if (res == "special") {
+        setState(() {
+          final row = _focusedRowIndex;
+          _getGridCtrl(row, 1).clear();
+          if (row < _items.length) {
+            _items.removeAt(row);
+          }
+          _orderType = 1;
+          _showSpecialOrderSidebar = true;
+          _isSpecialOrderMinimized = false;
+          _activeNotificationTab = "special";
+        });
+        _triggerSpecialOrderFocus(p.name, 1);
+      } else {
+        final pharma = Provider.of<PharmacyProvider>(context, listen: false);
+        pharma.logStockEnquiry(productName: p.name, productId: p.id, requestedQty: 1, agent: _agentCtrl.text);
+      }
+      return; // Block selection
+    }
+
     _isSelectingFromDropdown = true; // LOCKS FOCUS
     
     setState(() {
@@ -1954,10 +1920,7 @@ class _SalesScreenState extends State<SalesScreen> {
     _isSelectingBatch = false;
     _batchList.value = [];
     _moveFocus(_focusedRowIndex, 7);
-    
-    Future.delayed(const Duration(milliseconds: 150), () {
-      if (mounted) _isSelectingFromDropdown = false;
-    });
+    _isSelectingFromDropdown = false;
   }
 
   void _commitSelection(int row, Product p, {bool stayOnProduct = false}) {
@@ -2108,9 +2071,7 @@ class _SalesScreenState extends State<SalesScreen> {
       }
     }
 
-    Future.delayed(const Duration(milliseconds: 150), () {
-      if (mounted) _isSelectingFromDropdown = false;
-    });
+    _isSelectingFromDropdown = false;
   }
 
   // Pure math calculation: zero text controller touches, zero UI overhead
@@ -2118,19 +2079,30 @@ class _SalesScreenState extends State<SalesScreen> {
     _recalculateItem(it, isGstMode: isGstMode);
   }
 
-  // UI-facing calculation: used only when a single row changes via user input
+  // UI-facing calculation: only updates controllers if not currently focused on them
   void _calculateItem(int row) {
     if (row >= _items.length) return;
     final it = _items[row];
 
     _recalculateItemSilent(it, isGstMode: _gstType == 1);
 
-    _getGridCtrl(row, 9).text = it.product.mrp.toStringAsFixed(2);
-    _getGridCtrl(row, 10).text = it.mrp.toStringAsFixed(2);
-    _getGridCtrl(row, 12).text = it.discAmt.toStringAsFixed(2);
+    // Only update read-only display cells, avoid touching active input controllers during typing
+    if (!_getGridFocusNode(row, 9).hasFocus) {
+      _getGridCtrl(row, 9).text = it.product.mrp.toStringAsFixed(2);
+    }
+    if (!_getGridFocusNode(row, 10).hasFocus) {
+      _getGridCtrl(row, 10).text = it.mrp.toStringAsFixed(2);
+    }
+    if (!_getGridFocusNode(row, 12).hasFocus) {
+      _getGridCtrl(row, 12).text = it.discAmt.toStringAsFixed(2);
+    }
     double gVal = TaxCalculator.roundGstPercent(it.gstPercent);
-    _getGridCtrl(row, 13).text = gVal % 1 == 0 ? gVal.toInt().toString() : gVal.toStringAsFixed(1);
-    _getGridCtrl(row, 14).text = it.total.toStringAsFixed(2);
+    if (!_getGridFocusNode(row, 13).hasFocus) {
+      _getGridCtrl(row, 13).text = gVal % 1 == 0 ? gVal.toInt().toString() : gVal.toStringAsFixed(1);
+    }
+    if (!_getGridFocusNode(row, 14).hasFocus) {
+      _getGridCtrl(row, 14).text = it.total.toStringAsFixed(2);
+    }
 
     _calculateFooter();
   }
@@ -3427,9 +3399,7 @@ class _SalesScreenState extends State<SalesScreen> {
       if (it.product.name.trim().isEmpty) continue; // Skip blank trailing rows
 
       // 1. Verify Product Name exists in Product Master
-      bool isValidProduct = p.productMaster.any(
-        (m) => m.name.trim().toLowerCase() == it.product.name.trim().toLowerCase()
-      );
+      bool isValidProduct = p.getProductMasterByName(it.product.name) != null;
       if (!isValidProduct) {
         _errorCells.putIfAbsent(i, () => {}).add(1); // Column 1: Product Name
         validationErrors.add("Row ${i + 1}: '${it.product.name}' is not selected or fully typed from the dropdown list.");
@@ -3459,6 +3429,18 @@ class _SalesScreenState extends State<SalesScreen> {
       if (it.qty <= 0) {
         _errorCells.putIfAbsent(i, () => {}).add(6); // Column 6: Quantity
         validationErrors.add("Row ${i + 1}: Quantity must be greater than 0.");
+      }
+
+      // 4. Verify Stock Availability Constraint
+      String batchKey = "${it.product.id}|${it.product.batch.trim().toUpperCase()}";
+      int existingInvoiceQty = isEdit ? (_originalInvoiceBatchQtys[batchKey] ?? 0) : 0;
+      int liveStock = it.product.stock + existingInvoiceQty;
+      if (liveStock <= 0) {
+        _errorCells.putIfAbsent(i, () => {}).add(6);
+        validationErrors.add("Row ${i + 1}: '${it.product.name}' has 0 available stock.");
+      } else if (it.qty > liveStock) {
+        _errorCells.putIfAbsent(i, () => {}).add(6);
+        validationErrors.add("Row ${i + 1}: '${it.product.name}' quantity (${it.qty}) exceeds available stock ($liveStock).");
       }
     }
 
@@ -4091,14 +4073,20 @@ class _SalesScreenState extends State<SalesScreen> {
     final p = Provider.of<PharmacyProvider>(context, listen: false);
 
     if (!_hasValidItems()) {
-      p.clearSaleDraft();
-      p.clearSalesSession(p.activeSessionIdx);
-      await p.saveSalesDrafts();
+      if (_lastDraftSavedStateDirty) {
+        p.clearSaleDraft();
+        p.clearSalesSession(p.activeSessionIdx);
+        await p.saveSalesDrafts();
+        _lastDraftSavedStateDirty = false;
+      }
       return;
     }
 
-    _syncToGlobalSession();
-    await p.saveSalesDrafts();
+    if (_lastDraftSavedStateDirty) {
+      _syncToGlobalSession();
+      await p.saveSalesDrafts();
+      _lastDraftSavedStateDirty = false;
+    }
   }
 
   @override
@@ -4262,9 +4250,9 @@ class _SalesScreenState extends State<SalesScreen> {
 
     final c = AppColors.of(context);
     return Container(
-      height: 52,
+      height: 38,
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 8),
       decoration: BoxDecoration(
         color: c.cardBg,
         border: Border(bottom: BorderSide(color: c.border, width: 1)),
@@ -4424,7 +4412,7 @@ class _SalesScreenState extends State<SalesScreen> {
     bool showMobileBadge = pharma.prescriptions.any((pr) => !pr.isImported) && _hasNewMobileOrder;
 
     return Container(
-      height: 156,
+      height: 132,
       color: Colors.white,
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -4561,6 +4549,9 @@ class _SalesScreenState extends State<SalesScreen> {
             if (id == "special") {
               _showSpecialOrderSidebar = true;
               _isSpecialOrderMinimized = false;
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                _specialSearchFocus.requestFocus();
+              });
             }
           }
         });
@@ -5030,25 +5021,25 @@ class _SalesScreenState extends State<SalesScreen> {
   );
 
   Widget _topActionBtn(dynamic icon, String label, Color color, {Color? textColor, VoidCallback? onTap}) => Padding(
-    padding: const EdgeInsets.symmetric(horizontal: 5),
+    padding: const EdgeInsets.symmetric(horizontal: 4),
     child: MouseRegion(
       cursor: SystemMouseCursors.click,
       child: InkWell(
         onTap: onTap,
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(4),
         child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               if (icon is IconData)
-                Icon(icon, size: 28, color: color)
+                Icon(icon, size: 20, color: color)
               else if (icon is Widget)
-                SizedBox(width: 28, height: 28, child: icon),
-              const SizedBox(height: 2),
+                SizedBox(width: 20, height: 20, child: icon),
+              const SizedBox(height: 1),
               Text(
                 label,
-                style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: textColor ?? Colors.black87),
+                style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: textColor ?? Colors.black87),
               ),
             ],
           ),
@@ -5516,8 +5507,31 @@ class _SalesScreenState extends State<SalesScreen> {
                   _headerColumn("Mob", _headerInp(1, width: 90, height: 26, onSubmitted: (_) => _moveFocus(-1, 2))),
                   const SizedBox(width: 12),
                   _headerColumn("Days", _headerInp(3, width: 35, height: 26, onSubmitted: (_) => _moveFocus(_items.length, 1))),
-                  const SizedBox(width: 16),
-                  _topActionBtn(Icons.biotech_rounded, "Generic (F3)", const Color(0xFF00897B), onTap: _openGenericSearchDialog),
+                  const SizedBox(width: 12),
+                  _headerColumn("GENERIC", InkWell(
+                    onTap: _openGenericSearchDialog,
+                    borderRadius: BorderRadius.circular(4),
+                    child: Container(
+                      height: 26,
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      decoration: BoxDecoration(
+                        color: Colors.amber.shade50,
+                        border: Border.all(color: Colors.amber.shade700, width: 1.2),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.biotech_rounded, size: 14, color: Colors.amber.shade900),
+                          const SizedBox(width: 4),
+                          Text(
+                            "Generic (F3)",
+                            style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.amber.shade900),
+                          ),
+                        ],
+                      ),
+                    ),
+                  )),
                   const SizedBox(width: 12),
                   _headerColumn("TAX TYPE", Row(children: [_radio("Gst", 1), _radio("No", 2)]), align: CrossAxisAlignment.center),
                 ],
@@ -5558,7 +5572,10 @@ class _SalesScreenState extends State<SalesScreen> {
                                   _headerColumn("Time", Container(
                                     width: 70, height: 26, alignment: Alignment.center,
                                     decoration: BoxDecoration(color: const Color(0xFFF1F8E9), border: Border.all(color: Colors.green.shade300), borderRadius: BorderRadius.circular(4)),
-                                    child: Text(_timeString, style: const TextStyle(fontSize: 9, fontWeight: FontWeight.bold)),
+                                    child: ValueListenableBuilder<String>(
+                                      valueListenable: _timeNotifier,
+                                      builder: (_, timeStr, __) => Text(timeStr, style: const TextStyle(fontSize: 9, fontWeight: FontWeight.bold)),
+                                    ),
                                   )),
                                 ],
                               ),
@@ -5632,6 +5649,9 @@ class _SalesScreenState extends State<SalesScreen> {
             _isProductSyncEnabled = false;
             _isSpecialSyncEnabled = false;
             _specialOrderQtys.clear();
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              _specialSearchFocus.requestFocus();
+            });
           } else {
             _showSpecialOrderSidebar = false;
             _isSpecialOrderMinimized = false;
@@ -5880,6 +5900,26 @@ class _SalesScreenState extends State<SalesScreen> {
                     controller: _specialMainCtrl,
                     focusNode: _specialSearchFocus,
                     onChanged: _startSpecialProductSearch,
+                    onSubmitted: (v) {
+                      if (v.trim().isEmpty) {
+                        _specialCustomerNameFocus.requestFocus();
+                        _specialCustomerNameCtrl.selection = TextSelection(baseOffset: 0, extentOffset: _specialCustomerNameCtrl.text.length);
+                      } else {
+                        if (_specialSearchList.value.isNotEmpty) {
+                          _onSpecialProductSelected(_specialSearchList.value.first);
+                        } else {
+                          setState(() {
+                            _extraSpecialItems.add(v.trim());
+                            _specialOrderQtys[v.trim()] = 1;
+                            _specialMainCtrl.clear();
+                            _specialSearchList.value = [];
+                          });
+                          WidgetsBinding.instance.addPostFrameCallback((_) {
+                            _getSpecialFocusNode(v.trim()).requestFocus();
+                          });
+                        }
+                      }
+                    },
                     style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
                     textCapitalization: TextCapitalization.characters,
                     inputFormatters: [UpperCaseTextFormatter()],
@@ -5937,8 +5977,8 @@ class _SalesScreenState extends State<SalesScreen> {
                               _specialOrderQtys[name] = int.tryParse(v) ?? 0;
                             },
                             onSubmitted: (_) {
-                              _specialCustomerNameFocus.requestFocus();
-                              _specialCustomerNameCtrl.selection = TextSelection(baseOffset: 0, extentOffset: _specialCustomerNameCtrl.text.length);
+                              _specialSearchFocus.requestFocus();
+                              _specialMainCtrl.selection = TextSelection(baseOffset: 0, extentOffset: _specialMainCtrl.text.length);
                             },
                           ),
                         ),
@@ -6458,25 +6498,45 @@ class _SalesScreenState extends State<SalesScreen> {
 
   TextAlign _getColAlign(int i) => [TextAlign.center, TextAlign.center, TextAlign.left, TextAlign.center, TextAlign.left, TextAlign.center, TextAlign.right, TextAlign.right, TextAlign.center, TextAlign.right, TextAlign.right, TextAlign.right, TextAlign.right, TextAlign.right, TextAlign.right, TextAlign.right, TextAlign.center][i];
 
-  Widget _buildGrid() => Scrollbar(
-    controller: _verticalGridScrollCtrl,
-    child: ListView.builder(
+  Widget _buildGrid() {
+    final billQuantities = _getBillQuantitiesMap();
+    return Scrollbar(
+      controller: _verticalGridScrollCtrl,
+      child: ListView.builder(
         controller: _verticalGridScrollCtrl,
         padding: EdgeInsets.zero,
         itemExtent: 30.0,
         itemCount: _items.length + (_isDeleted ? 0 : 1),
         itemBuilder: (ctx, i) => RepaintBoundary(
-          child: i < _items.length ? _buildRow(i) : _buildEmptyRow(i),
+          child: i < _items.length ? _buildRow(i, billQuantities) : _buildEmptyRow(i),
         ),
-    ),
-  );
+      ),
+    );
+  }
 
   // ---> FALLBACK GETTERS PREVENT SCOPE ERRORS <---
   Color get defaultColor => Colors.black87;
   Color get nameColor => Colors.black87;
   Color get expiryColor => Colors.black87;
 
-  int _getLiveRemainingStock(int row) {
+  Map<String, int> _cachedRemainingStock = {};
+
+  // Pre-computes bill quantities in a single pass to eliminate O(N^2) frame lag
+  Map<String, int> _getBillQuantitiesMap() {
+    Map<String, int> usage = {};
+    for (var other in _items) {
+      final nameKey = Product.cleanProductName(other.product.name).toLowerCase();
+      if (nameKey.isNotEmpty) {
+        usage[nameKey] = (usage[nameKey] ?? 0) + other.qty + other.fQty;
+      }
+      if (other.product.id.isNotEmpty) {
+        usage[other.product.id] = (usage[other.product.id] ?? 0) + other.qty + other.fQty;
+      }
+    }
+    return usage;
+  }
+
+  int _getLiveRemainingStock(int row, Map<String, int> billQuantities) {
     if (row >= _items.length) return 0;
     final it = _items[row];
     final cleanName = Product.cleanProductName(it.product.name).toLowerCase();
@@ -6484,27 +6544,18 @@ class _SalesScreenState extends State<SalesScreen> {
 
     final provider = Provider.of<PharmacyProvider>(context, listen: false);
 
-    // 1. Instant O(1) Map Lookup for Total Stock Across All Batches
     int totalAllBatchesStock = provider.getTotalStockForProduct(cleanName);
     if (totalAllBatchesStock <= 0 && it.product.stock > 0) {
       totalAllBatchesStock = it.product.stock;
     }
 
-    // 2. Sum total quantity of this medicine added across ALL rows in current bill
-    int totalQtyInBill = 0;
-    for (int i = 0; i < _items.length; i++) {
-      final other = _items[i];
-      final otherCleanName = Product.cleanProductName(other.product.name).toLowerCase();
-      if ((it.product.id.isNotEmpty && other.product.id == it.product.id) || otherCleanName == cleanName) {
-        totalQtyInBill += other.qty + other.fQty;
-      }
-    }
+    int totalQtyInBill = billQuantities[it.product.id] ?? billQuantities[cleanName] ?? 0;
 
     int remaining = totalAllBatchesStock - totalQtyInBill;
     return remaining < 0 ? 0 : remaining;
   }
 
-  Widget _buildRow(int row) {
+  Widget _buildRow(int row, Map<String, int> billQuantities) {
     final it = _items[row];
     double profit = it.profit;
 
@@ -6516,7 +6567,7 @@ class _SalesScreenState extends State<SalesScreen> {
     Color rowExpiryColor = isExpired ? Colors.red.shade900 : Colors.black87;
     Color rowDefaultColor = isH1 ? Colors.red.shade900 : Colors.black87;
 
-    int liveRemStock = _getLiveRemainingStock(row);
+    int liveRemStock = _getLiveRemainingStock(row, billQuantities);
     Color remColor = liveRemStock > 0
         ? Colors.teal.shade800
         : (liveRemStock == 0 ? Colors.orange.shade900 : Colors.red.shade700);
@@ -6696,12 +6747,16 @@ class _SalesScreenState extends State<SalesScreen> {
         final ctrl = _getGridCtrl(row, col, val);
         
         if (!isFocused && ctrl.text != val) {
-          ctrl.text = val;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted && !isFocused && ctrl.text != val) {
+              ctrl.text = val;
+            }
+          });
         }
 
         const bool isEntryLocked = false;
         bool isActuallyInput = isInput && !_isDeleted && !isEntryLocked && !isLocked;
-        bool renderAsTextField = isActuallyInput && isFocused;
+        bool renderAsTextField = isActuallyInput;
 
         Color? bg;
         BoxBorder? customBorder;
@@ -6881,6 +6936,78 @@ class _SalesScreenState extends State<SalesScreen> {
         _buildNameOverlay(_patientLayer, _patientSearchList, _patientCtrl, _mobileFocus),
         _buildNameOverlay(_doctorLayer, _doctorSearchList, _doctorCtrl, null),
         _buildNameOverlay(_specialCustomerLayer, _patientSearchList, _specialCustomerNameCtrl, _specialCustomerPhoneFocus),
+        ValueListenableBuilder<List<Product>>(
+          valueListenable: _specialSearchList,
+          builder: (ctx, list, _) {
+            if (list.isEmpty) return const SizedBox();
+            return CompositedTransformFollower(
+              link: _specialSearchLayer,
+              showWhenUnlinked: false,
+              offset: const Offset(0, 36),
+              child: Listener(
+                behavior: HitTestBehavior.opaque,
+                onPointerDown: (_) {
+                  _isSelectingFromDropdown = true;
+                },
+                child: Material(
+                  elevation: 12,
+                  shadowColor: Colors.black54,
+                  child: Container(
+                    width: 334,
+                    constraints: const BoxConstraints(maxHeight: 200),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      border: Border.all(color: Colors.blue.shade900, width: 2),
+                    ),
+                    child: ValueListenableBuilder<int>(
+                      valueListenable: _searchIdx,
+                      builder: (ctx, idx, _) => ListView.builder(
+                        padding: EdgeInsets.zero,
+                        shrinkWrap: true,
+                        itemCount: list.length,
+                        itemBuilder: (ctx, i) {
+                          final p = list[i];
+                          bool sel = i == idx;
+                          return InkWell(
+                            onTap: () => _onSpecialProductSelected(p),
+                            child: Container(
+                              color: sel ? Colors.blue.shade100 : Colors.white,
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                              decoration: BoxDecoration(
+                                border: Border(bottom: BorderSide(color: Colors.grey.shade200, width: 0.5)),
+                              ),
+                              child: Row(
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      p.name,
+                                      style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: sel ? Colors.blue.shade900 : Colors.black87),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    "Stock: ${p.stock}",
+                                    style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.blue.shade700),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    "₹${p.mrp.toStringAsFixed(2)}",
+                                    style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.black87),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
 
         ListenableBuilder(
           listenable: Listenable.merge([_searchList, _batchList, _focusNotifier]),
@@ -7044,7 +7171,7 @@ class _SalesScreenState extends State<SalesScreen> {
                                           _GridCell(p.rack, width: 60, color: isH1 ? Colors.red.shade900 : null),
                                           _GridCell(p.category.length > 3 ? p.category.substring(0, 3).toUpperCase() : p.category, width: 50, color: isH1 ? Colors.red.shade900 : null),
                                           _GridCell(p.patent, width: 120, color: isH1 ? Colors.red.shade900 : null),
-                                          _GridCell(p.genericName.isNotEmpty ? p.genericName : (Provider.of<PharmacyProvider>(context, listen: false).productMaster.firstWhere((m) => m.id == p.id || m.name.toLowerCase().trim() == p.name.toLowerCase().trim(), orElse: () => Product(id: "", name: p.name)).genericName), width: 150, color: isH1 ? Colors.red.shade900 : null),
+                                          _GridCell(p.genericName.isNotEmpty ? p.genericName : (Provider.of<PharmacyProvider>(context, listen: false).getProductById(p.id)?.genericName ?? Provider.of<PharmacyProvider>(context, listen: false).getProductMasterByName(p.name)?.genericName ?? ""), width: 150, color: isH1 ? Colors.red.shade900 : null),
                                           _GridCell(p.use, flex: 1, color: isH1 ? Colors.red.shade900 : null)
                                         ]),
                                       ),
@@ -7560,7 +7687,7 @@ class _SalesScreenState extends State<SalesScreen> {
     );
   }
 
-  Widget _buildShortcutLegend() => Container(height: 32, padding: const EdgeInsets.symmetric(horizontal: 12), decoration: BoxDecoration(color: Colors.grey.shade900, border: const Border(top: BorderSide(color: Colors.amber, width: 2))), child: ListView(scrollDirection: Axis.horizontal, children: [_shortcutTag("C+1", "Pur Hist"), _shortcutTag("C+2", "Sal Hist"), _shortcutTag("C+L", "Stock Hist"), _shortcutTag("F2", "New"), _shortcutTag("F3", "Search"), _shortcutTag("F6", "Save"), _shortcutTag("F7", "Cust"), _shortcutTag("F8", "Pay"), _shortcutTag("F9", "Preview"), _shortcutTag("F10", "Invoice"), _shortcutTag("F11", "Hold"), _shortcutTag("F12", "Print"), _shortcutTag("Enter/Tab", "Next"), _shortcutTag("S+Enter", "Prev"), _shortcutTag("Arrows", "Nav"), _shortcutTag("Home/End", "Jump"), _shortcutTag("PgUp/Dn", "Scroll"), _shortcutTag("Del", "Clear"), _shortcutTag("C+Del", "Del Row"), _shortcutTag("Esc", "Close")]));
+  Widget _buildShortcutLegend() => Container(height: 32, padding: const EdgeInsets.symmetric(horizontal: 12), decoration: BoxDecoration(color: Colors.grey.shade900, border: const Border(top: BorderSide(color: Colors.amber, width: 2))), child: ListView(scrollDirection: Axis.horizontal, children: [_shortcutTag("F1", "New"), _shortcutTag("F2", "Generics"), _shortcutTag("F3", "Find"), _shortcutTag("C+1", "Pur Hist"), _shortcutTag("C+2", "Sal Hist"), _shortcutTag("C+L", "Stock Hist"), _shortcutTag("F6", "Save"), _shortcutTag("F7", "Cust"), _shortcutTag("F8", "Pay"), _shortcutTag("F9", "Preview"), _shortcutTag("F10", "Invoice"), _shortcutTag("F11", "Hold"), _shortcutTag("F12", "Print"), _shortcutTag("Enter/Tab", "Next"), _shortcutTag("S+Enter", "Prev"), _shortcutTag("Arrows", "Nav"), _shortcutTag("Home/End", "Jump"), _shortcutTag("PgUp/Dn", "Scroll"), _shortcutTag("Del", "Clear"), _shortcutTag("C+Del", "Del Row"), _shortcutTag("Esc", "Close")]));
   Widget _shortcutTag(String key, String label) => Padding(padding: const EdgeInsets.only(right: 15), child: Row(children: [Text(key, style: const TextStyle(color: Colors.amber, fontWeight: FontWeight.w900, fontSize: 10)), const SizedBox(width: 4), Text(label, style: const TextStyle(color: Colors.white, fontSize: 10))]));
 
   void _openSalesAsWindow(String invNo) {
@@ -7695,76 +7822,95 @@ class _SalesScreenState extends State<SalesScreen> {
   // FIND DIALOG
   // =========================================================================
   void _showFindDialog() {
-    final TextEditingController findCtrl = TextEditingController();
-    final FocusNode findFocusNode = FocusNode();
+    final TextEditingController patientCtrl = TextEditingController();
+    final TextEditingController doctorCtrl = TextEditingController();
+    final TextEditingController entryNoCtrl = TextEditingController();
+    final TextEditingController mobileCtrl = TextEditingController();
+
     setState(() => _isDialogOpen = true);
     showDialog(
       context: context,
       barrierDismissible: true,
       builder: (ctx) {
         return AlertDialog(
-          title: const Text("Find Invoice", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+          title: const Text("Search Sales Entry", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
           content: SizedBox(
-            width: 300,
+            width: 440,
             child: SingleChildScrollView(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Text("Enter Entry Number:", style: TextStyle(fontSize: 13)),
-                  const SizedBox(height: 10),
-                  TextField(
-                    controller: findCtrl,
-                    focusNode: findFocusNode,
-                    autofocus: true,
-                    keyboardType: TextInputType.text,
-                    onSubmitted: (val) {
-                      if (val.trim().isNotEmpty) {
-                        Navigator.pop(ctx, val.trim());
-                      }
-                    },
-                    decoration: const InputDecoration(
-                        border: OutlineInputBorder(),
-                        isDense: true,
-                        hintText: "Entry No (Ex: 101 or INV-001)"
-                    ),
-                  ),
+                  _buildFindRow("Patient", patientCtrl, Icons.person, (val) {
+                    if (val.trim().isNotEmpty) {
+                      Navigator.pop(ctx, val.trim());
+                    }
+                  }),
+                  const SizedBox(height: 12),
+                  _buildFindRow("Doctor", doctorCtrl, Icons.medical_services, (val) {
+                    if (val.trim().isNotEmpty) {
+                      Navigator.pop(ctx, val.trim());
+                    }
+                  }),
+                  const SizedBox(height: 12),
+                  _buildFindRow("Entry No:", entryNoCtrl, Icons.receipt_long, (val) {
+                    if (val.trim().isNotEmpty) {
+                      Navigator.pop(ctx, val.trim());
+                    }
+                  }),
+                  const SizedBox(height: 12),
+                  _buildFindRow("Mobile", mobileCtrl, Icons.phone_android, (val) {
+                    if (val.trim().isNotEmpty) {
+                      Navigator.pop(ctx, val.trim());
+                    }
+                  }),
                 ],
               ),
             ),
           ),
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("CANCEL")),
-            ElevatedButton(
-              onPressed: () {
-                if (findCtrl.text.trim().isNotEmpty) {
-                  Navigator.pop(ctx, findCtrl.text.trim());
-                }
-              },
-              child: const Text("SEARCH"),
-            ),
           ],
         );
       },
     ).then((val) async {
       if (mounted) setState(() => _isDialogOpen = false);
       if (val != null && val is String) {
-        // ---> THE FIX: Protect against losing unsaved edits <---
         if (_isExistingEntry && _isDirty) {
           bool? discard = await _promptDiscardChanges();
-          if (discard != true) return; // User chose to stay
+          if (discard != true) return;
         }
-
-        // Use a slight delay to ensure dialog is fully closed and focus is returned
         Future.delayed(const Duration(milliseconds: 100), () {
           if (mounted) _loadSaleData(val);
         });
       }
-      // Delay disposal to avoid "used after dispose" errors during the pop animation
-      Future.delayed(const Duration(seconds: 1), () {
-        findFocusNode.dispose();
-        findCtrl.dispose();
-      });
+      patientCtrl.dispose();
+      doctorCtrl.dispose();
+      entryNoCtrl.dispose();
+      mobileCtrl.dispose();
     });
+  }
+
+  Widget _buildFindRow(String label, TextEditingController ctrl, IconData icon, void Function(String) onSearch) {
+    return Row(
+      children: [
+        SizedBox(width: 80, child: Text(label, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13))),
+        const SizedBox(width: 8),
+        Expanded(
+          child: TextField(
+            controller: ctrl,
+            decoration: const InputDecoration(border: OutlineInputBorder(), isDense: true),
+            onSubmitted: onSearch,
+          ),
+        ),
+        const SizedBox(width: 8),
+        ElevatedButton.icon(
+          onPressed: () => onSearch(ctrl.text),
+          icon: Icon(icon, size: 16),
+          label: const Text("Search"),
+          style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF3F51B5), foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12)),
+        ),
+      ],
+    );
   }
 
   void _openStockMovementDrawer(String productName) {

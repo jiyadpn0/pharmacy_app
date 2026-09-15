@@ -49,13 +49,26 @@ class PharmacyProvider extends ChangeNotifier {
   final Map<String, List<Product>> _searchCache = {};
 
   final Map<String, List<Product>> _productBatchesMap = {};
+  final Map<String, List<Product>> _productBatchesByIdMap = {};
   int _stockVersion = 0;
   int get stockVersion => _stockVersion;
 
   List<Product> getBatchesForProductName(String name) {
-    final key = name.trim().toLowerCase();
+    final key = Product.cleanProductName(name).toLowerCase();
     if (key.isEmpty) return const [];
     return _productBatchesMap[key] ?? const [];
+  }
+
+  List<Product> getBatchesForProduct(String id, String name) {
+    if (id.isNotEmpty && _productBatchesByIdMap.containsKey(id)) {
+      final list = _productBatchesByIdMap[id]!;
+      if (list.isNotEmpty) return list;
+    }
+    final key = Product.cleanProductName(name).toLowerCase();
+    if (key.isNotEmpty && _productBatchesMap.containsKey(key)) {
+      return _productBatchesMap[key]!;
+    }
+    return const [];
   }
 
   final Map<String, int> _totalStockByProductName = {};
@@ -87,6 +100,7 @@ class PharmacyProvider extends ChangeNotifier {
     _stockVersion++;
     _searchCache.clear();
     _productBatchesMap.clear();
+    _productBatchesByIdMap.clear();
     _totalStockByProductName.clear();
     _productByIdMap.clear();
     _productMasterByNameMap.clear();
@@ -98,8 +112,11 @@ class PharmacyProvider extends ChangeNotifier {
     }
 
     for (var p in _products) {
-      if (p.id.isNotEmpty && !_productByIdMap.containsKey(p.id)) {
-        _productByIdMap[p.id] = p;
+      if (p.id.isNotEmpty) {
+        if (!_productByIdMap.containsKey(p.id)) {
+          _productByIdMap[p.id] = p;
+        }
+        _productBatchesByIdMap.putIfAbsent(p.id, () => []).add(p);
       }
       final key = Product.cleanProductName(p.name).toLowerCase();
       if (key.isNotEmpty) {
@@ -109,6 +126,31 @@ class PharmacyProvider extends ChangeNotifier {
         }
       }
     }
+
+    // Pre-consolidate & pre-sort all batch lists for instant O(1) FEFO dropdown loading
+    _productBatchesByIdMap.updateAll((_, list) {
+      final consolidated = consolidateBatches(list);
+      consolidated.sort((a, b) {
+        final dateA = _parseExpiry(a.expiry) ?? DateTime(2099);
+        final dateB = _parseExpiry(b.expiry) ?? DateTime(2099);
+        int expComp = dateA.compareTo(dateB);
+        if (expComp != 0) return expComp;
+        return b.stock.compareTo(a.stock);
+      });
+      return consolidated;
+    });
+
+    _productBatchesMap.updateAll((_, list) {
+      final consolidated = consolidateBatches(list);
+      consolidated.sort((a, b) {
+        final dateA = _parseExpiry(a.expiry) ?? DateTime(2099);
+        final dateB = _parseExpiry(b.expiry) ?? DateTime(2099);
+        int expComp = dateA.compareTo(dateB);
+        if (expComp != 0) return expComp;
+        return b.stock.compareTo(a.stock);
+      });
+      return consolidated;
+    });
   }
   final List<String> _accounts = [];
 
@@ -14292,13 +14334,106 @@ class PharmacyProvider extends ChangeNotifier {
   }
 
   // =========================================================================
+  // STOCK ENQUIRIES & LOST DEMAND ANALYTICS
+  // =========================================================================
+  Future<void> logStockEnquiry({
+    required String productName,
+    String productId = "",
+    int requestedQty = 1,
+    String agent = "",
+    String customerName = "",
+  }) async {
+    final cleanName = productName.trim().toUpperCase();
+    if (cleanName.isEmpty) return;
+
+    try {
+      final db = await DbHelper.instance.database;
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS stock_enquiries (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          product_id TEXT,
+          product_name TEXT NOT NULL,
+          requested_qty INTEGER DEFAULT 1,
+          enquiry_date TEXT NOT NULL,
+          agent TEXT DEFAULT '',
+          customer_name TEXT DEFAULT ''
+        )
+      ''');
+
+      await db.insert('stock_enquiries', {
+        'product_id': productId,
+        'product_name': cleanName,
+        'requested_qty': requestedQty > 0 ? requestedQty : 1,
+        'enquiry_date': DateTime.now().toIso8601String(),
+        'agent': agent,
+        'customer_name': customerName,
+      });
+      debugPrint("Logged stock enquiry for: $cleanName (Qty: $requestedQty)");
+    } catch (e) {
+      debugPrint("Error logging stock enquiry: $e");
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> getStockEnquiries({
+    DateTime? fromDate,
+    DateTime? toDate,
+  }) async {
+    try {
+      final db = await DbHelper.instance.database;
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS stock_enquiries (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          product_id TEXT,
+          product_name TEXT NOT NULL,
+          requested_qty INTEGER DEFAULT 1,
+          enquiry_date TEXT NOT NULL,
+          agent TEXT DEFAULT '',
+          customer_name TEXT DEFAULT ''
+        )
+      ''');
+
+      List<String> whereClauses = [];
+      List<dynamic> whereArgs = [];
+
+      if (fromDate != null) {
+        final startStr = DateTime(fromDate.year, fromDate.month, fromDate.day, 0, 0, 0).toIso8601String();
+        whereClauses.add("enquiry_date >= ?");
+        whereArgs.add(startStr);
+      }
+      if (toDate != null) {
+        final endStr = DateTime(toDate.year, toDate.month, toDate.day, 23, 59, 59).toIso8601String();
+        whereClauses.add("enquiry_date <= ?");
+        whereArgs.add(endStr);
+      }
+
+      String whereSql = whereClauses.isNotEmpty ? "WHERE ${whereClauses.join(' AND ')}" : "";
+
+      final query = '''
+        SELECT 
+          product_name,
+          product_id,
+          COUNT(*) as times_enquired,
+          SUM(requested_qty) as total_short_qty,
+          MAX(enquiry_date) as last_enquiry_date
+        FROM stock_enquiries
+        $whereSql
+        GROUP BY product_name
+      ''';
+
+      return await db.rawQuery(query, whereArgs);
+    } catch (e) {
+      debugPrint("Error getting stock enquiries: $e");
+      return [];
+    }
+  }
+
+  // =========================================================================
   // DRAFT WORKSPACE SESSIONS
   // =========================================================================
   Future<void> saveSalesDrafts() async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      List<String> drafts = _salesSessions.map((s) {
-        return jsonEncode({
+      List<Map<String, dynamic>> rawSessions = _salesSessions.map((s) {
+        return {
           'agent': s['agent'],
           'customerAcc': s['customerAcc'],
           'patient': s['patient'],
@@ -14307,24 +14442,20 @@ class PharmacyProvider extends ChangeNotifier {
           'taxType': s['taxType'],
           'orderType': s['orderType'],
           'items': (s['items'] as List<SaleItem>).map((i) => i.toMap()).toList(),
-        });
+        };
       }).toList();
+
+      int activeIdx = _activeSessionIdx.clamp(0, _salesSessions.length - 1);
+
+      // Offload jsonEncode stringification to background isolate (zero main-thread lag!)
+      final List<String> drafts = await compute(_serializeSalesSessions, rawSessions);
+
+      final prefs = await SharedPreferences.getInstance();
       await prefs.setStringList('sales_workspaces_v2', drafts);
 
-      // Save active session draft key for fast startup recovery
-      int activeIdx = _activeSessionIdx.clamp(0, _salesSessions.length - 1);
-      final activeData = _salesSessions[activeIdx];
-      final activeDraftJson = jsonEncode({
-        'agent': activeData['agent'],
-        'customerAcc': activeData['customerAcc'],
-        'patient': activeData['patient'],
-        'mobile': activeData['mobile'],
-        'doctor': activeData['doctor'],
-        'taxType': activeData['taxType'],
-        'orderType': activeData['orderType'],
-        'items': (activeData['items'] as List<SaleItem>).map((i) => i.toMap()).toList(),
-      });
-      await prefs.setString('sales_active_workspace_draft', activeDraftJson);
+      if (activeIdx < drafts.length) {
+        await prefs.setString('sales_active_workspace_draft', drafts[activeIdx]);
+      }
     } catch (e) {
       debugPrint("Error saving sales drafts: $e");
     }
@@ -14451,6 +14582,11 @@ class SyncTask {
 }
 
 // PURE TOP-LEVEL FUNCTION FOR BACKGROUND ISOLATE
+// PURE TOP-LEVEL FUNCTION FOR BACKGROUND ISOLATE
+List<String> _serializeSalesSessions(List<Map<String, dynamic>> sessions) {
+  return sessions.map((s) => jsonEncode(s)).toList();
+}
+
 List<Product> parseMasterProductsIsolate(List<Map<String, dynamic>> rows) {
   final List<Product> list = [];
   for (int i = 0; i < rows.length; i++) {

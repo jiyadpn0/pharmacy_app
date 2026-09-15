@@ -159,6 +159,18 @@ class PurchaseItemData {
     return (gstPercent - masterGstPercent!).abs() > 0.01;
   }
 
+  int? masterPack;
+
+  bool get hasPackAnomaly {
+    if (masterMrp == null || masterMrp! <= 0 || mrp <= 0) return false;
+    bool isMrpSpike = mrp >= masterMrp! * 1.4;
+    if (!isMrpSpike) return false;
+    if (masterPack != null && masterPack! > 0) {
+      return (packin - masterPack!).abs() <= 4;
+    }
+    return false;
+  }
+
   final Map<int, TextEditingController> controllers = {};
   final Map<int, FocusNode> focusNodes = {};
 
@@ -470,7 +482,7 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
   };
   double _totalWidth = 0;
 
-  final List<int> _navCols = [1, 2, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 18, 19];
+  final List<int> _navCols = [1, 2, 4, 5, 6, 7, 8, 9, 10, 12];
 
   final ValueNotifier<IntPair?> _focusNotifier = ValueNotifier(const IntPair(0, 1));
   IntPair? _lastFocus;
@@ -2058,6 +2070,7 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
         it.masterMrp = p.mrp;
         it.masterPRate = p.purchaseRate;
         it.masterGstPercent = p.gstPercent;
+        it.masterPack = p.packSize;
         it.hsncode = p.hsnCode;
         it.gstPercent = p.gstPercent;
         it.rack = p.rack;
@@ -2074,6 +2087,7 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
         it.masterMrp = p.mrp;
         it.masterPRate = p.purchaseRate;
         it.masterGstPercent = p.gstPercent;
+        it.masterPack = p.packSize;
         it.hsncode = p.hsnCode;
         it.rack = p.rack;
         it.sDiscPercent = p.sDiscPercent;
@@ -2433,23 +2447,18 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
               textColor = style.textColor;
             }
           }
-        } else if (col == 9 && row < _items.length) {
-          if (_items[row].hasMrpChanged) {
-            textColor = Colors.blue.shade800;
+        } else if (col == 6 && row < _items.length) {
+          if (_items[row].hasPackAnomaly) {
+            customCellBg = Colors.red.shade50;
+            textColor = Colors.red.shade800;
           }
         } else if (col == 10 && row < _items.length) {
           if (_items[row].isLowMargin) {
             customCellBg = Colors.amber.shade100;
-            textColor = Colors.orange.shade900;
-          } else if (_items[row].hasPRateChanged) {
-            textColor = Colors.blue.shade800;
-          }
-        } else if (col == 15 && row < _items.length) {
-          if (_items[row].hasGstMismatch) {
-            customCellBg = Colors.amber.shade300;
-            textColor = Colors.amber.shade900;
+            textColor = Colors.red.shade800;
           }
         }
+
 
         Widget cellChild;
 
@@ -2513,37 +2522,65 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
           final String displayText = ctrl.text.isEmpty && col == 1 && row == _items.length ? "Search Product..." : ctrl.text;
           final bool isHint = ctrl.text.isEmpty && col == 1 && row == _items.length;
 
-          String extraSuffix = "";
           String? cellTooltip;
+          bool hasChanged = false;
+          bool isIncreased = false;
 
           if (row < _items.length) {
             final item = _items[row];
             if (col == 9 && item.hasMrpChanged) {
-              extraSuffix = item.isMrpIncreased ? " ▲" : " ▼";
+              hasChanged = true;
+              isIncreased = item.isMrpIncreased;
               cellTooltip = "MRP Changed! Old Master MRP: ₹${item.masterMrp!.toStringAsFixed(2)}";
-            } else if (col == 10) {
-              if (item.hasPRateChanged) {
-                extraSuffix = item.isPRateIncreased ? " ▲" : " ▼";
-                cellTooltip = "P.Rate Changed! Old Master Rate: ₹${item.masterPRate!.toStringAsFixed(2)}";
+            } else if (col == 6) {
+              if (item.hasPackAnomaly) {
+                cellTooltip = "⚠️ Potential Pack Error: MRP increased significantly (+${((item.mrp - item.masterMrp!) / item.masterMrp! * 100).toStringAsFixed(0)}%), but pack size was not adjusted (master pack: ${item.masterPack}).";
               }
+            } else if (col == 10) {
               if (item.isLowMargin) {
-                cellTooltip = "${cellTooltip != null ? '$cellTooltip | ' : ''}⚠️ Low Margin: ${item.profitPctNoDisc.toStringAsFixed(1)}% (< 24.9%)";
+                cellTooltip = "⚠️ Low Margin: ${item.profitPctNoDisc.toStringAsFixed(1)}% (< 24.9%)";
               }
             } else if (col == 15 && item.hasGstMismatch) {
               cellTooltip = "Invoice GST: ${item.gstPercent.toStringAsFixed(1)}% (Master GST: ${item.masterGstPercent?.toStringAsFixed(1)}%)";
             }
           }
 
-          Widget textWidget = Text(
-            "$displayText$extraSuffix",
-            style: TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.bold,
-              color: isHint ? Colors.grey : textColor,
-            ),
-            overflow: TextOverflow.ellipsis,
-            maxLines: 1,
-          );
+          Widget textWidget;
+          if (hasChanged) {
+            final String arrowSymbol = isIncreased ? " ▲" : " ▼";
+            final Color arrowColor = isIncreased ? Colors.red : Colors.green;
+
+            textWidget = RichText(
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+              text: TextSpan(
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  color: isHint ? Colors.grey : textColor,
+                  fontFamily: DefaultTextStyle.of(context).style.fontFamily,
+                ),
+                children: [
+                  TextSpan(text: displayText),
+                  TextSpan(
+                    text: arrowSymbol,
+                    style: TextStyle(color: arrowColor, fontWeight: FontWeight.bold),
+                  ),
+                ],
+              ),
+            );
+          } else {
+            textWidget = Text(
+              displayText,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.bold,
+                color: isHint ? Colors.grey : textColor,
+              ),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+            );
+          }
 
           if (cellTooltip != null) {
             textWidget = Tooltip(
@@ -2783,6 +2820,7 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
             ..pRate = item.pRate
             ..masterMrp = matchedPm?.mrp
             ..masterPRate = matchedPm?.purchaseRate
+            ..masterPack = matchedPm?.packSize
             ..discPercent = item.discPercent
             ..gstPercent = item.gstPercent
             ..masterGstPercent = matchedPm?.gstPercent
@@ -5699,7 +5737,7 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> {
                 const SizedBox(height: 10),
                 _legendTile(Colors.amber.shade100, Colors.orange.shade900, "Orange / Amber Text", "Low Margin Alert (< 24.9% pure profit margin)"),
                 _legendTile(Colors.white, Colors.blue.shade800, "Blue Text with ▲ / ▼", "Price / MRP Changed compared to Product Master"),
-                _legendTile(Colors.amber.shade300, Colors.amber.shade900, "Yellow Highlight", "GST Rate Mismatch between Invoice and Product Master"),
+
                 _legendTile(Colors.red.shade100, Colors.red.shade900, "Red Row Highlight", "Negative Margin (P.Rate >= MRP) or Expired Stock"),
                 const SizedBox(height: 12),
                 const Text("EXPIRY COLOR SLABS", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.blueGrey)),

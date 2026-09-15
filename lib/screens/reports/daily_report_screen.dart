@@ -10,6 +10,7 @@ import '../../utils/printer_service.dart';
 import '../../services/whatsapp_service.dart';
 import '../../utils/theme_constants.dart';
 import '../../widgets/erp_tooltip.dart';
+import '../../widgets/pin_unlock_dialog.dart';
 
 class CashCounterData {
   int count500;
@@ -289,12 +290,21 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
     );
   }
 
-  void _showAddCustomHeadingDialog() {
+  void _showAddCustomHeadingDialog({bool isIncome = false}) {
     final headingNameCtrl = TextEditingController();
     final amountCtrl = TextEditingController();
     String? selectedPreset;
 
-    final presets = [
+    final incomePresets = [
+      "OTHER INCOME",
+      "COMMISSION & REBATE",
+      "RENTAL RECEIPT",
+      "INTEREST & DISCOUNTS",
+      "SCRAP & WASTE SALE",
+      "DIRECT RECEIPT",
+    ];
+
+    final expensePresets = [
       "STAFF SALARY & ADVANCE",
       "RENT & MAINTENANCE",
       "ELECTRICITY & UTILITIES",
@@ -303,16 +313,30 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
       "DIRECT EXPENSES",
     ];
 
+    final presets = isIncome ? incomePresets : expensePresets;
+    final primaryColor = isIncome ? Colors.teal.shade700 : Colors.purple.shade700;
+    final bgColor = isIncome ? Colors.teal.shade50 : Colors.purple.shade50;
+    final iconColor = isIncome ? Colors.teal.shade700 : Colors.purple;
+    final titleText = isIncome
+        ? "ADD INCOME HEADING FROM ADMIN DAY BOOK"
+        : "ADD EXPENSE HEADING FROM ADMIN DAY BOOK";
+
     showDialog(
       context: context,
       builder: (dialogCtx) => StatefulBuilder(
         builder: (ctx, setDialogState) => AlertDialog(
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
           title: Row(
-            children: const [
-              Icon(Icons.add_chart_rounded, color: Colors.purple, size: 22),
-              SizedBox(width: 8),
-              Text("ADD HEADING FROM ADMIN DAY BOOK", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+            children: [
+              Icon(Icons.add_chart_rounded, color: iconColor, size: 22),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  titleText,
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
             ],
           ),
           content: SizedBox(
@@ -331,8 +355,8 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
                     return ChoiceChip(
                       label: Text(preset, style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: isSelected ? Colors.white : Colors.black87)),
                       selected: isSelected,
-                      selectedColor: Colors.purple.shade700,
-                      backgroundColor: Colors.purple.shade50,
+                      selectedColor: primaryColor,
+                      backgroundColor: bgColor,
                       onSelected: (selected) {
                         setDialogState(() {
                           selectedPreset = selected ? preset : null;
@@ -347,10 +371,10 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
                 const SizedBox(height: 14),
                 TextField(
                   controller: headingNameCtrl,
-                  decoration: const InputDecoration(
+                  decoration: InputDecoration(
                     labelText: "Custom Heading Name",
-                    hintText: "e.g. MAINTENANCE, SALARY, etc.",
-                    border: OutlineInputBorder(),
+                    hintText: isIncome ? "e.g. COMMISSION, REBATE, etc." : "e.g. MAINTENANCE, SALARY, etc.",
+                    border: const OutlineInputBorder(),
                     isDense: true,
                   ),
                 ),
@@ -377,7 +401,7 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
               icon: const Icon(Icons.add_rounded, size: 16),
               label: const Text("ADD HEADING"),
               style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.purple.shade700,
+                backgroundColor: primaryColor,
                 foregroundColor: Colors.white,
               ),
               onPressed: () {
@@ -388,6 +412,8 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
                     id: "h_${DateTime.now().millisecondsSinceEpoch}",
                     name: name,
                     amount: amt,
+                    isIncome: isIncome,
+                    color: isIncome ? Colors.teal.shade700 : Colors.purple.shade800,
                   );
                   setState(() {
                     _customHeadings.add(newHeading);
@@ -657,7 +683,440 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
   @override
   void initState() {
     super.initState();
+    _loadDayBookTemplate();
     WidgetsBinding.instance.addPostFrameCallback((_) => _fetchDayRecords());
+  }
+
+  List<CustomHeadingData> _getDefaultHeadings() {
+    return [
+      CustomHeadingData(id: 'def_1', name: 'COUNTER CASH SALES', amount: 0.0, color: Colors.teal.shade700, isIncome: true),
+      CustomHeadingData(id: 'def_2', name: 'CREDIT / PRE-PAYMENTS / ADVANCES', amount: 0.0, color: Colors.teal.shade700, isIncome: true),
+      CustomHeadingData(id: 'def_3', name: 'BANK TO CASH / ADDED CASH', amount: 0.0, color: Colors.teal.shade700, isIncome: true),
+      CustomHeadingData(id: 'def_4', name: 'NOT RECEIVED', amount: 0.0, color: Colors.purple.shade800, isIncome: false),
+      CustomHeadingData(id: 'def_5', name: 'SALES RETURNS & REFUNDS', amount: 0.0, color: Colors.purple.shade800, isIncome: false),
+      CustomHeadingData(id: 'def_6', name: 'SHOP EXPENSES', amount: 0.0, color: Colors.purple.shade800, isIncome: false),
+      CustomHeadingData(id: 'def_7', name: 'SUPPLIER PAYMENTS', amount: 0.0, color: Colors.purple.shade800, isIncome: false),
+      CustomHeadingData(id: 'def_8', name: 'CASH TAKEN / DEPOSIT', amount: 0.0, color: Colors.purple.shade800, isIncome: false),
+    ];
+  }
+
+  Future<void> _loadDayBookTemplate() async {
+    final prefs = await _getPrefs();
+    final raw = prefs.getString("admin_day_book_template");
+    if (raw != null) {
+      try {
+        final List parsed = jsonDecode(raw);
+        final loaded = parsed.map((e) => CustomHeadingData.fromJson(e as Map<String, dynamic>)).toList();
+        if (loaded.isNotEmpty) {
+          setState(() {
+            _customHeadings = loaded;
+          });
+          return;
+        }
+      } catch (e) {
+        debugPrint("Error loading day book template: $e");
+      }
+    }
+    setState(() {
+      _customHeadings = _getDefaultHeadings();
+    });
+  }
+
+  Future<void> _saveDayBookTemplate(List<CustomHeadingData> headings) async {
+    final prefs = await _getPrefs();
+    final jsonStr = jsonEncode(headings.map((h) => h.toJson()).toList());
+    await prefs.setString("admin_day_book_template", jsonStr);
+    setState(() {
+      _customHeadings = List.from(headings);
+    });
+  }
+
+  Future<bool?> _showAdminDayBookDesignDialog() async {
+    List<CustomHeadingData> tempHeadings = List.from(_customHeadings);
+
+    return showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => StatefulBuilder(
+        builder: (ctx, setDialogState) {
+          final incomeBranches = tempHeadings.where((h) => h.isIncome).toList();
+          final expenseBranches = tempHeadings.where((h) => !h.isIncome).toList();
+
+          return AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            title: Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(color: Colors.purple.shade50, borderRadius: BorderRadius.circular(8)),
+                  child: Icon(Icons.account_tree_rounded, color: Colors.purple.shade800, size: 24),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        "MODEL DAY BOOK DESIGN & TREE MANAGER",
+                        style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                      ),
+                      Text(
+                        "Add, edit, or delete Day Book branches. Changes apply immediately across all staff registers.",
+                        style: TextStyle(fontSize: 11, color: Colors.grey.shade700),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            content: SizedBox(
+              width: 780,
+              height: 480,
+              child: Column(
+                children: [
+                  // Quick Presets Bar
+                  Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: Colors.blueGrey.shade50,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          "⚡ QUICK PRESET BRANCHES (CLICK TO TOGGLE):",
+                          style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.blueGrey),
+                        ),
+                        const SizedBox(height: 6),
+                        Wrap(
+                          spacing: 6,
+                          runSpacing: 6,
+                          children: [
+                            _presetChip("STAFF SALARY & ADVANCE", isIncome: false, setDialogState: setDialogState, tempHeadings: tempHeadings),
+                            _presetChip("RENT & MAINTENANCE", isIncome: false, setDialogState: setDialogState, tempHeadings: tempHeadings),
+                            _presetChip("ELECTRICITY & UTILITIES", isIncome: false, setDialogState: setDialogState, tempHeadings: tempHeadings),
+                            _presetChip("OFFICE SUPPLIES & TEA", isIncome: false, setDialogState: setDialogState, tempHeadings: tempHeadings),
+                            _presetChip("COURIER & LOGISTICS", isIncome: false, setDialogState: setDialogState, tempHeadings: tempHeadings),
+                            _presetChip("OTHER RECEIPT / INCOME", isIncome: true, setDialogState: setDialogState, tempHeadings: tempHeadings),
+                            _presetChip("COMMISSION & REBATE", isIncome: true, setDialogState: setDialogState, tempHeadings: tempHeadings),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+
+                  // Two Columns: Income Branches | Expense Branches
+                  Expanded(
+                    child: Row(
+                      children: [
+                        // LEFT: Income Branches
+                        Expanded(
+                          child: Container(
+                            decoration: BoxDecoration(
+                              border: Border.all(color: Colors.teal.shade200),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Column(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                                  decoration: BoxDecoration(
+                                    color: Colors.teal.shade700,
+                                    borderRadius: const BorderRadius.vertical(top: Radius.circular(7)),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      const Icon(Icons.arrow_downward_rounded, size: 16, color: Colors.white),
+                                      const SizedBox(width: 6),
+                                      const Text(
+                                        "INCOME / RECEIPTS BRANCHES",
+                                        style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11),
+                                      ),
+                                      const Spacer(),
+                                      InkWell(
+                                        onTap: () {
+                                          _promptAddBranch(context, isIncome: true, setDialogState: setDialogState, tempHeadings: tempHeadings);
+                                        },
+                                        child: Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                          decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(4)),
+                                          child: Text("+ Add", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.teal.shade800)),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                Expanded(
+                                  child: incomeBranches.isEmpty
+                                      ? const Center(child: Text("No custom income branches.", style: TextStyle(fontSize: 11, color: Colors.grey)))
+                                      : ListView.builder(
+                                          itemCount: incomeBranches.length,
+                                          padding: const EdgeInsets.all(6),
+                                          itemBuilder: (ctx, idx) {
+                                            final branch = incomeBranches[idx];
+                                            return _buildBranchCard(branch, setDialogState: setDialogState, tempHeadings: tempHeadings);
+                                          },
+                                        ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+
+                        // RIGHT: Expense Branches
+                        Expanded(
+                          child: Container(
+                            decoration: BoxDecoration(
+                              border: Border.all(color: Colors.purple.shade200),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Column(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                                  decoration: BoxDecoration(
+                                    color: Colors.purple.shade800,
+                                    borderRadius: const BorderRadius.vertical(top: Radius.circular(7)),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      const Icon(Icons.arrow_upward_rounded, size: 16, color: Colors.white),
+                                      const SizedBox(width: 6),
+                                      const Text(
+                                        "EXPENSE / PAYMENTS BRANCHES",
+                                        style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11),
+                                      ),
+                                      const Spacer(),
+                                      InkWell(
+                                        onTap: () {
+                                          _promptAddBranch(context, isIncome: false, setDialogState: setDialogState, tempHeadings: tempHeadings);
+                                        },
+                                        child: Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                          decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(4)),
+                                          child: Text("+ Add", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.purple.shade800)),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                Expanded(
+                                  child: expenseBranches.isEmpty
+                                      ? const Center(child: Text("No custom expense branches.", style: TextStyle(fontSize: 11, color: Colors.grey)))
+                                      : ListView.builder(
+                                          itemCount: expenseBranches.length,
+                                          padding: const EdgeInsets.all(6),
+                                          itemBuilder: (ctx, idx) {
+                                            final branch = expenseBranches[idx];
+                                            return _buildBranchCard(branch, setDialogState: setDialogState, tempHeadings: tempHeadings);
+                                          },
+                                        ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () async {
+                  final prefs = await _getPrefs();
+                  await prefs.remove("admin_day_book_template");
+                  final defaults = _getDefaultHeadings();
+                  setDialogState(() {
+                    tempHeadings = List.from(defaults);
+                  });
+                  await _saveDayBookTemplate(defaults);
+                  Navigator.pop(dialogCtx, true);
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text("Day Book Template reset to default items."), duration: Duration(seconds: 2)),
+                    );
+                  }
+                },
+                child: const Text("RESET DEFAULT", style: TextStyle(color: Colors.red)),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(dialogCtx, false),
+                child: const Text("CANCEL"),
+              ),
+              ElevatedButton.icon(
+                icon: const Icon(Icons.save_rounded, size: 16),
+                label: const Text("SAVE & APPLY TEMPLATE NOW"),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.purple.shade800,
+                  foregroundColor: Colors.white,
+                ),
+                onPressed: () async {
+                  await _saveDayBookTemplate(tempHeadings);
+                  Navigator.pop(dialogCtx, true);
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text("Day Book Design saved! All registers updated immediately."),
+                        backgroundColor: Colors.green,
+                        duration: Duration(seconds: 3),
+                      ),
+                    );
+                  }
+                },
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _presetChip(String label, {required bool isIncome, required StateSetter setDialogState, required List<CustomHeadingData> tempHeadings}) {
+    final exists = tempHeadings.any((h) => h.name.toUpperCase() == label.toUpperCase());
+    return ChoiceChip(
+      label: Text(label, style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: exists ? Colors.white : Colors.black87)),
+      selected: exists,
+      selectedColor: isIncome ? Colors.teal.shade700 : Colors.purple.shade700,
+      backgroundColor: isIncome ? Colors.teal.shade50 : Colors.purple.shade50,
+      onSelected: (_) {
+        setDialogState(() {
+          if (exists) {
+            tempHeadings.removeWhere((h) => h.name.toUpperCase() == label.toUpperCase());
+          } else {
+            tempHeadings.add(CustomHeadingData(
+              id: "h_${DateTime.now().millisecondsSinceEpoch}_${tempHeadings.length}",
+              name: label.toUpperCase(),
+              isIncome: isIncome,
+              color: isIncome ? Colors.teal.shade700 : Colors.purple.shade800,
+            ));
+          }
+        });
+      },
+    );
+  }
+
+  Widget _buildBranchCard(CustomHeadingData branch, {required StateSetter setDialogState, required List<CustomHeadingData> tempHeadings}) {
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 3),
+      elevation: 1,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        child: Row(
+          children: [
+            Icon(
+              branch.isIncome ? Icons.arrow_downward_rounded : Icons.arrow_upward_rounded,
+              size: 14,
+              color: branch.color,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                branch.name,
+                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            IconButton(
+              icon: const Icon(Icons.edit_outlined, size: 16, color: Colors.blueGrey),
+              constraints: const BoxConstraints(),
+              padding: const EdgeInsets.all(4),
+              tooltip: "Edit Branch Name",
+              onPressed: () {
+                _promptEditBranch(branch, setDialogState: setDialogState);
+              },
+            ),
+            IconButton(
+              icon: const Icon(Icons.delete_outline_rounded, size: 16, color: Colors.red),
+              constraints: const BoxConstraints(),
+              padding: const EdgeInsets.all(4),
+              tooltip: "Delete Branch",
+              onPressed: () {
+                setDialogState(() {
+                  tempHeadings.removeWhere((h) => h.id == branch.id);
+                });
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _promptAddBranch(BuildContext ctx, {required bool isIncome, required StateSetter setDialogState, required List<CustomHeadingData> tempHeadings}) {
+    final ctrl = TextEditingController();
+    showDialog(
+      context: ctx,
+      builder: (dialogCtx) => AlertDialog(
+        title: Text("ADD NEW ${isIncome ? 'INCOME' : 'EXPENSE'} BRANCH", style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: "Branch / Heading Name",
+            border: OutlineInputBorder(),
+            isDense: true,
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogCtx), child: const Text("CANCEL")),
+          ElevatedButton(
+            onPressed: () {
+              final name = ctrl.text.trim().toUpperCase();
+              if (name.isNotEmpty) {
+                setDialogState(() {
+                  tempHeadings.add(CustomHeadingData(
+                    id: "h_${DateTime.now().millisecondsSinceEpoch}",
+                    name: name,
+                    isIncome: isIncome,
+                    color: isIncome ? Colors.teal.shade700 : Colors.purple.shade800,
+                  ));
+                });
+                Navigator.pop(dialogCtx);
+              }
+            },
+            child: const Text("ADD"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _promptEditBranch(CustomHeadingData branch, {required StateSetter setDialogState}) {
+    final ctrl = TextEditingController(text: branch.name);
+    showDialog(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text("EDIT BRANCH NAME", style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: "Branch Name",
+            border: OutlineInputBorder(),
+            isDense: true,
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogCtx), child: const Text("CANCEL")),
+          ElevatedButton(
+            onPressed: () {
+              final name = ctrl.text.trim().toUpperCase();
+              if (name.isNotEmpty) {
+                setDialogState(() {
+                  branch.name = name;
+                });
+                Navigator.pop(dialogCtx);
+              }
+            },
+            child: const Text("UPDATE"),
+          ),
+        ],
+      ),
+    );
   }
 
   String _dateKey(DateTime dt) => DateFormat('yyyy-MM-dd').format(dt);
@@ -1501,6 +1960,11 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
     return Scaffold(
       backgroundColor: const Color(0xFFF1F5F9),
       appBar: AppBar(
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          tooltip: "Back",
+          onPressed: () => setState(() => _selectedStaff = null),
+        ),
         title: Row(
           children: [
             const Icon(Icons.account_tree_rounded, size: 22),
@@ -1509,11 +1973,6 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
           ],
         ),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.people_alt_rounded),
-            tooltip: "Switch Staff Register",
-            onPressed: () => setState(() => _selectedStaff = null),
-          ),
           IconButton(
             icon: const Icon(Icons.print_rounded),
             tooltip: "Print Daily Settlement",
@@ -1565,15 +2024,22 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
                 const SizedBox(width: 14),
                 _buildHeadingsFilterDropdown(),
                 const Spacer(),
-                ElevatedButton.icon(
-                  onPressed: () => setState(() => _selectedStaff = null),
-                  icon: const Icon(Icons.swap_horiz_rounded, size: 16),
-                  label: const Text("SWITCH STAFF REGISTER", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.blueGrey.shade800,
-                    foregroundColor: Colors.white,
+                if (_selectedStaff?.toUpperCase() == "ADMIN" || _selectedStaff?.toUpperCase() == "MODEL") ...[
+                  ElevatedButton.icon(
+                    onPressed: () async {
+                      final res = await _showAdminDayBookDesignDialog();
+                      if (res == true) {
+                        await _loadDayBookTemplate();
+                      }
+                    },
+                    icon: const Icon(Icons.account_tree_rounded, size: 16),
+                    label: const Text("EDIT DESIGN", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.purple.shade800,
+                      foregroundColor: Colors.white,
+                    ),
                   ),
-                ),
+                ],
               ],
             ),
           ),
@@ -3360,6 +3826,57 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
                             ),
                           ),
                         ),
+                        // Custom Income Headings added via "+" button on Income side
+                        for (var customHeading in _customHeadings.where((h) => h.isIncome)) ...[
+                          const SizedBox(width: 24),
+                          SizedBox(
+                            width: colNetWidth,
+                            child: _accountTile(
+                              "📑 ${customHeading.name}",
+                              customHeading.amount,
+                              customHeading.color,
+                              customHeading.color.withValues(alpha: 0.1),
+                              isBold: true,
+                              onTap: () => _openHeadingDetailView(
+                                headingTitle: customHeading.name,
+                                color: customHeading.color,
+                                records: [
+                                  HeadingDetailRecord(
+                                    dateStr: DateFormat('dd/MM/yyyy (EEE)').format(_selectedDate),
+                                    name: customHeading.name,
+                                    remark: "Custom Income Day Book Entry",
+                                    amount: customHeading.amount,
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                        const SizedBox(width: 12),
+                        // "+" Button on the left side (INCOME)
+                        InkWell(
+                          onTap: () => _showAddCustomHeadingDialog(isIncome: true),
+                          borderRadius: BorderRadius.circular(8),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                            decoration: BoxDecoration(
+                              color: Colors.teal.shade50,
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: Colors.teal.shade300, width: 1.5),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.add_circle_outline_rounded, size: 18, color: Colors.teal.shade800),
+                                const SizedBox(width: 4),
+                                Text(
+                                  "Add Heading",
+                                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.teal.shade900),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
                         if (_showNotReceived) ...[
                           const SizedBox(width: 24),
                           SizedBox(
@@ -3410,8 +3927,8 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
                             ),
                           ),
                         ],
-                        // Custom Headings added via "+" button
-                        for (var customHeading in _customHeadings) ...[
+                        // Custom Expense Headings added via "+" button on Expense side
+                        for (var customHeading in _customHeadings.where((h) => !h.isIncome)) ...[
                           const SizedBox(width: 24),
                           SizedBox(
                             width: colExpensesWidth,
@@ -3428,7 +3945,7 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
                                   HeadingDetailRecord(
                                     dateStr: DateFormat('dd/MM/yyyy (EEE)').format(_selectedDate),
                                     name: customHeading.name,
-                                    remark: "Custom Day Book Entry",
+                                    remark: "Custom Expense Day Book Entry",
                                     amount: customHeading.amount,
                                   ),
                                 ],
@@ -3436,10 +3953,10 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
                             ),
                           ),
                         ],
-                        const SizedBox(width: 16),
-                        // "+" Button on the right side of EXPENSES to add another Heading from Admin Day Book
+                        const SizedBox(width: 12),
+                        // "+" Button on the right side (EXPENSES)
                         InkWell(
-                          onTap: _showAddCustomHeadingDialog,
+                          onTap: () => _showAddCustomHeadingDialog(isIncome: false),
                           borderRadius: BorderRadius.circular(8),
                           child: Container(
                             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
@@ -3856,114 +4373,164 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
           ),
           const Divider(height: 1),
           Expanded(
-            child: GridView.builder(
-              padding: const EdgeInsets.all(20),
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 3,
-                childAspectRatio: 2.2,
-                crossAxisSpacing: 16,
-                mainAxisSpacing: 16,
-              ),
-              itemCount: availableStaff.length,
-              itemBuilder: (context, i) {
-                final staffName = availableStaff[i];
-                final isAll = staffName == "ALL";
-                final isHistory = staffName == "HISTORY";
+            child: Builder(
+              builder: (context) {
+                final List<String> regularItems = [];
+                final List<String> adminItems = [];
+                String? historyItem;
 
-                int invoiceCount = 0;
-                double totalRevenue = 0.0;
-
-                if (isAll || isHistory) {
-                  invoiceCount = _allDaySales.length;
-                  totalRevenue = _allDaySales.fold(0.0, (sum, s) => sum + s.grandTotal);
-                } else {
-                  final target = staffName.trim().toLowerCase();
-                  final staffSales = _allDaySales.where((s) => s.agent.trim().toLowerCase() == target).toList();
-                  invoiceCount = staffSales.length;
-                  totalRevenue = staffSales.fold(0.0, (sum, s) => sum + s.grandTotal);
+                for (final s in availableStaff) {
+                  if (s == "HISTORY") {
+                    historyItem = s;
+                  } else if (s.toUpperCase() == "ADMIN" || s.toUpperCase() == "MODEL") {
+                    adminItems.add(s);
+                  } else {
+                    regularItems.add(s);
+                  }
+                }
+                if (historyItem == null) {
+                  historyItem = "HISTORY";
                 }
 
-                Color cardBorderColor = isHistory
-                    ? Colors.amber.shade600
-                    : (isAll ? Colors.blue.shade300 : Colors.grey.shade300);
+                final List<String?> gridItems = [];
+                for (final item in regularItems) {
+                  gridItems.add(item);
+                }
 
-                Gradient? cardGradient = isHistory
-                    ? LinearGradient(colors: [Colors.amber.shade50, Colors.white])
-                    : (isAll ? LinearGradient(colors: [Colors.blue.shade50, Colors.white]) : null);
+                int remainder = gridItems.length % 3;
+                if (remainder > 0) {
+                  for (int i = 0; i < (3 - remainder); i++) {
+                    gridItems.add(null);
+                  }
+                }
 
-                Color avatarBg = isHistory
-                    ? Colors.amber.shade800
-                    : (isAll ? Colors.blue.shade800 : Colors.blueGrey.shade700);
+                gridItems.add(null); // Col 0 empty
+                for (final admin in adminItems) {
+                  gridItems.add(admin);
+                }
+                gridItems.add(historyItem); // Col 2 HISTORY
 
-                IconData avatarIcon = isHistory
-                    ? Icons.history_rounded
-                    : (isAll ? Icons.pie_chart_rounded : Icons.person_rounded);
-
-                String cardTitle = isHistory
-                    ? "REGISTER HISTORY"
-                    : (isAll ? "ALL STAFF (COMBINED REGISTER)" : staffName.toUpperCase());
-
-                Color titleColor = isHistory
-                    ? Colors.amber.shade900
-                    : (isAll ? Colors.blue.shade900 : Colors.black87);
-
-                return Card(
-                  elevation: 3,
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                  child: InkWell(
-                    onTap: () => _selectStaff(staffName),
-                    borderRadius: BorderRadius.circular(12),
-                    child: Container(
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: cardBorderColor, width: (isAll || isHistory) ? 2 : 1),
-                        gradient: cardGradient,
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          Row(
-                            children: [
-                              CircleAvatar(
-                                radius: 16,
-                                backgroundColor: avatarBg,
-                                child: Icon(avatarIcon, size: 18, color: Colors.white),
-                              ),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: Text(
-                                  cardTitle,
-                                  style: TextStyle(fontWeight: FontWeight.w900, fontSize: 13, color: titleColor),
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              ),
-                            ],
-                          ),
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text("INVOICES", style: TextStyle(fontSize: 10, color: isHistory ? Colors.amber.shade900 : Colors.grey, fontWeight: FontWeight.bold)),
-                                  Text("$invoiceCount Bills", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: isHistory ? Colors.amber.shade900 : Colors.black87)),
-                                ],
-                              ),
-                              Column(
-                                crossAxisAlignment: CrossAxisAlignment.end,
-                                children: [
-                                  Text(isHistory ? "HISTORY REVENUE" : "REVENUE", style: TextStyle(fontSize: 10, color: isHistory ? Colors.amber.shade900 : Colors.grey, fontWeight: FontWeight.bold)),
-                                  Text("₹ ${totalRevenue.toStringAsFixed(2)}", style: TextStyle(fontWeight: FontWeight.w900, fontSize: 14, color: isHistory ? Colors.amber.shade800 : Colors.green.shade800)),
-                                ],
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
+                return GridView.builder(
+                  padding: const EdgeInsets.all(20),
+                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 3,
+                    childAspectRatio: 1.8,
+                    crossAxisSpacing: 16,
+                    mainAxisSpacing: 16,
                   ),
+                  itemCount: gridItems.length,
+                  itemBuilder: (context, i) {
+                    final staffName = gridItems[i];
+                    if (staffName == null) {
+                      return const SizedBox.shrink();
+                    }
+
+                    final isAll = staffName == "ALL";
+                    final isHistory = staffName == "HISTORY";
+
+                    int invoiceCount = 0;
+                    double totalRevenue = 0.0;
+
+                    if (isAll || isHistory) {
+                      invoiceCount = _allDaySales.length;
+                      totalRevenue = _allDaySales.fold(0.0, (sum, s) => sum + s.grandTotal);
+                    } else {
+                      final target = staffName.trim().toLowerCase();
+                      final staffSales = _allDaySales.where((s) => s.agent.trim().toLowerCase() == target).toList();
+                      invoiceCount = staffSales.length;
+                      totalRevenue = staffSales.fold(0.0, (sum, s) => sum + s.grandTotal);
+                    }
+
+                    Color cardBorderColor = isHistory
+                        ? Colors.amber.shade600
+                        : (isAll ? Colors.blue.shade300 : Colors.grey.shade300);
+
+                    Gradient? cardGradient = isHistory
+                        ? LinearGradient(colors: [Colors.amber.shade50, Colors.white])
+                        : (isAll ? LinearGradient(colors: [Colors.blue.shade50, Colors.white]) : null);
+
+                    Color avatarBg = isHistory
+                        ? Colors.amber.shade800
+                        : (isAll ? Colors.blue.shade800 : Colors.blueGrey.shade700);
+
+                    IconData avatarIcon = isHistory
+                        ? Icons.history_rounded
+                        : (isAll ? Icons.pie_chart_rounded : Icons.person_rounded);
+
+                    String cardTitle = isHistory
+                        ? "REGISTER HISTORY"
+                        : (isAll ? "ALL STAFF (COMBINED REGISTER)" : (staffName.toUpperCase() == "ADMIN" ? "MODEL" : staffName.toUpperCase()));
+
+                    Color titleColor = isHistory
+                        ? Colors.amber.shade900
+                        : (isAll ? Colors.blue.shade900 : Colors.black87);
+
+                    return Center(
+                      child: FractionallySizedBox(
+                        widthFactor: 2 / 3,
+                        heightFactor: 0.5,
+                        child: Card(
+                          elevation: 3,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                          child: InkWell(
+                            onTap: () => _selectStaff(staffName),
+                            borderRadius: BorderRadius.circular(12),
+                            child: Container(
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(color: cardBorderColor, width: (isAll || isHistory) ? 2 : 1),
+                                gradient: cardGradient,
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                children: [
+                                  Row(
+                                    children: [
+                                      CircleAvatar(
+                                        radius: 14,
+                                        backgroundColor: avatarBg,
+                                        child: Icon(avatarIcon, size: 16, color: Colors.white),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Expanded(
+                                        child: Text(
+                                          cardTitle,
+                                          style: TextStyle(fontWeight: FontWeight.w900, fontSize: 12, color: titleColor),
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+
+                                  Row(
+                                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                    children: [
+                                      Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          Text("INVOICES", style: TextStyle(fontSize: 9, color: isHistory ? Colors.amber.shade900 : Colors.grey, fontWeight: FontWeight.bold)),
+                                          Text("$invoiceCount Bills", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: isHistory ? Colors.amber.shade900 : Colors.black87)),
+                                        ],
+                                      ),
+                                      Column(
+                                        crossAxisAlignment: CrossAxisAlignment.end,
+                                        children: [
+                                          Text(isHistory ? "HISTORY REVENUE" : "REVENUE", style: TextStyle(fontSize: 9, color: isHistory ? Colors.amber.shade900 : Colors.grey, fontWeight: FontWeight.bold)),
+                                          Text("₹ ${totalRevenue.toStringAsFixed(2)}", style: TextStyle(fontWeight: FontWeight.w900, fontSize: 12, color: isHistory ? Colors.amber.shade800 : Colors.green.shade800)),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    );
+                  },
                 );
               },
             ),
@@ -4048,13 +4615,33 @@ class CustomHeadingData {
   String name;
   double amount;
   Color color;
+  bool isIncome;
 
   CustomHeadingData({
     required this.id,
     required this.name,
     this.amount = 0.0,
     this.color = const Color(0xFF7C3AED),
+    this.isIncome = false,
   });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'amount': amount,
+        'color': color.value,
+        'isIncome': isIncome,
+      };
+
+  factory CustomHeadingData.fromJson(Map<String, dynamic> json) {
+    return CustomHeadingData(
+      id: json['id'] ?? '',
+      name: json['name'] ?? '',
+      amount: (json['amount'] as num?)?.toDouble() ?? 0.0,
+      color: json['color'] != null ? Color(json['color'] as int) : const Color(0xFF7C3AED),
+      isIncome: json['isIncome'] ?? false,
+    );
+  }
 }
 
 class HeadingDetailRecord {

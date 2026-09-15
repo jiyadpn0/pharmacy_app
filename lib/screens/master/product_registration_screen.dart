@@ -27,6 +27,12 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
   final TextEditingController _aliasCtrl = TextEditingController();
   final TextEditingController _searchCtrl = TextEditingController();
   final TextEditingController _genericCtrl = TextEditingController();
+  final TextEditingController _rackCtrl = TextEditingController(text: "A1");
+  final TextEditingController _categoryCtrl = TextEditingController(text: "Branded");
+  final TextEditingController _patentCtrl = TextEditingController(text: "Select Patent");
+  final TextEditingController _scheduleCtrl = TextEditingController(text: "Select");
+  final TextEditingController _gstCtrl = TextEditingController(text: "12");
+  final TextEditingController _wholesaleCtrl = TextEditingController(text: "Select Wholesale");
 
   // FOCUS NODES
   final FocusNode _nameFocus = FocusNode();
@@ -45,6 +51,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
   final FocusNode _barcodeFocus = FocusNode();
   final FocusNode _searchFocus = FocusNode();
   final FocusNode _gstFocus = FocusNode();
+  final FocusNode _wholesaleFocus = FocusNode();
   final FocusNode _keyboardFocusNode = FocusNode();
 
   int _highlightedSearchIndex = 0;
@@ -117,13 +124,31 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
 
   @override
   void dispose() {
-    for (var ctrl in [_nameCtrl, _hsnCtrl, _reorderCtrl, _maxCtrl, _packingCtrl, _discCtrl, _barcodeCtrl, _searchCtrl, _genericCtrl]) {
+    for (var ctrl in [_nameCtrl, _hsnCtrl, _reorderCtrl, _maxCtrl, _packingCtrl, _discCtrl, _barcodeCtrl, _searchCtrl, _genericCtrl, _rackCtrl, _categoryCtrl, _patentCtrl, _scheduleCtrl, _gstCtrl, _wholesaleCtrl]) {
       ctrl.dispose();
     }
-    for (var f in [_nameFocus, _hsnFocus, _rackFocus, _patentFocus, _reorderFocus, _maxFocus, _categoryFocus, _genericFocus, _packingFocus, _scheduleFocus, _discFocus, _barcodeFocus, _searchFocus, _gstFocus, _keyboardFocusNode]) {
+    for (var f in [_nameFocus, _hsnFocus, _rackFocus, _patentFocus, _reorderFocus, _maxFocus, _categoryFocus, _genericFocus, _packingFocus, _scheduleFocus, _discFocus, _barcodeFocus, _searchFocus, _gstFocus, _wholesaleFocus, _keyboardFocusNode]) {
       f.dispose();
     }
     super.dispose();
+  }
+
+  List<String> _getRackOptions(PharmacyProvider provider) {
+    final Set<String> set = {"A1"};
+    for (var r in provider.racks) {
+      if (r.trim().isNotEmpty) set.add(r.trim());
+    }
+    for (var p in provider.productMaster) {
+      if (p.rack.trim().isNotEmpty) set.add(p.rack.trim());
+    }
+    for (var p in provider.products) {
+      if (p.rack.trim().isNotEmpty) set.add(p.rack.trim());
+    }
+    if (_selectedRack.isNotEmpty) set.add(_selectedRack.trim());
+    if (_rackCtrl.text.trim().isNotEmpty) set.add(_rackCtrl.text.trim());
+    final list = set.toList();
+    list.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    return list;
   }
 
   List<String> _getPatentOptions(PharmacyProvider provider) {
@@ -141,6 +166,9 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
     }
     if (_selectedPatent.isNotEmpty && _selectedPatent != "Select Patent") {
       set.add(_selectedPatent.trim());
+    }
+    if (_patentCtrl.text.trim().isNotEmpty && _patentCtrl.text.trim() != "Select Patent") {
+      set.add(_patentCtrl.text.trim());
     }
     final list = set.toList();
     list.remove("Select Patent");
@@ -162,6 +190,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
     if (_selectedCategory.isNotEmpty) {
       set.add(_selectedCategory.trim());
     }
+    if (_categoryCtrl.text.trim().isNotEmpty) set.add(_categoryCtrl.text.trim());
     final list = set.toList();
     list.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
     return list;
@@ -181,10 +210,71 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
     if (_selectedGeneric.isNotEmpty && _selectedGeneric != "Select Generic") {
       set.add(_selectedGeneric.trim());
     }
+    if (_genericCtrl.text.trim().isNotEmpty && _genericCtrl.text.trim() != "Select Generic") {
+      set.add(_genericCtrl.text.trim());
+    }
     final list = set.toList();
     list.remove("Select Generic");
     list.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
     return ["Select Generic", ...list];
+  }
+
+  List<String> _getScheduleOptions(PharmacyProvider provider) {
+    final Set<String> set = {"Select", "H", "H1", "G", "X", "Narcotic"};
+    for (var p in provider.productMaster) {
+      if (p.schedule.trim().isNotEmpty) set.add(p.schedule.trim());
+    }
+    for (var p in provider.products) {
+      if (p.schedule.trim().isNotEmpty) set.add(p.schedule.trim());
+    }
+    if (_selectedSchedule.isNotEmpty && _selectedSchedule != "Select") {
+      set.add(_selectedSchedule.trim());
+    }
+    if (_scheduleCtrl.text.trim().isNotEmpty && _scheduleCtrl.text.trim() != "Select") {
+      set.add(_scheduleCtrl.text.trim());
+    }
+    final list = set.toList();
+    list.remove("Select");
+    list.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    return ["Select", ...list];
+  }
+
+  List<String> _getGstOptions(PharmacyProvider provider) {
+    final Set<String> set = {"0", "5", "12", "18"};
+    for (var p in provider.productMaster) {
+      if (p.gstPercent >= 0) set.add(p.gstPercent.toInt().toString());
+    }
+    for (var p in provider.products) {
+      if (p.gstPercent >= 0) set.add(p.gstPercent.toInt().toString());
+    }
+    if (_selectedGst.isNotEmpty) set.add(_selectedGst.trim());
+    if (_gstCtrl.text.trim().isNotEmpty) set.add(_gstCtrl.text.trim());
+    final list = set.toList();
+    list.sort((a, b) => (double.tryParse(a) ?? 0).compareTo(double.tryParse(b) ?? 0));
+    return list;
+  }
+
+  List<String> _getWholesaleOptions(PharmacyProvider provider) {
+    final Set<String> set = {"Select Wholesale"};
+    for (var s in provider.suppliers) {
+      if (s.trim().isNotEmpty) set.add(s.trim());
+    }
+    for (var p in provider.productMaster) {
+      if (p.preferredWholesale.trim().isNotEmpty) set.add(p.preferredWholesale.trim());
+    }
+    for (var p in provider.products) {
+      if (p.preferredWholesale.trim().isNotEmpty) set.add(p.preferredWholesale.trim());
+    }
+    if (_selectedWholesale.isNotEmpty && _selectedWholesale != "Select Wholesale") {
+      set.add(_selectedWholesale.trim());
+    }
+    if (_wholesaleCtrl.text.trim().isNotEmpty && _wholesaleCtrl.text.trim() != "Select Wholesale") {
+      set.add(_wholesaleCtrl.text.trim());
+    }
+    final list = set.toList();
+    list.remove("Select Wholesale");
+    list.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    return ["Select Wholesale", ...list];
   }
 
   void _selectProduct(Product p) {
@@ -198,12 +288,17 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
       _barcodeCtrl.text = p.batch;
       _aliasCtrl.text = p.alias;
       _selectedRack = p.rack.isNotEmpty ? p.rack : "A1";
+      _rackCtrl.text = _selectedRack;
       _selectedCategory = p.category.isNotEmpty ? p.category : "Branded";
+      _categoryCtrl.text = _selectedCategory;
       _selectedPatent = p.patent.isNotEmpty ? p.patent : (p.manufacturer.isNotEmpty ? p.manufacturer : "Select Patent");
+      _patentCtrl.text = _selectedPatent;
       _selectedGeneric = p.genericName.isEmpty ? "Select Generic" : p.genericName;
       _genericCtrl.text = p.genericName;
       _selectedSchedule = p.schedule.isEmpty ? "Select" : p.schedule;
+      _scheduleCtrl.text = _selectedSchedule;
       _selectedWholesale = p.preferredWholesale.isEmpty ? "Select Wholesale" : p.preferredWholesale;
+      _wholesaleCtrl.text = _selectedWholesale;
       _reorderCtrl.text = p.reorderLevel.toString();
       _maxCtrl.text = p.maxLevel.toString();
       _leadTimeCtrl.text = p.leadTime.toString();
@@ -212,8 +307,9 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
       if ([0.0, 5.0, 12.0, 18.0].contains(gst)) {
         _selectedGst = gst.toInt().toString();
       } else {
-        _selectedGst = "12";
+        _selectedGst = gst.toStringAsFixed(0);
       }
+      _gstCtrl.text = _selectedGst;
 
       _packingCtrl.text = p.packSize.toString();
       _discCtrl.text = p.sDiscPercent.toStringAsFixed(1);
@@ -362,27 +458,44 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
       return; // STOP EXECUTION - DON'T SAVE
     }
 
-    final patentVal = _selectedPatent == "Select Patent" ? "" : _selectedPatent;
+    final rText = _rackCtrl.text.trim();
+    final rackVal = rText.isNotEmpty ? rText : (_selectedRack.isEmpty ? "A1" : _selectedRack);
+
+    final cText = _categoryCtrl.text.trim();
+    final categoryVal = cText.isNotEmpty ? cText : (_selectedCategory.isEmpty ? "Branded" : _selectedCategory);
+
+    final patentVal = (_patentCtrl.text.trim().isNotEmpty && _patentCtrl.text.trim() != "Select Patent")
+        ? _patentCtrl.text.trim()
+        : (_selectedPatent == "Select Patent" ? "" : _selectedPatent);
+
     final String gText = _genericCtrl.text.trim();
     final String genericVal = (gText.isNotEmpty && gText != "Select Generic")
         ? gText
         : (_selectedGeneric == "Select Generic" ? "" : _selectedGeneric);
-    final scheduleVal = _selectedSchedule == "Select" ? "" : _selectedSchedule;
-    final wholesaleVal = _selectedWholesale == "Select Wholesale" ? "" : _selectedWholesale;
+
+    final scheduleVal = (_scheduleCtrl.text.trim().isNotEmpty && _scheduleCtrl.text.trim() != "Select")
+        ? _scheduleCtrl.text.trim()
+        : (_selectedSchedule == "Select" ? "" : _selectedSchedule);
+
+    final wholesaleVal = (_wholesaleCtrl.text.trim().isNotEmpty && _wholesaleCtrl.text.trim() != "Select Wholesale")
+        ? _wholesaleCtrl.text.trim()
+        : (_selectedWholesale == "Select Wholesale" ? "" : _selectedWholesale);
+
+    final gstVal = double.tryParse(_gstCtrl.text.trim()) ?? double.tryParse(_selectedGst) ?? 12.0;
 
     final p = Product(
       id: _editingProduct?.id ?? _generatedId,
       name: enteredName,
       hsnCode: _hsnCtrl.text.trim(),
       batch: _barcodeCtrl.text.trim(),
-      rack: _selectedRack,
-      category: _selectedCategory,
+      rack: rackVal,
+      category: categoryVal,
       patent: patentVal,
       manufacturer: patentVal,
       genericName: genericVal,
       packSize: int.tryParse(_packingCtrl.text) ?? 1,
       schedule: scheduleVal,
-      gstPercent: double.tryParse(_selectedGst) ?? 12.0,
+      gstPercent: gstVal,
       sDiscPercent: double.tryParse(_discCtrl.text) ?? 0.0,
       reorderLevel: int.tryParse(_reorderCtrl.text) ?? 0,
       maxLevel: int.tryParse(_maxCtrl.text) ?? 0,
@@ -428,6 +541,12 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
       _generatedId = _generate10DigitId();
       _nameCtrl.clear(); _hsnCtrl.clear(); _barcodeCtrl.clear(); _aliasCtrl.clear();
       _genericCtrl.clear();
+      _rackCtrl.text = "A1";
+      _categoryCtrl.text = "Branded";
+      _patentCtrl.text = "Select Patent";
+      _scheduleCtrl.text = "Select";
+      _gstCtrl.text = "12";
+      _wholesaleCtrl.text = "Select Wholesale";
       _packingCtrl.clear(); _reorderCtrl.clear(); _maxCtrl.clear();
       _discCtrl.clear(); _leadTimeCtrl.text = "2";
       _selectedCategory = "Branded"; _selectedRack = "A1";
@@ -1420,35 +1539,64 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
           children: [
             Expanded(child: _field("HSN CODE", _hsnCtrl, _hsnFocus, next: _rackFocus)),
             const SizedBox(width: 8),
-            SizedBox(
-              width: 100,
-              child: InkWell(
-                onTap: () async {
-                  final selected = await showDialog<String>(
-                    context: context,
-                    builder: (ctx) => const RackPickerDialog(),
-                  );
-                  if (selected != null) {
-                    setState(() => _selectedRack = selected);
-                  }
-                },
-                child: AbsorbPointer(
-                  child: _field("RACK", TextEditingController(text: _selectedRack), _rackFocus),
-                ),
-              ),
-            ),
+            Expanded(child: _searchableAutocompleteField(
+              label: "RACK",
+              controller: _rackCtrl,
+              focusNode: _rackFocus,
+              nextFocus: _categoryFocus,
+              getItems: _getRackOptions,
+              defaultOption: "A1",
+              provider: provider,
+              onValueChanged: (v) => setState(() => _selectedRack = v),
+            )),
             const SizedBox(width: 8),
-            Expanded(child: _dropdown("CATEGORY", _selectedCategory, _getCategoryOptions(provider), (v) => setState(() => _selectedCategory = v ?? "Branded"), focus: _categoryFocus)),
+            Expanded(child: _searchableAutocompleteField(
+              label: "CATEGORY",
+              controller: _categoryCtrl,
+              focusNode: _categoryFocus,
+              nextFocus: _genericFocus,
+              getItems: _getCategoryOptions,
+              defaultOption: "Branded",
+              provider: provider,
+              onValueChanged: (v) => setState(() => _selectedCategory = v),
+            )),
           ],
         ),
         const SizedBox(height: 8),
         Row(
           children: [
-            Expanded(flex: 2, child: _searchableGenericDropdown(provider)),
+            Expanded(flex: 2, child: _searchableAutocompleteField(
+              label: "GENERIC NAME",
+              controller: _genericCtrl,
+              focusNode: _genericFocus,
+              nextFocus: _patentFocus,
+              getItems: _getGenericOptions,
+              defaultOption: "Select Generic",
+              provider: provider,
+              onValueChanged: (v) => setState(() => _selectedGeneric = v),
+            )),
             const SizedBox(width: 8),
-            Expanded(child: _searchableDropdown("PATENT", _selectedPatent, _getPatentOptions(provider), (v) => setState(() => _selectedPatent = v), focus: _patentFocus)),
+            Expanded(child: _searchableAutocompleteField(
+              label: "PATENT",
+              controller: _patentCtrl,
+              focusNode: _patentFocus,
+              nextFocus: _scheduleFocus,
+              getItems: _getPatentOptions,
+              defaultOption: "Select Patent",
+              provider: provider,
+              onValueChanged: (v) => setState(() => _selectedPatent = v),
+            )),
             const SizedBox(width: 8),
-            Expanded(child: _searchableDropdown("SCHEDULE", _selectedSchedule, ["Select", "H", "H1", "G", "X", "Narcotic"], (v) => setState(() => _selectedSchedule = v), focus: _scheduleFocus)),
+            Expanded(child: _searchableAutocompleteField(
+              label: "SCHEDULE",
+              controller: _scheduleCtrl,
+              focusNode: _scheduleFocus,
+              nextFocus: _reorderFocus,
+              getItems: _getScheduleOptions,
+              defaultOption: "Select",
+              provider: provider,
+              onValueChanged: (v) => setState(() => _selectedSchedule = v),
+            )),
           ],
         ),
         const SizedBox(height: 12),
@@ -1463,7 +1611,19 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
             SizedBox(width: 75, child: _field("MAX LVL", _maxCtrl, _maxFocus)),
             SizedBox(width: 75, child: _field("PACKING", _packingCtrl, _packingFocus)),
             SizedBox(width: 75, child: _field("LEAD TIME", _leadTimeCtrl, _leadTimeFocus)),
-            SizedBox(width: 75, child: _dropdown("GST %", _selectedGst, ["0", "5", "12", "18"], (v) => setState(() => _selectedGst = v!), focus: _gstFocus)),
+            SizedBox(
+              width: 85,
+              child: _searchableAutocompleteField(
+                label: "GST %",
+                controller: _gstCtrl,
+                focusNode: _gstFocus,
+                nextFocus: _discFocus,
+                getItems: _getGstOptions,
+                defaultOption: "12",
+                provider: provider,
+                onValueChanged: (v) => setState(() => _selectedGst = v),
+              ),
+            ),
             SizedBox(width: 75, child: _field("DISC %", _discCtrl, _discFocus)),
             Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -1494,7 +1654,16 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
           ],
         ),
         const SizedBox(height: 8),
-        _searchableDropdown("PREFERRED WHOLESALE", _selectedWholesale, ["Select Wholesale", ...provider.suppliers], (v) => setState(() => _selectedWholesale = v)),
+        _searchableAutocompleteField(
+          label: "PREFERRED WHOLESALE",
+          controller: _wholesaleCtrl,
+          focusNode: _wholesaleFocus,
+          nextFocus: _barcodeFocus,
+          getItems: _getWholesaleOptions,
+          defaultOption: "Select Wholesale",
+          provider: provider,
+          onValueChanged: (v) => setState(() => _selectedWholesale = v),
+        ),
       ],
     );
   }
@@ -1534,80 +1703,86 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
     );
   }
 
-  Widget _searchableGenericDropdown(PharmacyProvider provider) {
-    final List<String> allGenerics = provider.generics;
+  Widget _searchableAutocompleteField({
+    required String label,
+    required TextEditingController controller,
+    required FocusNode focusNode,
+    FocusNode? nextFocus,
+    required List<String> Function(PharmacyProvider) getItems,
+    required String defaultOption,
+    required PharmacyProvider provider,
+    required Function(String) onValueChanged,
+  }) {
+    final List<String> allItems = getItems(provider);
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: [
         Text(
-          "GENERIC NAME",
+          label,
           style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.blueGrey.shade600),
         ),
         const SizedBox(height: 4),
         LayoutBuilder(
           builder: (context, constraints) {
             return RawAutocomplete<String>(
-              textEditingController: _genericCtrl,
-              focusNode: _genericFocus,
+              textEditingController: controller,
+              focusNode: focusNode,
               optionsBuilder: (TextEditingValue textEditingValue) {
                 final text = textEditingValue.text.trim().toLowerCase();
-                if (text.isEmpty || text == "select generic") {
-                  return allGenerics.take(50);
+                if (text.isEmpty || text == defaultOption.toLowerCase()) {
+                  return allItems.take(50);
                 }
-                final matches = allGenerics.where((g) => g.toLowerCase().contains(text)).toList();
+                final matches = allItems.where((g) => g.toLowerCase().contains(text)).toList();
                 return matches.take(50);
               },
               onSelected: (String selection) {
-                setState(() {
-                  _selectedGeneric = selection;
-                  _genericCtrl.text = selection;
-                });
-                _patentFocus.requestFocus();
+                onValueChanged(selection);
+                if (nextFocus != null) {
+                  nextFocus.requestFocus();
+                }
               },
-              fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) {
+              fieldViewBuilder: (context, textController, fieldFocusNode, onFieldSubmitted) {
                 return Container(
                   height: 32,
                   decoration: BoxDecoration(
                     color: Colors.white,
                     borderRadius: BorderRadius.circular(6),
                     border: Border.all(
-                      color: focusNode.hasFocus ? Colors.blue : Colors.grey.shade300,
-                      width: focusNode.hasFocus ? 1.5 : 1,
+                      color: fieldFocusNode.hasFocus ? Colors.blue : Colors.grey.shade300,
+                      width: fieldFocusNode.hasFocus ? 1.5 : 1,
                     ),
                   ),
                   child: Row(
                     children: [
                       Expanded(
                         child: TextField(
-                          controller: controller,
-                          focusNode: focusNode,
+                          controller: textController,
+                          focusNode: fieldFocusNode,
                           style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
                           decoration: InputDecoration(
                             isDense: true,
-                            hintText: "Select Generic",
+                            hintText: defaultOption,
                             hintStyle: TextStyle(fontSize: 12, color: Colors.grey.shade500, fontWeight: FontWeight.w500),
                             border: InputBorder.none,
                             contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                           ),
                           onChanged: (val) {
-                            setState(() {
-                              _selectedGeneric = val.trim().isEmpty ? "Select Generic" : val.trim();
-                            });
+                            onValueChanged(val.trim().isEmpty ? defaultOption : val.trim());
                           },
                           onSubmitted: (_) {
-                            _patentFocus.requestFocus();
+                            if (nextFocus != null) {
+                              nextFocus.requestFocus();
+                            }
                           },
                         ),
                       ),
-                      if (controller.text.isNotEmpty)
+                      if (textController.text.isNotEmpty && textController.text != defaultOption)
                         InkWell(
                           onTap: () {
-                            controller.clear();
-                            setState(() {
-                              _selectedGeneric = "Select Generic";
-                            });
+                            textController.clear();
+                            onValueChanged(defaultOption);
                           },
                           child: Padding(
                             padding: const EdgeInsets.symmetric(horizontal: 4),
@@ -1666,98 +1841,6 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
               },
             );
           },
-        ),
-      ],
-    );
-  }
-
-  Widget _searchableDropdown(String label, String val, List<String> items, Function(String) onChange, {FocusNode? focus}) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(label, style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.blueGrey.shade600)),
-        const SizedBox(height: 4),
-        InkWell(
-          focusNode: focus,
-          onTap: () async {
-            String? selected = await showDialog<String>(
-              context: context,
-              builder: (ctx) => _SearchablePickerOverlay(title: label, items: items, currentValue: val),
-            );
-            if (selected != null) {
-              onChange(selected);
-            }
-          },
-          borderRadius: BorderRadius.circular(6),
-          child: Container(
-            height: 32,
-            padding: const EdgeInsets.symmetric(horizontal: 10),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(6),
-              border: Border.all(
-                color: focus?.hasFocus == true ? Colors.blue : Colors.grey.shade300,
-                width: focus?.hasFocus == true ? 1.5 : 1,
-              ),
-            ),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    val,
-                    style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-                Icon(Icons.arrow_drop_down, color: Colors.grey.shade600, size: 20),
-              ],
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _dropdown(String label, String val, List<String> items, Function(String?) onChange, {FocusNode? focus}) {
-    final uniqueItems = items.toSet().toList();
-    if (!uniqueItems.contains(val)) {
-      uniqueItems.insert(0, val);
-    }
-    final safeVal = uniqueItems.contains(val) ? val : (uniqueItems.isNotEmpty ? uniqueItems.first : val);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(label, style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.blueGrey.shade600)),
-        const SizedBox(height: 4),
-        Container(
-          height: 32,
-          padding: const EdgeInsets.symmetric(horizontal: 10),
-          decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(6),
-            border: Border.all(
-              color: focus?.hasFocus == true ? Colors.blue : Colors.grey.shade300,
-              width: focus?.hasFocus == true ? 1.5 : 1,
-            ),
-          ),
-          child: DropdownButtonHideUnderline(
-            child: DropdownButton<String>(
-              value: safeVal,
-              isDense: true,
-              isExpanded: true,
-              focusNode: focus,
-              items: uniqueItems.map((e) => DropdownMenuItem(
-                  value: e,
-                  child: Text(e,
-                    style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-                    overflow: TextOverflow.ellipsis,
-                  )
-              )).toList(),
-              onChanged: onChange,
-            ),
-          ),
         ),
       ],
     );

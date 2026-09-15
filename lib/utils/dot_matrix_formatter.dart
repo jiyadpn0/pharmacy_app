@@ -2,6 +2,16 @@ import 'package:intl/intl.dart';
 import '../models/erp_models.dart';
 
 class DotMatrixFormatter {
+  static String _clampLeft(String text, int width) {
+    if (text.length > width) return text.substring(0, width);
+    return text.padLeft(width);
+  }
+
+  static String _clampRight(String text, int width) {
+    if (text.length > width) return text.substring(0, width);
+    return text.padRight(width);
+  }
+
   /// Word-aware wrapping engine to prevent breaking medicine names mid-word
   static List<String> _wrapText(String text, int maxWidth) {
     if (text.isEmpty) return [""];
@@ -77,29 +87,31 @@ class DotMatrixFormatter {
     buffer.writeln(patStr.padRight(padWidth > 0 ? padWidth : patStr.length) + docStr);
     buffer.writeln(divider);
 
-    // 3. TABLE COLUMN SIZING
-    int wSl = 2;
-    int wHsn = 6;
-    int wBatch = 7;
-    int wExp = 5;
-    int wQty = 3;
-    int wMrp = 7;
-    int wDisc = 6;
-    int wRate = 7;
-    int wTot = 8;
-    int wItem = columns - (wSl + wHsn + wBatch + wExp + wQty + wMrp + wDisc + wRate + wTot + 9);
+    // 3. TABLE COLUMN SIZING (Strictly clamped for 80 and 136 columns)
+    int wSl = columns >= 136 ? 3 : 2;
+    int wHsn = columns >= 136 ? 8 : 5;
+    int wBatch = columns >= 136 ? 10 : 6;
+    int wExp = columns >= 136 ? 6 : 5;
+    int wQty = columns >= 136 ? 5 : 3;
+    int wMrp = columns >= 136 ? 9 : 7;
+    int wDisc = columns >= 136 ? 8 : 6;
+    int wRate = columns >= 136 ? 9 : 7;
+    int wTot = columns >= 136 ? 10 : 8;
+
+    int fixedWidthSum = wSl + wHsn + wBatch + wExp + wQty + wMrp + wDisc + wRate + wTot + 9;
+    int wItem = columns - fixedWidthSum;
     if (wItem < 12) wItem = 12;
 
-    String th = "${"SL".padRight(wSl)} "
-        "${"HSN".padRight(wHsn)} "
-        "${"PRODUCT / MFR".padRight(wItem)} "
-        "${"BATCH".padRight(wBatch)} "
-        "${"EXP".padRight(wExp)} "
-        "${"QTY".padLeft(wQty)} "
-        "${"MRP".padLeft(wMrp)} "
-        "${"DISC".padLeft(wDisc)} "
-        "${"RATE".padLeft(wRate)} "
-        "${"TOTAL".padLeft(wTot)}";
+    String th = "${_clampRight("SL", wSl)} "
+        "${_clampRight("HSN", wHsn)} "
+        "${_clampRight("PRODUCT / MFR", wItem)} "
+        "${_clampRight("BATCH", wBatch)} "
+        "${_clampRight("EXP", wExp)} "
+        "${_clampLeft("QTY", wQty)} "
+        "${_clampLeft("MRP", wMrp)} "
+        "${_clampLeft("DISC", wDisc)} "
+        "${_clampLeft("RATE", wRate)} "
+        "${_clampLeft("TOTAL", wTot)}";
 
     buffer.writeln(th);
     buffer.writeln(divider);
@@ -113,27 +125,12 @@ class DotMatrixFormatter {
         nameLines.add("[MFR: ${item.product.manufacturer.toUpperCase()}]");
       }
 
-      String sl = (i + 1).toString().padRight(wSl);
-      String hsn = (item.product.hsnCode.isNotEmpty ? item.product.hsnCode : "3004").padRight(wHsn);
-      if (hsn.length > wHsn) hsn = hsn.substring(0, wHsn);
-
-      String nameChunk = nameLines[0].padRight(wItem);
-
-      String batch = item.product.batch.toUpperCase();
-      if (batch.length > wBatch) {
-        batch = batch.substring(0, wBatch);
-      } else {
-        batch = batch.padRight(wBatch);
-      }
-
-      String exp = item.product.expiry;
-      if (exp.length > wExp) {
-        exp = exp.substring(0, wExp);
-      } else {
-        exp = exp.padRight(wExp);
-      }
-
-      String qty = item.qty.toString().padLeft(wQty);
+      String sl = _clampRight((i + 1).toString(), wSl);
+      String hsn = _clampRight((item.product.hsnCode.isNotEmpty ? item.product.hsnCode : "3004"), wHsn);
+      String nameChunk = _clampRight(nameLines[0], wItem);
+      String batch = _clampRight(item.product.batch.toUpperCase(), wBatch);
+      String exp = _clampRight(item.product.expiry, wExp);
+      String qty = _clampLeft(item.qty.toString(), wQty);
 
       double packSize = item.product.packSize > 0 ? item.product.packSize.toDouble() : 1.0;
       double stripMrp = item.mrp > 0 ? item.mrp : (item.product.mrp * packSize);
@@ -144,16 +141,16 @@ class DotMatrixFormatter {
 
       double rate = item.sRate > 0 ? item.sRate : item.product.salePrice;
 
-      String mrpStr = stripMrp.toStringAsFixed(2).padLeft(wMrp);
-      String discStr = itemDisc.toStringAsFixed(2).padLeft(wDisc);
-      String rateStr = rate.toStringAsFixed(2).padLeft(wRate);
-      String totStr = item.total.toStringAsFixed(2).padLeft(wTot);
+      String mrpStr = _clampLeft(stripMrp.toStringAsFixed(2), wMrp);
+      String discStr = _clampLeft(itemDisc.toStringAsFixed(2), wDisc);
+      String rateStr = _clampLeft(rate.toStringAsFixed(2), wRate);
+      String totStr = _clampLeft(item.total.toStringAsFixed(2), wTot);
 
       buffer.writeln("$sl $hsn $nameChunk $batch $exp $qty $mrpStr $discStr $rateStr $totStr");
 
       for (int lineIdx = 1; lineIdx < nameLines.length; lineIdx++) {
-        String emptyPrefix = "${"".padRight(wSl)} ${"".padRight(wHsn)}";
-        String spilledName = nameLines[lineIdx].padRight(wItem);
+        String emptyPrefix = "${_clampRight("", wSl)} ${_clampRight("", wHsn)}";
+        String spilledName = _clampRight(nameLines[lineIdx], wItem);
         buffer.writeln("$emptyPrefix $spilledName");
       }
     }

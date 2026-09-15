@@ -26,6 +26,7 @@ import '../screens/master/account_registration_screen.dart';
 import '../screens/master/prescription_registration_screen.dart';
 import '../screens/master/product_import_screen.dart';
 import '../screens/reports/daily_report_screen.dart';
+import '../screens/reports/stock_enquiries_screen.dart';
 import '../screens/settings_screen.dart';
 import '../screens/damage_entry_screen.dart';
 import '../screens/stock_checking_screen.dart';
@@ -69,11 +70,13 @@ class TabItem {
 
 class AppProvider extends ChangeNotifier {
   final List<TabItem> _openTabs = [];
+  final List<TabItem> _closedTabsHistory = [];
   int _activeTabIndex = 0;
   String _statusMessage = "";
   bool _isDarkMode = false;
 
   List<TabItem> get openTabs => _openTabs;
+  List<TabItem> get closedTabsHistory => _closedTabsHistory;
   int get activeTabIndex => _activeTabIndex;
   String get statusMessage => _statusMessage;
   bool get isDarkMode => _isDarkMode;
@@ -118,6 +121,7 @@ class AppProvider extends ChangeNotifier {
   void openOrderBook() => addTab("Order Book", const SpecialOrdersScreen(initialView: 1));
   void openOrderConfirmation() => addTab("Order Confirmation", const OrderConfirmationScreen());
   void openSpecialOrders() => addTab("Special Orders", const SpecialOrdersScreen(initialView: 0));
+  void openStockEnquiries() => addTab("Stock Enquiries", const StockEnquiriesScreen());
   void openProductRanking() => addTab("Product Ranking", const ProductRankingScreen());
   void openSalesReport() => addTab("SALES ANALYSIS", const SalesReportScreen());
   void openScheduleH1Register() => addTab("SCHEDULE H1 REGISTER", const ScheduleH1RegisterScreen());
@@ -259,12 +263,30 @@ class AppProvider extends ChangeNotifier {
 
   void closeTab(int index) {
     if (index == 0) return;
-    _openTabs.removeAt(index);
+    if (index >= 0 && index < _openTabs.length) {
+      final removed = _openTabs.removeAt(index);
+      if (removed.closable) {
+        _closedTabsHistory.add(removed);
+        if (_closedTabsHistory.length > 20) {
+          _closedTabsHistory.removeAt(0);
+        }
+      }
+    }
     if (_activeTabIndex >= _openTabs.length) {
       _activeTabIndex = _openTabs.length - 1;
     }
     _statusMessage = "";
     notifyListeners();
+  }
+
+  void recoverLastClosedTab() {
+    if (_closedTabsHistory.isNotEmpty) {
+      final tabToRestore = _closedTabsHistory.removeLast();
+      _openTabs.add(tabToRestore);
+      _activeTabIndex = _openTabs.length - 1;
+      _statusMessage = "Recovered: ${tabToRestore.title}";
+      notifyListeners();
+    }
   }
 
   void reorderTabs(int oldIndex, int newIndex) {

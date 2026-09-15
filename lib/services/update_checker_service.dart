@@ -7,7 +7,7 @@ import 'package:url_launcher/url_launcher.dart';
 class UpdateCheckerService {
   static const String _repoOwner = 'jiyadpn0';
   static const String _repoName = 'pharmacy_app';
-  static const String currentVersion = '2.4.3';
+  static const String currentVersion = '2.4.4';
 
   /// Checks GitHub Releases for a newer version tag.
   static Future<void> checkForUpdates(BuildContext context, {bool silent = false}) async {
