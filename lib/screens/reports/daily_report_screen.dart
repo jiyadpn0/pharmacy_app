@@ -927,6 +927,8 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
             actions: [
               TextButton(
                 onPressed: () async {
+                  final nav = Navigator.of(dialogCtx);
+                  final messenger = ScaffoldMessenger.of(context);
                   final prefs = await _getPrefs();
                   await prefs.remove("admin_day_book_template");
                   final defaults = _getDefaultHeadings();
@@ -934,9 +936,9 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
                     tempHeadings = List.from(defaults);
                   });
                   await _saveDayBookTemplate(defaults);
-                  Navigator.pop(dialogCtx, true);
+                  nav.pop(true);
                   if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
+                    messenger.showSnackBar(
                       const SnackBar(content: Text("Day Book Template reset to default items."), duration: Duration(seconds: 2)),
                     );
                   }
@@ -955,10 +957,12 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
                   foregroundColor: Colors.white,
                 ),
                 onPressed: () async {
+                  final nav = Navigator.of(dialogCtx);
+                  final messenger = ScaffoldMessenger.of(context);
                   await _saveDayBookTemplate(tempHeadings);
-                  Navigator.pop(dialogCtx, true);
+                  nav.pop(true);
                   if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
+                    messenger.showSnackBar(
                       const SnackBar(
                         content: Text("Day Book Design saved! All registers updated immediately."),
                         backgroundColor: Colors.green,
@@ -1828,11 +1832,11 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
                               r.syncToItem();
                               return r.item;
                             }).toList();
+                            for (var r in rowHolders) { r.dispose(); }
+                            Navigator.pop(dialogCtx);
+                            if (mounted) setState(() {});
                             await onSave(finalItems);
                             await _saveSettingsForDate();
-                            for (var r in rowHolders) { r.dispose(); }
-                            if (mounted) setState(() {});
-                            Navigator.pop(dialogCtx);
                           },
                           icon: const Icon(Icons.check_circle_rounded, size: 16),
                           label: const Text("SAVE LIST", style: TextStyle(fontWeight: FontWeight.bold)),
@@ -2302,8 +2306,8 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
                     _autoFetchClosingSale = false;
                   }
                 });
-                await _saveSettingsForDate();
                 Navigator.pop(ctx);
+                await _saveSettingsForDate();
               },
               child: const Text("SAVE ENTRY"),
             ),

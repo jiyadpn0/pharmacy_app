@@ -9,6 +9,7 @@ import 'package:sqflite/sqflite.dart' as sql;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:excel/excel.dart';
 import 'package:synchronized/synchronized.dart';
+import 'package:flutter/material.dart';
 import '../models/erp_models.dart';
 import '../models/product_ranking.dart';
 export '../models/erp_models.dart';
@@ -16,6 +17,8 @@ import '../database/db_helper.dart';
 import '../utils/security_crypto.dart';
 import '../utils/tax_calculator.dart';
 import '../utils/app_formatters.dart';
+import '../utils/app_watchdog.dart';
+import '../utils/app_dialogs.dart';
 import '../services/excel_worker_service.dart';
 
 typedef Transaction = sql.Transaction;
@@ -24,13 +27,44 @@ class PharmacyProvider extends ChangeNotifier {
   final Lock _dbLock = Lock();
 
   /// Executes any critical database write inside a locked, atomic transaction block
-  Future<T> executeSerializedTransaction<T>(Future<T> Function(Transaction txn) action) async {
+  /// protected by the AppWatchdog global timeout safety net.
+  Future<T> executeSerializedTransaction<T>(
+    Future<T> Function(Transaction txn) action, {
+    String operationName = "Database Transaction",
+  }) async {
     final db = await DbHelper.instance.database;
     return await _dbLock.synchronized(() async {
       return await db.transaction((txn) async {
         return await action(txn);
       });
     });
+  }
+
+  /// Executes a complex write transaction with both Database Auto-Rollback AND In-Memory State Rollback.
+  Future<T?> executeSafeTransactionWithRollback<T, S>({
+    required Future<T> Function(Transaction txn) action,
+    required String operationName,
+    required S Function() captureState,
+    required void Function(S snapshot) restoreState,
+    BuildContext? context,
+    Duration timeout = const Duration(seconds: 5),
+  }) async {
+    return await AppWatchdog.runWithSafetyNet<T, S>(
+      operationName: operationName,
+      captureState: captureState,
+      restoreState: (snapshot) {
+        restoreState(snapshot);
+        notifyListeners(); // Refresh UI after state restoration
+      },
+      context: context,
+      timeout: timeout,
+      action: () async {
+        return await executeSerializedTransaction(
+          action,
+          operationName: operationName,
+        );
+      },
+    );
   }
 
   final List<Product> _products = [];
@@ -151,6 +185,199 @@ class PharmacyProvider extends ChangeNotifier {
       });
       return consolidated;
     });
+  }
+
+  Future<void> syncInventoryFromDb() async {
+    final db = kIsWeb ? null : await DbHelper.instance.database;
+    if (db == null) return;
+
+    try {
+      // Auto-consolidate any duplicate batch rows in stock_batches DB table
+      final List<Map<String, dynamic>> duplicates = await db.rawQuery('''
+        SELECT product_id, batch_number, COUNT(*) as cnt, SUM(current_stock) as total_stock
+        FROM stock_batches
+        GROUP BY product_id, batch_number
+        HAVING cnt > 1
+      ''');
+
+      if (duplicates.isNotEmpty) {
+        await db.transaction((txn) async {
+          for (var dup in duplicates) {
+            final pId = dup['product_id'].toString();
+            final bNo = dup['batch_number'].toString();
+            final totalStock = (dup['total_stock'] as num?)?.toInt() ?? 0;
+
+            final rows = await txn.rawQuery(
+              'SELECT rowid, * FROM stock_batches WHERE product_id = ? AND batch_number = ? ORDER BY rowid ASC',
+              [pId, bNo],
+            );
+
+            if (rows.isNotEmpty && rows.first['rowid'] != null) {
+              final firstRowId = (rows.first['rowid'] as num).toInt();
+              await txn.rawUpdate(
+                'UPDATE stock_batches SET current_stock = ? WHERE rowid = ?',
+                [totalStock, firstRowId],
+              );
+              await txn.rawDelete(
+                'DELETE FROM stock_batches WHERE product_id = ? AND batch_number = ? AND rowid != ?',
+                [pId, bNo, firstRowId],
+              );
+            }
+          }
+        });
+      }
+
+      final List<Map<String, dynamic>> masterResults = await db.query('product_master');
+      final Map<String, Product> masterMap = {};
+
+      for (var row in masterResults) {
+        final p = Product(
+          id: row['id'].toString(),
+          name: row['name'] ?? "UNKNOWN",
+          hsnCode: row['hsn_code'] ?? "",
+          rack: row['rack_id'] ?? "",
+          category: row['category_id'] ?? "General",
+          subCategory: row['sub_category_id'] ?? "",
+          packSize: (row['packing'] as num?)?.toInt() ?? 1,
+          mrp: (row['mrp'] as num?)?.toDouble() ?? 0.0,
+          purchaseRate: (row['purchase_rate'] as num?)?.toDouble() ?? 0.0,
+          salePrice: (row['sale_rate'] as num?)?.toDouble() ?? 0.0,
+          gstPercent: TaxCalculator.roundGstPercent((row['gst_percent'] as num?)?.toDouble() ?? 12.0),
+          sDiscPercent: (row['s_disc_percent'] as num?)?.toDouble() ?? 0.0,
+          patent: row['patent'] ?? "",
+          schedule: row['schedule'] ?? "",
+          reorderLevel: (row['reorder_level'] as num?)?.toInt() ?? 10,
+          maxLevel: (row['max_level'] as num?)?.toInt() ?? 100,
+          manufacturer: row['manufacturer_id'] ?? "",
+          genericName: row['generic_name'] ?? "",
+          stock: 0,
+        );
+        masterMap[p.id] = p;
+      }
+
+      final List<Map<String, dynamic>> batchResults = await db.rawQuery('''
+        SELECT sb.product_id, sb.batch_number, sb.expiry_date, sb.mrp, sb.sale_rate, sb.purchase_rate, sb.landing_cost, sb.supplier_name, sb.rack, sb.gst_percent,
+               SUM(sb.current_stock) as current_stock,
+               pm.name as master_name, 
+               pm.generic_name as master_generic, 
+               pm.hsn_code as master_hsn, 
+               pm.category_id as master_category, 
+               pm.rack_id as master_rack, 
+               pm.packing as master_packing
+        FROM stock_batches sb
+        LEFT JOIN product_master pm ON sb.product_id = pm.id
+        GROUP BY sb.product_id, sb.batch_number
+      ''');
+
+      _products.clear();
+      for (var row in batchResults) {
+        final productId = row['product_id'].toString();
+        final currentStock = (row['current_stock'] as num?)?.toInt() ?? 0;
+
+        String resolvedName = masterMap[productId]?.name ?? row['master_name']?.toString() ?? "UNKNOWN";
+
+        final p = Product(
+          id: productId,
+          name: resolvedName,
+          genericName: masterMap[productId]?.genericName ?? row['master_generic']?.toString() ?? "",
+          hsnCode: masterMap[productId]?.hsnCode ?? row['master_hsn']?.toString() ?? "",
+          category: masterMap[productId]?.category ?? row['master_category']?.toString() ?? "General",
+          packSize: (row['packing'] as num?)?.toInt() ?? masterMap[productId]?.packSize ?? (row['master_packing'] as num?)?.toInt() ?? 1,
+          batch: row['batch_number'] ?? "",
+          expiry: row['expiry_date'] ?? "",
+          stock: currentStock,
+          purchaseRate: (row['purchase_rate'] as num?)?.toDouble() ?? 0.0,
+          landingCost: (row['landing_cost'] as num?)?.toDouble() ?? 0.0,
+          gstPercent: TaxCalculator.roundGstPercent((row['gst_percent'] as num?)?.toDouble() ?? 12.0),
+          mrp: (row['mrp'] as num?)?.toDouble() ?? 0.0,
+          salePrice: (row['sale_rate'] as num?)?.toDouble() ?? 0.0,
+          supplier: row['supplier_name'] ?? "",
+          rack: row['rack'] ?? masterMap[productId]?.rack ?? row['master_rack']?.toString() ?? "",
+        );
+
+        _products.add(p);
+
+        if (masterMap.containsKey(productId)) {
+          masterMap[productId]!.stock += currentStock;
+        }
+      }
+
+      _productMaster.clear();
+      _productMaster.addAll(masterMap.values);
+      _recalculateStockTotals();
+      _rebuildSearchIndex();
+      await _recalculateTodayStatsFromDb();
+      notifyListeners();
+    } catch (e) {
+      debugPrint("syncInventoryFromDb Error: $e");
+    }
+  }
+
+  Future<void> _recalculateTodayStatsFromDb() async {
+    final db = kIsWeb ? null : await DbHelper.instance.database;
+    if (db == null) return;
+
+    try {
+      final nowStr = DateFormat('yyyy-MM-dd').format(DateTime.now());
+      final salesRes = await db.rawQuery('''
+        SELECT SUM(grand_total) as today_rev, COUNT(*) as today_count 
+        FROM sales_invoices 
+        WHERE date(date) = ? AND (is_deleted = 0 OR is_deleted IS NULL)
+      ''', [nowStr]);
+
+      if (salesRes.isNotEmpty) {
+        _todayRevenue = (salesRes.first['today_rev'] as num?)?.toDouble() ?? 0.0;
+        _todaySalesCount = (salesRes.first['today_count'] as num?)?.toInt() ?? 0;
+      }
+
+      final purRes = await db.rawQuery('''
+        SELECT SUM(grand_total) as today_pur, COUNT(*) as today_count 
+        FROM purchase_entries 
+        WHERE date(date) = ? AND (is_deleted = 0 OR is_deleted IS NULL)
+      ''', [nowStr]);
+
+      if (purRes.isNotEmpty) {
+        _todayPurchase = (purRes.first['today_pur'] as num?)?.toDouble() ?? 0.0;
+        _todayPurchasesCount = (purRes.first['today_count'] as num?)?.toInt() ?? 0;
+      }
+    } catch (e) {
+      debugPrint("recalculateTodayStatsFromDb Error: $e");
+    }
+  }
+
+  Future<void> _restoreBatchStockInTxn(
+    sql.Transaction txn, 
+    String productId, 
+    String batchNumber, 
+    int qtyToRestore, 
+    {double mrp = 0.0, double purchaseRate = 0.0, String expiryDate = ''}
+  ) async {
+    if (productId.isEmpty || qtyToRestore <= 0) return;
+
+    final String cleanBatch = batchNumber.trim();
+
+    final List<Map<String, dynamic>> target = await txn.rawQuery('''
+      SELECT rowid FROM stock_batches 
+      WHERE product_id = ? AND batch_number = ? COLLATE NOCASE 
+      ORDER BY current_stock DESC, rowid ASC LIMIT 1
+    ''', [productId, cleanBatch]);
+
+    if (target.isNotEmpty) {
+      final int targetRowId = (target.first['rowid'] as num).toInt();
+      await txn.rawUpdate(
+        'UPDATE stock_batches SET current_stock = current_stock + ? WHERE rowid = ?',
+        [qtyToRestore, targetRowId]
+      );
+    } else if (cleanBatch.isNotEmpty) {
+      await txn.insert('stock_batches', {
+        'product_id': productId,
+        'batch_number': cleanBatch,
+        'current_stock': qtyToRestore,
+        'mrp': mrp,
+        'purchase_rate': purchaseRate,
+        'expiry_date': expiryDate,
+      });
+    }
   }
   final List<String> _accounts = [];
 
@@ -463,9 +690,12 @@ class PharmacyProvider extends ChangeNotifier {
   List<SaleReturnInvoice> get saleReturns => _saleReturns;
   List<PurchaseEntry> get purchases => _purchases;
   List<String> get doneByNames {
-    final names = _purchases.map((p) => p.doneBy).where((n) => n.isNotEmpty).toSet().toList();
+    final names = <String>{"ADMIN", ...staffNames};
+    names.addAll(_purchases.map((p) => p.doneBy).where((n) => n.isNotEmpty));
     names.addAll(_adjustments.map((a) => a.doneBy).where((n) => n.isNotEmpty));
-    return names.toSet().toList()..sort();
+    final sorted = names.where((n) => n.trim().isNotEmpty).toList();
+    sorted.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    return sorted;
   }
   List<PurchaseReturnEntry> get purchaseReturns => _purchaseReturns;
   List<StockAdjustment> get adjustments => _adjustments;
@@ -748,6 +978,67 @@ class PharmacyProvider extends ChangeNotifier {
         .where((p) => p.stock > 0 && p.stock <= p.reorderLevel)
         .take(8)
         .toList();
+  }
+
+  Future<String> auditAndConsolidateStockBatches() async {
+    final db = kIsWeb ? null : await DbHelper.instance.database;
+    if (db == null) return "Web platform not supported.";
+    int consolidatedCount = 0;
+    try {
+      await db.transaction((txn) async {
+        final List<Map<String, dynamic>> duplicates = await txn.rawQuery('''
+          SELECT product_id, batch_number, COUNT(*) as cnt, SUM(current_stock) as total_stock
+          FROM stock_batches
+          GROUP BY product_id, batch_number
+          HAVING cnt > 1
+        ''');
+
+        for (var dup in duplicates) {
+          final pId = dup['product_id'].toString();
+          final bNo = dup['batch_number'].toString();
+          final totalStock = (dup['total_stock'] as num?)?.toInt() ?? 0;
+
+          final rows = await txn.query(
+            'stock_batches',
+            where: 'product_id = ? AND batch_number = ?',
+            whereArgs: [pId, bNo],
+            orderBy: 'rowid ASC',
+          );
+
+          if (rows.isNotEmpty) {
+            final firstRowId = rows.first['rowid'] as int;
+            await txn.rawUpdate(
+              'UPDATE stock_batches SET current_stock = ? WHERE rowid = ?',
+              [totalStock, firstRowId],
+            );
+            await txn.rawDelete(
+              'DELETE FROM stock_batches WHERE product_id = ? AND batch_number = ? AND rowid != ?',
+              [pId, bNo, firstRowId],
+            );
+            consolidatedCount++;
+          }
+        }
+      });
+
+      await loadFromDatabase();
+      notifyListeners();
+      return "Stock audit completed successfully! Consolidated $consolidatedCount duplicate batch entries.";
+    } catch (e) {
+      debugPrint("Audit stock batches error: $e");
+      return "Stock audit failed: $e";
+    }
+  }
+
+  Future<void> healNegativeStockBatches(sql.Database db) async {
+    try {
+      final int resetBatches = await db.rawUpdate('UPDATE stock_batches SET current_stock = 0 WHERE current_stock < 0');
+
+      if (resetBatches > 0) {
+        debugPrint("--- HEAL STOCK: Automatically reset $resetBatches negative batch rows to 0 ---");
+      }
+    } catch (e) {
+      debugPrint("Error healing negative stock batches: $e");
+    }
   }
 
   void recalculateSpecialOrders() {
@@ -1081,6 +1372,9 @@ class PharmacyProvider extends ChangeNotifier {
       // Auto-cleanup any dummy/invalid product entries created by misaligned Excel imports
       await _autoCleanupInvalidProducts(db);
 
+      // Auto-heal and clamp any negative stock rows in SQLite database
+      await healNegativeStockBatches(db);
+
       // confirm counts for the user log
       final countResult = await db.rawQuery('SELECT COUNT(*) as total FROM product_master');
       final totalInDb = countResult.first['total'] as int;
@@ -1162,9 +1456,10 @@ class PharmacyProvider extends ChangeNotifier {
         }
       }
 
-      // 2. INVENTORY LOAD: Load only ACTIVE stock batches with LEFT JOIN to guarantee product names
+      // 2. INVENTORY LOAD: Load all active/net stock batches with SUM(current_stock) to ensure UI matches DB exact total
       final List<Map<String, dynamic>> batchResults = await db.rawQuery('''
-        SELECT sb.*, 
+        SELECT sb.product_id, sb.batch_number, sb.expiry_date, sb.mrp, sb.sale_rate, sb.purchase_rate, sb.landing_cost, sb.supplier_name, sb.rack, sb.gst_percent,
+               SUM(sb.current_stock) as current_stock,
                pm.name as master_name, 
                pm.generic_name as master_generic, 
                pm.hsn_code as master_hsn, 
@@ -1173,7 +1468,7 @@ class PharmacyProvider extends ChangeNotifier {
                pm.packing as master_packing
         FROM stock_batches sb
         LEFT JOIN product_master pm ON sb.product_id = pm.id
-        WHERE sb.current_stock > 0
+        GROUP BY sb.product_id, sb.batch_number
       ''');
 
       for (int i = 0; i < batchResults.length; i++) {
@@ -2011,7 +2306,11 @@ class PharmacyProvider extends ChangeNotifier {
   }
 
   Future<String> getNextSaleEntryNo() async {
-    return _peekNextNo('sales_invoices', 'entry_no', _selectedFinancialYear, excludePrefix: 'ORD-');
+    return _peekNextNo('sales_invoices', 'entry_no', _selectedFinancialYear, excludePrefix: 'SO-');
+  }
+
+  Future<String> getNextSpecialOrderNo() async {
+    return _peekNextNo('sales_invoices', 'entry_no', _selectedFinancialYear, prefix: 'SO-');
   }
 
   Future<String> getNextPurchaseEntryNo() async {
@@ -2022,14 +2321,15 @@ class PharmacyProvider extends ChangeNotifier {
     return _peekNextNo('stock_adjustments', 'entry_no', _selectedFinancialYear);
   }
 
-  Future<String> _peekNextNo(String table, String column, String fy, {String? excludePrefix}) async {
+  Future<String> _peekNextNo(String table, String column, String fy, {String? excludePrefix, String? prefix}) async {
     final db = await DbHelper.instance.database;
+    final String voucherKey = prefix != null ? '${table}_$prefix' : table;
 
     final res = await db.query(
       'voucher_sequences',
       columns: ['last_sequence'],
       where: 'voucher_type = ? AND financial_year = ?',
-      whereArgs: [table, fy],
+      whereArgs: [voucherKey, fy],
     );
 
     int lastSeq = 0;
@@ -2037,45 +2337,33 @@ class PharmacyProvider extends ChangeNotifier {
       lastSeq = (res.first['last_sequence'] as int? ?? 0);
     }
 
-    if (lastSeq > 0) {
-      int effectiveLast = lastSeq;
-      if (table == 'purchase_entries' && _purchases.isNotEmpty) {
-        for (var p in _purchases) {
-          String clean = cleanEntryNo(p.entryNo);
-          int? parsed = int.tryParse(clean);
-          if (parsed != null && parsed > effectiveLast) effectiveLast = parsed;
-        }
-      } else if (table == 'sales_invoices' && _sales.isNotEmpty) {
-        for (var s in _sales) {
-          String clean = cleanEntryNo(s.entryNo);
-          int? parsed = int.tryParse(clean);
-          if (parsed != null && parsed > effectiveLast) effectiveLast = parsed;
-        }
-      }
-      return (effectiveLast + 1).toString();
-    }
+    String cleanColExpr = prefix != null
+        ? "REPLACE($column, '$prefix', '')"
+        : "CASE WHEN instr($column, '_') > 0 THEN substr($column, instr($column, '_') + 1) ELSE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE($column, 'SRET-', ''), 'PRET-', ''), 'ADJ-', ''), 'ORD-', ''), 'SO-', '') END";
 
-    String cleanColExpr = "CASE WHEN instr($column, '_') > 0 THEN substr($column, instr($column, '_') + 1) ELSE REPLACE(REPLACE(REPLACE(REPLACE($column, 'SRET-', ''), 'PRET-', ''), 'ADJ-', ''), 'ORD-', '') END";
-    String where = "financial_year = ?";
+    String where = "financial_year = ? AND CAST($cleanColExpr AS INTEGER) < 100000000";
     List<dynamic> args = [fy];
-    if (excludePrefix != null) {
+
+    if (prefix != null) {
+      where += " AND $column LIKE ?";
+      args.add("$prefix%");
+    } else if (excludePrefix != null) {
       where += " AND $column NOT LIKE ?";
       args.add("$excludePrefix%");
     }
-    
+
     final maxRes = await db.rawQuery(
         "SELECT MAX(CAST($cleanColExpr AS INTEGER)) as max_no FROM $table WHERE $where", 
         args
     );
     int maxInDb = (maxRes.first['max_no'] as num?)?.toInt() ?? 0;
-
     int effectiveLast = maxInDb > lastSeq ? maxInDb : lastSeq;
 
     if (table == 'purchase_entries' && _purchases.isNotEmpty) {
       for (var p in _purchases) {
         String clean = cleanEntryNo(p.entryNo);
         int? parsed = int.tryParse(clean);
-        if (parsed != null && parsed > effectiveLast) {
+        if (parsed != null && parsed < 100000000 && parsed > effectiveLast) {
           effectiveLast = parsed;
         }
       }
@@ -2083,7 +2371,7 @@ class PharmacyProvider extends ChangeNotifier {
       for (var s in _sales) {
         String clean = cleanEntryNo(s.entryNo);
         int? parsed = int.tryParse(clean);
-        if (parsed != null && parsed > effectiveLast) {
+        if (parsed != null && parsed < 100000000 && parsed > effectiveLast) {
           effectiveLast = parsed;
         }
       }
@@ -2091,14 +2379,14 @@ class PharmacyProvider extends ChangeNotifier {
 
     if (effectiveLast > lastSeq || res.isEmpty) {
       await db.insert('voucher_sequences', {
-        'voucher_type': table,
+        'voucher_type': voucherKey,
         'financial_year': fy,
         'last_sequence': effectiveLast
       }, conflictAlgorithm: sql.ConflictAlgorithm.replace);
     }
 
     int nextSeq = effectiveLast + 1;
-    return nextSeq.toString();
+    return prefix != null ? "$prefix$nextSeq" : nextSeq.toString();
   }
 
   Future<void> syncVoucherSequences() async {
@@ -8165,10 +8453,11 @@ class PharmacyProvider extends ChangeNotifier {
     for (int i = 3; i < lines.length; i++) {
       final r = lines[i].split(',');
       if (r.length >= 26) {
+        final parsedStock = double.tryParse(r[10].toString())?.toInt() ?? 0;
         products.add(Product(
           id: "CSV_$i",
           name: r[3].toString(),
-          stock: double.tryParse(r[10].toString())?.toInt() ?? 0,
+          stock: parsedStock < 0 ? 0 : parsedStock,
           batch: r[8].toString(),
           expiry: r[9].toString(),
           mrp: double.tryParse(r[25].toString()) ?? 0.0,
@@ -8248,10 +8537,7 @@ class PharmacyProvider extends ChangeNotifier {
               final pQty = (oldItem['qty'] as num?)?.toInt() ?? 0;
 
               if (pId.isNotEmpty && pQty > 0) {
-                await txn.rawUpdate(
-                  'UPDATE stock_batches SET current_stock = current_stock + ? WHERE product_id = ? AND batch_number = ? COLLATE NOCASE',
-                  [pQty, pId, pBatch]
-                );
+                await _restoreBatchStockInTxn(txn, pId, pBatch, pQty);
               }
             }
             await txn.delete('sales_items', where: 'invoice_no = ?', whereArgs: [finalEntryNo]);
@@ -8482,10 +8768,9 @@ class PharmacyProvider extends ChangeNotifier {
       _sales.sort((a, b) => b.date.compareTo(a.date));
       if (_sales.length > 50) _sales.removeLast();
 
-      _rebuildSearchIndex();
+      await syncInventoryFromDb();
       await refreshSalesFrequency();
 
-      notifyListeners();
       return finalEntryNo;
     } catch (e) {
       debugPrint("Save Sale Error: $e");
@@ -8550,8 +8835,8 @@ class PharmacyProvider extends ChangeNotifier {
               String batch = entry.key.split('|')[1];
 
               await txn.rawUpdate('UPDATE stock_batches SET current_stock = current_stock WHERE product_id = ? AND batch_number = ?', [pId, batch]);
-              final stockCheck = await txn.rawQuery('SELECT current_stock FROM stock_batches WHERE product_id = ? AND batch_number = ? COLLATE NOCASE', [pId, batch]);
-              int liveStock = stockCheck.isNotEmpty ? (stockCheck.first['current_stock'] as num).toInt() : 0;
+              final stockCheck = await txn.rawQuery('SELECT SUM(current_stock) as total_stock FROM stock_batches WHERE product_id = ? AND batch_number = ? COLLATE NOCASE', [pId, batch]);
+              int liveStock = stockCheck.isNotEmpty ? (stockCheck.first['total_stock'] as num?)?.toInt() ?? 0 : 0;
 
               if (liveStock < requiredToRemove) {
                 final pNameRow = await txn.rawQuery('SELECT name FROM product_master WHERE id = ?', [pId]);
@@ -8634,28 +8919,52 @@ class PharmacyProvider extends ChangeNotifier {
             }
 
             int looseQty = (item.qty + item.fQty) * item.packin;
-            await txn.rawInsert('''
-              INSERT INTO stock_batches (product_id, batch_number, expiry_date, current_stock, purchase_rate, landing_cost, mrp, sale_rate, packing, supplier_name, gst_percent, rack, is_active)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-              ON CONFLICT(product_id, batch_number, expiry_date, purchase_rate, landing_cost, mrp, sale_rate, packing, supplier_name, gst_percent) 
-              DO UPDATE SET current_stock = current_stock + excluded.current_stock,
-                            rack = excluded.rack,
-                            is_active = 1
-            ''', [
-              productId,
-              item.batch.trim(),
-              item.expiry,
-              looseQty,
-              item.pRate,
-              trueLandingCost,
-              item.mrp,
-              item.sRate,
-              item.packin,
-              purchase.supplierName,
-              item.gstPercent,
-              item.rack,
-              1,
-            ]);
+            final List<Map<String, dynamic>> existingBatch = await txn.rawQuery('''
+              SELECT rowid FROM stock_batches 
+              WHERE product_id = ? AND batch_number = ? COLLATE NOCASE 
+              ORDER BY rowid ASC LIMIT 1
+            ''', [productId, item.batch.trim()]);
+
+            if (existingBatch.isNotEmpty) {
+              final int targetRowId = (existingBatch.first['rowid'] as num).toInt();
+              await txn.rawUpdate('''
+                UPDATE stock_batches 
+                SET current_stock = current_stock + ?, 
+                    purchase_rate = ?, 
+                    landing_cost = ?, 
+                    mrp = ?, 
+                    sale_rate = ?, 
+                    expiry_date = ?, 
+                    rack = ?, 
+                    is_active = 1 
+                WHERE rowid = ?
+              ''', [
+                looseQty,
+                item.pRate,
+                trueLandingCost,
+                item.mrp,
+                item.sRate,
+                item.expiry,
+                item.rack,
+                targetRowId
+              ]);
+            } else {
+              await txn.insert('stock_batches', {
+                'product_id': productId,
+                'batch_number': item.batch.trim(),
+                'expiry_date': item.expiry,
+                'current_stock': looseQty,
+                'purchase_rate': item.pRate,
+                'landing_cost': trueLandingCost,
+                'mrp': item.mrp,
+                'sale_rate': item.sRate,
+                'packing': item.packin,
+                'supplier_name': purchase.supplierName,
+                'gst_percent': item.gstPercent,
+                'rack': item.rack,
+                'is_active': 1,
+              });
+            }
 
             await txn.insert('purchase_items', {
               'entry_no': finalEntryNo, 'product_id': productId, 'product_name': item.productName, 'extra': item.extra, 'batch': item.batch.trim(),
@@ -8781,8 +9090,8 @@ class PharmacyProvider extends ChangeNotifier {
       _purchases.sort((a, b) => b.date.compareTo(a.date));
       if (_purchases.length > 50) _purchases.removeLast();
 
-      _rebuildSearchIndex();
-      notifyListeners();
+      await syncInventoryFromDb();
+      await fetchAccounts();
       return finalEntryNo;
     } catch (e) {
       debugPrint("Save Purchase Error: $e");
@@ -8822,10 +9131,10 @@ class PharmacyProvider extends ChangeNotifier {
         );
 
         final stockCheck = await txn.rawQuery(
-            'SELECT current_stock FROM stock_batches WHERE product_id = ? AND batch_number = ?',
+            'SELECT SUM(current_stock) as total_stock FROM stock_batches WHERE product_id = ? AND batch_number = ? COLLATE NOCASE',
             [pId, batch]
         );
-        int liveStock = stockCheck.isNotEmpty ? (stockCheck.first['current_stock'] as num).toInt() : 0;
+        int liveStock = stockCheck.isNotEmpty ? (stockCheck.first['total_stock'] as num?)?.toInt() ?? 0 : 0;
 
         // THE MASTER LOCK: Block the transaction and throw the popup
         if (liveStock < requiredToRemove) {
@@ -8843,7 +9152,7 @@ class PharmacyProvider extends ChangeNotifier {
   Future<String> _generateNextNoWithFY(sql.Transaction txn, String table, String column, String fy) async {
     String cleanColExpr = "CASE WHEN instr($column, '_') > 0 THEN substr($column, instr($column, '_') + 1) ELSE REPLACE(REPLACE(REPLACE($column, 'SRET-', ''), 'PRET-', ''), 'ADJ-', '') END";
     final List<Map<String, dynamic>> maxRes = await txn.rawQuery(
-        "SELECT MAX(CAST($cleanColExpr AS INTEGER)) as max_no FROM $table WHERE financial_year = ?", [fy]);
+        "SELECT MAX(CAST($cleanColExpr AS INTEGER)) as max_no FROM $table WHERE financial_year = ? AND CAST($cleanColExpr AS INTEGER) < 100000000", [fy]);
     int maxInDb = (maxRes.first['max_no'] as num?)?.toInt() ?? 0;
 
     final List<Map<String, dynamic>> res = await txn.query(
@@ -9040,7 +9349,7 @@ class PharmacyProvider extends ChangeNotifier {
         _adjustments.insert(0, savedAdj);
       }
 
-      notifyListeners();
+      await syncInventoryFromDb();
       return finalEntryNo;
     } catch (e) {
       debugPrint("Save Stock Adjustment Error: $e");
@@ -9112,10 +9421,7 @@ class PharmacyProvider extends ChangeNotifier {
             );
             if (affected == 0) throw "Stock race condition on adjustment deletion.";
           } else {
-            await txn.rawUpdate(
-              'UPDATE stock_batches SET current_stock = current_stock + ? WHERE product_id = ? AND batch_number = ? COLLATE NOCASE',
-              [qty.abs(), pId, batch]
-            );
+            await _restoreBatchStockInTxn(txn, pId, batch, qty.abs());
           }
 
           // Sync in-memory lists
@@ -9130,7 +9436,7 @@ class PharmacyProvider extends ChangeNotifier {
       });
 
       _adjustments.removeWhere((adj) => adj.entryNo == entryNo);
-      notifyListeners();
+      await syncInventoryFromDb();
     } catch (e) {
       debugPrint("Delete Stock Adjustment Error: $e");
       rethrow;
@@ -9191,7 +9497,7 @@ class PharmacyProvider extends ChangeNotifier {
         });
 
         _writeOffs.add(writeOff);
-        notifyListeners();
+        await syncInventoryFromDb();
       } catch (e) {
         debugPrint("Save Write-Off Error: $e");
         rethrow; // Throws back to UI to trigger the SnackBar error
@@ -9221,17 +9527,7 @@ class PharmacyProvider extends ChangeNotifier {
 
         // 2. Restore stock to stock_batches
         if (productId.isNotEmpty && quantity > 0) {
-          await txn.rawUpdate(
-            'UPDATE stock_batches SET current_stock = current_stock + ? WHERE product_id = ? AND batch_number = ? COLLATE NOCASE',
-            [quantity, productId, batch],
-          );
-
-          // 3. In-memory sync
-          final pIdx = _products.indexWhere((p) => p.id == productId && p.batch.toUpperCase() == batch.toUpperCase());
-          if (pIdx != -1) _products[pIdx].stock += quantity;
-
-          final mIdx = _productMaster.indexWhere((p) => p.id == productId);
-          if (mIdx != -1) _productMaster[mIdx].stock += quantity;
+          await _restoreBatchStockInTxn(txn, productId, batch, quantity);
         }
 
         // 4. Delete row
@@ -9239,7 +9535,7 @@ class PharmacyProvider extends ChangeNotifier {
       });
 
       _writeOffs.removeWhere((w) => w.id == id);
-      notifyListeners();
+      await syncInventoryFromDb();
     } catch (e) {
       debugPrint("Delete Write-Off Error: $e");
       rethrow;
@@ -9295,28 +9591,12 @@ class PharmacyProvider extends ChangeNotifier {
           }
 
           if (pId.isNotEmpty && totalUnits > 0) {
-            final int affected = await txn.rawUpdate(
-              'UPDATE stock_batches SET current_stock = current_stock + ? WHERE product_id = ? AND batch_number = ? COLLATE NOCASE',
-              [totalUnits, pId, batch],
+            await _restoreBatchStockInTxn(
+              txn, pId, batch, totalUnits,
+              mrp: (item['mrp'] as num?)?.toDouble() ?? 0.0,
+              purchaseRate: (item['purchase_rate'] as num?)?.toDouble() ?? 0.0,
+              expiryDate: item['expiry_date']?.toString() ?? '',
             );
-
-            if (affected == 0 && batch.isNotEmpty) {
-              await txn.insert('stock_batches', {
-                'product_id': pId,
-                'batch_number': batch,
-                'current_stock': totalUnits,
-                'mrp': (item['mrp'] as num?)?.toDouble() ?? 0.0,
-                'purchase_rate': (item['purchase_rate'] as num?)?.toDouble() ?? 0.0,
-                'expiry_date': item['expiry_date']?.toString() ?? '',
-              });
-            }
-
-            // In-Memory sync
-            final pIndex = _products.indexWhere((p) => p.id == pId && p.batch.toUpperCase() == batch.toUpperCase());
-            if (pIndex != -1) _products[pIndex].stock += totalUnits;
-
-            final mIndex = _productMaster.indexWhere((p) => p.id == pId);
-            if (mIndex != -1) _productMaster[mIndex].stock += totalUnits;
           }
         }
 
@@ -9341,7 +9621,7 @@ class PharmacyProvider extends ChangeNotifier {
           financialYear: s.financialYear, isPaid: s.isPaid, isDeleted: true,
         );
       }
-      notifyListeners();
+      await syncInventoryFromDb();
     } catch (e) {
       debugPrint("Delete Sale Error: $e");
       rethrow;
@@ -9502,9 +9782,8 @@ class PharmacyProvider extends ChangeNotifier {
       });
 
       _purchases.removeWhere((p) => p.entryNo == entryNo);
-      _rebuildSearchIndex();
+      await syncInventoryFromDb();
       await fetchAccounts();
-      notifyListeners();
     } catch (e) { 
       debugPrint("Delete Purchase Error: $e"); 
       rethrow;
@@ -9604,8 +9883,7 @@ class PharmacyProvider extends ChangeNotifier {
       });
       
       _saleReturns.removeWhere((s) => s.entryNo == entryNo);
-      _rebuildSearchIndex();
-      notifyListeners();
+      await syncInventoryFromDb();
     } catch (e) {
       debugPrint("Delete Sale Return Error: $e");
       rethrow;
@@ -9618,25 +9896,35 @@ class PharmacyProvider extends ChangeNotifier {
     if (db == null) return;
     try {
       await db.transaction((txn) async {
-        // 1. Idempotency Check
-        final check = await txn.query(
-          'purchase_return_entries', 
-          columns: ['is_deleted', 'supplier_name', 'grand_total', 'is_imported'],
-          where: 'entry_no = ?', 
-          whereArgs: [entryNo]
-        );
-        if (check.isEmpty || check.first['is_deleted'] == 1) return;
+        String search1 = entryNo.trim();
+        String search2 = search1.toUpperCase().startsWith("PRET-") ? search1 : "PRET-$search1";
+        String cleanNo = search1.startsWith("PRET-") ? search1.substring(5) : search1;
+        if (cleanNo.contains('_')) {
+          cleanNo = cleanNo.substring(cleanNo.indexOf('_') + 1);
+        }
 
-        final bool isImported = (check.first['is_imported'] as int?) == 1;
-        final double grandTotal = (check.first['grand_total'] as num?)?.toDouble() ?? 0.0;
-        final String supplierName = check.first['supplier_name']?.toString() ?? "";
+        // 1. Flexible lookup to find actual database record
+        final check = await txn.rawQuery(
+          "SELECT * FROM purchase_return_entries WHERE (entry_no = ? OR entry_no = ? OR entry_no LIKE ?) AND IFNULL(is_deleted, 0) = 0 LIMIT 1",
+          [search1, search2, "%_$cleanNo"]
+        );
+
+        if (check.isEmpty) {
+          throw "Purchase Return Entry #$entryNo not found or already deleted.";
+        }
+
+        final record = check.first;
+        final String actualEntryNo = record['entry_no'].toString();
+        final bool isImported = (record['is_imported'] as int?) == 1;
+        final double grandTotal = (record['grand_total'] as num?)?.toDouble() ?? 0.0;
+        final String supplierName = record['supplier_name']?.toString() ?? "";
 
         // 2. Restore Stock including Free Goods
         if (!isImported) {
           final List<Map<String, dynamic>> items = await txn.query(
             'purchase_return_items', 
             where: 'entry_no = ?', 
-            whereArgs: [entryNo]
+            whereArgs: [actualEntryNo]
           );
           for (var item in items) {
             final mRes = await txn.query(
@@ -9654,16 +9942,7 @@ class PharmacyProvider extends ChangeNotifier {
 
               // Restore (Billed + Free) * packin + Loose
               final int totalUnitsToRestore = ((qty + fQty) * (packin > 0 ? packin : 1)) + looseQty;
-
-              await txn.rawUpdate(
-                'UPDATE stock_batches SET current_stock = current_stock + ? WHERE product_id = ? AND batch_number = ? COLLATE NOCASE',
-                [totalUnitsToRestore, productId, item['batch']]
-              );
-
-              final pIndex = _products.indexWhere((p) => p.id == productId && p.batch.toUpperCase() == item['batch'].toString().toUpperCase());
-              if (pIndex != -1) _products[pIndex].stock += totalUnitsToRestore;
-              final mIndex = _productMaster.indexWhere((p) => p.id == productId);
-              if (mIndex != -1) _productMaster[mIndex].stock += totalUnitsToRestore;
+              await _restoreBatchStockInTxn(txn, productId, item['batch']?.toString() ?? '', totalUnitsToRestore);
             }
           }
         }
@@ -9676,10 +9955,12 @@ class PharmacyProvider extends ChangeNotifier {
           );
         }
 
-        await txn.update('purchase_return_entries', {'is_deleted': 1}, where: 'entry_no = ?', whereArgs: [entryNo]);
+        await txn.update('purchase_return_entries', {'is_deleted': 1}, where: 'entry_no = ?', whereArgs: [actualEntryNo]);
+
+        _purchaseReturns.removeWhere((p) => p.entryNo == actualEntryNo || p.entryNo == entryNo);
       });
-      
-      _purchaseReturns.removeWhere((p) => p.entryNo == entryNo);
+
+      await syncInventoryFromDb();
       notifyListeners();
     } catch (e) {
       debugPrint("Delete Purchase Return Error: $e");
@@ -9846,7 +10127,7 @@ class PharmacyProvider extends ChangeNotifier {
           final List<Map<String, dynamic>> prod = await txn.query('product_master', columns: ['id'], where: 'name = ?', whereArgs: [item.productName]);
           if (prod.isNotEmpty) {
             int totalUnits = (item.qty + item.fQty) * (item.packin > 0 ? item.packin : 1);
-            await txn.rawUpdate('UPDATE stock_batches SET current_stock = current_stock + ? WHERE product_id = ? AND batch_number = ?', [totalUnits, prod[0]['id'], item.batch]);
+            await _restoreBatchStockInTxn(txn, prod[0]['id'].toString(), item.batch, totalUnits);
           }
         }
       });
@@ -9864,7 +10145,7 @@ class PharmacyProvider extends ChangeNotifier {
         // 1. Reverse old sale stock
         for (var item in oldSale.items) {
           int totalOldQty = item.qty;
-          await txn.rawUpdate('UPDATE stock_batches SET current_stock = current_stock + ? WHERE product_id = ? AND batch_number = ?', [totalOldQty, item.product.id, item.product.batch]);
+          await _restoreBatchStockInTxn(txn, item.product.id, item.product.batch, totalOldQty);
         }
         // 2. Delete old records
         await txn.delete('sales_items', where: 'invoice_no = ?', whereArgs: [oldSale.entryNo]);
@@ -10109,33 +10390,11 @@ class PharmacyProvider extends ChangeNotifier {
               'gst_percent': item.gstPercent,
             });
 
-            // Re-insert or Update the specific batch line
-            final batchCheck = await txn.query('stock_batches', 
-              where: 'product_id = ? AND batch_number = ? COLLATE NOCASE', 
-              whereArgs: [pId, item.product.batch]
+            await _restoreBatchStockInTxn(
+              txn, pId, item.product.batch, item.qty + item.fQty,
+              purchaseRate: item.purchaseRate,
+              expiryDate: item.product.expiry,
             );
-
-            if (batchCheck.isNotEmpty) {
-              await txn.rawUpdate(
-                'UPDATE stock_batches SET current_stock = current_stock + ? WHERE product_id = ? AND batch_number = ? COLLATE NOCASE',
-                [item.qty + item.fQty, pId, item.product.batch]
-              );
-            } else {
-              await txn.insert('stock_batches', {
-                'product_id': pId, 
-                'batch_number': item.product.batch, 
-                'expiry_date': item.product.expiry, 
-                'current_stock': item.qty + item.fQty, 
-                'purchase_rate': item.purchaseRate, 
-                'landing_cost': item.landingCost,
-                'mrp': item.product.mrp, 
-                'sale_rate': item.product.salePrice, 
-                'supplier_name': item.supplier, 
-                'rack': item.product.rack, 
-                'packing': item.packin,
-                'gst_percent': item.gstPercent
-              });
-            }
           }
         });
 
@@ -10238,7 +10497,7 @@ class PharmacyProvider extends ChangeNotifier {
       _saleReturns.sort((a, b) => b.date.compareTo(a.date));
       if (_saleReturns.length > 50) _saleReturns.removeLast();
 
-      notifyListeners();
+      await syncInventoryFromDb();
       return finalEntryNo;
     } catch (e) {
       debugPrint("Save Sale Return Error: $e");
@@ -10387,14 +10646,7 @@ class PharmacyProvider extends ChangeNotifier {
               final mRes = await txn.query('product_master', columns: ['id'], where: 'name = ? COLLATE NOCASE', whereArgs: [pName]);
               if (mRes.isNotEmpty) {
                 final productId = mRes.first['id'].toString();
-                await txn.rawUpdate(
-                  'UPDATE stock_batches SET current_stock = current_stock + ? WHERE product_id = ? AND batch_number = ?',
-                  [totalUnitsToRestore, productId, batch]
-                );
-                final pIndex = _products.indexWhere((p) => p.id == productId && p.batch == batch);
-                if (pIndex != -1) _products[pIndex].stock += totalUnitsToRestore;
-                final mIndex = _productMaster.indexWhere((p) => p.id == productId);
-                if (mIndex != -1) _productMaster[mIndex].stock += totalUnitsToRestore;
+                await _restoreBatchStockInTxn(txn, productId, batch, totalUnitsToRestore);
               }
             }
             await txn.delete('purchase_return_items', where: 'entry_no = ?', whereArgs: [finalEntryNo]);
@@ -10500,13 +10752,56 @@ class PharmacyProvider extends ChangeNotifier {
       _purchaseReturns.sort((a, b) => b.date.compareTo(a.date));
       if (_purchaseReturns.length > 50) _purchaseReturns.removeLast();
 
-      _rebuildSearchIndex();
-      notifyListeners();
+      await syncInventoryFromDb();
       return finalEntryNo;
     } catch (e) {
       debugPrint("Save Purchase Return Error: $e");
       rethrow;
     }
+  }
+
+  Future<List<Map<String, dynamic>>> searchSalesInvoices({
+    String? patient,
+    String? doctor,
+    String? mobile,
+    String? billValue,
+  }) async {
+    final db = await DbHelper.instance.database;
+    List<String> conditions = ["(is_deleted IS NULL OR is_deleted = 0)"];
+    List<dynamic> args = [];
+
+    if (patient != null && patient.trim().isNotEmpty) {
+      conditions.add("patient LIKE ?");
+      args.add("%${patient.trim()}%");
+    }
+    if (doctor != null && doctor.trim().isNotEmpty) {
+      conditions.add("doctor LIKE ?");
+      args.add("%${doctor.trim()}%");
+    }
+    if (mobile != null && mobile.trim().isNotEmpty) {
+      conditions.add("mobile LIKE ?");
+      args.add("%${mobile.trim()}%");
+    }
+    if (billValue != null && billValue.trim().isNotEmpty) {
+      final valStr = billValue.trim();
+      final double? valNum = double.tryParse(valStr);
+      if (valNum != null) {
+        conditions.add("(CAST(grand_total AS TEXT) LIKE ? OR grand_total = ?)");
+        args.add("%$valStr%");
+        args.add(valNum);
+      } else {
+        conditions.add("CAST(grand_total AS TEXT) LIKE ?");
+        args.add("%$valStr%");
+      }
+    }
+
+    if (conditions.length == 1) return [];
+
+    String whereClause = conditions.join(" AND ");
+    return await db.rawQuery(
+      "SELECT entry_no, date, patient, doctor, mobile, grand_total FROM sales_invoices WHERE $whereClause ORDER BY rowid DESC LIMIT 50",
+      args,
+    );
   }
 
   Future<Map<String, dynamic>?> navigateInvoice(String currentEntry, String direction, {bool isPurchase = false, bool isSaleReturn = false, bool isPurchaseReturn = false, bool isAdjustment = false}) async {
@@ -10532,20 +10827,23 @@ class PharmacyProvider extends ChangeNotifier {
     String isDelFilter = '';
 
     if (direction == 'find') {
+      String search1 = currentEntry.trim();
+      String search2 = (prefix.isNotEmpty && !search1.toUpperCase().startsWith(prefix)) ? "$prefix$search1" : search1;
+
       // Step 1: Fast exact primary key or invoice_no match (O(1) indexed lookup)
       List<Map<String, dynamic>> res = await db.rawQuery(
         table == 'sales_invoices'
-            ? "SELECT * FROM $table WHERE (entry_no = ? OR invoice_no = ?) $isDelFilter LIMIT 1"
-            : "SELECT * FROM $table WHERE entry_no = ? $isDelFilter LIMIT 1",
-        table == 'sales_invoices' ? [currentEntry, currentEntry] : [currentEntry]
+            ? "SELECT * FROM $table WHERE (entry_no = ? OR invoice_no = ? OR entry_no = ?) $isDelFilter LIMIT 1"
+            : "SELECT * FROM $table WHERE (entry_no = ? OR entry_no = ?) $isDelFilter LIMIT 1",
+        table == 'sales_invoices' ? [search1, search1, search2] : [search1, search2]
       );
       if (res.isNotEmpty) return res.first;
 
       // Step 2: Fallback for entry numbers with financial year prefix (e.g. "2024-25_17876")
       if (currentNo.isNotEmpty) {
         res = await db.rawQuery(
-          "SELECT * FROM $table WHERE entry_no LIKE ? $isDelFilter LIMIT 1",
-          ["%_$currentNo"]
+          "SELECT * FROM $table WHERE (entry_no LIKE ? OR entry_no LIKE ?) $isDelFilter LIMIT 1",
+          ["%_$currentNo", "%_$search2"]
         );
         if (res.isNotEmpty) return res.first;
       }
@@ -11821,17 +12119,11 @@ class PharmacyProvider extends ChangeNotifier {
       if (isStart) {
         startsMatches.add(p);
       } else {
-        if (containsMatches.length < 50) {
-          final bool isContain = nameLower.contains(q) ||
-              (includeGenerics && p.genericName.trim().toLowerCase().contains(q));
-          if (isContain) {
-            containsMatches.add(p);
-          }
+        final bool isContain = nameLower.contains(q) ||
+            (includeGenerics && p.genericName.trim().toLowerCase().contains(q));
+        if (isContain) {
+          containsMatches.add(p);
         }
-      }
-
-      if (startsMatches.length >= 50 && containsMatches.length >= 50) {
-        break; // Stop scanning thousands of extra items once top 100 matches are collected
       }
     }
 
@@ -12419,28 +12711,60 @@ class PharmacyProvider extends ChangeNotifier {
     }
   }
 
-  Future<List<StockLedgerItem>> getStockLedgerReport(DateTime fromDate, DateTime toDate) async {
+  Future<List<StockLedgerItem>> getStockLedgerReport(
+    DateTime fromDate, 
+    DateTime toDate, {
+    String? supplierFilter,
+    String? categoryFilter,
+  }) async {
     if (kIsWeb) return [];
     final db = await DbHelper.instance.database;
     final fromStr = fromDate.toIso8601String().split('T')[0];
     final toStr = toDate.toIso8601String().split('T')[0];
+
+    List<dynamic> whereParams = [];
+    String whereClause = "WHERE (b.is_active = 1 OR b.is_active IS NULL)";
+    
+    if (supplierFilter != null && supplierFilter != 'ALL' && supplierFilter.trim().isNotEmpty) {
+      whereClause += " AND LOWER(TRIM(b.supplier_name)) = LOWER(TRIM(?))";
+      whereParams.add(supplierFilter.trim());
+    }
+    if (categoryFilter != null && categoryFilter != 'ALL' && categoryFilter.trim().isNotEmpty) {
+      whereClause += " AND (LOWER(TRIM(p.category_id)) = LOWER(TRIM(?)) OR LOWER(TRIM(p.sub_category_id)) = LOWER(TRIM(?)))";
+      whereParams.add(categoryFilter.trim());
+      whereParams.add(categoryFilter.trim());
+    }
+
+    final List<dynamic> queryArgs = [
+      fromStr,
+      fromStr, toStr,
+      fromStr, toStr,
+      fromStr, toStr,
+      fromStr, toStr,
+      fromStr, toStr,
+      fromStr, toStr,
+      fromStr, toStr,
+      ...whereParams
+    ];
 
     final List<Map<String, dynamic>> results = await db.rawQuery('''
       SELECT 
           b.product_id, 
           b.batch_number,
           p.name as product_name,
-          p.patent,
-          p.packing,
-          p.hsn_code,
-          p.gst_percent,
-          b.mrp,
-          b.purchase_rate,
-          b.supplier_name,
+          IFNULL(p.patent, '') as patent,
+          IFNULL(p.packing, 1) as packing,
+          IFNULL(p.hsn_code, '') as hsn_code,
+          IFNULL(p.gst_percent, 12.0) as gst_percent,
+          IFNULL(b.mrp, 0.0) as mrp,
+          IFNULL(b.purchase_rate, 0.0) as purchase_rate,
+          IFNULL(b.supplier_name, '') as supplier_name,
+          IFNULL(b.current_stock, 0) as current_stock,
           
-          SUM(CASE WHEN t.date < ? THEN t.qty * t.factor ELSE 0 END) as opening_stock,
+          SUM(CASE WHEN t.date < ? THEN t.qty * t.factor ELSE 0 END) as hist_opening,
           SUM(CASE WHEN t.date BETWEEN ? AND ? AND t.type = 'PUR' THEN t.qty ELSE 0 END) as purchase,
-          SUM(CASE WHEN t.date BETWEEN ? AND ? AND t.type = 'SAL' THEN t.qty ELSE 0 END) as sales,
+          SUM(CASE WHEN t.date BETWEEN ? AND ? AND (t.type = 'SAL' OR t.type = 'B2B') THEN t.qty ELSE 0 END) as sales,
+          SUM(CASE WHEN t.date BETWEEN ? AND ? AND t.type = 'B2B' THEN t.qty ELSE 0 END) as b2b_sales,
           SUM(CASE WHEN t.date BETWEEN ? AND ? AND t.type = 'SRET' THEN t.qty ELSE 0 END) as sale_return,
           SUM(CASE WHEN t.date BETWEEN ? AND ? AND t.type = 'PRET' THEN t.qty ELSE 0 END) as purchase_return,
           SUM(CASE WHEN t.date BETWEEN ? AND ? AND t.type = 'ADJ' THEN t.qty ELSE 0 END) as adjustment,
@@ -12448,28 +12772,30 @@ class PharmacyProvider extends ChangeNotifier {
       FROM stock_batches b
       JOIN product_master p ON b.product_id = p.id
       LEFT JOIN (
-          -- 1. PURCHASES (With is_deleted Filter)
+          -- 1. PURCHASES
           SELECT pi.product_id, pi.batch, (pi.qty + pi.f_qty) * (CASE WHEN pi.packin > 0 THEN pi.packin ELSE 1 END) as qty, 1 as factor, 'PUR' as type, date(pe.date) as date
           FROM purchase_items pi 
           JOIN purchase_entries pe ON pi.entry_no = pe.entry_no
           WHERE IFNULL(pe.is_deleted, 0) = 0
           
           UNION ALL
-          -- 2. SALES (With is_deleted Filter)
-          SELECT si.product_id, si.batch_number as batch, si.qty, -1 as factor, 'SAL' as type, date(sv.date) as date
+          -- 2. SALES
+          SELECT si.product_id, si.batch_number as batch, si.qty, -1 as factor, 
+                 CASE WHEN UPPER(IFNULL(sv.tax_type, '')) LIKE '%B2B%' OR (IFNULL(sv.customer_acc, '') != '' AND LOWER(sv.customer_acc) != 'cash') THEN 'B2B' ELSE 'SAL' END as type, 
+                 date(sv.date) as date
           FROM sales_items si
           JOIN sales_invoices sv ON si.invoice_no = sv.entry_no
           WHERE IFNULL(sv.is_deleted, 0) = 0
           
           UNION ALL
-          -- 3. SALES RETURNS (With is_deleted Filter)
+          -- 3. SALES RETURNS
           SELECT sri.product_id, sri.batch_number as batch, sri.quantity as qty, 1 as factor, 'SRET' as type, date(srv.date) as date
           FROM sales_return_items sri
           JOIN sales_return_invoices srv ON sri.return_no = srv.entry_no
           WHERE IFNULL(srv.is_deleted, 0) = 0
           
           UNION ALL
-          -- 4. PURCHASE RETURNS (With is_deleted Filter)
+          -- 4. PURCHASE RETURNS
           SELECT pri_p.id as product_id, pri.batch, (pri.qty * (CASE WHEN pri.packin > 0 THEN pri.packin ELSE 1 END)) + pri.loose_qty as qty, -1 as factor, 'PRET' as type, date(prv.date) as date
           FROM purchase_return_items pri
           JOIN purchase_return_entries prv ON pri.entry_no = prv.entry_no
@@ -12477,7 +12803,7 @@ class PharmacyProvider extends ChangeNotifier {
           WHERE IFNULL(prv.is_deleted, 0) = 0
           
           UNION ALL
-          -- 5. STOCK ADJUSTMENTS (With is_deleted Filter)
+          -- 5. STOCK ADJUSTMENTS
           SELECT sai.product_id, sai.batch_number as batch, sai.qty, 1 as factor, 
                  CASE WHEN UPPER(sa.reason) LIKE '%DAMAGE%' THEN 'DMG' ELSE 'ADJ' END as type, 
                  date(sa.date) as date
@@ -12491,27 +12817,22 @@ class PharmacyProvider extends ChangeNotifier {
                  'DMG' as type, date(swo.date) as date
           FROM stock_write_offs swo
       ) t ON b.product_id = t.product_id AND b.batch_number = t.batch
+      $whereClause
       GROUP BY b.product_id, b.batch_number
       ORDER BY p.name ASC
-    ''', [
-      fromStr,
-      fromStr, toStr,
-      fromStr, toStr,
-      fromStr, toStr,
-      fromStr, toStr,
-      fromStr, toStr,
-      fromStr, toStr
-    ]);
+    ''', queryArgs);
 
     return results.map((r) {
-      int openStk = (r['opening_stock'] as num?)?.toInt() ?? 0;
+      int histOpen = (r['hist_opening'] as num?)?.toInt() ?? 0;
       int pur = (r['purchase'] as num?)?.toInt() ?? 0;
       int sal = (r['sales'] as num?)?.toInt() ?? 0;
+      int b2bSal = (r['b2b_sales'] as num?)?.toInt() ?? 0;
       int sRet = (r['sale_return'] as num?)?.toInt() ?? 0;
       int pRet = (r['purchase_return'] as num?)?.toInt() ?? 0;
       int adj = (r['adjustment'] as num?)?.toInt() ?? 0;
       int dmg = (r['damage'] as num?)?.toInt() ?? 0;
 
+      int openStk = histOpen;
       int closing = openStk + pur - sal + sRet - pRet + adj - dmg;
 
       return StockLedgerItem(
@@ -12527,6 +12848,7 @@ class PharmacyProvider extends ChangeNotifier {
         openingStock: openStk,
         purchase: pur,
         sales: sal,
+        b2bSales: b2bSal,
         saleReturn: sRet,
         purchaseReturn: pRet,
         adjustment: adj,
@@ -12761,7 +13083,805 @@ class PharmacyProvider extends ChangeNotifier {
         DoubleCellValue((row['mrpValuation'] as num?)?.toDouble() ?? 0.0),
       ]);
     }
-    return Uint8List.fromList(excel.encode()!);
+    final bytes = excel.save();
+    return Uint8List.fromList(bytes ?? []);
+  }
+
+  Future<Uint8List?> exportStockLedgerReportToExcelBytes(
+    List<StockLedgerItem> items,
+    DateTime fromDate,
+    DateTime toDate,
+  ) async {
+    try {
+      final fromStr = DateFormat('dd/MM/yyyy').format(fromDate);
+      final toStr = DateFormat('dd/MM/yyyy').format(toDate);
+      final data = items.map((item) => {
+        'productName': item.productName,
+        'patent': item.patent,
+        'packin': item.packin,
+        'batch': item.batch,
+        'hsnCode': item.hsnCode,
+        'gst': item.gst,
+        'mrp': item.mrp,
+        'supplier': item.supplier,
+        'openingStock': item.openingStock,
+        'purchase': item.purchase,
+        'damage': item.damage,
+        'saleReturn': item.saleReturn,
+        'sales': item.sales,
+        'b2bSales': item.b2bSales,
+        'purchaseReturn': item.purchaseReturn,
+        'adjustment': item.adjustment,
+        'closingStock': item.closingStock,
+        'mrpValue': item.mrpValue,
+        'lCostValue': item.lCostValue,
+      }).toList();
+
+      return await compute(_generateStockLedgerReportExcelIsolate, {
+        'from': fromStr,
+        'to': toStr,
+        'items': data,
+      });
+    } catch (e) {
+      debugPrint("Export Stock Ledger Excel Error: $e");
+      return null;
+    }
+  }
+
+  static Uint8List _generateStockLedgerReportExcelIsolate(Map<String, dynamic> params) {
+    final String fromStr = params['from'] ?? '';
+    final String toStr = params['to'] ?? '';
+    final List<Map<String, dynamic>> items = List<Map<String, dynamic>>.from(params['items'] ?? []);
+
+    var excel = Excel.createExcel();
+    Sheet sheetObject = excel['Stock Ledger Register'];
+    excel.delete('Sheet1');
+
+    sheetObject.appendRow([
+      TextCellValue("CONSOLIDATED STOCK MOVEMENT REGISTER"),
+      TextCellValue("Period: $fromStr to $toStr"),
+    ]);
+    sheetObject.appendRow([]);
+
+    sheetObject.appendRow([
+      TextCellValue("SL"),
+      TextCellValue("Product"),
+      TextCellValue("Patent"),
+      TextCellValue("Packing"),
+      TextCellValue("Batch"),
+      TextCellValue("HSN Code"),
+      TextCellValue("GST %"),
+      TextCellValue("MRP (₹)"),
+      TextCellValue("Supplier"),
+      TextCellValue("Opening Stock"),
+      TextCellValue("Purchase"),
+      TextCellValue("Damage"),
+      TextCellValue("S.Return"),
+      TextCellValue("Sales"),
+      TextCellValue("B2BSales"),
+      TextCellValue("P.Return"),
+      TextCellValue("Adjustment"),
+      TextCellValue("Closing Stock"),
+      TextCellValue("MRP Value (₹)"),
+      TextCellValue("LCost Value (₹)"),
+    ]);
+
+    for (int i = 0; i < items.length; i++) {
+      final row = items[i];
+      sheetObject.appendRow([
+        IntCellValue(i + 1),
+        TextCellValue(row['productName']?.toString() ?? ""),
+        TextCellValue(row['patent']?.toString() ?? ""),
+        IntCellValue((row['packin'] as num?)?.toInt() ?? 1),
+        TextCellValue(row['batch']?.toString() ?? ""),
+        TextCellValue(row['hsnCode']?.toString() ?? ""),
+        DoubleCellValue((row['gst'] as num?)?.toDouble() ?? 0.0),
+        DoubleCellValue((row['mrp'] as num?)?.toDouble() ?? 0.0),
+        TextCellValue(row['supplier']?.toString() ?? ""),
+        IntCellValue((row['openingStock'] as num?)?.toInt() ?? 0),
+        IntCellValue((row['purchase'] as num?)?.toInt() ?? 0),
+        IntCellValue((row['damage'] as num?)?.toInt() ?? 0),
+        IntCellValue((row['saleReturn'] as num?)?.toInt() ?? 0),
+        IntCellValue((row['sales'] as num?)?.toInt() ?? 0),
+        IntCellValue((row['b2bSales'] as num?)?.toInt() ?? 0),
+        IntCellValue((row['purchaseReturn'] as num?)?.toInt() ?? 0),
+        IntCellValue((row['adjustment'] as num?)?.toInt() ?? 0),
+        IntCellValue((row['closingStock'] as num?)?.toInt() ?? 0),
+        DoubleCellValue((row['mrpValue'] as num?)?.toDouble() ?? 0.0),
+        DoubleCellValue((row['lCostValue'] as num?)?.toDouble() ?? 0.0),
+      ]);
+    }
+    final bytes = excel.save();
+    return Uint8List.fromList(bytes ?? []);
+  }
+
+  Future<List<Map<String, dynamic>>> getWholesalerNamesWithCounts() async {
+    final db = await DbHelper.instance.database;
+    final rows = await db.rawQuery('''
+      SELECT supplier_name as name, COUNT(DISTINCT product_id) as count FROM (
+        SELECT pe.supplier_name, pi.product_id FROM purchase_items pi JOIN purchase_entries pe ON pi.entry_no = pe.entry_no WHERE (pe.is_deleted = 0 OR pe.is_deleted IS NULL) AND pe.supplier_name IS NOT NULL AND pe.supplier_name != ''
+        UNION
+        SELECT supplier_name, product_id FROM stock_batches WHERE supplier_name IS NOT NULL AND supplier_name != ''
+        UNION
+        SELECT preferred_wholesale as supplier_name, id as product_id FROM product_master WHERE preferred_wholesale IS NOT NULL AND preferred_wholesale != ''
+        UNION
+        SELECT wholesaler_name as supplier_name, product_id FROM ProductMappings WHERE wholesaler_name IS NOT NULL AND wholesaler_name != ''
+      ) WHERE supplier_name IS NOT NULL AND supplier_name != ''
+      GROUP BY supplier_name 
+      ORDER BY supplier_name ASC
+    ''');
+    return rows.map((r) => {
+      'name': r['name']?.toString() ?? '',
+      'count': (r['count'] as num?)?.toInt() ?? 0
+    }).toList();
+  }
+
+  Future<Map<String, Set<String>>> getWholesaler1YearPurchasesMap({DateTime? referenceDate}) async {
+    final db = await DbHelper.instance.database;
+    final refDate = referenceDate ?? DateTime.now();
+    final oneYearAgo = refDate.subtract(const Duration(days: 365));
+
+    final List<Map<String, dynamic>> rows = await db.rawQuery('''
+      SELECT pe.supplier_name, pi.product_id, pe.date
+      FROM purchase_items pi
+      JOIN purchase_entries pe ON pi.entry_no = pe.entry_no
+      WHERE (pe.is_deleted = 0 OR pe.is_deleted IS NULL)
+        AND pe.supplier_name IS NOT NULL AND TRIM(pe.supplier_name) != ''
+        AND pi.product_id IS NOT NULL AND pi.product_id != ''
+    ''');
+
+    final Map<String, Set<String>> resultMap = {};
+
+    for (var r in rows) {
+      final supplier = r['supplier_name']?.toString().trim().toLowerCase() ?? '';
+      final pid = r['product_id']?.toString().trim() ?? '';
+      final rawDate = r['date']?.toString() ?? '';
+
+      if (supplier.isEmpty || pid.isEmpty) continue;
+
+      DateTime? itemDate;
+      if (rawDate.contains('/')) {
+        final parts = rawDate.split(' ')[0].split('/');
+        if (parts.length == 3) {
+          final day = int.tryParse(parts[0]) ?? 1;
+          final month = int.tryParse(parts[1]) ?? 1;
+          final year = int.tryParse(parts[2]) ?? 2000;
+          itemDate = DateTime(year, month, day);
+        }
+      } else {
+        itemDate = DateTime.tryParse(rawDate);
+      }
+
+      if (itemDate == null || itemDate.isAfter(oneYearAgo) || itemDate.isAtSameMomentAs(oneYearAgo)) {
+        resultMap.putIfAbsent(supplier, () => {}).add(pid);
+      }
+    }
+
+    // Include Product Master Preferred Wholesalers & Product Mappings
+    final List<Map<String, dynamic>> masterRows = await db.rawQuery('''
+      SELECT LOWER(TRIM(preferred_wholesale)) as supplier, id as product_id
+      FROM product_master
+      WHERE preferred_wholesale IS NOT NULL AND TRIM(preferred_wholesale) != ''
+      UNION
+      SELECT LOWER(TRIM(wholesaler_name)) as supplier, product_id
+      FROM ProductMappings
+      WHERE wholesaler_name IS NOT NULL AND TRIM(wholesaler_name) != ''
+    ''');
+
+    for (var r in masterRows) {
+      final supplier = r['supplier']?.toString().trim().toLowerCase() ?? '';
+      final pid = r['product_id']?.toString().trim() ?? '';
+      if (supplier.isNotEmpty && pid.isNotEmpty) {
+        resultMap.putIfAbsent(supplier, () => {}).add(pid);
+      }
+    }
+
+    return resultMap;
+  }
+
+  Future<List<WholesaleStockItem>> getWholesaleDirectoryForSupplier(String supplierName) async {
+    if (supplierName.trim().isEmpty) return [];
+
+    final db = await DbHelper.instance.database;
+    final String cleanSupplier = supplierName.trim();
+
+    final rankingsMap = await getProductRankingsMap();
+    final List<ProductRanking> rankingList = rankingsMap.values.toSet().toList();
+    rankingList.sort((a, b) => b.weightedScore.compareTo(a.weightedScore));
+    final Map<String, int> rankPositionMap = {};
+    for (int i = 0; i < rankingList.length; i++) {
+      final pr = rankingList[i];
+      if (pr.id.isNotEmpty) rankPositionMap[pr.id] = i + 1;
+      if (pr.name.isNotEmpty) rankPositionMap[pr.name.toUpperCase().trim()] = i + 1;
+    }
+
+    final String query = '''
+      SELECT 
+        p.id as product_id,
+        p.name as product_name,
+        IFNULL(p.generic_name, '') as generic_name,
+        IFNULL(NULLIF(p.manufacturer_id, ''), 'Unassigned') as company_name,
+        COALESCE(NULLIF(p.category_id, ''), NULLIF(p.patent, ''), NULLIF(p.sub_category_id, ''), 'General') as category_name,
+        IFNULL(p.unit, 'Strip') as unit,
+        IFNULL(p.packing, 1) as packing,
+        IFNULL(stk.total_stock, 0) as current_stock
+      FROM (
+        SELECT pi.product_id FROM purchase_items pi JOIN purchase_entries pe ON pi.entry_no = pe.entry_no WHERE (pe.is_deleted = 0 OR pe.is_deleted IS NULL) AND LOWER(pe.supplier_name) = LOWER(?)
+        UNION
+        SELECT product_id FROM stock_batches WHERE LOWER(supplier_name) = LOWER(?)
+        UNION
+        SELECT id as product_id FROM product_master WHERE LOWER(preferred_wholesale) = LOWER(?)
+        UNION
+        SELECT product_id FROM ProductMappings WHERE LOWER(wholesaler_name) = LOWER(?)
+      ) wp
+      JOIN product_master p ON wp.product_id = p.id
+      LEFT JOIN (
+        SELECT product_id, SUM(current_stock) as total_stock
+        FROM stock_batches
+        GROUP BY product_id
+      ) stk ON p.id = stk.product_id
+      WHERE (p.is_active = 1 OR p.is_active IS NULL)
+      GROUP BY p.id
+      ORDER BY p.name ASC
+    ''';
+
+    final List<Map<String, dynamic>> rows = await db.rawQuery(query, [cleanSupplier, cleanSupplier, cleanSupplier, cleanSupplier]);
+
+    return rows.map((r) {
+      final String pId = r['product_id']?.toString() ?? '';
+      final String pName = (r['product_name']?.toString() ?? '').toUpperCase().trim();
+      final int rRank = rankPositionMap[pId] ?? rankPositionMap[pName] ?? 0;
+      final int cStock = (r['current_stock'] as num?)?.toInt() ?? 0;
+
+      return WholesaleStockItem(
+        productId: pId,
+        productName: r['product_name']?.toString() ?? '',
+        genericName: r['generic_name']?.toString() ?? '',
+        companyName: r['company_name']?.toString() ?? 'Unassigned',
+        categoryName: r['category_name']?.toString() ?? 'General',
+        wholesaleName: cleanSupplier,
+        batchNumber: '-',
+        expiryDate: '-',
+        currentStock: cStock,
+        purchaseRate: 0.0,
+        mrp: 0.0,
+        saleRate: 0.0,
+        rack: '-',
+        unit: r['unit']?.toString() ?? 'Strip',
+        packing: (r['packing'] as num?)?.toInt() ?? 1,
+        rank: rRank,
+      );
+    }).toList();
+  }
+
+  /// Extracts the base brand name from a full medicine product name.
+  /// E.g. "DOLO 650 MG TAB" -> "DOLO"
+  String extractBaseBrandName(String rawName) {
+    if (rawName.trim().isEmpty) return "";
+    String cleaned = rawName.toUpperCase();
+
+    // Remove dosage units and forms
+    final RegExp removeRegExp = RegExp(
+      r'\b(\d+(\.\d+)?\s*(MG|ML|GM|MCG|IU|%|S|CAP|TAB|TABLET|INJ|INJECTION|SYP|SYRUP|SUSP|OINT|CREAM|GEL|DROPS|FORTE|PLUS|GOLD|SR|CR|ER|PR|TR|XL|MD|DT|DS|STRIP))\b',
+      caseSensitive: false,
+    );
+    cleaned = cleaned.replaceAll(removeRegExp, ' ');
+    cleaned = cleaned.replaceAll(RegExp(r'\b\d+(\.\d+)?\b'), ' ');
+    cleaned = cleaned.replaceAll(RegExp(r'\s+'), ' ').trim();
+
+    final tokens = cleaned.split(' ').where((t) => t.length > 1).toList();
+    if (tokens.isNotEmpty) {
+      return tokens.first;
+    }
+    final origTokens = rawName.trim().split(RegExp(r'\s+'));
+    if (origTokens.isNotEmpty) return origTokens.first.toUpperCase();
+    return rawName.trim().toUpperCase();
+  }
+
+  /// Ultra-fast check of Wholesalers for a product (Green, Orange, Yellow)
+  Future<List<WholesalerAvailabilityResult>> checkWholesalerAvailability({
+    required String productName,
+    String patent = "",
+    String category = "",
+    String productId = "",
+  }) async {
+    final db = await DbHelper.instance.database;
+    final String cleanProdName = productName.trim();
+    if (cleanProdName.isEmpty) return [];
+
+    final String baseBrand = extractBaseBrandName(cleanProdName);
+
+    // 1. Resolve product_id, patent, and category from product_master if missing
+    String resolvedPid = productId.trim();
+    String resolvedPatent = patent.trim().toLowerCase();
+    String resolvedCategory = category.trim().toLowerCase();
+
+    final String pidEscaped = resolvedPid.replaceAll("'", "''");
+
+    final pmLookups = await db.rawQuery('''
+      SELECT id, name, patent, manufacturer_id, category_id, sub_category_id
+      FROM product_master
+      WHERE ${pidEscaped.isNotEmpty ? "id = '$pidEscaped' OR " : ""} LOWER(TRIM(name)) = LOWER(?)
+      LIMIT 1
+    ''', [cleanProdName.toLowerCase()]);
+
+    if (pmLookups.isNotEmpty) {
+      final pm = pmLookups.first;
+      if (resolvedPid.isEmpty) resolvedPid = pm['id']?.toString() ?? '';
+      if (resolvedPatent.isEmpty) {
+        resolvedPatent = (pm['patent']?.toString() ?? pm['manufacturer_id']?.toString() ?? '').trim().toLowerCase();
+      }
+      if (resolvedCategory.isEmpty) {
+        resolvedCategory = (pm['category_id']?.toString() ?? pm['sub_category_id']?.toString() ?? '').trim().toLowerCase();
+      }
+    }
+
+    final String cleanSearchTerm = cleanProdName.toLowerCase();
+    final String cleanPidEscaped = resolvedPid.replaceAll("'", "''");
+
+    // 2. Fetch Exact Purchases / Opening Inventory per Wholesaler (Green)
+    final List<Map<String, dynamic>> exactRows = await db.rawQuery('''
+      SELECT DISTINCT wholesaler, product_name FROM (
+        -- Past Saved Purchase Invoices
+        SELECT pe.supplier_name as wholesaler, pi.product_name
+        FROM purchase_items pi
+        JOIN purchase_entries pe ON CAST(pi.entry_no AS TEXT) = CAST(pe.entry_no AS TEXT)
+        LEFT JOIN product_master pm ON pi.product_id = pm.id
+        WHERE (pe.is_deleted = 0 OR pe.is_deleted IS NULL OR pe.is_deleted = '0')
+          AND pe.supplier_name IS NOT NULL AND pe.supplier_name != ''
+          AND (
+            LOWER(TRIM(pi.product_name)) = ?
+            OR LOWER(TRIM(IFNULL(pm.name, ''))) = ?
+            ${cleanPidEscaped.isNotEmpty ? "OR pi.product_id = '$cleanPidEscaped'" : ""}
+          )
+        -- Stock Batches (joining product_master)
+        UNION
+        SELECT sb.supplier_name as wholesaler, pm.name as product_name
+        FROM stock_batches sb
+        JOIN product_master pm ON sb.product_id = pm.id
+        WHERE sb.supplier_name IS NOT NULL AND sb.supplier_name != ''
+          AND (
+            LOWER(TRIM(pm.name)) = ?
+            ${cleanPidEscaped.isNotEmpty ? "OR sb.product_id = '$cleanPidEscaped'" : ""}
+          )
+        -- Product Master Preferred Wholesaler
+        UNION
+        SELECT pm.preferred_wholesale as wholesaler, pm.name as product_name
+        FROM product_master pm
+        WHERE pm.preferred_wholesale IS NOT NULL AND pm.preferred_wholesale != ''
+          AND (
+            LOWER(TRIM(pm.name)) = ?
+            ${cleanPidEscaped.isNotEmpty ? "OR pm.id = '$cleanPidEscaped'" : ""}
+          )
+      ) WHERE wholesaler IS NOT NULL AND wholesaler != ''
+    ''', [
+      cleanSearchTerm, cleanSearchTerm,
+      cleanSearchTerm,
+      cleanSearchTerm,
+    ]);
+
+    final Map<String, String> exactWholesalers = {};
+    final Map<String, String> displayNames = {};
+
+    for (var r in exactRows) {
+      final w = r['wholesaler']?.toString().trim() ?? '';
+      final pName = r['product_name']?.toString().trim() ?? cleanProdName;
+      if (w.isNotEmpty) {
+        final wLower = w.toLowerCase();
+        exactWholesalers[wLower] = pName;
+        displayNames[wLower] = w;
+      }
+    }
+
+    // 3. Fetch Brand Variant Purchases / Opening Inventory per Wholesaler (Orange)
+    final Map<String, String> brandVariantWholesalers = {};
+    if (baseBrand.length >= 2) {
+      final List<Map<String, dynamic>> brandRows = await db.rawQuery('''
+        SELECT DISTINCT wholesaler, product_name FROM (
+          SELECT pe.supplier_name as wholesaler, pi.product_name
+          FROM purchase_items pi
+          JOIN purchase_entries pe ON CAST(pi.entry_no AS TEXT) = CAST(pe.entry_no AS TEXT)
+          LEFT JOIN product_master pm ON pi.product_id = pm.id
+          WHERE (pe.is_deleted = 0 OR pe.is_deleted IS NULL OR pe.is_deleted = '0')
+            AND pe.supplier_name IS NOT NULL AND pe.supplier_name != ''
+            AND (UPPER(pi.product_name) LIKE ? OR UPPER(IFNULL(pm.name, '')) LIKE ?)
+          UNION
+          SELECT sb.supplier_name as wholesaler, pm.name as product_name
+          FROM stock_batches sb
+          JOIN product_master pm ON sb.product_id = pm.id
+          WHERE sb.supplier_name IS NOT NULL AND sb.supplier_name != ''
+            AND UPPER(pm.name) LIKE ?
+          UNION
+          SELECT pm.preferred_wholesale as wholesaler, pm.name as product_name
+          FROM product_master pm
+          WHERE pm.preferred_wholesale IS NOT NULL AND pm.preferred_wholesale != ''
+            AND UPPER(pm.name) LIKE ?
+        ) WHERE wholesaler IS NOT NULL AND wholesaler != ''
+      ''', ['%$baseBrand%', '%$baseBrand%', '%$baseBrand%', '%$baseBrand%']);
+
+      for (var r in brandRows) {
+        final w = r['wholesaler']?.toString().trim() ?? '';
+        final pName = r['product_name']?.toString().trim() ?? '';
+        if (w.isNotEmpty) {
+          final wLower = w.toLowerCase();
+          if (!exactWholesalers.containsKey(wLower)) {
+            brandVariantWholesalers[wLower] = pName;
+            displayNames[wLower] = w;
+          }
+        }
+      }
+    }
+
+    // 4. Fetch Directory / Mapping Matches (Yellow)
+    final Map<String, String> yellowWholesalers = {};
+
+    // 4a. Check Product Mappings & Directory for exact item or brand family
+    final List<Map<String, dynamic>> mapBrandRows = await db.rawQuery('''
+      SELECT DISTINCT wholesaler, product_name FROM (
+        SELECT wholesaler_name as wholesaler, p.name as product_name
+        FROM ProductMappings pm
+        JOIN product_master p ON pm.product_id = p.id
+        WHERE wholesaler_name IS NOT NULL AND wholesaler_name != ''
+          AND (UPPER(p.name) LIKE ? ${cleanPidEscaped.isNotEmpty ? "OR pm.product_id = '$cleanPidEscaped'" : ""})
+        UNION
+        SELECT preferred_wholesale as wholesaler, name as product_name
+        FROM product_master
+        WHERE preferred_wholesale IS NOT NULL AND preferred_wholesale != ''
+          AND (UPPER(name) LIKE ? ${cleanPidEscaped.isNotEmpty ? "OR id = '$cleanPidEscaped'" : ""})
+        UNION
+        SELECT sb.supplier_name as wholesaler, p.name as product_name
+        FROM stock_batches sb
+        JOIN product_master p ON sb.product_id = p.id
+        WHERE sb.supplier_name IS NOT NULL AND sb.supplier_name != ''
+          AND (UPPER(p.name) LIKE ? ${cleanPidEscaped.isNotEmpty ? "OR sb.product_id = '$cleanPidEscaped'" : ""})
+      ) WHERE wholesaler IS NOT NULL AND wholesaler != ''
+    ''', ['%$baseBrand%', '%$baseBrand%', '%$baseBrand%']);
+
+    for (var r in mapBrandRows) {
+      final w = r['wholesaler']?.toString().trim() ?? '';
+      final pName = r['product_name']?.toString().trim() ?? cleanProdName;
+      if (w.isNotEmpty) {
+        final wLower = w.toLowerCase();
+        if (!exactWholesalers.containsKey(wLower) && !brandVariantWholesalers.containsKey(wLower)) {
+          yellowWholesalers[wLower] = "Mapped product: $pName";
+          displayNames[wLower] = w;
+        }
+      }
+    }
+
+    // 5. Populate Master Suppliers and purchase counts
+    final masterWholesalers = await getWholesalerNamesWithCounts();
+    final Map<String, int> wholesalerCounts = {};
+    for (var m in masterWholesalers) {
+      final w = m['name']?.toString().trim() ?? '';
+      final cnt = (m['count'] as num?)?.toInt() ?? 0;
+      if (w.isNotEmpty) {
+        final wLower = w.toLowerCase();
+        wholesalerCounts[wLower] = cnt;
+        if (!displayNames.containsKey(wLower)) {
+          displayNames[wLower] = w;
+        }
+      }
+    }
+
+    // 6. Assemble and Sort Final Results
+    final Set<String> matchedKeys = {
+      ...exactWholesalers.keys,
+      ...brandVariantWholesalers.keys,
+      ...yellowWholesalers.keys,
+    };
+
+    final List<WholesalerAvailabilityResult> results = [];
+
+    for (var wLower in matchedKeys) {
+      final String wName = displayNames[wLower] ?? wLower.toUpperCase();
+      final int pCount = wholesalerCounts[wLower] ?? 0;
+
+      if (exactWholesalers.containsKey(wLower)) {
+        results.add(WholesalerAvailabilityResult(
+          wholesalerName: wName,
+          status: WholesalerMatchStatus.exactPurchase,
+          matchReason: "Bought exact item previously",
+          matchedDetail: exactWholesalers[wLower]!,
+          purchaseCount: pCount,
+        ));
+      } else if (brandVariantWholesalers.containsKey(wLower)) {
+        results.add(WholesalerAvailabilityResult(
+          wholesalerName: wName,
+          status: WholesalerMatchStatus.brandVariantPurchase,
+          matchReason: "Bought $baseBrand family variant previously",
+          matchedDetail: brandVariantWholesalers[wLower]!,
+          purchaseCount: pCount,
+        ));
+      } else if (yellowWholesalers.containsKey(wLower)) {
+        results.add(WholesalerAvailabilityResult(
+          wholesalerName: wName,
+          status: WholesalerMatchStatus.directoryMatch,
+          matchReason: yellowWholesalers[wLower]!,
+          matchedDetail: "${resolvedPatent.isNotEmpty ? resolvedPatent.toUpperCase() : ''} ${resolvedCategory.isNotEmpty ? '(${resolvedCategory.toUpperCase()})' : ''}".trim(),
+          purchaseCount: pCount,
+        ));
+      }
+    }
+
+    // Primary sort: Status color (Green = 0, Orange = 1, Yellow = 2)
+    // Secondary sort: Most number of purchases on top (descending)
+    // Tertiary sort: Alphabetical A-Z
+    results.sort((a, b) {
+      final int orderA = a.status == WholesalerMatchStatus.exactPurchase
+          ? 0
+          : (a.status == WholesalerMatchStatus.brandVariantPurchase ? 1 : 2);
+      final int orderB = b.status == WholesalerMatchStatus.exactPurchase
+          ? 0
+          : (b.status == WholesalerMatchStatus.brandVariantPurchase ? 1 : 2);
+      if (orderA != orderB) return orderA.compareTo(orderB);
+
+      final int countCompare = b.purchaseCount.compareTo(a.purchaseCount);
+      if (countCompare != 0) return countCompare;
+
+      return a.wholesalerName.toLowerCase().compareTo(b.wholesalerName.toLowerCase());
+    });
+
+    return results;
+  }
+
+
+  Future<List<WholesaleStockItem>> getWholesaleStockDirectoryData({String? targetWholesaler}) async {
+    final db = await DbHelper.instance.database;
+
+    // 1. Fetch Product Mappings in 1 ultra-fast query
+    final List<Map<String, dynamic>> mappingRows = await db.rawQuery(
+      "SELECT product_id, wholesaler_name FROM ProductMappings WHERE wholesaler_name IS NOT NULL AND wholesaler_name != ''"
+    );
+    final Map<String, String> mappingMap = {};
+    for (var r in mappingRows) {
+      final pid = r['product_id']?.toString() ?? '';
+      final wname = r['wholesaler_name']?.toString() ?? '';
+      if (pid.isNotEmpty && wname.isNotEmpty && !mappingMap.containsKey(pid)) {
+        mappingMap[pid] = wname;
+      }
+    }
+
+    // 2. Query combined purchase history, stock batches, and mapped products
+    String whereWholesalerClause = "";
+    List<dynamic> whereArgs = [];
+    if (targetWholesaler != null && targetWholesaler.isNotEmpty && targetWholesaler != "ALL") {
+      whereWholesalerClause = "AND LOWER(wp.wholesaler) = ?";
+      whereArgs.add(targetWholesaler.toLowerCase());
+    }
+
+    final String query = '''
+      WITH WholesalerProducts AS (
+        -- Past Purchases History
+        SELECT 
+          pi.product_id,
+          pe.supplier_name as wholesaler,
+          pe.date as last_date,
+          pe.entry_no as last_entry,
+          pi.batch as batch,
+          pi.expiry as expiry,
+          pi.p_rate as p_rate,
+          pi.mrp as mrp,
+          pi.s_rate as s_rate,
+          (IFNULL(pi.qty, 0) + IFNULL(pi.f_qty, 0)) as purchased_qty
+        FROM purchase_items pi
+        JOIN purchase_entries pe ON pi.entry_no = pe.entry_no
+        WHERE (pe.is_deleted = 0 OR pe.is_deleted IS NULL)
+          AND pe.supplier_name IS NOT NULL AND pe.supplier_name != ''
+
+        UNION ALL
+
+        -- Current Stock Batches
+        SELECT 
+          sb.product_id,
+          sb.supplier_name as wholesaler,
+          '' as last_date,
+          '' as last_entry,
+          sb.batch_number as batch,
+          sb.expiry_date as expiry,
+          sb.purchase_rate as p_rate,
+          sb.mrp as mrp,
+          sb.sale_rate as s_rate,
+          0 as purchased_qty
+        FROM stock_batches sb
+        WHERE sb.supplier_name IS NOT NULL AND sb.supplier_name != ''
+
+        UNION ALL
+
+        -- Product Master Preferred Wholesale
+        SELECT 
+          pm.id as product_id,
+          pm.preferred_wholesale as wholesaler,
+          '' as last_date,
+          '' as last_entry,
+          '-' as batch,
+          '-' as expiry,
+          pm.purchase_rate as p_rate,
+          pm.mrp as mrp,
+          pm.sale_rate as s_rate,
+          0 as purchased_qty
+        FROM product_master pm
+        WHERE pm.preferred_wholesale IS NOT NULL AND pm.preferred_wholesale != ''
+      )
+      SELECT 
+        p.id as product_id,
+        p.name as product_name,
+        IFNULL(p.generic_name, '') as generic_name,
+        IFNULL(NULLIF(p.manufacturer_id, ''), 'Unassigned') as company_name,
+        IFNULL(NULLIF(p.category_id, ''), 'General') as category_name,
+        wp.wholesaler as wholesale_name,
+        MAX(wp.last_date) as last_purchase_date,
+        MAX(wp.last_entry) as last_inv_no,
+        MAX(wp.batch) as batch_number,
+        MAX(wp.expiry) as expiry_date,
+        MAX(wp.p_rate) as purchase_rate,
+        MAX(wp.mrp) as mrp,
+        MAX(wp.s_rate) as sale_rate,
+        SUM(wp.purchased_qty) as total_purchased_qty,
+        IFNULL(sb_tot.stock_qty, 0) as current_stock,
+        IFNULL(p.unit, 'Strip') as unit,
+        IFNULL(p.packing, 1) as packing,
+        IFNULL(p.rack_id, '-') as rack
+      FROM WholesalerProducts wp
+      JOIN product_master p ON wp.product_id = p.id
+      LEFT JOIN (
+        SELECT product_id, supplier_name, SUM(current_stock) as stock_qty
+        FROM stock_batches
+        GROUP BY product_id, supplier_name
+      ) sb_tot ON p.id = sb_tot.product_id AND sb_tot.supplier_name = wp.wholesaler
+      WHERE (p.is_active = 1 OR p.is_active IS NULL)
+        $whereWholesalerClause
+      GROUP BY p.id, wp.wholesaler
+      ORDER BY p.name ASC
+    ''';
+
+    final List<Map<String, dynamic>> rows = await db.rawQuery(query, whereArgs);
+
+    Map<String, _WholesaleStockItemBuilder> map = {};
+
+    for (var r in rows) {
+      final pid = r['product_id']?.toString() ?? '';
+      if (pid.isEmpty) continue;
+
+      String wholesaleName = r['wholesale_name']?.toString()?.trim() ?? 'Unassigned';
+      if (wholesaleName.isEmpty) wholesaleName = 'Unassigned';
+
+      String mfg = r['company_name']?.toString()?.trim() ?? '';
+      if (mfg.isEmpty) mfg = 'Unassigned';
+
+      String cat = r['category_name']?.toString()?.trim() ?? '';
+      if (cat.isEmpty) cat = 'General';
+
+      int stock = (r['current_stock'] as num?)?.toInt() ?? 0;
+      double prate = (r['purchase_rate'] as num?)?.toDouble() ?? 0.0;
+      double mrp = (r['mrp'] as num?)?.toDouble() ?? 0.0;
+      double srate = (r['sale_rate'] as num?)?.toDouble() ?? 0.0;
+
+      String rack = r['rack']?.toString()?.trim() ?? '-';
+      if (rack.isEmpty) rack = '-';
+
+      String batch = r['batch_number']?.toString()?.trim() ?? '';
+      String exp = r['expiry_date']?.toString()?.trim() ?? '';
+      String pDate = r['last_purchase_date']?.toString()?.trim() ?? '-';
+      String pInv = r['last_inv_no']?.toString()?.trim() ?? '-';
+      int purQty = (r['total_purchased_qty'] as num?)?.toInt() ?? 0;
+
+      String key = "$pid|$wholesaleName";
+
+      if (!map.containsKey(key)) {
+        map[key] = _WholesaleStockItemBuilder(
+          productId: pid,
+          productName: r['product_name']?.toString() ?? '',
+          genericName: r['generic_name']?.toString() ?? '',
+          companyName: mfg,
+          categoryName: cat,
+          wholesaleName: wholesaleName,
+          unit: r['unit']?.toString() ?? 'Strip',
+          packing: (r['packing'] as num?)?.toInt() ?? 1,
+          purchaseRate: prate,
+          mrp: mrp,
+          saleRate: srate,
+          rack: rack,
+          batches: batch.isNotEmpty && batch != '-' ? [batch] : [],
+          expiryDate: exp,
+          totalStock: stock,
+          lastPurchaseDate: pDate,
+          lastInvNo: pInv,
+          totalPurchasedQty: purQty,
+        );
+      }
+    }
+
+    return map.values.map((b) => b.build()).toList();
+  }
+
+  Future<Uint8List?> exportWholesaleStockToExcelBytes(
+    List<WholesaleStockItem> items,
+    String selectedWholesaler,
+    String selectedCategory,
+  ) async {
+    try {
+      final data = items.map((item) => {
+        'productName': item.productName,
+        'companyName': item.companyName,
+        'categoryName': item.categoryName,
+        'wholesaleName': item.wholesaleName,
+        'rank': item.rank,
+        'batchNumber': item.batchNumber,
+        'expiryDate': item.expiryDate,
+        'rack': item.rack,
+        'currentStock': item.currentStock,
+        'purchaseRate': item.purchaseRate,
+        'mrp': item.mrp,
+        'saleRate': item.saleRate,
+        'purchaseValuation': item.purchaseValuation,
+        'mrpValuation': item.mrpValuation,
+      }).toList();
+
+      return await compute(_generateWholesaleStockExcelIsolate, {
+        'wholesaler': selectedWholesaler,
+        'category': selectedCategory,
+        'items': data,
+      });
+    } catch (e) {
+      debugPrint("Export Wholesale Stock Error: $e");
+      return null;
+    }
+  }
+
+  static Uint8List _generateWholesaleStockExcelIsolate(Map<String, dynamic> params) {
+    final String wholesaler = params['wholesaler'] ?? 'ALL';
+    final String category = params['category'] ?? 'ALL';
+    final List<Map<String, dynamic>> items = List<Map<String, dynamic>>.from(params['items'] ?? []);
+
+    var excel = Excel.createExcel();
+    Sheet sheetObject = excel['Wholesale Stock Directory'];
+    excel.delete('Sheet1');
+
+    sheetObject.appendRow([
+      TextCellValue("WHOLESALE STOCK DIRECTORY REPORT"),
+      TextCellValue("Wholesaler: $wholesaler"),
+      TextCellValue("Category: $category"),
+    ]);
+    sheetObject.appendRow([]);
+
+    sheetObject.appendRow([
+      TextCellValue("SL"),
+      TextCellValue("Medicine / Product Name"),
+      TextCellValue("Company / Manufacturer"),
+      TextCellValue("Category"),
+      TextCellValue("Wholesaler"),
+      TextCellValue("Batch No"),
+      TextCellValue("Expiry"),
+      TextCellValue("Rack"),
+      TextCellValue("Current Stock"),
+      TextCellValue("Purchase Rate (₹)"),
+      TextCellValue("MRP (₹)"),
+      TextCellValue("Sale Rate (₹)"),
+      TextCellValue("Stock Valuation (₹)"),
+    ]);
+
+    for (int i = 0; i < items.length; i++) {
+      final row = items[i];
+      sheetObject.appendRow([
+        IntCellValue(i + 1),
+        TextCellValue(row['productName']?.toString() ?? ""),
+        TextCellValue(row['companyName']?.toString() ?? ""),
+        TextCellValue(row['categoryName']?.toString() ?? ""),
+        TextCellValue(row['wholesaleName']?.toString() ?? ""),
+        TextCellValue(row['batchNumber']?.toString() ?? ""),
+        TextCellValue(row['expiryDate']?.toString() ?? ""),
+        TextCellValue(row['rack']?.toString() ?? ""),
+        IntCellValue((row['currentStock'] as num?)?.toInt() ?? 0),
+        DoubleCellValue((row['purchaseRate'] as num?)?.toDouble() ?? 0.0),
+        DoubleCellValue((row['mrp'] as num?)?.toDouble() ?? 0.0),
+        DoubleCellValue((row['saleRate'] as num?)?.toDouble() ?? 0.0),
+        DoubleCellValue((row['purchaseValuation'] as num?)?.toDouble() ?? 0.0),
+      ]);
+    }
+
+    final bytes = excel.save();
+    return Uint8List.fromList(bytes ?? []);
   }
 
   Future<Map<String, dynamic>> generateStockLedger(String productName, DateTime fromDate, DateTime toDate) async {
@@ -12911,11 +14031,11 @@ class PharmacyProvider extends ChangeNotifier {
     return {
       'opening': openingBalance,
       'closing': closingBalance,
-      'entries': entries.length > 20 ? entries.sublist(entries.length - 20) : entries,
+      'entries': entries,
     };
   }
 
-  /// Fetches the last 20 stock movement transactions across purchases, sales, adjustments, and returns
+  /// Fetches the last 20 stock movement transactions across purchases, sales, adjustments, returns, and damages
   Future<List<Map<String, dynamic>>> get20RecentStockChanges() async {
     final db = await DbHelper.instance.database;
     try {
@@ -12937,11 +14057,12 @@ class PharmacyProvider extends ChangeNotifier {
             
             UNION ALL
             
-            SELECT sa.date, 'ADJUSTMENT' as type, sa.entry_no as ref_no, sai.product_name, IFNULL(sai.batch_number, '') as batch,
-                   CASE WHEN sai.adjusted_qty > 0 THEN sai.adjusted_qty ELSE 0 END as in_qty,
-                   CASE WHEN sai.adjusted_qty < 0 THEN -sai.adjusted_qty ELSE 0 END as out_qty
+            SELECT sa.date, 'ADJUSTMENT' as type, sa.entry_no as ref_no, IFNULL(pm.name, '') as product_name, IFNULL(sai.batch_number, '') as batch,
+                   CASE WHEN IFNULL(sai.qty, 0) > 0 THEN sai.qty ELSE 0 END as in_qty,
+                   CASE WHEN IFNULL(sai.qty, 0) < 0 THEN ABS(sai.qty) ELSE 0 END as out_qty
             FROM stock_adjustment_items sai
             JOIN stock_adjustments sa ON sai.adjustment_no = sa.entry_no
+            LEFT JOIN product_master pm ON sai.product_id = pm.id
             WHERE IFNULL(sa.is_deleted, 0) = 0
 
             UNION ALL
@@ -12959,6 +14080,13 @@ class PharmacyProvider extends ChangeNotifier {
             FROM purchase_return_items pri
             JOIN purchase_return_entries prn ON pri.entry_no = prn.entry_no
             WHERE IFNULL(prn.is_deleted, 0) = 0
+
+            UNION ALL
+
+            SELECT swo.date, 'DAMAGE / WRITE OFF' as type, swo.id as ref_no, IFNULL(pm.name, '') as product_name, IFNULL(swo.batch_number, '') as batch,
+                   0 as in_qty, IFNULL(swo.quantity, 0) as out_qty
+            FROM stock_write_offs swo
+            LEFT JOIN product_master pm ON swo.product_id = pm.id
         ) t 
         ORDER BY date DESC
         LIMIT 20
@@ -13213,6 +14341,8 @@ class PharmacyProvider extends ChangeNotifier {
 
       return {
         'productName': r['name'].toString(),
+        'totalQty': qA,
+        'totalBills': bA,
         'qtyA': qA,
         'billsA': bA,
         'qtyB': qB,
@@ -14307,30 +15437,67 @@ class PharmacyProvider extends ChangeNotifier {
     );
   }
 
-  Future<List<Map<String, dynamic>>> getEditedInvoices(String type, DateTime from, DateTime to, {bool editedOnly = false}) async {
+  Future<List<Map<String, dynamic>>> getEditedInvoices(String type, DateTime from, DateTime to, {bool editedOnly = true}) async {
     if (kIsWeb) return [];
     final db = await DbHelper.instance.database;
     final fromStr = DateTime(from.year, from.month, from.day, 0, 0, 0).toIso8601String();
     final toStr = DateTime(to.year, to.month, to.day, 23, 59, 59).toIso8601String();
 
-    String table = 'sales_invoices';
-    if (type == 'Purchase') {
-      table = 'purchase_entries';
-    } else if (type == 'Sale Return') {
-      table = 'sales_return_invoices';
-    } else if (type == 'Purchase Return') {
-      table = 'purchase_return_entries';
+    List<Map<String, dynamic>> results = [];
+
+    Future<List<Map<String, dynamic>>> fetchForTable(String table, String idCol, String entryTypeLabel) async {
+      String query = '''
+        SELECT t.*, e.edit_timestamp, e.previous_grand_total, e.previous_items_json, e.reason_for_edit
+        FROM $table t
+        ${editedOnly ? 'INNER JOIN' : 'LEFT JOIN'} edit_history_logs e ON CAST(t.$idCol AS TEXT) = e.original_entry_no
+        WHERE t.date >= ? AND t.date <= ?
+        ORDER BY e.edit_timestamp DESC, t.date DESC
+      ''';
+      try {
+        final rows = await db.rawQuery(query, [fromStr, toStr]);
+        return rows.map((r) {
+          final map = Map<String, dynamic>.from(r);
+          map['_entry_type'] = entryTypeLabel;
+          if (table == 'stock_write_offs') {
+            map['entry_no'] = r['id']?.toString() ?? "";
+            map['grand_total'] = r['loss_value'] ?? 0.0;
+          }
+          return map;
+        }).toList();
+      } catch (e) {
+        debugPrint("Error fetching edited invoices for $table: $e");
+        return [];
+      }
     }
 
-    String query = '''
-      SELECT t.*, e.edit_timestamp, e.previous_grand_total, e.previous_items_json, e.reason_for_edit
-      FROM $table t
-      ${editedOnly ? 'INNER JOIN' : 'LEFT JOIN'} edit_history_logs e ON t.entry_no = e.original_entry_no
-      WHERE t.date >= ? AND t.date <= ?
-      ORDER BY t.date DESC
-    ''';
+    if (type == 'All') {
+      results.addAll(await fetchForTable('sales_invoices', 'entry_no', 'sale entry'));
+      results.addAll(await fetchForTable('purchase_entries', 'entry_no', 'purchase entry'));
+      results.addAll(await fetchForTable('sales_return_invoices', 'entry_no', 'S.R'));
+      results.addAll(await fetchForTable('purchase_return_entries', 'entry_no', 'P.R'));
+      results.addAll(await fetchForTable('stock_write_offs', 'id', 'DAMAGE'));
+      results.addAll(await fetchForTable('stock_adjustments', 'entry_no', 'ADJUSTMENT'));
+    } else if (type == 'Sales') {
+      results.addAll(await fetchForTable('sales_invoices', 'entry_no', 'sale entry'));
+    } else if (type == 'Purchase') {
+      results.addAll(await fetchForTable('purchase_entries', 'entry_no', 'purchase entry'));
+    } else if (type == 'Sale Return' || type == 'S.R') {
+      results.addAll(await fetchForTable('sales_return_invoices', 'entry_no', 'S.R'));
+    } else if (type == 'Purchase Return' || type == 'P.R') {
+      results.addAll(await fetchForTable('purchase_return_entries', 'entry_no', 'P.R'));
+    } else if (type == 'Damage' || type == 'DAMAGE') {
+      results.addAll(await fetchForTable('stock_write_offs', 'id', 'DAMAGE'));
+    } else if (type == 'Adjustment' || type == 'ADJUSTMENT') {
+      results.addAll(await fetchForTable('stock_adjustments', 'entry_no', 'ADJUSTMENT'));
+    }
 
-    return await db.rawQuery(query, [fromStr, toStr]);
+    results.sort((a, b) {
+      final tA = a['edit_timestamp']?.toString() ?? a['date']?.toString() ?? "";
+      final tB = b['edit_timestamp']?.toString() ?? b['date']?.toString() ?? "";
+      return tB.compareTo(tA);
+    });
+
+    return results;
   }
 
   // =========================================================================
@@ -14545,6 +15712,85 @@ class PharmacyProvider extends ChangeNotifier {
       if (allMatched) return true;
     }
     return false;
+  }
+}
+
+class _WholesaleStockItemBuilder {
+  final String productId;
+  final String productName;
+  final String genericName;
+  final String companyName;
+  final String categoryName;
+  String wholesaleName;
+  final String unit;
+  final int packing;
+  double purchaseRate;
+  double mrp;
+  double saleRate;
+  String rack;
+  List<String> batches;
+  String expiryDate;
+  int totalStock;
+  String lastPurchaseDate;
+  String lastInvNo;
+  int totalPurchasedQty;
+
+  _WholesaleStockItemBuilder({
+    required this.productId,
+    required this.productName,
+    required this.genericName,
+    required this.companyName,
+    required this.categoryName,
+    required this.wholesaleName,
+    required this.unit,
+    required this.packing,
+    required this.purchaseRate,
+    required this.mrp,
+    required this.saleRate,
+    required this.rack,
+    required this.batches,
+    required this.expiryDate,
+    required this.totalStock,
+    this.lastPurchaseDate = "-",
+    this.lastInvNo = "-",
+    this.totalPurchasedQty = 0,
+  });
+
+  WholesaleStockItem build() {
+    String formattedBatch = '-';
+    if (batches.isNotEmpty) {
+      final cleanedBatches = batches
+          .map((b) => b.replaceAll(RegExp(r'\.+$'), '').trim())
+          .where((b) => b.isNotEmpty && b != '-')
+          .toSet()
+          .toList();
+      if (cleanedBatches.length == 1) {
+        formattedBatch = cleanedBatches.first;
+      } else if (cleanedBatches.length > 1) {
+        formattedBatch = "${cleanedBatches.first} (+${cleanedBatches.length - 1})";
+      }
+    }
+
+    return WholesaleStockItem(
+      productId: productId,
+      productName: productName,
+      genericName: genericName,
+      companyName: companyName,
+      categoryName: categoryName,
+      wholesaleName: wholesaleName,
+      batchNumber: formattedBatch,
+      expiryDate: expiryDate.isEmpty ? '-' : expiryDate,
+      currentStock: totalStock,
+      purchaseRate: purchaseRate,
+      mrp: mrp,
+      saleRate: saleRate,
+      rack: rack,
+      unit: unit,
+      packing: packing,
+      lastPurchaseDate: lastPurchaseDate,
+      lastInvNo: lastInvNo,
+      totalPurchasedQty: totalPurchasedQty,
+    );
   }
 }
 

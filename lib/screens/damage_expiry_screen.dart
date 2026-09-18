@@ -38,9 +38,18 @@ class _DamageExpiryScreenState extends State<DamageExpiryScreen> {
     });
   }
 
+  double _getUnitCost(Product p) {
+    int packSize = p.packSize > 0 ? p.packSize : 1;
+    double rate = p.purchaseRate > 0
+        ? p.purchaseRate
+        : (p.landingCost > 0 ? p.landingCost : p.mrp);
+    return rate / packSize;
+  }
+
   void _onProductSelected(Product p) {
     setState(() {
-      _selectedItems.add(_WriteOffRow(product: p, qty: 1, reason: "Damaged", lossValue: p.purchaseRate));
+      double unitCost = _getUnitCost(p);
+      _selectedItems.add(_WriteOffRow(product: p, qty: 1, reason: "Damaged", lossValue: unitCost));
       _isEnteringDetails = true;
       _qtyCtrl.text = "1";
       _searchCtrl.clear();
@@ -65,7 +74,8 @@ class _DamageExpiryScreenState extends State<DamageExpiryScreen> {
       setState(() {
         item.qty = enteredQty;
         item.reason = _selectedReason;
-        item.lossValue = item.product.purchaseRate * item.qty; // Loss is calculated on YOUR cost (purchaseRate)
+        double unitCost = _getUnitCost(item.product);
+        item.lossValue = unitCost * item.qty; // Multi-level cost fallback
         _isEnteringDetails = false;
         _qtyCtrl.clear();
       });
@@ -148,6 +158,28 @@ class _DamageExpiryScreenState extends State<DamageExpiryScreen> {
     );
   }
 
+  void _navigateEntry(String dir) async {
+    final p = Provider.of<PharmacyProvider>(context, listen: false);
+    try {
+      final data = await p.navigateInvoice(_entryNo, dir, isAdjustment: true);
+      if (data != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Loaded Write-off Entry #${data['entry_no']}"), duration: const Duration(seconds: 2)),
+        );
+      } else if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(dir == 'next' ? "End of write-off records." : "First record reached."), duration: const Duration(seconds: 2)),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Navigation notice: $e"), duration: const Duration(seconds: 2)),
+        );
+      }
+    }
+  }
+
   Widget _buildToolbar() {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
@@ -168,6 +200,10 @@ class _DamageExpiryScreenState extends State<DamageExpiryScreen> {
             ],
           ),
           const Spacer(),
+          _toolbarButton(Icons.chevron_left, "PREV", Colors.blueGrey, onTap: () => _navigateEntry('prev')),
+          const SizedBox(width: 8),
+          _toolbarButton(Icons.chevron_right, "NEXT", Colors.blueGrey, onTap: () => _navigateEntry('next')),
+          const SizedBox(width: 8),
           _toolbarButton(Icons.check_circle_outline, "SAVE WRITE-OFF", Colors.red, onTap: _saveWriteOffs),
         ],
       ),

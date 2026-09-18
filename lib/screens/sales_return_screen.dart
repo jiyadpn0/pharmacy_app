@@ -18,6 +18,7 @@ import '../utils/app_formatters.dart';
 import '../utils/tax_calculator.dart';
 import '../widgets/app_date_picker.dart';
 import '../widgets/erp_tooltip.dart';
+import '../utils/unsaved_handler.dart';
 
 class SalesReturnScreen extends StatefulWidget {
   final String? initialReturnNo;
@@ -27,7 +28,14 @@ class SalesReturnScreen extends StatefulWidget {
   State<SalesReturnScreen> createState() => _SalesReturnScreenState();
 }
 
-class _SalesReturnScreenState extends State<SalesReturnScreen> {
+class _SalesReturnScreenState extends State<SalesReturnScreen> implements UnsavedHandler {
+  @override
+  bool hasUnsavedChanges() => _isDirty || (_items.isNotEmpty && !_isExistingEntry);
+
+  @override
+  void showDifferences() {
+    _promptDiscardChanges();
+  }
   final List<SaleItem> _items = [];
   List<SaleItem> _originalInvoiceItems = [];
   bool _isExistingEntry = false;
@@ -203,6 +211,7 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> {
   @override
   void initState() {
     super.initState();
+    UnsavedChangesRegistry.register("SALES RETURN", this);
     final p = Provider.of<PharmacyProvider>(context, listen: false);
     Future.microtask(() async {
       if (widget.initialReturnNo != null) {
@@ -239,6 +248,7 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> {
 
   @override
   void dispose() {
+    UnsavedChangesRegistry.unregister("SALES RETURN");
     _scrollTimer?.cancel();
     _gridScrollCtrl.dispose();
     _verticalGridScrollCtrl.dispose();
@@ -493,6 +503,10 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> {
     }
     if (key == LogicalKeyboardKey.f2) {
       _resetPage();
+      return true;
+    }
+    if (key == LogicalKeyboardKey.f3) {
+      _showFindDialog();
       return true;
     }
 
@@ -983,27 +997,29 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> {
   }
 
   void _navigateEntry(String dir, {String? searchNo}) async {
+    final p = Provider.of<PharmacyProvider>(context, listen: false);
     // ---> THE FIX: Protect against losing unsaved edits <---
     if (_isExistingEntry && _isDirty) {
       bool? discard = await _promptDiscardChanges();
       if (discard != true) return; // User chose to stay
     }
 
+    if (!mounted) return;
     _closeAllDropdowns();
-    final p = Provider.of<PharmacyProvider>(context, listen: false);
     setState(() => _isLoading = true);
 
     try {
       String targetNo = searchNo ?? _entryNo;
       final data = await p.navigateInvoice(targetNo, dir, isSaleReturn: true);
 
-      if (data != null && data['is_deleted'] != 1 && mounted) {
+      if (data != null && mounted) {
         String actualNo = data['entry_no']?.toString() ?? targetNo;
+        bool isDel = (data['is_deleted'] == 1 || data['is_deleted'] == true || data['is_deleted'] == '1');
         final items = await p.getInvoiceItems(actualNo, isSaleReturn: true);
 
         setState(() {
           _isExistingEntry = true;
-          _isDeleted = false;
+          _isDeleted = isDel;
           _isDirty = false; // Freshly loaded, reset dirty flag
           String cleanNo = actualNo.startsWith("SRET-") ? actualNo.substring(5) : actualNo;
           if (cleanNo.contains('_')) {
@@ -1107,21 +1123,26 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> {
         });
       } else if (data != null && data['is_deleted'] == 1) {
         _resetPage();
-        AppDialogs.showFastDialog(context: context, title: "Deleted Return", content: "This sales return record was previously deleted.");
+        _showFastDialog("Deleted Return", "This sales return record was previously deleted.");
       } else if (dir == 'next') {
         if (_isExistingEntry) {
           _resetPage();
         } else {
-          AppDialogs.showFastDialog(context: context, title: "Navigation", content: "End of sales return records.");
+          _showFastDialog("Navigation", "End of sales return records.");
         }
       } else if (dir == 'prev') {
-        AppDialogs.showFastDialog(context: context, title: "Navigation", content: "First sales return record reached.");
+        _showFastDialog("Navigation", "First sales return record reached.");
       }
     } catch (e) {
       debugPrint("Sale Return Nav Error: $e");
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
+  }
+
+  void _showFastDialog(String title, String content) {
+    if (!mounted) return;
+    AppDialogs.showFastDialog(context: context, title: title, content: content);
   }
 
   // --- GENERATE DETAILED EDIT DIFF SPANS FOR RE-WRITE DIALOG ---
@@ -1307,6 +1328,7 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> {
 
   void _saveReturn({bool isEdit = false}) async {
     if (_isSaving || _isLoading) return;
+    final p = Provider.of<PharmacyProvider>(context, listen: false);
 
     try {
       setState(() => _errorCells.clear());
@@ -1488,13 +1510,13 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> {
             ],
           ),
         );
+        if (!mounted) return;
         if (confirmed != true) return;
       }
 
       _isSaving = true;
 
       setState(() => _isLoading = true);
-      final p = Provider.of<PharmacyProvider>(context, listen: false);
 
       final entry = SaleReturnInvoice(
         entryNo: isEdit ? _entryNo : "",
@@ -1535,6 +1557,7 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> {
 
   void _deleteSale() async {
     if (!_isExistingEntry || _isDeleted) return;
+    final p = Provider.of<PharmacyProvider>(context, listen: false);
 
     final confirmed = await AppDialogs.showConfirmDialog(
       context: context,
@@ -1545,7 +1568,6 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> {
 
     if (confirmed == true) {
       setState(() => _isLoading = true);
-      final p = Provider.of<PharmacyProvider>(context, listen: false);
       try {
         await p.deleteSaleReturn(_entryNo);
         p.logAudit('DELETE_SALE_RETURN', 'Sales Return Entry $_entryNo deleted.');
@@ -1561,16 +1583,18 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> {
     }
   }
 
-  void _resetPage() async {
+  Future<void> _resetPage() async {
     // ---> THE FIX: Protect against losing unsaved edits <---
     if (_isExistingEntry && _isDirty) {
       bool? discard = await _promptDiscardChanges();
       if (discard != true) return; // User chose to stay
     }
 
-    final p = Provider.of<PharmacyProvider>(context, listen: false);
+    if (!mounted) return;
+    final currentCtx = context;
+    final p = Provider.of<PharmacyProvider>(currentCtx, listen: false);
     _closeAllDropdowns();
-    FocusScope.of(context).unfocus();
+    FocusScope.of(currentCtx).unfocus();
 
     for (var m in _gridCtrls.values) {
       for (var c in m.values) { c.dispose(); }
@@ -1713,6 +1737,29 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> {
                 Column(
                   children: [
                     _buildTopToolbar(),
+                    if (_isDeleted)
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        color: const Color(0xFF7F1D1D),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.delete_forever_rounded, color: Colors.amberAccent, size: 20),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                "🗑️ DELETED ENTRY: Sales Return Entry #$_entryNo is marked as DELETED and is Read-Only.",
+                                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13, letterSpacing: 0.5),
+                              ),
+                            ),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              decoration: BoxDecoration(color: const Color(0xFF450A0A), borderRadius: BorderRadius.circular(4), border: Border.all(color: Colors.amberAccent)),
+                              child: const Text("READ-ONLY", style: TextStyle(color: Colors.amberAccent, fontWeight: FontWeight.bold, fontSize: 11)),
+                            ),
+                          ],
+                        ),
+                      ),
                     _buildHeader(),
                     Expanded(
                       child: LayoutBuilder(builder: (ctx, con) {
@@ -1771,10 +1818,18 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> {
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           const Text("SALES RETURN ENTRY", style: TextStyle(fontWeight: FontWeight.w900, fontSize: 14, color: Colors.black87)),
+          if (_isDeleted)
+            Container(
+              margin: const EdgeInsets.only(left: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(color: const Color(0xFF7F1D1D), borderRadius: BorderRadius.circular(4)),
+              child: const Text("DELETED", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 10)),
+            ),
           const SizedBox(width: 30),
           _topActionBtn(Icons.add_box_rounded, "New (F2)", Colors.blue, onTap: _resetPage),
           _topActionBtn(Icons.check_circle_rounded, "Save (F6)", canSave ? Colors.green : Colors.grey.shade400, onTap: canSave ? () => _saveReturn(isEdit: false) : () {}),
           _topActionBtn(Icons.edit_document, "Edit", canEdit ? Colors.orange : Colors.grey.shade400, onTap: canEdit ? () => _saveReturn(isEdit: true) : () {}),
+          _topActionBtn(Icons.search_rounded, "Find (F3)", const Color(0xFF3F51B5), onTap: _showFindDialog),
           _topActionBtn(Icons.print_rounded, "Print", Colors.blueGrey, onTap: _exportToPdf),
           _topActionBtn(Icons.picture_as_pdf_rounded, "PDF", const Color(0xFFE53935), onTap: _exportToPdf),
           _topActionBtn(_buildWhatsAppLogo(size: 24), "WhatsApp", const Color(0xFF25D366), onTap: _shareReturnWhatsApp),
@@ -1783,6 +1838,60 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> {
         ],
       ),
     );
+  }
+
+  void _showFindDialog() {
+    final TextEditingController findCtrl = TextEditingController();
+    final FocusNode findFocusNode = FocusNode();
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        title: const Row(
+          children: [
+            Icon(Icons.search, color: Colors.blue, size: 24),
+            SizedBox(width: 8),
+            Text("Find Sales Return Entry", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+          ],
+        ),
+        content: SizedBox(
+          width: 380,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: findCtrl,
+                focusNode: findFocusNode,
+                autofocus: true,
+                keyboardType: TextInputType.text,
+                decoration: const InputDecoration(
+                  labelText: "Entry Number",
+                  hintText: "Enter Entry No (e.g. 1 or SRET-1)...",
+                  prefixIcon: Icon(Icons.search, color: Colors.blue),
+                  border: OutlineInputBorder(),
+                ),
+                onSubmitted: (v) { Navigator.pop(ctx, v); },
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("CANCEL")),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF3F51B5),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+            ),
+            onPressed: () => Navigator.pop(ctx, findCtrl.text),
+            child: const Text("SEARCH", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    ).then((val) {
+      if (val != null && val.toString().trim().isNotEmpty) {
+        _navigateEntry('find', searchNo: val.toString().trim());
+      }
+    });
   }
 
   Widget _buildWhatsAppLogo({double size = 24}) {
@@ -2088,12 +2197,29 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> {
           child: Row(
             children: [
               _cell(row, 0, "${row + 1}", _colWidths[0]!, align: TextAlign.center),
-              _cell(row, 1, it.product.name.toUpperCase(), dynamicWidth, isInput: true, onChanged: (v) { _saveUndoState(); it.product.name = v; _startProductSearch(v); }),
+              _cell(row, 1, _isDeleted ? "" : it.product.name.toUpperCase(), dynamicWidth, isInput: true, onChanged: (v) { _saveUndoState(); it.product.name = v; _startProductSearch(v); }),
               _cell(row, 2, it.product.hsnCode.toUpperCase(), _colWidths[2]!, isInput: true, onChanged: (v) { _saveUndoState(); it.product.hsnCode = v; }),
               _cell(row, 3, cleanBatch(it.product.batch).toUpperCase(), _colWidths[3]!, isInput: true, onChanged: (v) { _saveUndoState(); it.product.batch = v; _startBatchSearch(row, v); }),
               _cell(row, 4, it.product.expiry, _colWidths[4]!, isInput: true, align: TextAlign.center, onChanged: (v) { _saveUndoState(); it.product.expiry = v; }),
               _cell(row, 5, it.packin.toString(), _colWidths[5]!, align: TextAlign.right),
-              _cell(row, 6, it.qty.toString(), _colWidths[6]!, isInput: true, align: TextAlign.right, onChanged: (v) { _saveUndoState(); it.qty = int.tryParse(v) ?? 0; _calculateItem(row); }),
+              _cell(row, 6, it.qty.toString(), _colWidths[6]!, isInput: true, align: TextAlign.right, onChanged: (v) {
+                _saveUndoState();
+                it.qty = int.tryParse(v) ?? 0;
+                if (_originalInvoiceItems.isNotEmpty) {
+                  final origMatches = _originalInvoiceItems.where(
+                    (o) => o.product.name.trim().toLowerCase() == it.product.name.trim().toLowerCase()
+                  ).toList();
+                  int maxSoldQty = origMatches.fold(0, (sum, o) => sum + o.qty);
+                  if (it.qty > maxSoldQty && maxSoldQty > 0) {
+                    _markRowError(row);
+                  } else {
+                    _errorCells[row]?.remove(6);
+                  }
+                } else {
+                  _errorCells[row]?.remove(6);
+                }
+                _calculateItem(row);
+              }),
               _cell(row, 7, (it.product.mrp > 0 ? it.product.mrp : it.mrp * (it.packin > 0 ? it.packin : 1)).toStringAsFixed(2), _colWidths[7]!, align: TextAlign.right),
               _cell(row, 8, it.discPercent.toStringAsFixed(2), _colWidths[8]!, isInput: true, align: TextAlign.right, onChanged: (v) { _saveUndoState(); it.discPercent = double.tryParse(v) ?? 0.0; _calculateItem(row); }),
               _cell(row, 9, it.discAmt.toStringAsFixed(2), _colWidths[9]!, align: TextAlign.right),
@@ -2286,7 +2412,7 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> {
             if (list.isEmpty) return const SizedBox();
 
             final link = isBatch ? _batchLayer : _searchLayer;
-            const double dropWidth = 1100.0;
+            const double dropWidth = 1350.0;
             const headerColor = Color(0xFF334155);
 
             return CompositedTransformFollower(
@@ -2400,7 +2526,7 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> {
                                               _GridCell(p.category, width: 50),
                                               _GridCell(p.manufacturer, width: 120),
                                               _GridCell(p.genericName.isNotEmpty ? p.genericName : (Provider.of<PharmacyProvider>(context, listen: false).getProductById(p.id)?.genericName ?? Provider.of<PharmacyProvider>(context, listen: false).getProductMasterByName(p.name)?.genericName ?? ""), width: 150),
-                                              const _GridCell("", flex: 1),
+                                              _GridCell(p.use.isNotEmpty ? p.use : (Provider.of<PharmacyProvider>(context, listen: false).getProductById(p.id)?.use ?? Provider.of<PharmacyProvider>(context, listen: false).getProductMasterByName(p.name)?.use ?? ""), flex: 1),
                                             ],
                                     ),
                                   ),

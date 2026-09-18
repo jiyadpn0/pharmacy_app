@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import '../providers/pharmacy_provider.dart';
 import '../utils/app_formatters.dart';
 import '../utils/theme_constants.dart';
+import '../widgets/app_strict_autocomplete.dart';
 
 class QuickAdjustDialog extends StatefulWidget {
   const QuickAdjustDialog({super.key});
@@ -16,11 +17,17 @@ class _QuickAdjustDialogState extends State<QuickAdjustDialog> {
   final TextEditingController _productCtrl = TextEditingController();
   final TextEditingController _batchCtrl = TextEditingController();
   final TextEditingController _actualStockCtrl = TextEditingController();
+  final TextEditingController _reasonCtrl = TextEditingController(text: "Physical Verification");
+  final TextEditingController _doneByCtrl = TextEditingController(text: "ADMIN");
+
+  final FocusNode _reasonFocus = FocusNode();
+  final FocusNode _doneByFocus = FocusNode();
 
   Product? _selectedProduct;
   Product? _selectedBatch;
   Key _batchDropdownKey = UniqueKey();
-  String _reason = "Packing Correction";
+  String _reason = "Physical Verification";
+  String _doneBy = "ADMIN";
   int _systemStock = 0;
   bool _isLoading = false;
   String? _focusedProductText;
@@ -30,6 +37,10 @@ class _QuickAdjustDialogState extends State<QuickAdjustDialog> {
     _productCtrl.dispose();
     _batchCtrl.dispose();
     _actualStockCtrl.dispose();
+    _reasonCtrl.dispose();
+    _doneByCtrl.dispose();
+    _reasonFocus.dispose();
+    _doneByFocus.dispose();
     super.dispose();
   }
 
@@ -102,12 +113,15 @@ class _QuickAdjustDialogState extends State<QuickAdjustDialog> {
         total: variance * unitLandingCost,
       );
 
+      final finalDoneBy = _doneByCtrl.text.trim().isEmpty ? "ADMIN" : _doneByCtrl.text.trim();
+      final finalReason = _reasonCtrl.text.trim().isEmpty ? "PHYSICAL VERIFICATION" : _reasonCtrl.text.trim();
+
       final nextNo = await provider.getNextAdjustmentNo();
       final adjustment = StockAdjustment(
         entryNo: nextNo,
         date: DateTime.now(),
-        doneBy: "ADMIN (QUICK ADJUST)",
-        reason: _reason.toUpperCase(),
+        doneBy: finalDoneBy.toUpperCase(),
+        reason: finalReason.toUpperCase(),
         items: [adjustmentItem],
         grandTotal: variance * unitLandingCost,
       );
@@ -139,10 +153,16 @@ class _QuickAdjustDialogState extends State<QuickAdjustDialog> {
     final c = AppColors.of(context);
     final provider = Provider.of<PharmacyProvider>(context);
 
+    final int totalStock = _selectedProduct == null
+        ? 0
+        : provider.products
+            .where((p) => p.name.trim().toLowerCase() == _selectedProduct!.name.trim().toLowerCase())
+            .fold<int>(0, (sum, p) => sum + p.stock);
+
     return Dialog(
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       child: Container(
-        width: 420,
+        width: 480,
         padding: const EdgeInsets.all(20),
         decoration: BoxDecoration(
           color: c.surface,
@@ -180,6 +200,51 @@ class _QuickAdjustDialogState extends State<QuickAdjustDialog> {
                 return provider.searchProducts(value.text.trim(), includeGenerics: false);
               },
               onSelected: _onProductSelected,
+              optionsViewBuilder: (context, onSelected, options) {
+                final highlightedIndex = AutocompleteHighlightedOption.of(context);
+                return Align(
+                  alignment: Alignment.topLeft,
+                  child: Material(
+                    elevation: 6.0,
+                    borderRadius: BorderRadius.circular(6),
+                    color: Colors.white,
+                    child: Container(
+                      constraints: const BoxConstraints(maxHeight: 250),
+                      width: 400,
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: Colors.grey.shade300),
+                      ),
+                      child: ListView.separated(
+                        padding: EdgeInsets.zero,
+                        shrinkWrap: true,
+                        itemCount: options.length,
+                        separatorBuilder: (context, index) => Divider(height: 1, color: Colors.grey.shade200),
+                        itemBuilder: (context, index) {
+                          final option = options.elementAt(index);
+                          final isHighlighted = (highlightedIndex == index) || (highlightedIndex == -1 && index == 0);
+                          return InkWell(
+                            onTap: () => onSelected(option),
+                            child: Container(
+                              color: isHighlighted ? Colors.grey.shade300 : Colors.white,
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                              child: Text(
+                                option.name,
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: isHighlighted ? FontWeight.bold : FontWeight.w500,
+                                  color: Colors.black87,
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+                );
+              },
               fieldViewBuilder: (ctx, ctrl, focus, onSubmitted) {
                 focus.addListener(() {
                   if (focus.hasFocus) {
@@ -196,6 +261,9 @@ class _QuickAdjustDialogState extends State<QuickAdjustDialog> {
                       _focusedProductText = ctrl.text;
                     }
                   },
+                  onSubmitted: (_) {
+                    onSubmitted();
+                  },
                   style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
                   decoration: const InputDecoration(
                     isDense: true,
@@ -211,6 +279,7 @@ class _QuickAdjustDialogState extends State<QuickAdjustDialog> {
             Row(
               children: [
                 Expanded(
+                  flex: 5,
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -251,12 +320,13 @@ class _QuickAdjustDialogState extends State<QuickAdjustDialog> {
                     ],
                   ),
                 ),
-                const SizedBox(width: 12),
+                const SizedBox(width: 8),
                 Expanded(
+                  flex: 3,
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text("System Stock", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.blueGrey)),
+                      const Text("Batch Stock", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.blueGrey)),
                       const SizedBox(height: 4),
                       Container(
                         height: 38,
@@ -275,6 +345,31 @@ class _QuickAdjustDialogState extends State<QuickAdjustDialog> {
                     ],
                   ),
                 ),
+                const SizedBox(width: 8),
+                Expanded(
+                  flex: 3,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text("Total Stock", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.teal)),
+                      const SizedBox(height: 4),
+                      Container(
+                        height: 38,
+                        alignment: Alignment.centerRight,
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                        decoration: BoxDecoration(
+                          color: Colors.teal.shade50,
+                          border: Border.all(color: Colors.teal.shade200),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          "$totalStock",
+                          style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.teal.shade800),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ],
             ),
             const SizedBox(height: 12),
@@ -282,58 +377,102 @@ class _QuickAdjustDialogState extends State<QuickAdjustDialog> {
             Row(
               children: [
                 Expanded(
-                  flex: 2,
+                  flex: 3,
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       const Text("Actual Count", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.green)),
                       const SizedBox(height: 4),
-                      TextField(
-                        controller: _actualStockCtrl,
-                        keyboardType: TextInputType.number,
-                        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                        textAlign: TextAlign.right,
-                        style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.green),
-                        decoration: const InputDecoration(
-                          isDense: true,
-                          border: OutlineInputBorder(),
-                          contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                      SizedBox(
+                        height: 32,
+                        child: TextField(
+                          controller: _actualStockCtrl,
+                          keyboardType: TextInputType.number,
+                          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                          textAlign: TextAlign.right,
+                          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.green),
+                          decoration: const InputDecoration(
+                            isDense: true,
+                            border: OutlineInputBorder(),
+                            contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                          ),
+                          onChanged: (_) {
+                            setState(() {});
+                          },
                         ),
                       ),
                     ],
                   ),
                 ),
-                const SizedBox(width: 12),
+                const SizedBox(width: 8),
                 Expanded(
-                  flex: 3,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text("Reason", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
-                      const SizedBox(height: 4),
-                      Builder(
-                        builder: (context) {
-                          final reasons = {"Packing Correction", "Damage", "Expiry", "Physical Verification"}.toList();
-                          final safeReason = reasons.contains(_reason) ? _reason : reasons.first;
+                  flex: 2,
+                  child: Builder(
+                    builder: (context) {
+                      final int physicalStock = int.tryParse(_actualStockCtrl.text) ?? _systemStock;
+                      final int variance = physicalStock - _systemStock;
+                      final String diffText = variance == 0 ? "0" : (variance > 0 ? "+$variance" : "$variance");
+                      final Color textColor = variance == 0 ? Colors.grey : (variance > 0 ? Colors.green : Colors.red);
+                      final Color bgColor = variance == 0 ? Colors.grey.shade50 : (variance > 0 ? Colors.green.shade50 : Colors.red.shade50);
+                      final Color borderColor = variance == 0 ? Colors.grey.shade300 : (variance > 0 ? Colors.green.shade300 : Colors.red.shade300);
 
-                          return DropdownButtonFormField<String>(
-                            initialValue: safeReason,
-                            isExpanded: true,
-                            decoration: const InputDecoration(
-                              isDense: true,
-                              border: OutlineInputBorder(),
-                              contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text("Diff", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: textColor)),
+                          const SizedBox(height: 4),
+                          Container(
+                            height: 32,
+                            alignment: Alignment.center,
+                            decoration: BoxDecoration(
+                              color: bgColor,
+                              border: Border.all(color: borderColor),
+                              borderRadius: BorderRadius.circular(4),
                             ),
-                            items: reasons
-                                .map((e) => DropdownMenuItem(value: e, child: Text(e, style: const TextStyle(fontSize: 11))))
-                                .toList(),
-                            onChanged: (v) {
-                              if (v != null) setState(() => _reason = v);
-                            },
-                          );
-                        },
-                      ),
-                    ],
+                            child: Text(
+                              diffText,
+                              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: textColor),
+                            ),
+                          ),
+                        ],
+                      );
+                    },
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  flex: 4,
+                  child: AppStrictAutocomplete(
+                    label: "Reason",
+                    controller: _reasonCtrl,
+                    focusNode: _reasonFocus,
+                    items: const ["Physical Verification", "Packing Correction", "Damage", "Expiry"],
+                    defaultOption: "Physical Verification",
+                    isStrict: true,
+                    height: 32,
+                    onValueChanged: (val) {
+                      setState(() {
+                        _reason = val.isEmpty ? "Physical Verification" : val;
+                      });
+                    },
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  flex: 4,
+                  child: AppStrictAutocomplete(
+                    label: "Done By",
+                    controller: _doneByCtrl,
+                    focusNode: _doneByFocus,
+                    getItems: () => provider.doneByNames,
+                    defaultOption: "ADMIN",
+                    isStrict: false,
+                    height: 32,
+                    onValueChanged: (val) {
+                      setState(() {
+                        _doneBy = val.isEmpty ? "ADMIN" : val;
+                      });
+                    },
                   ),
                 ),
               ],

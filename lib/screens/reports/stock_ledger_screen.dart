@@ -9,6 +9,7 @@ import '../../widgets/app_date_picker.dart';
 import '../../utils/report_pdf_generator.dart';
 import '../../utils/printer_service.dart';
 import '../../utils/app_formatters.dart';
+import '../../utils/app_dialogs.dart';
 
 class StockLedgerScreen extends StatefulWidget {
   const StockLedgerScreen({super.key});
@@ -82,7 +83,8 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
           _isLoading = false;
         });
       }
-    } catch (e) {
+    } catch (e, stack) {
+      debugPrint("Error fetching stock ledger data: $e\n$stack");
       if (mounted) setState(() => _isLoading = false);
     }
   }
@@ -136,7 +138,7 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
       r['date'].toString(),
       r['type'].toString(),
       r['ref_no'].toString(),
-      r['batch'].toString(),
+      cleanBatch(r['batch'].toString()),
       r['in_qty'] > 0 ? r['in_qty'].toString() : "-",
       r['out_qty'] > 0 ? r['out_qty'].toString() : "-",
       r['balance'].toString(),
@@ -261,7 +263,31 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
               ],
             ),
           ),
-          const SizedBox(width: 16),
+          const SizedBox(width: 8),
+          ElevatedButton.icon(
+            onPressed: () => Provider.of<AppProvider>(context, listen: false).openConsolidateStock(),
+            icon: const Icon(Icons.grid_on_rounded, size: 16),
+            label: const Text("FULL REGISTER", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.indigo.shade800,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+          ),
+          const SizedBox(width: 8),
+          ElevatedButton.icon(
+            onPressed: _reconcileStockBatches,
+            icon: const Icon(Icons.build_circle_outlined, size: 16),
+            label: const Text("RECONCILE BATCHES", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.teal.shade800,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+          ),
+          const SizedBox(width: 8),
           ElevatedButton.icon(
             onPressed: _printLedger,
             icon: const Icon(Icons.print_rounded, size: 16),
@@ -276,6 +302,18 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
         ],
       ),
     );
+  }
+
+  Future<void> _reconcileStockBatches() async {
+    final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
+    final msg = await pharmacy.auditAndConsolidateStockBatches();
+    if (!mounted) return;
+    AppDialogs.showFastDialog(
+      context: context,
+      title: "Stock Audit & Reconciliation",
+      content: msg,
+    );
+    _fetchData();
   }
 
   Widget _modeToggleButton({required String label, required bool isActive, required VoidCallback onTap}) {
@@ -906,7 +944,7 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
                             }
                           }
                         }
-                        return LineTooltipItem('', const TextStyle());
+                        return const LineTooltipItem('', TextStyle());
                       }).toList();
                     },
                   ),
@@ -1062,7 +1100,8 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
                     scrollDirection: Axis.horizontal,
                     child: DataTable(
                       headingRowHeight: 36,
-                      dataRowHeight: 38,
+                      dataRowMinHeight: 38,
+                      dataRowMaxHeight: 38,
                       headingRowColor: WidgetStateProperty.all(const Color(0xFFF1F5F9)),
                       columns: const [
                         DataColumn(label: Text("DATE", style: TextStyle(fontSize: 11, fontWeight: FontWeight.w900))),
@@ -1428,29 +1467,7 @@ class _MovementScreenerDialogState extends State<_MovementScreenerDialog> {
     );
   }
 
-  Widget _themeToggleButton({required IconData icon, required String label, required bool isActive, required VoidCallback onTap}) {
-    return InkWell(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-        decoration: BoxDecoration(
-          color: isActive ? (_isDarkMode ? Colors.blue.shade800 : Colors.white) : Colors.transparent,
-          borderRadius: BorderRadius.circular(4),
-          boxShadow: isActive && !_isDarkMode ? [BoxShadow(color: Colors.black.withValues(alpha: 0.1), blurRadius: 2)] : null,
-        ),
-        child: Row(
-          children: [
-            Icon(icon, size: 12, color: isActive ? (_isDarkMode ? Colors.white : Colors.blue.shade800) : (_isDarkMode ? const Color(0xFF94A3B8) : const Color(0xFF64748B))),
-            const SizedBox(width: 4),
-            Text(
-              label,
-              style: TextStyle(fontSize: 9, fontWeight: FontWeight.w900, color: isActive ? (_isDarkMode ? Colors.white : Colors.blue.shade800) : (_isDarkMode ? const Color(0xFF94A3B8) : const Color(0xFF64748B))),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
+
 
   Widget _presetChip(String label, String key, {Color? color, required bool isDark}) {
     final isActive = _activePreset == key;

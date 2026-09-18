@@ -577,13 +577,14 @@ class _StockCheckingScreenState extends State<StockCheckingScreen> {
 
   void _showAdminAdjustmentDialog() async {
     final pharma = Provider.of<PharmacyProvider>(context, listen: false);
+    final mdi = Provider.of<MdiController>(context, listen: false);
+
     if (pharma.securityToggles['require_pin_admin_stock_adjustment'] == true) {
       bool ok = await PinUnlockDialog.show(context, pharma,
           title: "Adjustment (Admin) Access", message: "Enter Master PIN to access the consolidated adjustment window.");
+      if (!mounted) return;
       if (!ok) return;
     }
-
-    final mdi = Provider.of<MdiController>(context, listen: false);
     mdi.openWindow(MdiWindow(
       id: "admin_adjustment",
       title: "ADJUSTMENT (ADMIN)",

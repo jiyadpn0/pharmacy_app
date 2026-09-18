@@ -33,6 +33,7 @@ import '../screens/stock_checking_screen.dart';
 import '../screens/lists/supplier_list_screen.dart';
 import '../screens/lists/patient_list_screen.dart';
 import '../screens/expiry_check_screen.dart';
+import '../screens/wholesale_stock_directory_screen.dart';
 import '../screens/sales_return_screen.dart';
 import '../screens/purchase_return_screen.dart';
 import '../screens/lists/stock_list_report_screen.dart';
@@ -175,6 +176,7 @@ class AppProvider extends ChangeNotifier {
   void openExpiryList() => addTab("Expiry List", const ExpiryCheckScreen());
   void openDailyReport() => addTab("Daily Report", const DailyReportScreen());
   void openConsolidateStock() => addTab("Consolidate Stock Position", const ConsolidateStockScreen());
+  void openWholesaleStockDirectory() => addTab("Wholesale Stock Directory", const WholesaleStockDirectoryScreen());
   void openDamageEntry() => addTab("Damage Entry", const DamageEntryScreen(initialReason: "damage"));
   void openSettings({String? tab}) => addTab("Settings", SettingsScreen(initialTab: tab));
   void openSecuritySettings() => openSettings(tab: "Security & Backup");

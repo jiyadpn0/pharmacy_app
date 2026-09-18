@@ -514,25 +514,15 @@ class _StockListScreenState extends State<StockListScreen> {
 
   Widget _buildActionIcons(Product p, {required double width}) => SizedBox(
     width: width,
-    child: Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        IconButton(
-          icon: Icon(Icons.edit_outlined, size: 16, color: Colors.blue.shade600),
-          padding: EdgeInsets.zero,
-          constraints: const BoxConstraints(),
-          onPressed: () {
-            Provider.of<AppProvider>(context, listen: false).openProductRegistration();
-          },
-        ),
-        const SizedBox(width: 12),
-        IconButton(
-          icon: Icon(Icons.delete_outline_rounded, size: 16, color: Colors.red.shade600),
-          padding: EdgeInsets.zero,
-          constraints: const BoxConstraints(),
-          onPressed: () => _confirmDeleteProduct(p),
-        ),
-      ],
+    child: Center(
+      child: IconButton(
+        icon: Icon(Icons.edit_outlined, size: 16, color: Colors.blue.shade600),
+        padding: EdgeInsets.zero,
+        constraints: const BoxConstraints(),
+        onPressed: () {
+          Provider.of<AppProvider>(context, listen: false).openProductRegistration();
+        },
+      ),
     ),
   );
 

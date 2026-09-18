@@ -363,6 +363,8 @@ class SaleItem {
   double purchaseRate;
   double landingCost;
   String supplier;
+  double? dailyDosage;
+  double? originalExportQty;
 
   int get mrpPaise => (mrp * 100).round();
   int get taxableSPPaise => (taxableSP * 100).round();
@@ -400,6 +402,8 @@ class SaleItem {
     this.purchaseRate = 0.0,
     this.landingCost = 0.0,
     this.supplier = "",
+    this.dailyDosage,
+    this.originalExportQty,
   }) : uuid = uuid ?? DateTime.now().microsecondsSinceEpoch.toString();
 
   SaleItem clone() {
@@ -426,6 +430,8 @@ class SaleItem {
       purchaseRate: purchaseRate,
       landingCost: landingCost,
       supplier: supplier,
+      dailyDosage: dailyDosage,
+      originalExportQty: originalExportQty,
     );
   }
 
@@ -862,6 +868,30 @@ class Supplier {
     this.dlNumber = "",
     this.currentBalance = 0.0,
   });
+
+  Map<String, dynamic> toMap() {
+    return {
+      'id': id,
+      'name': name,
+      'address': address,
+      'phone': phone,
+      'gst_in': gstIn,
+      'dl_number': dlNumber,
+      'current_balance': currentBalance,
+    };
+  }
+
+  factory Supplier.fromMap(Map<String, dynamic> map) {
+    return Supplier(
+      id: map['id']?.toString() ?? '',
+      name: map['name']?.toString() ?? '',
+      address: map['address']?.toString() ?? '',
+      phone: map['phone']?.toString() ?? '',
+      gstIn: map['gst_in']?.toString() ?? '',
+      dlNumber: map['dl_number']?.toString() ?? '',
+      currentBalance: (map['current_balance'] as num?)?.toDouble() ?? 0.0,
+    );
+  }
 }
 
 class Patient {
@@ -1067,6 +1097,53 @@ class PurchaseReturnItem {
       ..total = total
       ..reason = reason;
   }
+}
+
+class WholesaleStockItem {
+  final String productId;
+  final String productName;
+  final String genericName;
+  final String companyName;
+  final String categoryName;
+  final String wholesaleName;
+  final String batchNumber;
+  final String expiryDate;
+  final int currentStock;
+  final double purchaseRate;
+  final double mrp;
+  final double saleRate;
+  final String rack;
+  final String unit;
+  final int packing;
+  final String lastPurchaseDate;
+  final String lastInvNo;
+  final int totalPurchasedQty;
+  final int rank;
+
+  WholesaleStockItem({
+    required this.productId,
+    required this.productName,
+    required this.genericName,
+    required this.companyName,
+    required this.categoryName,
+    required this.wholesaleName,
+    required this.batchNumber,
+    required this.expiryDate,
+    required this.currentStock,
+    required this.purchaseRate,
+    required this.mrp,
+    required this.saleRate,
+    required this.rack,
+    required this.unit,
+    required this.packing,
+    this.lastPurchaseDate = "-",
+    this.lastInvNo = "-",
+    this.totalPurchasedQty = 0,
+    this.rank = 0,
+  });
+
+  double get purchaseValuation => currentStock * purchaseRate;
+  double get mrpValuation => currentStock * mrp;
 }
 
 class Prescription {
@@ -1443,4 +1520,27 @@ class Staff {
       isActive: map['is_active'] == null ? true : map['is_active'] == 1,
     );
   }
+}
+
+enum WholesalerMatchStatus {
+  exactPurchase,       // 🟢 GREEN: Exact product purchased from wholesaler before
+  brandVariantPurchase,// 🟧 ORANGE: Same brand family purchased from wholesaler before
+  directoryMatch,      // 🟡 YELLOW: Wholesaler carries Patent/Company & Category
+  none,
+}
+
+class WholesalerAvailabilityResult {
+  final String wholesalerName;
+  final WholesalerMatchStatus status;
+  final String matchReason;
+  final String matchedDetail;
+  final int purchaseCount;
+
+  WholesalerAvailabilityResult({
+    required this.wholesalerName,
+    required this.status,
+    required this.matchReason,
+    this.matchedDetail = '',
+    this.purchaseCount = 0,
+  });
 }

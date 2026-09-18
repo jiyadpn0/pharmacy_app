@@ -61,6 +61,7 @@ class _GstReportScreenState extends State<GstReportScreen> {
         title: "Tax Report Locked",
         message: "Enter Master PIN to access GST filings and tax returns.",
       );
+      if (!mounted) return;
       if (isUnlocked) {
         setState(() => _isAuthorized = true);
         _generateReport();
@@ -276,6 +277,7 @@ class _GstReportScreenState extends State<GstReportScreen> {
   }
 
   void _exportToGovtJson() async {
+    final p = Provider.of<PharmacyProvider>(context, listen: false);
     final String defaultFileName = "GSTR1_${DateFormat('MMM_yyyy').format(_fromDate)}.json";
     String? outputFile = await FilePicker.saveFile(
       dialogTitle: 'Export Statutory GSTR-1 JSON for Govt Portal',
@@ -285,7 +287,6 @@ class _GstReportScreenState extends State<GstReportScreen> {
     );
 
     if (outputFile != null) {
-      final p = Provider.of<PharmacyProvider>(context, listen: false);
       await GstExportService.exportGstr1JsonFile(_fromDate, _toDate, outputFile, provider: p);
       if (mounted) {
         AppDialogs.showPathDialog(

@@ -8,8 +8,11 @@ analyzer:
     unused_import: warning
     unnecessary_import: info
     deprecated_member_use: info
+    unawaited_futures: warning
+    cancel_subscriptions: warning
 
 linter:
   rules:
-    avoid_print: false
+    avoid_print: true
     prefer_single_quotes: false
+

@@ -24,7 +24,7 @@ class _EditedInvoicesScreenState extends State<EditedInvoicesScreen> {
   DateTime _fromDate = DateTime.now().subtract(const Duration(days: 180)); // 6 Months
   DateTime _toDate = DateTime.now();
   String _selectedType = 'Sales';
-  bool _editedOnly = false;
+  bool _editedOnly = true;
 
   List<Map<String, dynamic>> _editedData = [];
   bool _isLoading = false;
@@ -66,11 +66,16 @@ class _EditedInvoicesScreenState extends State<EditedInvoicesScreen> {
         item['_edit_summary'] = diffs.join(" | ");
       } else if (oldItems.isNotEmpty) {
         item['_edit_summary'] = item['reason_for_edit'] ?? "Manual Edit";
+      } else if (item['reason_for_edit'] != null && item['reason_for_edit'].toString().isNotEmpty) {
+        item['_edit_summary'] = item['reason_for_edit'];
       } else {
         item['_edit_summary'] = "No Edits";
       }
 
-      processedData.add(item);
+      // Strictly only show edited entries (exclude 'No Edits')
+      if (item['_edit_summary'] != "No Edits") {
+        processedData.add(item);
+      }
     }
 
     if (mounted) {
@@ -78,6 +83,33 @@ class _EditedInvoicesScreenState extends State<EditedInvoicesScreen> {
         _editedData = processedData;
         _isLoading = false;
       });
+    }
+  }
+
+  String _getEntryLabel(Map<String, dynamic> item) {
+    if (item['_entry_type'] != null && item['_entry_type'].toString().isNotEmpty) {
+      return item['_entry_type'].toString();
+    }
+    final type = item['source_type'] ?? _selectedType;
+    switch (type) {
+      case 'Sales':
+        return 'sale entry';
+      case 'Purchase':
+        return 'purchase entry';
+      case 'Purchase Return':
+      case 'P.R':
+        return 'P.R';
+      case 'Sale Return':
+      case 'S.R':
+        return 'S.R';
+      case 'Damage':
+      case 'DAMAGE':
+        return 'DAMAGE';
+      case 'Adjustment':
+      case 'ADJUSTMENT':
+        return 'ADJUSTMENT';
+      default:
+        return type.toString();
     }
   }
 
@@ -89,7 +121,8 @@ class _EditedInvoicesScreenState extends State<EditedInvoicesScreen> {
       final entryNo = item['entry_no']?.toString().toLowerCase() ?? "";
       final party = (item['patient'] ?? item['supplier_name'] ?? "").toString().toLowerCase();
       final summary = (item['_edit_summary'] ?? "").toString().toLowerCase();
-      return entryNo.contains(query) || party.contains(query) || summary.contains(query);
+      final entryLabel = _getEntryLabel(item).toLowerCase();
+      return entryNo.contains(query) || party.contains(query) || summary.contains(query) || entryLabel.contains(query);
     }).toList();
   }
 
@@ -145,7 +178,7 @@ class _EditedInvoicesScreenState extends State<EditedInvoicesScreen> {
               controller: _searchCtrl,
               onChanged: (_) => setState(() {}),
               decoration: InputDecoration(
-                hintText: "Search Invoice or Party...",
+                hintText: "Search Entry or Party...",
                 prefixIcon: const Icon(Icons.search, size: 18),
                 isDense: true,
                 border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: Colors.grey.shade300)),
@@ -173,10 +206,13 @@ class _EditedInvoicesScreenState extends State<EditedInvoicesScreen> {
             const SizedBox(width: 16),
             SegmentedButton<String>(
               segments: const [
+                ButtonSegment(value: 'All', label: Text('All', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold))),
                 ButtonSegment(value: 'Sales', label: Text('Sales', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold))),
                 ButtonSegment(value: 'Purchase', label: Text('Purchase', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold))),
                 ButtonSegment(value: 'Sale Return', label: Text('Sales Ret', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold))),
                 ButtonSegment(value: 'Purchase Return', label: Text('Pur Ret', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold))),
+                ButtonSegment(value: 'Damage', label: Text('Damage', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold))),
+                ButtonSegment(value: 'Adjustment', label: Text('Adjustment', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold))),
               ],
               selected: {_selectedType},
               onSelectionChanged: (Set<String> newSelection) {
@@ -272,6 +308,13 @@ class _EditedInvoicesScreenState extends State<EditedInvoicesScreen> {
   }
 
   Widget _buildDataTable(List<Map<String, dynamic>> data) {
+    String partyHeader = "PATIENT / SUPPLIER NAME";
+    if (_selectedType == 'Sales' || _selectedType == 'Sale Return') {
+      partyHeader = "PATIENT NAME";
+    } else if (_selectedType == 'Purchase' || _selectedType == 'Purchase Return') {
+      partyHeader = "SUPPLIER NAME";
+    }
+
     return Container(
       margin: const EdgeInsets.all(24),
       decoration: BoxDecoration(
@@ -290,8 +333,8 @@ class _EditedInvoicesScreenState extends State<EditedInvoicesScreen> {
                   const _Hdr("SL", width: 40, textAlign: TextAlign.center),
                   const _Hdr("DATE", width: 80),
                   const _Hdr("TIME", width: 60),
-                  const _Hdr("INV NO", width: 90),
-                  _Hdr(_selectedType.contains('Purchase') ? "SUPPLIER NAME" : "PATIENT NAME", flex: 2),
+                  const _Hdr("ENTRY", width: 130),
+                  _Hdr(partyHeader, flex: 2),
                   const _Hdr("EDIT DETAILS", flex: 3),
                   const _Hdr("OLD TOTAL", width: 100, textAlign: TextAlign.right),
                   const _Hdr("NEW TOTAL", width: 100, textAlign: TextAlign.right),
@@ -312,6 +355,7 @@ class _EditedInvoicesScreenState extends State<EditedInvoicesScreen> {
                   final editSummary = item['_edit_summary']?.toString() ?? "N/A";
                   final oldTotal = (item['previous_grand_total'] as num?)?.toDouble() ?? 0.0;
                   final newTotal = (item['grand_total'] as num?)?.toDouble() ?? 0.0;
+                  final entryLabel = _getEntryLabel(item);
 
                   return InkWell(
                     onTap: () => _openInvoiceInEditor(item),
@@ -326,7 +370,7 @@ class _EditedInvoicesScreenState extends State<EditedInvoicesScreen> {
                           _Cell("${i + 1}", width: 40, textAlign: TextAlign.center),
                           _Cell(DateFormat('dd/MM/yy').format(dt), width: 80),
                           _Cell(DateFormat('HH:mm').format(dt), width: 60),
-                          _Cell(entryNo.toUpperCase(), width: 90, fontWeight: FontWeight.bold, color: Colors.blue.shade900),
+                          _Cell(entryLabel, width: 130, fontWeight: FontWeight.bold, color: Colors.blue.shade900),
                           _Cell(party.toUpperCase(), flex: 2, fontWeight: FontWeight.bold),
                           _Cell(editSummary, flex: 3, color: Colors.blueGrey.shade800, fontWeight: FontWeight.w600),
                           _Cell(oldTotal.toStringAsFixed(2), width: 100, textAlign: TextAlign.right, color: Colors.red.shade700),
@@ -345,25 +389,7 @@ class _EditedInvoicesScreenState extends State<EditedInvoicesScreen> {
                                 IconButton(
                                   icon: const Icon(Icons.print, color: Colors.blueGrey, size: 18),
                                   tooltip: "Print Preview",
-                                  onPressed: () async {
-                                    final p = Provider.of<PharmacyProvider>(context, listen: false);
-                                    if (_selectedType == 'Sales') {
-                                      final inv = await p.getSaleInvoiceById(entryNo);
-                                      if (inv != null && mounted) {
-                                        final doc = await InvoicePdfGenerator.buildPdfDocument(inv, p.companyProfile);
-                                        if (!mounted) return;
-                                        PrinterService.showProfessionalPreview(context: context, doc: doc, title: "Invoice $entryNo Preview");
-                                      }
-                                    } else if (_selectedType == 'Purchase') {
-                                      final purList = await p.fetchPurchasesInDateRange(_fromDate, _toDate, loadItems: true);
-                                      final entry = purList.cast<PurchaseEntry?>().firstWhere((e) => e?.entryNo == entryNo, orElse: () => null);
-                                      if (entry != null && mounted) {
-                                        final doc = await InvoicePdfGenerator.buildPurchasePdf(entry, p.companyProfile);
-                                        if (!mounted) return;
-                                        PrinterService.showProfessionalPreview(context: context, doc: doc, title: "Purchase $entryNo Preview");
-                                      }
-                                    }
-                                  },
+                                  onPressed: () => _showPrintPreview(item),
                                 ),
                               ],
                             ),
@@ -395,28 +421,55 @@ class _EditedInvoicesScreenState extends State<EditedInvoicesScreen> {
           context,
           provider,
           title: "Locked Entry",
-          message: "Enter Master Password to modify Invoice $entryNo."
+          message: "Enter Master Password to modify Entry $entryNo."
       );
 
       if (!mounted) return;
       if (!isUnlocked) return;
     }
 
-    if (_selectedType == 'Sales') {
+    final entryLabel = _getEntryLabel(item);
+
+    if (entryLabel == 'sale entry' || _selectedType == 'Sales') {
       appProvider.openSales(invoiceNo: entryNo);
-    } else if (_selectedType == 'Purchase') {
+    } else if (entryLabel == 'purchase entry' || _selectedType == 'Purchase') {
       appProvider.openPurchase(entryNo: entryNo);
-    } else if (_selectedType == 'Sale Return') {
+    } else if (entryLabel == 'S.R' || _selectedType == 'Sale Return') {
       appProvider.openSalesReturn(entryNo: entryNo);
-    } else if (_selectedType == 'Purchase Return') {
+    } else if (entryLabel == 'P.R' || _selectedType == 'Purchase Return') {
       appProvider.openPurchaseReturn(entryNo: entryNo);
+    } else if (entryLabel == 'DAMAGE' || _selectedType == 'Damage') {
+      appProvider.openDamageEntry();
+    } else if (entryLabel == 'ADJUSTMENT' || _selectedType == 'Adjustment') {
+      appProvider.openStockAdjustment();
     }
 
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text("Editing $_selectedType #$entryNo"),
+      content: Text("Editing $entryLabel #$entryNo"),
       backgroundColor: Colors.orange,
       duration: const Duration(seconds: 2),
     ));
+  }
+
+  void _showPrintPreview(Map<String, dynamic> item) async {
+    final entryNo = item['entry_no']?.toString() ?? "";
+    final label = _getEntryLabel(item);
+    final p = Provider.of<PharmacyProvider>(context, listen: false);
+
+    if (label == 'sale entry' || _selectedType == 'Sales') {
+      final inv = await p.getSaleInvoiceById(entryNo);
+      if (inv == null || !mounted) return;
+      final doc = await InvoicePdfGenerator.buildPdfDocument(inv, p.companyProfile);
+      if (!mounted) return;
+      PrinterService.showProfessionalPreview(context: context, doc: doc, title: "Invoice $entryNo Preview");
+    } else if (label == 'purchase entry' || _selectedType == 'Purchase') {
+      final purList = await p.fetchPurchasesInDateRange(_fromDate, _toDate, loadItems: true);
+      final entry = purList.cast<PurchaseEntry?>().firstWhere((e) => e?.entryNo == entryNo, orElse: () => null);
+      if (entry == null || !mounted) return;
+      final doc = await InvoicePdfGenerator.buildPurchasePdf(entry, p.companyProfile);
+      if (!mounted) return;
+      PrinterService.showProfessionalPreview(context: context, doc: doc, title: "Purchase $entryNo Preview");
+    }
   }
 
   Widget _buildFooter(int count) {

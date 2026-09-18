@@ -49,6 +49,12 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
   final Map<dynamic, int> _orderedQtys = {};
   final Map<dynamic, String> _orderedSuppliers = {};
 
+  // Wholesaler Search Dropdown Filter State
+  String _selectedWholesaler = "ALL WHOLESALERS";
+  Map<String, Set<String>> _wholesaler1YearMap = {};
+  List<String> _availableWholesalers = [];
+  final FocusNode _wholesalerFocusNode = FocusNode();
+
   Color _getSupplierBgColor(String name, bool isDark) {
     final clean = name.trim();
     if (clean.isEmpty || clean == '-' || clean == 'General Wholesale') {
@@ -227,14 +233,51 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
     } else {
       _selectedTab = 'ORDER';
     }
+    _loadAvailableWholesalers();
     _fetchData();
   }
 
   @override
   void dispose() {
+    _wholesalerFocusNode.dispose();
     _leftVerticalScroll.dispose();
     _rightVerticalScroll.dispose();
     super.dispose();
+  }
+
+  Future<void> _loadAvailableWholesalers() async {
+    final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
+    try {
+      final whList = await pharmacy.getWholesalerNamesWithCounts();
+      final List<String> namesFromCounts = whList.map((m) => m['name']?.toString() ?? '').where((n) => n.trim().isNotEmpty).toList();
+      final List<String> combined = [
+        ...namesFromCounts,
+        ...pharmacy.suppliers,
+      ].where((s) => s.trim().isNotEmpty && s != 'General Wholesale' && s != '-').toSet().toList();
+
+      combined.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+
+      if (mounted) {
+        setState(() {
+          _availableWholesalers = combined;
+        });
+      }
+    } catch (e) {
+      debugPrint("Error loading available wholesalers: $e");
+    }
+  }
+
+  void _onWholesalerSelected(String wholesaler) {
+    final clean = wholesaler.trim();
+    final newSel = (clean.isEmpty || clean.toUpperCase() == "ALL" || clean.toUpperCase() == "ALL WHOLESALERS")
+        ? "ALL WHOLESALERS"
+        : clean;
+
+    if (newSel == _selectedWholesaler) return;
+
+    setState(() {
+      _selectedWholesaler = newSel;
+    });
   }
 
   Future<void> _fetchData() async {
@@ -267,6 +310,15 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
         _specialOrders = allItems;
 
       } else if (_selectedTab == 'ORDER') {
+        // Hydrate wholesaler 1-year purchase map in background seamlessly
+        p.getWholesaler1YearPurchasesMap(referenceDate: _selectedDate).then((whMap) {
+          if (mounted) {
+            setState(() {
+              _wholesaler1YearMap = whMap;
+            });
+          }
+        });
+
         // Step 1: Load base items & stock instantly (20ms!)
         final baseItems = await p.getFastBaseOrderBookAnalysis();
         if (baseItems.isNotEmpty && mounted) {
@@ -602,14 +654,10 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
                     ],
                     const SizedBox(width: 12),
                     _buildTabSelector(),
-                    if (_selectedTab == 'ORDER') ...[
-                      const SizedBox(width: 12),
-                      _buildModeSwitch(),
-                    ],
 
                     const Spacer(),
 
-                    // RIGHT SIDE: Checkboxes on Top, Dropdowns Slightly Below
+                    // RIGHT SIDE: Checkboxes on Top, Mode Switch & Dropdowns Below
                     Column(
                       crossAxisAlignment: CrossAxisAlignment.end,
                       mainAxisSize: MainAxisSize.min,
@@ -631,10 +679,14 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
                           ],
                         ),
                         const SizedBox(height: 4),
-                        // Bottom Sub-Row: Dropdowns 1st Pur > and Last Sale >
+                        // Bottom Sub-Row: Mode Switch (ORDER BOOK / EXCESS STOCK) + Dropdowns 1st Pur > and Last Sale >
                         Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
+                            if (_selectedTab == 'ORDER') ...[
+                              _buildModeSwitch(),
+                              const SizedBox(width: 8),
+                            ],
                             _buildHighlightDaysPicker(
                               label: "1st Pur >",
                               selectedDays: _highlightFirstPurDays,
@@ -905,6 +957,178 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
         children: [
           _buildTabItem("ORDER ANALYSIS", 'ORDER'),
           _buildTabItem("SPECIAL ORDERS", 'SPECIAL_ORDERS'),
+          if (_selectedTab == 'ORDER') ...[
+            const SizedBox(width: 8),
+            _buildWholesalerHeaderDropdown(),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWholesalerHeaderDropdown() {
+    final List<String> options = [
+      "ALL WHOLESALERS",
+      ..._availableWholesalers,
+    ].toSet().toList();
+
+    final bool isSelected = _selectedWholesaler.isNotEmpty &&
+        _selectedWholesaler != "ALL WHOLESALERS" &&
+        _selectedWholesaler != "ALL";
+
+    return Container(
+      width: 210,
+      height: 30,
+      padding: const EdgeInsets.symmetric(horizontal: 6),
+      decoration: BoxDecoration(
+        color: isSelected
+            ? (_isDarkMode ? const Color(0xFF1E3A8A) : const Color(0xFFEFF6FF))
+            : (_isDarkMode ? const Color(0xFF1E293B) : Colors.white),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(
+          color: isSelected
+              ? const Color(0xFF2563EB)
+              : (_isDarkMode ? Colors.blueGrey.shade700 : Colors.grey.shade300),
+          width: isSelected ? 1.5 : 1.0,
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            Icons.storefront_outlined,
+            size: 14,
+            color: isSelected
+                ? const Color(0xFF2563EB)
+                : (_isDarkMode ? Colors.tealAccent : const Color(0xFF2563EB)),
+          ),
+          const SizedBox(width: 4),
+          Expanded(
+            child: Autocomplete<String>(
+              initialValue: TextEditingValue(text: _selectedWholesaler),
+              optionsBuilder: (TextEditingValue textEditingValue) {
+                final String query = textEditingValue.text.trim().toLowerCase();
+                if (query.isEmpty || query == "all wholesalers" || query == "all") {
+                  return options;
+                }
+                return options.where((String option) => option.toLowerCase().contains(query));
+              },
+              onSelected: (String selection) {
+                _onWholesalerSelected(selection);
+              },
+              fieldViewBuilder: (context, textController, fieldFocusNode, onFieldSubmitted) {
+                if (!fieldFocusNode.hasFocus &&
+                    textController.text != _selectedWholesaler) {
+                  textController.text = _selectedWholesaler;
+                }
+
+                return TextField(
+                  controller: textController,
+                  focusNode: fieldFocusNode,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: isSelected ? FontWeight.w900 : FontWeight.w700,
+                    color: isSelected
+                        ? (_isDarkMode ? Colors.white : const Color(0xFF1E40AF))
+                        : (_isDarkMode ? Colors.white70 : const Color(0xFF1E293B)),
+                  ),
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    contentPadding: EdgeInsets.symmetric(vertical: 6),
+                    border: InputBorder.none,
+                    hintText: "Select Wholesaler...",
+                    hintStyle: TextStyle(fontSize: 11, color: Colors.grey),
+                  ),
+                  onSubmitted: (val) {
+                    _onWholesalerSelected(val);
+                  },
+                );
+              },
+              optionsViewBuilder: (context, onSelected, options) {
+                return Align(
+                  alignment: Alignment.topLeft,
+                  child: Material(
+                    elevation: 6.0,
+                    borderRadius: BorderRadius.circular(8),
+                    color: _isDarkMode ? const Color(0xFF1E293B) : Colors.white,
+                    child: Container(
+                      width: 250,
+                      constraints: const BoxConstraints(maxHeight: 260),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: _isDarkMode ? Colors.blueGrey.shade700 : Colors.grey.shade300),
+                      ),
+                      child: ListView.separated(
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        shrinkWrap: true,
+                        itemCount: options.length,
+                        separatorBuilder: (context, index) => Divider(
+                          height: 1,
+                          color: _isDarkMode ? Colors.white10 : Colors.grey.shade200,
+                        ),
+                        itemBuilder: (context, index) {
+                          final option = options.elementAt(index);
+                          final isAll = option == "ALL WHOLESALERS";
+                          final isCurrent = option == _selectedWholesaler;
+
+                          return InkWell(
+                            onTap: () => onSelected(option),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                              color: isCurrent
+                                  ? (_isDarkMode ? Colors.blue.withValues(alpha: 0.3) : Colors.blue.shade50)
+                                  : Colors.transparent,
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    isAll ? Icons.all_inclusive : Icons.business,
+                                    size: 14,
+                                    color: isCurrent ? Colors.blue : Colors.grey,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      option,
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
+                                        color: isCurrent
+                                            ? Colors.blue
+                                            : (_isDarkMode ? Colors.white : Colors.black87),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          if (isSelected)
+            GestureDetector(
+              onTap: () {
+                _onWholesalerSelected("ALL WHOLESALERS");
+              },
+              child: const Padding(
+                padding: EdgeInsets.only(left: 2),
+                child: Icon(
+                  Icons.close,
+                  size: 14,
+                  color: Color(0xFF2563EB),
+                ),
+              ),
+            )
+          else
+            const Icon(
+              Icons.arrow_drop_down,
+              size: 16,
+              color: Colors.grey,
+            ),
         ],
       ),
     );
@@ -923,7 +1147,6 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
         children: [
           _buildModeSwitchItem("ORDER BOOK", 'ORDER_BOOK', const Color(0xFF2563EB)),
           _buildModeSwitchItem("EXCESS STOCK", 'EXCESS_STOCK', const Color(0xFF16A34A)),
-          _buildModeSwitchItem("ALL", 'ALL', Colors.grey),
         ],
       ),
     );
@@ -1287,6 +1510,25 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
 
         // Shows Green Excess Stocks
         if (!isExcessOrder) return false;
+      }
+
+      // Wholesaler Search Dropdown Filter (Check 1 Year Purchases & Mapped/Preferred Wholesaler)
+      if (_selectedWholesaler.isNotEmpty &&
+          _selectedWholesaler != "ALL WHOLESALERS" &&
+          _selectedWholesaler != "ALL") {
+        final String itemId = item['id']?.toString() ?? '';
+        final String selLower = _selectedWholesaler.toLowerCase().trim();
+        final Set<String> validPids = _wholesaler1YearMap[selLower] ?? {};
+
+        final String bestProf = (item['bestProfitWholesale'] ?? '').toString().toLowerCase().trim();
+        final String pref = (item['preferred_wholesale'] ?? '').toString().toLowerCase().trim();
+        final String mapped = (item['mappedWholesaler'] ?? item['mappedName'] ?? '').toString().toLowerCase().trim();
+        final String orderedSup = (_orderedSuppliers[item['id']] ?? '').toString().toLowerCase().trim();
+
+        final bool in1YearPurchased = validPids.contains(itemId);
+        final bool matchesPreferred = bestProf == selLower || pref == selLower || mapped == selLower || orderedSup == selLower;
+
+        if (!in1YearPurchased && !matchesPreferred) return false;
       }
 
       return true;

@@ -47,11 +47,11 @@ class _PaymentReceivedDialogState extends State<PaymentReceivedDialog> {
     super.dispose();
   }
 
-  Future<void> _fetchLedger() async {
+  Future<void> _fetchLedger([PharmacyProvider? p]) async {
     if (_selectedAccountName.trim().isEmpty) return;
     setState(() => _isLoadingLedger = true);
 
-    final provider = Provider.of<PharmacyProvider>(context, listen: false);
+    final provider = p ?? Provider.of<PharmacyProvider>(context, listen: false);
     final db = await DbHelper.instance.database;
 
     try {
@@ -215,7 +215,7 @@ class _PaymentReceivedDialogState extends State<PaymentReceivedDialog> {
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
-        builder: (context, setSubState) {
+        builder: (subCtx, setSubState) {
           double cashVal = double.tryParse(cashCtrl.text) ?? 0.0;
           double upiVal = double.tryParse(upiCtrl.text) ?? 0.0;
           double cardVal = double.tryParse(cardCtrl.text) ?? 0.0;
@@ -463,6 +463,7 @@ class _PaymentReceivedDialogState extends State<PaymentReceivedDialog> {
                       ? "Split Tender [${splitParts.join(', ')}] ${userRemarks.isNotEmpty ? '| $userRemarks' : ''}"
                       : (userRemarks.isNotEmpty ? userRemarks : (_selectedTarget == AccountTarget.customer ? "Direct Customer Receipt" : "Wholesaler Settlement"));
 
+                  final messenger = ScaffoldMessenger.of(context);
                   final provider = Provider.of<PharmacyProvider>(context, listen: false);
 
                   if (_selectedTarget == AccountTarget.customer) {
@@ -475,6 +476,7 @@ class _PaymentReceivedDialogState extends State<PaymentReceivedDialog> {
                       paymentMethod: finalPaymentMode,
                       remarks: finalRemarks,
                     ));
+                    if (!mounted) return;
                   } else {
                     await provider.addSupplierPayment(SupplierPayment(
                       id: "PAY_${DateTime.now().millisecondsSinceEpoch}",
@@ -485,12 +487,13 @@ class _PaymentReceivedDialogState extends State<PaymentReceivedDialog> {
                       paymentMethod: finalPaymentMode,
                       remarks: finalRemarks,
                     ));
+                    if (!mounted) return;
                   }
 
+                  _fetchLedger(provider);
+                  if (ctx.mounted) Navigator.pop(ctx);
                   if (mounted) {
-                    Navigator.pop(ctx);
-                    _fetchLedger();
-                    ScaffoldMessenger.of(context).showSnackBar(
+                    messenger.showSnackBar(
                       const SnackBar(content: Text("Payment transaction recorded successfully!"), backgroundColor: Colors.green),
                     );
                   }

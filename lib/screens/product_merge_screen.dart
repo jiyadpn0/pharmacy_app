@@ -43,11 +43,14 @@ class _ProductMergeScreenState extends State<ProductMergeScreen> {
         title: "Security Clearance", 
         message: "Enter Master PIN to authorize product consolidation.",
       );
+      if (!mounted) return;
       if (!isUnlocked) return; 
     }
 
+    if (!mounted) return;
+    final currentCtx = context;
     bool confirm = await showDialog<bool>(
-      context: context,
+      context: currentCtx,
       builder: (ctx) => AlertDialog(
         title: const Text("Confirm Product Merge"),
         content: Text("Are you sure you want to merge '${_duplicateProduct!.name}' into '${_targetProduct!.name}'?\n\nAll historical sales, purchases, and stock batches will transfer to '${_targetProduct!.name}', and '${_duplicateProduct!.name}' will be permanently deleted."),

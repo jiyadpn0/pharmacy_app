@@ -21,6 +21,8 @@ import '../widgets/app_date_picker.dart';
 import '../widgets/erp_tooltip.dart';
 import '../utils/search_debouncer.dart';
 import '../widgets/purchase/purchase_footer.dart';
+import '../utils/unsaved_handler.dart';
+import '../widgets/pin_unlock_dialog.dart';
 
 class PurchaseReturnScreen extends StatefulWidget {
   final String? initialEntryNo;
@@ -31,7 +33,14 @@ class PurchaseReturnScreen extends StatefulWidget {
   State<PurchaseReturnScreen> createState() => _PurchaseReturnScreenState();
 }
 
-class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
+class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements UnsavedHandler {
+  @override
+  bool hasUnsavedChanges() => _isDirty || (_items.isNotEmpty && !_isExistingEntry);
+
+  @override
+  void showDifferences() {
+    _promptDiscardChanges();
+  }
   final List<PurchaseReturnItem> _items = [];
   bool _isExistingEntry = false;
   bool _isDeleted = false;
@@ -92,7 +101,13 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
     16: 65,  17: 65,  18: 50,  19: 75,  20: 80,  21: 30,
   };
 
-  final List<int> _navCols = [1, 3, 8, 9, 10, 11];
+  List<int> get _navCols {
+    final List<int> cols = [1, 3];
+    if (_showSupplierCol) cols.add(5);
+    if (_showInvNoCol) cols.add(6);
+    cols.addAll([9, 10, 11]);
+    return cols;
+  }
 
   final Map<int, Map<int, TextEditingController>> _gridCtrls = {};
   final Map<int, Map<int, FocusNode>> _gridFocusNodes = {};
@@ -213,6 +228,7 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
   @override
   void initState() {
     super.initState();
+    UnsavedChangesRegistry.register("PURCHASE RETURN", this);
     final p = Provider.of<PharmacyProvider>(context, listen: false);
     Future.microtask(() async {
       final next = await p.getNextPurchaseReturnEntryNo();
@@ -306,6 +322,7 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
 
   @override
   void dispose() {
+    UnsavedChangesRegistry.unregister("PURCHASE RETURN");
     _gridScrollCtrl.dispose();
     _verticalGridScrollCtrl.dispose();
     _dropdownScrollCtrl.dispose();
@@ -532,6 +549,10 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
       _navigateEntry('next');
       return true;
     }
+    if (key == LogicalKeyboardKey.f3) {
+      _showFindDialog();
+      return true;
+    }
 
     if (isCtrl) {
       if (key == LogicalKeyboardKey.digit1) {
@@ -649,7 +670,7 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
         final exactIdx = _batchList.value.indexWhere((b) => b.batch.toUpperCase() == typed);
         _finalizeBatchSelection(_batchList.value[exactIdx != -1 ? exactIdx : _searchIdx.value]);
       } else {
-        _moveFocus(row, 8);
+        _moveFocus(row, 9);
       }
     } else {
       int curIdx = _navCols.indexOf(col);
@@ -875,29 +896,34 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
     if (row < _items.length) {
       _fetchBatchPurchaseDetails(row, _items[row].product.name, _items[row].product.id, p.batch);
     }
-    _moveFocus(_focusedRowIndex, 8);
+    _moveFocus(_focusedRowIndex, 9);
   }
 
   void _calculateItem(int row) {
     if (row >= _items.length) return;
     final it = _items[row];
     
+    int pRatePaise = (it.pRate * 100).round();
     double ps = it.packin > 0 ? it.packin.toDouble() : 1.0;
-    double stripValue = it.pRate * it.qty;
-    double looseValue = (it.pRate / ps) * it.looseQty;
-    
-    it.gross = double.parse((stripValue + looseValue).toStringAsFixed(2));
-    it.discAmt = double.parse((it.gross * (it.discPercent / 100.0)).toStringAsFixed(2));
-    it.net = double.parse((it.gross - it.discAmt).toStringAsFixed(2));
+    int stripPaise = pRatePaise * it.qty;
+    int loosePaise = ((pRatePaise / ps) * it.looseQty).round();
+    int grossPaise = stripPaise + loosePaise;
+    int discPaise = ((grossPaise * it.discPercent) / 100.0).round();
+    int netPaise = grossPaise - discPaise;
+    if (netPaise < 0) netPaise = 0;
 
     it.gstPercent = TaxCalculator.roundGstPercent(it.gstPercent);
+    int gstPaise = 0;
     if (_gstMode == 1 && it.gstPercent > 0) {
-      it.gstAmt = double.parse((it.net * (it.gstPercent / 100.0)).toStringAsFixed(2));
-      it.total = double.parse((it.net + it.gstAmt).toStringAsFixed(2));
-    } else {
-      it.gstAmt = 0.0;
-      it.total = double.parse(it.net.toStringAsFixed(2));
+      gstPaise = ((netPaise * it.gstPercent) / 100.0).round();
     }
+    int totalPaise = netPaise + gstPaise;
+
+    it.gross = grossPaise / 100.0;
+    it.discAmt = discPaise / 100.0;
+    it.net = netPaise / 100.0;
+    it.gstAmt = gstPaise / 100.0;
+    it.total = totalPaise / 100.0;
 
     _getGridCtrl(row, 14, it.gross.toStringAsFixed(2)).text = it.gross.toStringAsFixed(2);
     _getGridCtrl(row, 15, it.discPercent.toStringAsFixed(2)).text = it.discPercent.toStringAsFixed(2);
@@ -1171,6 +1197,14 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
           errors.add("Row ${i + 1}: Return quantity must be greater than 0");
           _markRowError(i);
         }
+
+        int pack = it.packin > 0 ? it.packin : 1;
+        int totalReturnLoose = (it.qty * pack) + it.looseQty + (it.fQty * pack);
+        int availableStockLoose = it.product.stock;
+        if (totalReturnLoose > availableStockLoose && !_isExistingEntry) {
+          errors.add("Row ${i + 1} (${it.product.name}): Return qty ($totalReturnLoose loose units) exceeds available stock ($availableStockLoose units)");
+          _markRowError(i);
+        }
       }
 
       if (errors.isNotEmpty) {
@@ -1351,13 +1385,14 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
       String targetNo = searchNo ?? _entryNo;
       final data = await p.navigateInvoice(targetNo, dir, isPurchaseReturn: true);
       
-      if (data != null && data['is_deleted'] != 1 && mounted) {
+      if (data != null && mounted) {
         String actualNo = data['entry_no']?.toString() ?? targetNo;
+        bool isDel = (data['is_deleted'] == 1 || data['is_deleted'] == true || data['is_deleted'] == '1');
         final items = await p.getInvoiceItems(actualNo, isPurchaseReturn: true);
 
         setState(() {
           _isExistingEntry = true;
-          _isDeleted = false;
+          _isDeleted = isDel;
           _isDirty = false; // Freshly loaded, reset dirty flag
           String cleanNo = actualNo.startsWith("PRET-") ? actualNo.substring(5) : actualNo;
           if (cleanNo.contains('_')) {
@@ -1420,7 +1455,13 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
           );
         });
       } else if (dir == 'next') {
-        if (_isExistingEntry) _resetPage();
+        if (_isExistingEntry) {
+          _resetPage();
+        } else {
+          AppDialogs.showFastDialog(context: context, title: "Navigation", content: "NO MORE RECORDS TO SHOW");
+        }
+      } else if (dir == 'prev') {
+        AppDialogs.showFastDialog(context: context, title: "Navigation", content: "FIRST RECORD REACHED");
       }
     } catch (e) {
       debugPrint("Load Purchase Return Error: $e");
@@ -1531,6 +1572,29 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
             Column(
               children: [
                 _buildTopToolbar(),
+                if (_isDeleted)
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    color: const Color(0xFF7F1D1D),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.delete_forever_rounded, color: Colors.amberAccent, size: 20),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            "🗑️ DELETED ENTRY: Purchase Return Entry #$_entryNo is marked as DELETED and is Read-Only.",
+                            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13, letterSpacing: 0.5),
+                          ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(color: const Color(0xFF450A0A), borderRadius: BorderRadius.circular(4), border: Border.all(color: Colors.amberAccent)),
+                          child: const Text("READ-ONLY", style: TextStyle(color: Colors.amberAccent, fontWeight: FontWeight.bold, fontSize: 11)),
+                        ),
+                      ],
+                    ),
+                  ),
                 _buildHeader(),
                 Expanded(
                   child: LayoutBuilder(builder: (ctx, con) {
@@ -1593,9 +1657,21 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
       child: Stack(
         alignment: Alignment.center,
         children: [
-          const Align(
+          Align(
             alignment: Alignment.centerLeft,
-            child: Text("PURCHASE RETURN ENTRY", style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16, color: Colors.black87)),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text("PURCHASE RETURN ENTRY", style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16, color: Colors.black87)),
+                if (_isDeleted)
+                  Container(
+                    margin: const EdgeInsets.only(left: 8),
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(color: const Color(0xFF7F1D1D), borderRadius: BorderRadius.circular(4)),
+                    child: const Text("DELETED", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 10)),
+                  ),
+              ],
+            ),
           ),
           Row(
             mainAxisSize: MainAxisSize.min,
@@ -1604,6 +1680,8 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
               _topActionBtn(Icons.add_box_rounded, "New (F2)", Colors.blue, onTap: _resetPage),
               _topActionBtn(Icons.check_circle_rounded, "Save (F6)", canSave ? Colors.green : Colors.grey.shade400, onTap: canSave ? () => _saveReturn(isEdit: false) : () {}),
               _topActionBtn(Icons.edit_document, "Edit", canEdit ? Colors.orange : Colors.grey.shade400, onTap: canEdit ? () => _saveReturn(isEdit: true) : () {}),
+              _topActionBtn(Icons.delete_forever_rounded, "Delete", canEdit ? const Color(0xFFD32F2F) : Colors.grey.shade400, onTap: canEdit ? _showDeleteConfirm : () {}),
+              _topActionBtn(Icons.search_rounded, "Find (F3)", const Color(0xFF3F51B5), onTap: _showFindDialog),
               _topActionBtn(Icons.print_rounded, "Print", Colors.blueGrey, onTap: _exportToPdf),
               _topActionBtn(Icons.file_download_outlined, "Export", Colors.green.shade800, onTap: _exportToExcel),
             ],
@@ -1611,6 +1689,108 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
         ],
       ),
     );
+  }
+
+  void _showDeleteConfirm() async {
+    if (!_isExistingEntry || _isDeleted) return;
+
+    final p = Provider.of<PharmacyProvider>(context, listen: false);
+
+    if (p.securityToggles['require_pin_delete_purchases'] == true) {
+      bool isUnlocked = await PinUnlockDialog.show(
+        context,
+        p,
+        title: "Confirm Deletion",
+        message: "Enter Master Password to permanently delete Purchase Return Entry #$_entryNo."
+      );
+      if (!mounted) return;
+      if (!isUnlocked) return;
+    }
+
+    if (!mounted) return;
+
+    final res = await AppDialogs.showConfirmDialog(
+      context: context,
+      title: "Delete Entry?",
+      content: "Are you sure you want to delete Purchase Return Entry #$_entryNo? Stock will be restored.",
+      isDangerous: true,
+    );
+
+    if (res == true) {
+      try {
+        setState(() => _isLoading = true);
+        await p.deletePurchaseReturn(_entryNo);
+        p.logAudit('DELETE_PURCHASE_RETURN', 'Purchase Return Entry $_entryNo deleted by ${_doneByCtrl.text.isNotEmpty ? _doneByCtrl.text : "Admin"}.', userId: _doneByCtrl.text.isNotEmpty ? _doneByCtrl.text : "Admin");
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Purchase Return Entry Deleted"), backgroundColor: Colors.red),
+          );
+          _isDirty = false;
+          _isExistingEntry = false;
+          _resetPage();
+        }
+      } catch (e) {
+        if (mounted) {
+          AppDialogs.showFastDialog(context: context, title: "Delete Failed", content: e.toString());
+        }
+      } finally {
+        if (mounted) setState(() => _isLoading = false);
+      }
+    }
+  }
+
+  void _showFindDialog() {
+    final TextEditingController findCtrl = TextEditingController();
+    final FocusNode findFocusNode = FocusNode();
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        title: const Row(
+          children: [
+            Icon(Icons.search, color: Colors.blue, size: 24),
+            SizedBox(width: 8),
+            Text("Find Purchase Return Entry", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+          ],
+        ),
+        content: SizedBox(
+          width: 380,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: findCtrl,
+                focusNode: findFocusNode,
+                autofocus: true,
+                keyboardType: TextInputType.text,
+                decoration: const InputDecoration(
+                  labelText: "Entry Number",
+                  hintText: "Enter Entry No (e.g. 1 or PRET-1)...",
+                  prefixIcon: Icon(Icons.search, color: Colors.blue),
+                  border: OutlineInputBorder(),
+                ),
+                onSubmitted: (v) { Navigator.pop(ctx, v); },
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("CANCEL")),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF3F51B5),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+            ),
+            onPressed: () => Navigator.pop(ctx, findCtrl.text),
+            child: const Text("SEARCH", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    ).then((val) {
+      if (val != null && val.toString().trim().isNotEmpty) {
+        _navigateEntry('find', searchNo: val.toString().trim());
+      }
+    });
   }
 
   Widget _topActionBtn(IconData icon, String label, Color color, {VoidCallback? onTap}) => Padding(
@@ -2046,14 +2226,14 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
           child: Row(
             children: [
               _cell(row, 0, "${row + 1}", _colWidths[0]!, align: TextAlign.center),
-              _cell(row, 1, it.product.name.toUpperCase(), _colWidths[1]!, isInput: true, fontWeight: FontWeight.bold, onChanged: (v) { _saveUndoState(); it.product.name = v; _startProductSearch(v); }),
+              _cell(row, 1, _isDeleted ? "" : it.product.name.toUpperCase(), _colWidths[1]!, isInput: true, fontWeight: FontWeight.bold, onChanged: (v) { _saveUndoState(); it.product.name = v; _startProductSearch(v); }),
               _cell(row, 2, it.hsncode.toUpperCase(), _colWidths[2]!),
               _cell(row, 3, cleanBatch(it.product.batch).toUpperCase(), _colWidths[3]!, isInput: true, onChanged: (v) { _saveUndoState(); it.product.batch = v; _startBatchSearch(row, v); }),
               _cell(row, 4, it.product.expiry, _colWidths[4]!, align: TextAlign.center),
               if (_showSupplierCol) _cell(row, 5, it.supplier.toUpperCase(), _colWidths[5]!, isInput: true, onChanged: (v) { _saveUndoState(); it.supplier = v; }),
               if (_showInvNoCol) _cell(row, 6, it.supInvNo.toUpperCase(), _colWidths[6]!, isInput: true, onChanged: (v) { _saveUndoState(); it.supInvNo = v; }),
               if (_showEntryNoCol) _cell(row, 7, _entryNo, _colWidths[7]!, align: TextAlign.center),
-              _cell(row, 8, it.packin.toString(), _colWidths[8]!, isInput: true, align: TextAlign.right, onChanged: (v) { _saveUndoState(); it.packin = int.tryParse(v) ?? 1; _calculateItem(row); }),
+              _cell(row, 8, it.packin.toString(), _colWidths[8]!, align: TextAlign.right),
               _cell(row, 9, it.qty.toString(), _colWidths[9]!, isInput: true, align: TextAlign.right, onChanged: (v) { _saveUndoState(); it.qty = int.tryParse(v) ?? 0; _calculateItem(row); }),
               _cell(row, 10, it.looseQty.toString(), _colWidths[10]!, isInput: true, align: TextAlign.right, onChanged: (v) { _saveUndoState(); it.looseQty = int.tryParse(v) ?? 0; _calculateItem(row); }),
               _cell(row, 11, it.fQty.toString(), _colWidths[11]!, isInput: true, align: TextAlign.right),
@@ -2093,7 +2273,7 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
               if (_showSupplierCol) _cell(row, 5, "", _colWidths[5]!),
               if (_showInvNoCol) _cell(row, 6, "", _colWidths[6]!),
               if (_showEntryNoCol) _cell(row, 7, "", _colWidths[7]!, align: TextAlign.center),
-              _cell(row, 8, "", _colWidths[8]!, isInput: true, align: TextAlign.right),
+              _cell(row, 8, "", _colWidths[8]!, align: TextAlign.right),
               _cell(row, 9, "", _colWidths[9]!, isInput: true, align: TextAlign.right),
               _cell(row, 10, "", _colWidths[10]!, isInput: true, align: TextAlign.right),
               _cell(row, 11, "", _colWidths[11]!, align: TextAlign.right),
@@ -2295,7 +2475,7 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
             if (list.isEmpty) return const SizedBox();
 
             final link = isBatch ? _batchLayer : _searchLayer;
-            const double dropWidth = 1100.0;
+            const double dropWidth = 1350.0;
             const headerColor = Color(0xFF334155);
 
             return CompositedTransformFollower(
@@ -2409,7 +2589,7 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> {
                                               _GridCell(p.category, width: 50),
                                               _GridCell(p.manufacturer, width: 120),
                                               _GridCell(p.genericName.isNotEmpty ? p.genericName : (Provider.of<PharmacyProvider>(context, listen: false).getProductById(p.id)?.genericName ?? Provider.of<PharmacyProvider>(context, listen: false).getProductMasterByName(p.name)?.genericName ?? ""), width: 150),
-                                              const _GridCell("", flex: 1),
+                                              _GridCell(p.use.isNotEmpty ? p.use : (Provider.of<PharmacyProvider>(context, listen: false).getProductById(p.id)?.use ?? Provider.of<PharmacyProvider>(context, listen: false).getProductMasterByName(p.name)?.use ?? ""), flex: 1),
                                             ],
                                     ),
                                   ),

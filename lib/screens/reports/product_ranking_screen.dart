@@ -294,6 +294,8 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
   }
 
   Future<void> _loadCacheOrLightweight() async {
+    final provider = Provider.of<PharmacyProvider>(context, listen: false);
+    int months = int.tryParse(_monthsCtrl.text) ?? 1;
     final prefs = await SharedPreferences.getInstance();
     final savedTime = prefs.getString('pr_last_updated_time') ?? "";
     final cachedList = prefs.getStringList('pr_cached_rankings_v2');
@@ -320,8 +322,6 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
     }
 
     try {
-      final provider = Provider.of<PharmacyProvider>(context, listen: false);
-      int months = int.tryParse(_monthsCtrl.text) ?? 1;
       final lightData = await provider.getLightweightProductList(monthsCount: months);
       if (mounted) {
         setState(() {
@@ -339,6 +339,7 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
   }
 
   Future<void> _performAnalysis() async {
+    final provider = Provider.of<PharmacyProvider>(context, listen: false);
     int months = int.tryParse(_monthsCtrl.text) ?? 1;
     if (months > 24) {
       months = 24;
@@ -346,9 +347,8 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
     }
     await _saveSettings();
 
+    if (!mounted) return;
     setState(() => _isLoading = true);
-
-    final provider = Provider.of<PharmacyProvider>(context, listen: false);
 
     try {
       final data = await provider.getDynamicProductRanking(months, rollingMode: _includeCurrentMonth);
@@ -384,6 +384,7 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
       return;
     }
 
+    final provider = Provider.of<PharmacyProvider>(context, listen: false);
     String? outputFile = await FilePicker.saveFile(
       dialogTitle: 'Select where to save Product Ranking Excel:',
       fileName: 'product_ranking_export.xlsx',
@@ -392,9 +393,9 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
     );
 
     if (outputFile != null) {
+      if (!mounted) return;
       setState(() => _isLoading = true);
       try {
-        final provider = Provider.of<PharmacyProvider>(context, listen: false);
         final bytes = await provider.exportProductRankingToExcelBytes(_displayRankings, _customMetricColumns);
 
         if (bytes != null) {

@@ -12,6 +12,8 @@ import 'quick_adjust_dialog.dart';
 import 'current_stock_screen.dart';
 import 'product_profile_screen.dart';
 import '../services/update_checker_service.dart';
+import 'package:pharmacy_app/services/remote_logger_service.dart';
+import '../utils/unsaved_handler.dart';
 import 'package:window_manager/window_manager.dart';
 
 class MainShell extends StatefulWidget {
@@ -31,15 +33,28 @@ class _MainShellState extends State<MainShell> with WindowListener {
     // Silent check for software updates on boot
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
-        UpdateCheckerService.checkForUpdates(context, silent: true);
+        try {
+          UpdateCheckerService.checkForUpdates(context, silent: true);
+        } catch (e) {
+          debugPrint("Silent update check failed: $e");
+        }
       }
     });
 
     // Delay auto-backup so it never contends for DB locks during startup
     Timer(const Duration(seconds: 15), () async {
       if (!mounted) return;
-      final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
-      await pharmacy.performAutoBackupIfNeeded();
+      try {
+        final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
+        await pharmacy.performAutoBackupIfNeeded();
+      } catch (e, stack) {
+        RemoteLoggerService.instance.logError(
+          e,
+          stackTrace: stack,
+          library: 'MainShell Timer',
+          context: 'Auto-backup background timer',
+        );
+      }
     });
   }
 
@@ -52,10 +67,20 @@ class _MainShellState extends State<MainShell> with WindowListener {
 
   @override
   void onWindowClose() async {
-    bool isPreventClose = await windowManager.isPreventClose();
-    if (isPreventClose && mounted) {
-      final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
-      await pharmacy.performAutoBackupIfNeeded(forceOnExit: true);
+    try {
+      bool isPreventClose = await windowManager.isPreventClose();
+      if (isPreventClose && mounted) {
+        final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
+        await pharmacy.performAutoBackupIfNeeded(forceOnExit: true);
+        await windowManager.destroy();
+      }
+    } catch (e, stack) {
+      RemoteLoggerService.instance.logError(
+        e,
+        stackTrace: stack,
+        library: 'MainShell WindowClose',
+        context: 'Window close auto-backup',
+      );
       await windowManager.destroy();
     }
   }
@@ -158,12 +183,12 @@ class _MainShellState extends State<MainShell> with WindowListener {
       child: WindowControlsBar(
         height: 32.0,
         backgroundColor: const Color(0xFF0F172A),
-        titleWidget: const Row(
+        titleWidget: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.medical_services_rounded, color: Colors.white, size: 16),
-            SizedBox(width: 8),
-            Text(
+            const Icon(Icons.medical_services_rounded, color: Colors.white, size: 16),
+            const SizedBox(width: 8),
+            const Text(
               "PHARMA PRO",
               style: TextStyle(
                 color: Colors.white,
@@ -172,23 +197,18 @@ class _MainShellState extends State<MainShell> with WindowListener {
                 letterSpacing: 1.0,
               ),
             ),
+            const SizedBox(width: 16),
+            Container(height: 16, width: 1, color: Colors.white24),
+            const SizedBox(width: 12),
+            Consumer<PharmacyProvider>(
+              builder: (_, pharma, __) => _buildActiveStaffBar(app, pharma),
+            ),
           ],
         ),
         trailingActions: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Consumer<PharmacyProvider>(
-              builder: (_, pharma, __) => Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  _buildAgentSelector(pharma),
-                  const SizedBox(width: 8),
-                  _buildGlobalWorkspaces(app, pharma),
-                  const SizedBox(width: 8),
-                  _buildThemeToggleButton(app),
-                ],
-              ),
-            ),
+            _buildThemeToggleButton(app),
             const SizedBox(width: 8),
             _buildFinancialYearSelector(context),
             const SizedBox(width: 4),
@@ -219,73 +239,154 @@ class _MainShellState extends State<MainShell> with WindowListener {
     );
   }
 
-  // ---> NEW: DYNAMIC AGENT SELECTOR WIDGET <---
-  Widget _buildAgentSelector(PharmacyProvider pharma) {
-    List<String> agents = pharma.staffNames;
-    if (agents.isEmpty) {
-      agents = ["Admin", "Jiyad", "Suresh", "Ramesh", "Staff 1", "Staff 2"];
-    } else {
-      agents = List<String>.from(agents);
-    }
-    
-    String currentAgent = "Agent";
-    if (pharma.salesSessions.isNotEmpty && pharma.activeSessionIdx < pharma.salesSessions.length) {
-      final String raw = pharma.salesSessions[pharma.activeSessionIdx]['agent']?.toString() ?? "";
-      if (raw.isNotEmpty) {
-        if (!agents.contains(raw)) {
-          agents.add(raw);
-        }
-        currentAgent = raw;
-      }
+  Widget _buildActiveStaffBar(AppProvider app, PharmacyProvider pharma) {
+    // 1. Get ONLY ACTIVE staff members from Staff Management
+    List<String> activeStaff = pharma.activeStaffList
+        .map((s) => s.name.trim())
+        .where((n) => n.isNotEmpty)
+        .toList();
+
+    if (activeStaff.isEmpty) {
+      activeStaff = pharma.staffNames
+          .where((n) => n.trim().isNotEmpty)
+          .toList();
     }
 
-    return Container(
-      height: 22,
-      padding: const EdgeInsets.symmetric(horizontal: 6),
-      decoration: BoxDecoration(
-        color: Colors.white10,
-        borderRadius: BorderRadius.circular(4),
-        border: Border.all(color: Colors.white24),
-      ),
-      child: DropdownButtonHideUnderline(
-        child: DropdownButton<String>(
-          dropdownColor: const Color(0xFF1E293B),
-          value: currentAgent == "Agent" ? null : currentAgent,
-          hint: const Row(
-            children: [
-              Icon(Icons.support_agent_rounded, color: Colors.white70, size: 12),
-              SizedBox(width: 4),
-              Text("Select Agent", style: TextStyle(color: Colors.white70, fontSize: 10, fontWeight: FontWeight.bold)),
-            ],
-          ),
-          icon: const Padding(
-            padding: EdgeInsets.only(left: 4),
-            child: Icon(Icons.arrow_drop_down, color: Colors.white60, size: 14),
-          ),
-          isDense: true,
-          style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
-          items: agents.map((String agent) {
-            return DropdownMenuItem<String>(
-              value: agent,
+    // Sort A-to-Z alphabetically (A starting on left, Z on right)
+    activeStaff.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+
+    if (activeStaff.isEmpty) {
+      activeStaff = ["Admin"];
+    }
+
+    // 2. Currently selected sales agent
+    String currentAgent = "";
+    if (pharma.salesSessions.isNotEmpty && pharma.activeSessionIdx < pharma.salesSessions.length) {
+      currentAgent = pharma.salesSessions[pharma.activeSessionIdx]['agent']?.toString().trim() ?? "";
+    }
+
+    // Helper to select an agent
+    void selectAgent(String name) {
+      int existingIdx = pharma.salesSessions.indexWhere(
+        (s) => s['agent']?.toString().trim().toLowerCase() == name.toLowerCase()
+      );
+      if (existingIdx != -1) {
+        pharma.setSalesSession(existingIdx);
+      } else {
+        final session = Map<String, dynamic>.from(pharma.salesSessions[pharma.activeSessionIdx]);
+        session['agent'] = name;
+        pharma.updateSalesSession(pharma.activeSessionIdx, session);
+      }
+      app.switchToSalesTab();
+    }
+
+    const int maxVisible = 7;
+    final bool hasOverflow = activeStaff.length > maxVisible;
+    final List<String> visibleStaff = hasOverflow ? activeStaff.sublist(0, maxVisible) : activeStaff;
+    final List<String> overflowStaff = hasOverflow ? activeStaff.sublist(maxVisible) : [];
+
+    bool isCurrentInOverflow = overflowStaff.any((s) => s.toLowerCase() == currentAgent.toLowerCase());
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        ...visibleStaff.map((name) {
+          final bool isSelected = currentAgent.toLowerCase() == name.toLowerCase();
+          return Container(
+            margin: const EdgeInsets.only(right: 4),
+            child: InkWell(
+              onTap: () => selectAgent(name),
+              borderRadius: BorderRadius.circular(4),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+                decoration: BoxDecoration(
+                  color: isSelected ? Colors.amber.shade700 : Colors.white12,
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(
+                    color: isSelected ? Colors.amberAccent : Colors.white24,
+                    width: isSelected ? 1.5 : 1.0,
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.person,
+                      size: 11,
+                      color: isSelected ? Colors.white : Colors.white70,
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      name,
+                      style: TextStyle(
+                        color: isSelected ? Colors.white : Colors.white.withValues(alpha: 0.9),
+                        fontSize: 10,
+                        fontWeight: isSelected ? FontWeight.bold : FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        }),
+        if (hasOverflow)
+          PopupMenuButton<String>(
+            color: const Color(0xFF1E293B),
+            elevation: 8,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            onSelected: selectAgent,
+            itemBuilder: (context) => overflowStaff.map((name) {
+              final bool isSel = currentAgent.toLowerCase() == name.toLowerCase();
+              return PopupMenuItem<String>(
+                value: name,
+                height: 32,
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.person,
+                      size: 13,
+                      color: isSel ? Colors.amberAccent : Colors.white70,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      name,
+                      style: TextStyle(
+                        color: isSel ? Colors.amberAccent : Colors.white,
+                        fontSize: 11,
+                        fontWeight: isSel ? FontWeight.bold : FontWeight.normal,
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }).toList(),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: isCurrentInOverflow ? Colors.amber.shade700 : Colors.white10,
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(
+                  color: isCurrentInOverflow ? Colors.amberAccent : Colors.white24,
+                ),
+              ),
               child: Row(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Icon(Icons.person, color: Colors.white70, size: 12),
-                  const SizedBox(width: 6),
-                  Text(agent),
+                  Text(
+                    isCurrentInOverflow ? "Other: $currentAgent" : "Other...",
+                    style: TextStyle(
+                      color: isCurrentInOverflow ? Colors.white : Colors.white70,
+                      fontSize: 10,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const Icon(Icons.arrow_drop_down, color: Colors.white70, size: 14),
                 ],
               ),
-            );
-          }).toList(),
-          onChanged: (String? newValue) {
-            if (newValue != null) {
-              // Updates the agent for the current workspace and triggers UI rebuild
-              final session = Map<String, dynamic>.from(pharma.salesSessions[pharma.activeSessionIdx]);
-              session['agent'] = newValue;
-              pharma.updateSalesSession(pharma.activeSessionIdx, session);
-            }
-          },
-        ),
-      ),
+            ),
+          ),
+      ],
     );
   }
 
@@ -386,6 +487,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
             }),
             _MenuAction("Stock Ledger", () => app.openStockLedger()),
             _MenuAction("Consolidate Stock", () => app.openConsolidateStock()),
+            _MenuAction("Wholesale Stock Directory", () => app.openWholesaleStockDirectory()),
             _MenuAction("Inventory", () => app.openAllStockDetails()),
           ]),
           _CompactDropdownMenu(title: "STOCK MANAGEMENT", actions: [
@@ -478,86 +580,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
     }
   }
 
-  Widget _buildGlobalWorkspaces(AppProvider app, PharmacyProvider pharma) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8),
-      child: Row(
-        children: List.generate(3, (i) {
-          bool isSessionActive = pharma.activeSessionIdx == i;
-          String agent = pharma.salesSessions[i]['agent'];
-          bool hasName = agent.isNotEmpty;
-          if (agent.isEmpty) agent = "W${i + 1}";
 
-          // Apply unique colors ONLY if an agent is selected
-          Color agentColor = hasName ? _getAgentColor(agent) : Colors.transparent;
-
-          // Background: Colored if assigned, grey if unassigned
-          Color bgColor = hasName 
-              ? agentColor.withValues(alpha: isSessionActive ? 0.3 : 0.1) 
-              : (isSessionActive ? const Color(0xFF37474F) : Colors.black26);
-
-          // Border: Colored if assigned, white/grey if unassigned
-          Color borderColor = hasName 
-              ? agentColor 
-              : (isSessionActive ? Colors.white54 : Colors.white12);
-
-          return Stack(
-            clipBehavior: Clip.none,
-            children: [
-              GestureDetector(
-                onTap: () {
-                  pharma.setSalesSession(i);
-                  app.switchToSalesTab();
-                },
-                child: Container(
-                  width: 50,
-                  height: 22,
-                  margin: const EdgeInsets.only(left: 4),
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    color: bgColor,
-                    borderRadius: BorderRadius.circular(4),
-                    border: Border.all(
-                      color: borderColor,
-                      width: isSessionActive ? 1.5 : 1.0,
-                    ),
-                  ),
-                  child: Text(
-                    agent,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      color: (hasName || isSessionActive) ? Colors.white : Colors.white60,
-                      fontSize: 9,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ),
-              ),
-              if (isSessionActive && hasName)
-                Positioned(
-                  top: -4,
-                  right: -4,
-                  child: GestureDetector(
-                    onTap: () {
-                      // ---> THE FIX: Explicitly clear the agent when clicking the red X <---
-                      final session = Map<String, dynamic>.from(pharma.salesSessions[i]);
-                      session['agent'] = "";
-                      pharma.updateSalesSession(i, session, notify: false);
-                      pharma.clearSalesSession(i);
-                    },
-                    child: Container(
-                      padding: const EdgeInsets.all(2),
-                      decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
-                      child: const Icon(Icons.close, size: 8, color: Colors.white),
-                    ),
-                  ),
-                ),
-            ],
-          );
-        }),
-      ),
-    );
-  }
 
   void _showTabContextMenu(BuildContext context, AppProvider app, Offset position) async {
     final RenderBox? overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
@@ -696,7 +719,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
                               Material(
                                 color: Colors.transparent,
                                 child: InkWell(
-                                  onTap: () => confirmCloseTab(context, () => app.closeTab(item['index'] as int)),
+                                  onTap: () => confirmCloseTab(context, item['index'] as int),
                                   borderRadius: BorderRadius.circular(4),
                                   hoverColor: Colors.red.withValues(alpha: 0.2),
                                   child: Padding(
@@ -758,9 +781,9 @@ class _MainShellState extends State<MainShell> with WindowListener {
                 ),
               ),
               const Expanded(child: SizedBox()),
-              const Text(
-                "SAHAKAR MEDICALS - v1.0.0",
-                style: TextStyle(color: Colors.white38, fontSize: 10),
+              Text(
+                "SAHAKAR MEDICALS - v${UpdateCheckerService.currentVersion}",
+                style: const TextStyle(color: Colors.white38, fontSize: 10),
               ),
             ],
           ),
@@ -1015,7 +1038,7 @@ class MdiArea extends StatelessWidget {
                       isMaximized: isMax,
                       isActive: isActive,
                       showHeader: !isHome && !tab.isMaximized, 
-                      onClose: tab.closable ? () => confirmCloseTab(context, () => app.closeTab(i)) : null,
+                      onClose: tab.closable ? () => confirmCloseTab(context, i) : null,
                       onMaximize: isHome ? null : () => app.toggleWindowMaximize(i),
                       onFocus: () => app.focusTab(i),
                       onDragFinished: (newPos) => app.updateWindowPosition(i, newPos),
@@ -1306,35 +1329,32 @@ class _ResizeHandlePainter extends CustomPainter {
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
 
-void confirmCloseTab(BuildContext context, VoidCallback onConfirm) {
-  final FocusNode noFocusNode = FocusNode();
+void confirmCloseTab(BuildContext context, int tabIndex) {
+  final app = Provider.of<AppProvider>(context, listen: false);
+  if (tabIndex < 0 || tabIndex >= app.openTabs.length) return;
 
-  showDialog(
-    context: context,
-    builder: (ctx) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        noFocusNode.requestFocus();
-      });
+  final tab = app.openTabs[tabIndex];
+  final tabTitle = tab.title;
 
-      return AlertDialog(
-        title: const Text("Unsaved Changes", style: TextStyle(fontWeight: FontWeight.bold)),
-        content: const Text("Some data are not saved, are you sure to delete?"),
-        actions: [
-          TextButton(
-            focusNode: noFocusNode,
-            onPressed: () => Navigator.of(ctx).pop(), // No (default focused)
-            child: const Text("No", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blue)),
-          ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
-            onPressed: () {
-              Navigator.of(ctx).pop();
-              onConfirm(); // Yes
-            },
-            child: const Text("Yes"),
-          ),
-        ],
-      );
-    },
-  );
+  // 1. Non-entry tabs close instantly
+  if (!UnsavedChangesRegistry.isEntryTab(tabTitle)) {
+    app.closeTab(tabIndex);
+    return;
+  }
+
+  // 2. Entry tabs check for unsaved changes
+  final handler = UnsavedChangesRegistry.getHandler(tabTitle);
+  if (handler == null || !handler.hasUnsavedChanges()) {
+    app.closeTab(tabIndex);
+    return;
+  }
+
+  // 3. Show 3-Option Dialog
+  showUnsavedChangesDialog(context).then((result) {
+    if (result == UnsavedDialogResult.showDifference) {
+      handler.showDifferences();
+    } else if (result == UnsavedDialogResult.discard) {
+      app.closeTab(tabIndex);
+    }
+  });
 }

@@ -286,8 +286,8 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
             ElevatedButton(
               onPressed: () async {
                 final p = Provider.of<PharmacyProvider>(context, listen: false);
-                await p.settleSalePayment(entryNo, selectedMode, remarksCtrl.text);
                 Navigator.pop(ctx);
+                await p.settleSalePayment(entryNo, selectedMode, remarksCtrl.text);
                 _search();
               },
               style: ElevatedButton.styleFrom(backgroundColor: Colors.green.shade800, foregroundColor: Colors.white),
@@ -341,6 +341,7 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
             'mobile': s.mobile,
             'patient': s.patient,
             'doctor': s.doctor,
+            'agent': s.agent,
             'tax': s.taxType,
             'is_tax': s.taxType == 'Gst' ? 'Yes' : 'No',
             'gross': s.subTotal, // Raw MRP sum
@@ -371,6 +372,7 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
               'mobile': s.mobile,
               'patient': s.patient,
               'doctor': s.doctor,
+              'agent': s.agent,
               'product': item.product.name,
               'category': item.product.category,
               'sub_category': item.product.subCategory,
@@ -497,6 +499,7 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
           _ColInfo("mobile", "Mobile", flex: 1.1),
           _ColInfo("patient", "Patient", flex: 1.1),
           _ColInfo("doctor", "Doctor", flex: 1.1),
+          _ColInfo("agent", "Agent", flex: 1.1),
           _ColInfo("tax", "Tax", flex: 1.0),
           _ColInfo("gross", "Gross", flex: 1.0, align: TextAlign.right, type: ColumnType.numeric),
           _ColInfo("discount", "Discount", flex: 1.0, align: TextAlign.right, type: ColumnType.numeric),
@@ -517,6 +520,7 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
           _ColInfo("mobile", "Mobile", flex: 1.1),
           _ColInfo("patient", "Patient", flex: 1.1),
           _ColInfo("doctor", "Doctor", flex: 1.1),
+          _ColInfo("agent", "Agent", flex: 1.1),
           _ColInfo("product", "Product", flex: 2.2),
           _ColInfo("category", "Category", flex: 1.3),
           _ColInfo("patent_name", "Patent name", flex: 1.3),
@@ -1046,7 +1050,7 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
       },
       child: Container(
         height: 25,
-        color: isDeleted ? Colors.red.shade50 : (index % 2 == 0 ? Colors.white : const Color(0xFFF9F9F9)),
+        color: isDeleted ? const Color(0xFFFEF2F2) : (index % 2 == 0 ? Colors.white : const Color(0xFFF9F9F9)),
         child: ClipRect(
           child: SingleChildScrollView(
             scrollDirection: Axis.horizontal,
@@ -1159,7 +1163,7 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
                     text,
                     style: TextStyle(
                       fontSize: 10,
-                      color: cellText ?? (isDeleted ? Colors.red.shade900 : Colors.black87),
+                      color: cellText ?? (isDeleted ? const Color(0xFF7F1D1D) : Colors.black87),
                       fontWeight: (isDeleted && col.key == 'status') || cellText != null ? FontWeight.bold : FontWeight.normal,
                       decoration: isDeleted && col.key != 'status' ? TextDecoration.lineThrough : null,
                     ),
@@ -1307,27 +1311,33 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
             title: "Confirm Deletion",
             message: "Enter Master Password to permanently delete Invoice $entryNo."
         ) ?? false;
+        if (!mounted) return;
         if (!isUnlocked) return;
         provider.refreshAdminSession();
       }
     }
 
+    if (!mounted) return;
+    final currentCtx = context;
+
     // PREVIOUS DAY LOCK CHECK
     bool isOldLocked = provider.isEditLocked(date);
     if (isOldLocked && !provider.isAdminSessionActive()) {
       bool isUnlocked = await PinUnlockDialog.show(
-          context,
+          currentCtx,
           provider,
           title: "Locked Entry",
           message: "This entry is from a previous day. Enter Master Password to unlock it for deletion."
       ) ?? false;
+      if (!mounted) return;
       if (!isUnlocked) return;
       provider.refreshAdminSession();
       provider.logAudit('UNLOCK_OLD_ENTRY_DELETE', 'Unlocked old entry $entryNo from ${DateFormat('yyyy-MM-dd').format(date)} for deletion.');
     }
 
+    if (!currentCtx.mounted) return;
     bool? confirm = await showDialog<bool>(
-      context: context,
+      context: currentCtx,
       barrierDismissible: false,
       builder: (ctx) {
         int focusedIdx = 1; // 1: Delete (Right), 2: Cancel (Left)

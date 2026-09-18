@@ -121,8 +121,12 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
           title: "High-Security Lock",
           message: "Enter Master PIN to perform database wipes or bulk imports."
       );
+      if (!mounted) return;
       if (!isUnlocked) return;
     }
+
+    if (!mounted) return;
+    final currentCtx = context;
 
     setState(() {
       _activeOption = option;
@@ -131,8 +135,9 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
     if (option == 0 || option == 1) {
       await _pickAndImport(option);
     } else if (option == 2) {
+      if (!currentCtx.mounted) return;
       final res = await AppDialogs.showConfirmDialog(
-        context: context,
+        context: currentCtx,
         title: "CLEAN JUNK / NUMERIC NAMES?",
         content: "This will remove automatically created numeric or invalid product names (e.g. '115', '120', '45', '7S') and their associated stock batches created during past bad imports. Valid medicine names will NOT be affected.",
         yesLabel: "CLEAN NOW",

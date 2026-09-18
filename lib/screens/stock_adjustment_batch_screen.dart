@@ -7,6 +7,10 @@ import '../utils/app_dialogs.dart';
 import '../widgets/pin_unlock_dialog.dart';
 import '../utils/app_formatters.dart';
 import '../utils/theme_constants.dart';
+import '../utils/report_pdf_generator.dart';
+import '../utils/printer_service.dart';
+import '../utils/unsaved_handler.dart';
+import '../widgets/app_strict_autocomplete.dart';
 
 class StockAdjustmentBatchScreen extends StatefulWidget {
   const StockAdjustmentBatchScreen({super.key});
@@ -15,13 +19,21 @@ class StockAdjustmentBatchScreen extends StatefulWidget {
   State<StockAdjustmentBatchScreen> createState() => _StockAdjustmentBatchScreenState();
 }
 
-class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen> with AutomaticKeepAliveClientMixin {
+class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen> with AutomaticKeepAliveClientMixin implements UnsavedHandler {
+  @override
+  bool hasUnsavedChanges() => _isDirty || (_hasValidItems() && !_isExistingEntry);
+
+  @override
+  void showDifferences() {
+    _promptDiscardChanges();
+  }
   @override
   bool get wantKeepAlive => true;
 
   final TextEditingController _entryNoCtrl = TextEditingController();
   final TextEditingController _dateCtrl = TextEditingController();
   final TextEditingController _doneByCtrl = TextEditingController(text: "ADMIN");
+  final FocusNode _doneByFocus = FocusNode();
   final TextEditingController _reasonCtrl = TextEditingController();
 
   final FocusNode _globalFocus = FocusNode();
@@ -98,6 +110,7 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
   @override
   void initState() {
     super.initState();
+    UnsavedChangesRegistry.register("STOCK ADJUSTMENT", this);
     _dateCtrl.text = DateFormat('dd/MM/yyyy').format(DateTime.now());
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -107,9 +120,11 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
 
   @override
   void dispose() {
+    UnsavedChangesRegistry.unregister("STOCK ADJUSTMENT");
     _entryNoCtrl.dispose();
     _dateCtrl.dispose();
     _doneByCtrl.dispose();
+    _doneByFocus.dispose();
     _reasonCtrl.dispose();
     _globalFocus.dispose();
     for (var row in _rows) {
@@ -120,13 +135,12 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
   }
 
   void _resetPage() async {
+    final p = Provider.of<PharmacyProvider>(context, listen: false);
     // ---> THE FIX: Protect against losing unsaved edits <---
     if (_isExistingEntry && _isDirty) {
       bool? discard = await _promptDiscardChanges();
       if (discard != true) return; // User chose to stay
     }
-
-    final p = Provider.of<PharmacyProvider>(context, listen: false);
     final nextNo = await p.getNextAdjustmentNo();
     
     if (mounted) {
@@ -164,13 +178,12 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
   }
 
   void _navigateEntry(String dir, {String? searchNo}) async {
+    final p = Provider.of<PharmacyProvider>(context, listen: false);
     // ---> THE FIX: Protect against losing unsaved edits <---
     if (_isExistingEntry && _isDirty) {
       bool? discard = await _promptDiscardChanges();
       if (discard != true) return; // User chose to stay
     }
-
-    final p = Provider.of<PharmacyProvider>(context, listen: false);
     setState(() => _isLoading = true);
 
     try {
@@ -389,8 +402,12 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
           title: "Authorization Required",
           message: "Enter Master PIN to save stock adjustments."
       ) ?? false;
+      if (!mounted) return;
       if (!isUnlocked) return;
     }
+
+    if (!mounted) return;
+    final currentCtx = context;
 
     List<StockAdjustmentItem> adjustmentItems = [];
 
@@ -468,12 +485,15 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
       return;
     }
 
+    if (!mounted) return;
+
     if (isEdit || _isExistingEntry) {
       final diffSpans = _generateDiffSpans();
 
       if (diffSpans.isEmpty) {
+        if (!currentCtx.mounted) return;
         await showDialog(
-          context: context,
+          context: currentCtx,
           builder: (ctx) => AlertDialog(
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
             title: const Row(
@@ -499,8 +519,9 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
         return;
       }
 
+      if (!currentCtx.mounted) return;
       final confirmed = await showDialog<bool>(
-        context: context,
+        context: currentCtx,
         barrierDismissible: false,
         builder: (ctx) => AlertDialog(
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
@@ -669,10 +690,109 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
                 _showDialog("Locked", "This is a new entry. Click 'Save' instead.");
               }
           ),
-          _actionBtn(Icons.print, "Print", Colors.blueGrey),
+          _actionBtn(
+              Icons.delete,
+              "Delete",
+              _isExistingEntry ? Colors.red : Colors.grey.shade400,
+              textColor: _isExistingEntry ? Colors.black87 : Colors.grey.shade400,
+              onTap: _isExistingEntry ? () => _confirmDeleteCurrentEntry() : () {
+                _showDialog("Delete", "No saved entry loaded to delete.");
+              }
+          ),
+          _actionBtn(Icons.print, "Print", Colors.blueGrey, onTap: _printAdjustmentReport),
         ],
       ),
     );
+  }
+
+  void _confirmDeleteCurrentEntry() {
+    final entryNo = _entryNoCtrl.text.trim();
+    if (entryNo.isEmpty || !_isExistingEntry) {
+      _showDialog("Delete", "No saved entry loaded to delete.");
+      return;
+    }
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("Confirm Delete"),
+        content: Text("Are you sure you want to delete stock adjustment #$entryNo? This will revert the physical stock changes."),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("CANCEL")),
+          ElevatedButton(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              setState(() => _isLoading = true);
+              try {
+                await Provider.of<PharmacyProvider>(context, listen: false).deleteStockAdjustment(entryNo);
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text("Adjustment deleted and inventory stock restored!"))
+                  );
+                  _resetPage();
+                }
+              } catch (e) {
+                if (mounted) {
+                  _showDialog("Delete Error", e.toString());
+                }
+              } finally {
+                if (mounted) setState(() => _isLoading = false);
+              }
+            },
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            child: const Text("DELETE", style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _printAdjustmentReport() async {
+    final validRows = _rows.where((r) => r.selectedBatch != null && r.physicalCtrl.text.trim().isNotEmpty).toList();
+    if (validRows.isEmpty) {
+      _showDialog("Print", "No items to print in stock adjustment voucher.");
+      return;
+    }
+    final provider = Provider.of<PharmacyProvider>(context, listen: false);
+    final company = provider.companyProfile;
+    List<List<String>> tableData = [];
+    int index = 1;
+    for (var r in validRows) {
+      final p = r.selectedBatch!;
+      int physical = int.tryParse(r.physicalCtrl.text.trim()) ?? p.stock;
+      int systemStock = p.stock;
+      if (_isExistingEntry) systemStock -= r.savedVariance;
+      int variance = physical - systemStock;
+      tableData.add([
+        "$index",
+        p.name,
+        p.batch,
+        "$systemStock",
+        "$physical",
+        variance == 0 ? "0" : (variance > 0 ? "+$variance" : "$variance"),
+        p.landingCost.toStringAsFixed(2),
+      ]);
+      index++;
+    }
+
+    try {
+      final doc = await ReportPdfGenerator.buildReportPdf(
+        title: "STOCK ADJUSTMENT VOUCHER #${_entryNoCtrl.text}",
+        subtitle: "Date: ${_dateCtrl.text} | Total Items: ${validRows.length}",
+        company: company,
+        headers: ["#", "Product Name", "Batch", "System Stock", "Physical Stock", "Variance", "Unit Cost"],
+        data: tableData,
+      );
+      if (mounted) {
+        PrinterService.showProfessionalPreview(
+          context: context,
+          doc: doc,
+          title: "Stock Adjustment Voucher Preview",
+        );
+      }
+    } catch (e) {
+      if (mounted) _showDialog("Print Error", e.toString());
+    }
   }
 
   Widget _actionBtn(IconData icon, String label, Color color, {Color? textColor, VoidCallback? onTap}) => Padding(
@@ -719,7 +839,28 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
           const SizedBox(width: 20),
           _field("Date:", _dateCtrl, width: 100),
           const SizedBox(width: 20),
-          _field("Done By:", _doneByCtrl, width: 120),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text("Done By:", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+              const SizedBox(width: 8),
+              SizedBox(
+                width: 150,
+                height: 28,
+                child: AppStrictAutocomplete(
+                  controller: _doneByCtrl,
+                  focusNode: _doneByFocus,
+                  getItems: () => Provider.of<PharmacyProvider>(context, listen: false).doneByNames,
+                  defaultOption: "ADMIN",
+                  isStrict: false,
+                  height: 28,
+                  onValueChanged: (val) {
+                    _markDirty();
+                  },
+                ),
+              ),
+            ],
+          ),
         ],
       ),
     );
@@ -848,13 +989,8 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
                         row.selectedBatch = batch;
                         row.batchCtrl.text = cleanBatch(batch.batch);
                         row.expiryCtrl.text = batch.expiry;
-                        
-                        int pack = batch.packSize > 0 ? batch.packSize : 1;
-                        row.physicalStripsCtrl.text = (batch.stock ~/ pack).toString();
-                        row.physicalLooseCtrl.text = (batch.stock % pack).toString();
                         row.physicalCtrl.text = batch.stock.toString();
-                        
-                        row.physicalStripsFocus.requestFocus();
+                        row.physicalFocus.requestFocus();
                       });
                     },
                   ),
@@ -885,82 +1021,38 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
               _Cell(systemStock.toString(), flex: 10, align: TextAlign.right, fontWeight: FontWeight.bold, color: Colors.blueGrey),
 
               Expanded(
-                flex: 12,
-                child: Row(
-                  children: [
-                    // STRIPS INPUT
-                    Expanded(
-                      flex: 3,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 4),
-                        child: TextField(
-                          controller: row.physicalStripsCtrl,
-                          focusNode: row.physicalStripsFocus,
-                          textAlign: TextAlign.center,
-                          keyboardType: TextInputType.number,
-                          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
-                          decoration: InputDecoration(
-                            isDense: true,
-                            hintText: "Strips",
-                            hintStyle: const TextStyle(fontSize: 9, color: Colors.grey),
-                            border: const OutlineInputBorder(),
-                            contentPadding: const EdgeInsets.symmetric(vertical: 6),
-                            fillColor: row.hasPhysicalError ? Colors.red.shade100 : Colors.yellow.shade50,
-                            filled: true,
-                          ),
-                          onChanged: (_) {
-                            _markDirty();
-                            int pack = (p?.packSize ?? 1) > 0 ? (p?.packSize ?? 1) : 1;
-                            int strips = int.tryParse(row.physicalStripsCtrl.text) ?? 0;
-                            int loose = int.tryParse(row.physicalLooseCtrl.text) ?? 0;
-                            row.physicalCtrl.text = ((strips * pack) + loose).toString();
-                          },
-                          onSubmitted: (_) => row.physicalLooseFocus.requestFocus(),
-                        ),
-                      ),
+                flex: 10,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+                  child: TextField(
+                    controller: row.physicalCtrl,
+                    focusNode: row.physicalFocus,
+                    textAlign: TextAlign.center,
+                    keyboardType: TextInputType.number,
+                    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                    decoration: InputDecoration(
+                      isDense: true,
+                      hintText: "Qty",
+                      hintStyle: const TextStyle(fontSize: 10, color: Colors.grey),
+                      border: const OutlineInputBorder(),
+                      contentPadding: const EdgeInsets.symmetric(vertical: 6),
+                      fillColor: row.hasPhysicalError ? Colors.red.shade100 : Colors.yellow.shade50,
+                      filled: true,
                     ),
-                    const Text("/", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.grey)),
-                    // LOOSE UNITS INPUT
-                    Expanded(
-                      flex: 2,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 4),
-                        child: TextField(
-                          controller: row.physicalLooseCtrl,
-                          focusNode: row.physicalLooseFocus,
-                          textAlign: TextAlign.center,
-                          keyboardType: TextInputType.number,
-                          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
-                          decoration: InputDecoration(
-                            isDense: true,
-                            hintText: "Loose",
-                            hintStyle: const TextStyle(fontSize: 9, color: Colors.grey),
-                            border: const OutlineInputBorder(),
-                            contentPadding: const EdgeInsets.symmetric(vertical: 6),
-                            fillColor: row.hasPhysicalError ? Colors.red.shade100 : Colors.yellow.shade50,
-                            filled: true,
-                          ),
-                          onChanged: (_) {
-                            _markDirty();
-                            int pack = (p?.packSize ?? 1) > 0 ? (p?.packSize ?? 1) : 1;
-                            int strips = int.tryParse(row.physicalStripsCtrl.text) ?? 0;
-                            int loose = int.tryParse(row.physicalLooseCtrl.text) ?? 0;
-                            row.physicalCtrl.text = ((strips * pack) + loose).toString();
-                          },
-                          onSubmitted: (_) {
-                            setState(() {});
-                            if (index == _rows.length - 1) {
-                              _addNewRow();
-                            } else {
-                              _moveFocus(_rows.length - 1, 0);
-                            }
-                          },
-                        ),
-                      ),
-                    ),
-                  ],
+                    onChanged: (_) {
+                      _markDirty();
+                      setState(() {});
+                    },
+                    onSubmitted: (_) {
+                      setState(() {});
+                      if (index == _rows.length - 1) {
+                        _addNewRow();
+                      } else {
+                        _moveFocus(index + 1, 0);
+                      }
+                    },
+                  ),
                 ),
               ),
 
@@ -1067,10 +1159,6 @@ class _AdjustmentRow {
   final FocusNode productFocus = FocusNode();
   final TextEditingController batchCtrl = TextEditingController();
   final FocusNode batchFocus = FocusNode();
-  final TextEditingController physicalStripsCtrl = TextEditingController(); // NEW
-  final FocusNode physicalStripsFocus = FocusNode();                        // NEW
-  final TextEditingController physicalLooseCtrl = TextEditingController();  // NEW
-  final FocusNode physicalLooseFocus = FocusNode();                         // NEW
   final TextEditingController physicalCtrl = TextEditingController();
   final FocusNode physicalFocus = FocusNode();
   final TextEditingController expiryCtrl = TextEditingController();
@@ -1079,21 +1167,29 @@ class _AdjustmentRow {
   Product? selectedProduct;
   Product? selectedBatch;
   int savedVariance = 0; 
+  int snapshotSystemStock = 0;
   
-  // NEW: Cell error trackers
+  // Cell error trackers
   bool hasProductError = false;
   bool hasBatchError = false;
   bool hasPhysicalError = false;
+
+  _AdjustmentRow() {
+    physicalFocus.addListener(() {
+      if (physicalFocus.hasFocus) {
+        physicalCtrl.selection = TextSelection(
+          baseOffset: 0,
+          extentOffset: physicalCtrl.text.length,
+        );
+      }
+    });
+  }
 
   void dispose() {
     productCtrl.dispose();
     productFocus.dispose();
     batchCtrl.dispose();
     batchFocus.dispose();
-    physicalStripsCtrl.dispose();
-    physicalStripsFocus.dispose();
-    physicalLooseCtrl.dispose();
-    physicalLooseFocus.dispose();
     physicalCtrl.dispose();
     physicalFocus.dispose();
     expiryCtrl.dispose();
@@ -1338,17 +1434,20 @@ class _ProductSearchCellState extends State<_ProductSearchCell> {
               }
             },
             onChanged: (v) {
+              if (v.isEmpty || !mounted || !widget.focusNode.hasFocus) {
+                setState(() { _results = []; _hideOverlay(); });
+                return;
+              }
               final provider = Provider.of<PharmacyProvider>(context, listen: false);
               setState(() {
-                if (v.isEmpty) { _results = []; _hideOverlay(); }
-                else {
-                  _results = provider.searchProducts(v, includeGenerics: true);
-                  _selectedIndex = 0;
-                  if (_overlayEntry == null) {
-                    _showOverlay();
-                  } else {
-                    _overlayEntry?.markNeedsBuild();
-                  }
+                _results = provider.searchProducts(v, includeGenerics: true);
+                _selectedIndex = 0;
+                if (_results.isEmpty) {
+                  _hideOverlay();
+                } else if (_overlayEntry == null) {
+                  _showOverlay();
+                } else {
+                  _overlayEntry?.markNeedsBuild();
                 }
               });
             },

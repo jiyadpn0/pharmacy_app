@@ -17,10 +17,120 @@ class _ProductMappingReportScreenState extends State<ProductMappingReportScreen>
   final Map<String, Map<String, dynamic>> _activeFilters = {};
   List<ProductMapping> _displayData = [];
 
+  // Edit state variables
+  String? _editingKey;
+  final TextEditingController _editInternalNameCtrl = TextEditingController();
+  final FocusNode _editInternalNameFocus = FocusNode();
+  String _editingProductId = "";
+  Product? _selectedProduct;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) => _refreshData());
+  }
+
+  @override
+  void dispose() {
+    _editInternalNameCtrl.dispose();
+    _editInternalNameFocus.dispose();
+    super.dispose();
+  }
+
+  String _getMappingKey(ProductMapping m) {
+    return "${m.id ?? 'noid'}_${m.wholesalerName}_${m.externalName}_${m.externalCode}";
+  }
+
+  void _startEdit(ProductMapping m) {
+    final provider = Provider.of<PharmacyProvider>(context, listen: false);
+    Product? match;
+    if (m.productId.isNotEmpty) {
+      match = provider.productMaster.cast<Product?>().firstWhere(
+        (p) => p != null && p.id == m.productId,
+        orElse: () => null,
+      );
+    }
+    match ??= provider.productMaster.cast<Product?>().firstWhere(
+      (p) => p != null && p.name.trim().toLowerCase() == m.internalName.trim().toLowerCase(),
+      orElse: () => null,
+    );
+
+    setState(() {
+      _editingKey = _getMappingKey(m);
+      _editInternalNameCtrl.text = m.internalName;
+      _editingProductId = m.productId;
+      _selectedProduct = match;
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_editInternalNameFocus.canRequestFocus) {
+        _editInternalNameFocus.requestFocus();
+      }
+    });
+  }
+
+  void _cancelEdit() {
+    setState(() {
+      _editingKey = null;
+      _editInternalNameCtrl.clear();
+      _editingProductId = "";
+      _selectedProduct = null;
+    });
+  }
+
+  void _saveEdit(ProductMapping originalMapping) async {
+    final newInternalName = _editInternalNameCtrl.text.trim();
+    if (newInternalName.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("My Stock Name cannot be empty!"),
+          backgroundColor: Colors.red,
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+
+    final provider = Provider.of<PharmacyProvider>(context, listen: false);
+
+    String finalProductId = _editingProductId;
+    if (finalProductId.isEmpty || finalProductId == originalMapping.productId) {
+      final match = provider.productMaster.cast<Product?>().firstWhere(
+        (p) => p != null && p.name.trim().toLowerCase() == newInternalName.toLowerCase(),
+        orElse: () => null,
+      );
+      if (match != null) {
+        finalProductId = match.id;
+      }
+    }
+
+    final updatedMapping = ProductMapping(
+      id: originalMapping.id,
+      wholesalerName: originalMapping.wholesalerName,
+      externalCode: originalMapping.externalCode,
+      externalName: originalMapping.externalName,
+      internalName: newInternalName,
+      productId: finalProductId,
+    );
+
+    await provider.saveProductMapping(updatedMapping);
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Product mapping updated successfully!"),
+          backgroundColor: Colors.green,
+          duration: Duration(seconds: 2),
+        ),
+      );
+      setState(() {
+        _editingKey = null;
+        _editInternalNameCtrl.clear();
+        _editingProductId = "";
+        _selectedProduct = null;
+      });
+      _refreshData();
+    }
   }
 
   void _showMappingHeadingsHint() {
@@ -221,7 +331,7 @@ class _ProductMappingReportScreenState extends State<ProductMappingReportScreen>
             onPressed: () async {
               final provider = Provider.of<PharmacyProvider>(context, listen: false);
               await provider.deleteProductMapping(mapping.id, mapping.wholesalerName, mapping.externalName, mapping.externalCode);
-              Navigator.pop(ctx);
+              if (mounted) Navigator.pop(ctx);
               _refreshData();
             },
             style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
@@ -342,42 +452,263 @@ class _ProductMappingReportScreenState extends State<ProductMappingReportScreen>
   }
 
   Widget _buildGridRow(ProductMapping m, List<_ColInfo> columns, int index) {
-    return Container(
-      height: 32,
-      decoration: BoxDecoration(
-        color: index % 2 == 0 ? Colors.white : const Color(0xFFF8FAFC),
-        border: const Border(bottom: BorderSide(color: Color(0xFFF1F5F9), width: 0.5)),
-      ),
-      child: Row(
-        children: columns.map((col) {
-          if (col.key == "actions") {
+    final bool isEditing = _editingKey != null && _editingKey == _getMappingKey(m);
+
+    return GestureDetector(
+      onDoubleTap: () => _startEdit(m),
+      child: Container(
+        height: isEditing ? 38 : 32,
+        decoration: BoxDecoration(
+          color: isEditing
+              ? Colors.amber.shade50
+              : (index % 2 == 0 ? Colors.white : const Color(0xFFF8FAFC)),
+          border: Border(
+            bottom: BorderSide(
+              color: isEditing ? Colors.amber.shade300 : const Color(0xFFF1F5F9),
+              width: isEditing ? 1.0 : 0.5,
+            ),
+          ),
+        ),
+        child: Row(
+          children: columns.map((col) {
+            if (col.key == "actions") {
+              return Expanded(
+                flex: (col.flex * 10).toInt(),
+                child: isEditing
+                    ? Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          IconButton(
+                            icon: const Icon(Icons.check_circle_rounded, color: Colors.green, size: 18),
+                            onPressed: () => _saveEdit(m),
+                            tooltip: "Save Mapping",
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(minWidth: 26, minHeight: 26),
+                          ),
+                          const SizedBox(width: 4),
+                          IconButton(
+                            icon: Icon(Icons.cancel_rounded, color: Colors.grey.shade600, size: 18),
+                            onPressed: _cancelEdit,
+                            tooltip: "Cancel Edit",
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(minWidth: 26, minHeight: 26),
+                          ),
+                        ],
+                      )
+                    : Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          IconButton(
+                            icon: Icon(Icons.edit_outlined, color: Colors.blue.shade700, size: 16),
+                            onPressed: () => _startEdit(m),
+                            tooltip: "Edit Mapping",
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
+                          ),
+                          const SizedBox(width: 4),
+                          IconButton(
+                            icon: const Icon(Icons.delete_outline, color: Colors.red, size: 16),
+                            onPressed: () => _deleteMapping(m),
+                            tooltip: "Delete Mapping",
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
+                          ),
+                        ],
+                      ),
+              );
+            }
+
+            if (col.key == "internal_name" && isEditing) {
+              return Expanded(
+                flex: (col.flex * 10).toInt(),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                  child: Autocomplete<Product>(
+                    focusNode: _editInternalNameFocus,
+                    textEditingController: _editInternalNameCtrl,
+                    displayStringForOption: (Product p) => p.name,
+                    optionsBuilder: (TextEditingValue textEditingValue) {
+                      final query = textEditingValue.text.trim();
+                      final provider = Provider.of<PharmacyProvider>(context, listen: false);
+                      if (query.isEmpty) {
+                        return provider.productMaster.take(30);
+                      }
+                      // Uses same upper exact / starts-with priority sorting as Sales Window!
+                      final matches = provider.searchProducts(query, isSalesWindow: true);
+                      if (matches.isEmpty) {
+                        return provider.searchProducts(query, includeGenerics: true);
+                      }
+                      return matches.take(30);
+                    },
+                    onSelected: (Product p) {
+                      setState(() {
+                        _selectedProduct = p;
+                        _editInternalNameCtrl.text = p.name;
+                        _editingProductId = p.id;
+                      });
+                    },
+                    fieldViewBuilder: (ctx, ctrl, fn, onFieldSubmitted) {
+                      return TextField(
+                        controller: ctrl,
+                        focusNode: fn,
+                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF0F172A)),
+                        decoration: InputDecoration(
+                          isDense: true,
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+                          hintText: "Select / Search Product...",
+                          hintStyle: const TextStyle(fontSize: 10, color: Colors.grey),
+                          fillColor: Colors.white,
+                          filled: true,
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(3), borderSide: const BorderSide(color: Colors.blue)),
+                          focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(3), borderSide: BorderSide(color: Colors.blue.shade700, width: 1.5)),
+                          suffixIcon: const Icon(Icons.arrow_drop_down, color: Colors.blueGrey, size: 18),
+                          suffixIconConstraints: const BoxConstraints(minWidth: 20, minHeight: 20),
+                        ),
+                        onChanged: (val) {
+                          final provider = Provider.of<PharmacyProvider>(context, listen: false);
+                          final match = provider.productMaster.cast<Product?>().firstWhere(
+                            (p) => p != null && p.name.trim().toLowerCase() == val.trim().toLowerCase(),
+                            orElse: () => null,
+                          );
+                          setState(() {
+                            if (match != null) {
+                              _selectedProduct = match;
+                              _editingProductId = match.id;
+                            }
+                          });
+                        },
+                        onSubmitted: (_) => _saveEdit(m),
+                      );
+                    },
+                    optionsViewBuilder: (context, onSelected, options) {
+                      return Align(
+                        alignment: Alignment.topLeft,
+                        child: Material(
+                          elevation: 8,
+                          borderRadius: BorderRadius.circular(4),
+                          color: Colors.white,
+                          child: ConstrainedBox(
+                            constraints: const BoxConstraints(maxHeight: 260, maxWidth: 380),
+                            child: ListView.builder(
+                              padding: EdgeInsets.zero,
+                              shrinkWrap: true,
+                              itemCount: options.length,
+                              itemBuilder: (BuildContext context, int optionIndex) {
+                                final Product option = options.elementAt(optionIndex);
+                                final bool isCurrentSel = option.id == _editingProductId || option.name.toLowerCase() == _editInternalNameCtrl.text.trim().toLowerCase();
+                                return InkWell(
+                                  onTap: () => onSelected(option),
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                    decoration: BoxDecoration(
+                                      color: isCurrentSel ? Colors.blue.shade50 : null,
+                                      border: Border(bottom: BorderSide(color: Colors.grey.shade200, width: 0.5)),
+                                    ),
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Row(
+                                          children: [
+                                            Expanded(
+                                              child: Text(
+                                                option.name,
+                                                style: TextStyle(
+                                                  fontSize: 11,
+                                                  fontWeight: FontWeight.bold,
+                                                  color: isCurrentSel ? Colors.blue.shade900 : const Color(0xFF1E293B),
+                                                ),
+                                                overflow: TextOverflow.ellipsis,
+                                              ),
+                                            ),
+                                            if (option.stock > 0)
+                                              Container(
+                                                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                                                decoration: BoxDecoration(
+                                                  color: Colors.green.shade50,
+                                                  borderRadius: BorderRadius.circular(3),
+                                                  border: Border.all(color: Colors.green.shade200),
+                                                ),
+                                                child: Text(
+                                                  "Stock: ${option.stock}",
+                                                  style: TextStyle(fontSize: 8, fontWeight: FontWeight.bold, color: Colors.green.shade700),
+                                                ),
+                                              ),
+                                          ],
+                                        ),
+                                        const SizedBox(height: 2),
+                                        Text(
+                                          "ID: ${option.id} | MRP: \u{20B9}${option.mrp.toStringAsFixed(2)}${option.genericName.isNotEmpty ? ' | Generic: ${option.genericName}' : ''}",
+                                          style: TextStyle(fontSize: 9, color: Colors.grey.shade600),
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              );
+            }
+
+            if (col.key == "product_id" && isEditing) {
+              return Expanded(
+                flex: (col.flex * 10).toInt(),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  alignment: Alignment.centerLeft,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: Colors.blue.shade50,
+                      borderRadius: BorderRadius.circular(3),
+                      border: Border.all(color: Colors.blue.shade200),
+                    ),
+                    child: Text(
+                      _editingProductId.isNotEmpty ? _editingProductId : "(Auto)",
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.blue.shade900,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ),
+              );
+            }
+
+            String text = "";
+            if (col.key == "wholesaler") {
+              text = m.wholesalerName;
+            } else if (col.key == "external_code") text = m.externalCode;
+            else if (col.key == "external_name") text = m.externalName;
+            else if (col.key == "internal_name") text = m.internalName;
+            else if (col.key == "product_id") text = m.productId;
+
             return Expanded(
               flex: (col.flex * 10).toInt(),
-              child: IconButton(
-                icon: const Icon(Icons.delete_outline, color: Colors.red, size: 16),
-                onPressed: () => _deleteMapping(m),
-                tooltip: "Delete Mapping",
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  text,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: isEditing ? const Color(0xFF64748B) : const Color(0xFF334155),
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
               ),
             );
-          }
-
-          String text = "";
-          if (col.key == "wholesaler") {
-            text = m.wholesalerName;
-          } else if (col.key == "external_code") text = m.externalCode;
-          else if (col.key == "external_name") text = m.externalName;
-          else if (col.key == "internal_name") text = m.internalName;
-          else if (col.key == "product_id") text = m.productId;
-
-          return Expanded(
-            flex: (col.flex * 10).toInt(),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              alignment: Alignment.centerLeft,
-              child: Text(text, style: const TextStyle(fontSize: 11, color: Color(0xFF334155)), overflow: TextOverflow.ellipsis),
-            ),
-          );
-        }).toList(),
+          }).toList(),
+        ),
       ),
     );
   }

@@ -88,16 +88,11 @@ class WindowControlsBar extends StatelessWidget {
             ),
           ),
 
-          // 3. RIGHT SIDE: Actions + OS Window Controls (Flexible to avoid overflow)
-          if (trailingActions != null)
-            Flexible(
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: trailingActions!,
-              ),
-            ),
+          // 3. RIGHT SIDE: Actions
+          if (trailingActions != null) trailingActions!,
           const SizedBox(width: 8),
 
+          // 4. ABSOLUTE FAR RIGHT: OS Window Controls
           if (onClose == null) ...[
             _buildBtn(Icons.remove, hoverColor: Colors.white24, onTap: () => windowManager.minimize()),
 

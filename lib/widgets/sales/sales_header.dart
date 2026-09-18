@@ -87,12 +87,12 @@ class SalesHeader extends StatelessWidget {
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                 decoration: BoxDecoration(
                   color: isDeleted 
-                      ? Colors.red.withValues(alpha: 0.15)
+                      ? const Color(0xFFFEF2F2)
                       : (isExistingEntry ? Colors.orange.withValues(alpha: 0.15) : Colors.blue.withValues(alpha: 0.15)),
                   borderRadius: BorderRadius.circular(6),
                   border: Border.all(
                     color: isDeleted 
-                        ? Colors.red 
+                        ? const Color(0xFF7F1D1D) 
                         : (isExistingEntry ? Colors.orange : Colors.blue.shade600),
                   ),
                 ),
@@ -101,7 +101,7 @@ class SalesHeader extends StatelessWidget {
                     Icon(
                       isDeleted ? Icons.cancel : (isExistingEntry ? Icons.edit_note : Icons.receipt_long),
                       size: 16,
-                      color: isDeleted ? Colors.redAccent : (isExistingEntry ? Colors.orangeAccent : Colors.blueAccent),
+                      color: isDeleted ? const Color(0xFF7F1D1D) : (isExistingEntry ? Colors.orangeAccent : Colors.blueAccent),
                     ),
                     const SizedBox(width: 6),
                     Text(
@@ -110,7 +110,7 @@ class SalesHeader extends StatelessWidget {
                         fontWeight: FontWeight.bold,
                         fontSize: 13,
                         color: isDeleted 
-                            ? Colors.redAccent 
+                            ? const Color(0xFF7F1D1D) 
                             : (isExistingEntry ? Colors.orangeAccent : Colors.blueAccent),
                       ),
                     ),

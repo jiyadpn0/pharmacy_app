@@ -9,6 +9,9 @@ import '../widgets/pin_unlock_dialog.dart';
 import '../utils/app_formatters.dart';
 import '../utils/search_debouncer.dart';
 import '../utils/theme_constants.dart';
+import '../utils/report_pdf_generator.dart';
+import '../utils/printer_service.dart';
+import '../utils/unsaved_handler.dart';
 
 class DamageEntryScreen extends StatefulWidget {
   final String? initialReason;
@@ -37,7 +40,14 @@ class _StockRow {
   }
 }
 
-class _DamageEntryScreenState extends State<DamageEntryScreen> {
+class _DamageEntryScreenState extends State<DamageEntryScreen> implements UnsavedHandler {
+  @override
+  bool hasUnsavedChanges() => _isDirty || (_hasValidItems() && !_isExistingEntry);
+
+  @override
+  void showDifferences() {
+    _promptDiscardChanges();
+  }
   final TextEditingController _entryNoCtrl = TextEditingController();
   final TextEditingController _dateCtrl = TextEditingController();
   final TextEditingController _doneByCtrl = TextEditingController(text: "ADMIN");
@@ -115,6 +125,7 @@ class _DamageEntryScreenState extends State<DamageEntryScreen> {
   @override
   void initState() {
     super.initState();
+    UnsavedChangesRegistry.register("DAMAGE ENTRY", this);
     _reasonCtrl.text = widget.initialReason?.toUpperCase() ?? "DAMAGED";
     _dateCtrl.text = DateFormat('dd/MM/yyyy').format(DateTime.now());
 
@@ -135,6 +146,7 @@ class _DamageEntryScreenState extends State<DamageEntryScreen> {
 
   @override
   void dispose() {
+    UnsavedChangesRegistry.unregister("DAMAGE ENTRY");
     _entryNoCtrl.dispose();
     _dateCtrl.dispose();
     _doneByCtrl.dispose();
@@ -430,8 +442,7 @@ class _DamageEntryScreenState extends State<DamageEntryScreen> {
           }
         }
 
-        int pSize = row.product!.packSize > 0 ? row.product!.packSize : 1;
-        double unitCost = row.product!.purchaseRate / pSize;
+        double unitCost = _getLooseUnitCost(row.product);
         double total = unitCost * qty;
 
         items.add(StockAdjustmentItem(
@@ -477,6 +488,7 @@ class _DamageEntryScreenState extends State<DamageEntryScreen> {
             ],
           ),
         );
+        if (!mounted) return;
         return;
       }
 
@@ -549,17 +561,20 @@ class _DamageEntryScreenState extends State<DamageEntryScreen> {
           ],
         ),
       );
+      if (!mounted) return;
       if (confirmed != true) return;
     }
 
     // 1. SECURITY CHECK: PIN for Damage Entries
     if (provider.securityToggles['require_pin_write_off'] == true) {
+      if (!context.mounted) return;
       bool isUnlocked = await PinUnlockDialog.show(
           context,
           provider,
           title: "Auth Required",
           message: "Enter Master Password to authorize this stock write-off."
       );
+      if (!mounted) return;
       if (!isUnlocked) return;
     }
 
@@ -718,10 +733,57 @@ class _DamageEntryScreenState extends State<DamageEntryScreen> {
                 _showDialog("Locked", "This is a new entry. Click 'Save' instead.");
               }
           ),
-          _actionBtn(Icons.print, "Print", Colors.blueGrey),
+          _actionBtn(Icons.print, "Print", Colors.blueGrey, onTap: _printDamageReport),
         ],
       ),
     );
+  }
+
+  void _printDamageReport() async {
+    final validRows = _rows.where((r) => r.product != null && r.qtyCtrl.text.trim().isNotEmpty).toList();
+    if (validRows.isEmpty) {
+      _showDialog("Print", "No items to print in damage entry voucher.");
+      return;
+    }
+    final provider = Provider.of<PharmacyProvider>(context, listen: false);
+    final company = provider.companyProfile;
+    List<List<String>> tableData = [];
+    int index = 1;
+    for (var r in validRows) {
+      final p = r.product!;
+      int qty = int.tryParse(r.qtyCtrl.text.trim()) ?? 0;
+      double unitCost = _getLooseUnitCost(p);
+      double lossValue = unitCost * qty;
+      tableData.add([
+        "$index",
+        p.name,
+        p.batch,
+        r.expiryCtrl.text.trim().isNotEmpty ? r.expiryCtrl.text.trim() : p.expiry,
+        "$qty",
+        unitCost.toStringAsFixed(2),
+        lossValue.toStringAsFixed(2),
+      ]);
+      index++;
+    }
+
+    try {
+      final doc = await ReportPdfGenerator.buildReportPdf(
+        title: "DAMAGE ENTRY VOUCHER #${_entryNoCtrl.text}",
+        subtitle: "Entry Date: ${_dateCtrl.text} | Total Items: ${validRows.length}",
+        company: company,
+        headers: ["#", "Product Name", "Batch", "Expiry", "Qty", "Unit Cost", "Loss Value"],
+        data: tableData,
+      );
+      if (mounted) {
+        PrinterService.showProfessionalPreview(
+          context: context,
+          doc: doc,
+          title: "Damage Entry Voucher Preview",
+        );
+      }
+    } catch (e) {
+      if (mounted) _showDialog("Print Error", e.toString());
+    }
   }
 
   Widget _actionBtn(IconData icon, String label, Color color, {Color? textColor, VoidCallback? onTap}) => Padding(
@@ -980,7 +1042,7 @@ class _DamageEntryScreenState extends State<DamageEntryScreen> {
             ),
           ),
           _TableCell(p?.supplier ?? "", flex: 2),
-          _TableCell(p?.purchaseRate.toStringAsFixed(2) ?? "0.00", flex: 1, textAlign: TextAlign.right),
+          _TableCell(_getLooseUnitCost(p).toStringAsFixed(2), flex: 1, textAlign: TextAlign.right),
           _TableCell(_calculateTotal(row).toStringAsFixed(2), flex: 1, textAlign: TextAlign.right),
           SizedBox(
             width: 30,
@@ -995,10 +1057,19 @@ class _DamageEntryScreenState extends State<DamageEntryScreen> {
     );
   }
 
+  double _getLooseUnitCost(Product? p) {
+    if (p == null) return 0.0;
+    int pSize = p.packSize > 0 ? p.packSize : 1;
+    double baseRate = p.purchaseRate > 0
+        ? p.purchaseRate
+        : (p.landingCost > 0 ? p.landingCost : p.mrp);
+    return baseRate / pSize;
+  }
+
   double _calculateTotal(_StockRow row) {
     if (row.product == null) return 0;
     int qty = int.tryParse(row.qtyCtrl.text) ?? 0;
-    return row.product!.purchaseRate * qty;
+    return _getLooseUnitCost(row.product) * qty;
   }
 
   Widget _buildFooter() {
@@ -1007,7 +1078,7 @@ class _DamageEntryScreenState extends State<DamageEntryScreen> {
     for (var row in _rows) {
       int qty = int.tryParse(row.qtyCtrl.text) ?? 0;
       totalQty += qty;
-      grandTotal += (row.product?.purchaseRate ?? 0) * qty;
+      grandTotal += _calculateTotal(row);
     }
 
     return Container(
@@ -1248,13 +1319,18 @@ class _ProductSearchCellState extends State<_ProductSearchCell> {
                 return;
               }
               _debouncer.run(() {
-                if (!mounted) return;
+                if (!mounted || !widget.focusNode.hasFocus) {
+                  _hideOverlay();
+                  return;
+                }
                 final provider = Provider.of<PharmacyProvider>(context, listen: false);
                 final matches = _searchProductsAndBatches(provider, v);
                 setState(() {
                   _results = matches;
                   _selectedIndex = 0;
-                  if (_overlayEntry == null) {
+                  if (matches.isEmpty) {
+                    _hideOverlay();
+                  } else if (_overlayEntry == null) {
                     _showOverlay();
                   } else {
                     _overlayEntry?.markNeedsBuild();

@@ -1,8 +1,17 @@
 import 'package:flutter/foundation.dart';
+import 'package:sqflite/sqflite.dart';
 import '../database/db_helper.dart';
+import '../models/erp_models.dart';
 import '../providers/pharmacy_provider.dart';
 
 class InventoryRepository {
+  final DbHelper _dbHelper;
+
+  InventoryRepository({DbHelper? dbHelper})
+      : _dbHelper = dbHelper ?? DbHelper.instance;
+
+  Future<Database> get _db => _dbHelper.database;
+
   /// Fetches active stock batches for a product sorted by FEFO (First-Expire, First-Out)
   static Future<List<Product>> getFefoBatches(
     String productId, {
@@ -82,5 +91,22 @@ class InventoryRepository {
       }
       return 0.0;
     }
+  }
+
+  /// Archive zero stock batches from database
+  Future<int> archiveZeroStockBatches() async {
+    final db = await _db;
+    return await db.delete('stock_batches', where: 'current_stock <= 0');
+  }
+
+  /// Update current stock of a batch
+  Future<void> updateBatchStock(String productId, String batchNumber, int newStock) async {
+    final db = await _db;
+    await db.update(
+      'stock_batches',
+      {'current_stock': newStock},
+      where: 'product_id = ? AND batch_number = ?',
+      whereArgs: [productId, batchNumber],
+    );
   }
 }

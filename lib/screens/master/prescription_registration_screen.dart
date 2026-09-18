@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import '../../providers/pharmacy_provider.dart';
+import '../../widgets/app_strict_autocomplete.dart';
 import '../../utils/theme_constants.dart';
 
 class PrescriptionRegistrationScreen extends StatefulWidget {
@@ -491,79 +492,19 @@ class _PrescriptionRegistrationScreenState extends State<PrescriptionRegistratio
   }
 
   Widget _formAutocomplete(String label, TextEditingController ctrl, List<String> suggestions, {double? width, FocusNode? focusNode}) {
-    String? focusedText;
     return SizedBox(
       width: width,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(label, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 4),
-          LayoutBuilder(
-            builder: (context, constraints) => RawAutocomplete<String>(
-              textEditingController: ctrl,
-              focusNode: focusNode,
-              optionsBuilder: (TextEditingValue textEditingValue) {
-                if (textEditingValue.text.isEmpty) return const Iterable<String>.empty();
-                final query = textEditingValue.text.trim().toLowerCase();
-                if (focusedText != null &&
-                    textEditingValue.text == focusedText &&
-                    suggestions.any((s) => s.trim().toLowerCase() == query)) {
-                  return const Iterable<String>.empty();
-                }
-                return suggestions.where((String option) => option.toLowerCase().contains(textEditingValue.text.toLowerCase()));
-              },
-              fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) {
-                focusNode.addListener(() {
-                  if (focusNode.hasFocus) {
-                    focusedText = controller.text;
-                  } else {
-                    focusedText = null;
-                  }
-                });
-                return Container(
-                  height: 28,
-                  decoration: BoxDecoration(color: Colors.white, border: Border.all(color: Colors.grey.shade400)),
-                  child: TextField(
-                    controller: controller,
-                    focusNode: focusNode,
-                    onTap: () {
-                      if (focusNode.hasFocus) {
-                        focusedText = controller.text;
-                      }
-                    },
-                    style: const TextStyle(fontSize: 13),
-                    decoration: const InputDecoration(border: InputBorder.none, isDense: true, contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 8)),
-                  ),
-                );
-              },
-              optionsViewBuilder: (context, onSelected, options) {
-                return Align(
-                  alignment: Alignment.topLeft,
-                  child: Material(
-                    elevation: 4.0,
-                    child: SizedBox(
-                      width: constraints.maxWidth,
-                      child: ListView.builder(
-                        padding: EdgeInsets.zero,
-                        shrinkWrap: true,
-                        itemCount: options.length,
-                        itemBuilder: (context, index) {
-                          final option = options.elementAt(index);
-                          return ListTile(
-                            title: Text(option, style: const TextStyle(fontSize: 12)),
-                            dense: true,
-                            onTap: () => onSelected(option),
-                          );
-                        },
-                      ),
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
-        ],
+      child: AppStrictAutocomplete(
+        label: label,
+        controller: ctrl,
+        focusNode: focusNode ?? FocusNode(),
+        items: suggestions,
+        isStrict: false,
+        height: 28,
+        style: const TextStyle(fontSize: 13),
+        onValueChanged: (val) {
+          ctrl.text = val;
+        },
       ),
     );
   }

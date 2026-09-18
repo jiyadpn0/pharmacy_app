@@ -305,56 +305,67 @@ class _ExpiryCheckScreenState extends State<ExpiryCheckScreen> {
   }
 
   Widget _buildExpiryGrid(List<Product> products, {required bool isCritical}) {
-    return Column(
-      children: [
-        SingleChildScrollView(
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final double calculatedWidth = 40 + _colWidths.values.fold(0.0, (sum, w) => sum + w);
+        final double tableWidth = calculatedWidth < constraints.maxWidth ? constraints.maxWidth : calculatedWidth;
+
+        return SingleChildScrollView(
           scrollDirection: Axis.horizontal,
-          child: Container(
-            height: _headerHeight,
-            color: const Color(0xFFF5F5F5), // Standardized ERP Header Background
-            child: Row(
+          child: SizedBox(
+            width: tableWidth,
+            child: Column(
               children: [
-                const SizedBox(width: 40, child: Center(child: Text("SL", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.blueGrey)))),
-                _hdr("MEDICINE NAME", 'name', flex: 1),
-                _hdr("BATCH NO", 'batch', width: _colWidths['batch']!),
-                _hdr("RACK", 'rack', width: _colWidths['rack']!),
-                _hdr("CATEGORY", 'category', width: _colWidths['category']!),
-                _hdr("STOCK", 'stock', width: _colWidths['stock']!),
-                _hdr("EXPIRY DATE", 'expiry', width: _colWidths['expiry']!),
+                Container(
+                  height: _headerHeight,
+                  color: const Color(0xFFF5F5F5), // Standardized ERP Header Background
+                  child: Row(
+                    children: [
+                      const SizedBox(width: 40, child: Center(child: Text("SL", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.blueGrey)))),
+                      _hdr("MEDICINE NAME", 'name', width: _colWidths['name']!),
+                      _hdr("BATCH NO", 'batch', width: _colWidths['batch']!),
+                      _hdr("RACK", 'rack', width: _colWidths['rack']!),
+                      _hdr("CATEGORY", 'category', width: _colWidths['category']!),
+                      _hdr("STOCK", 'stock', width: _colWidths['stock']!),
+                      _hdr("EXPIRY DATE", 'expiry', width: _colWidths['expiry']!),
+                    ],
+                  ),
+                ),
+                Expanded(
+                  child: products.isEmpty
+                      ? Center(
+                          child: Text(
+                            "No $_selectedStatus products found.",
+                            style: const TextStyle(color: Colors.grey, fontSize: 13, fontWeight: FontWeight.w600),
+                          ),
+                        )
+                      : ListView.builder(
+                          itemCount: products.length,
+                          itemBuilder: (context, i) {
+                            final p = products[i];
+                            return Container(
+                              height: 40,
+                              decoration: BoxDecoration(color: i % 2 == 0 ? Colors.white : Colors.grey.shade50, border: Border(bottom: BorderSide(color: Colors.grey.shade100))),
+                              child: Row(
+                                children: [
+                                  _Cell("${i + 1}", width: 40, align: TextAlign.center, color: Colors.grey),
+                                  _Cell(p.name, width: _colWidths['name']!, fontWeight: FontWeight.w800, color: AppColors.primary),
+                                  _Cell(cleanBatch(p.batch), width: _colWidths['batch']!, fontWeight: FontWeight.bold),
+                                  _Cell(p.rack, width: _colWidths['rack']!, color: AppColors.accent, fontWeight: FontWeight.w900),
+                                  _Cell(p.category, width: _colWidths['category']!),
+                                  _Cell("${p.stock} units", width: _colWidths['stock']!, align: TextAlign.right, fontWeight: FontWeight.w900),
+                                  _Cell(p.expiry, width: _colWidths['expiry']!, align: TextAlign.center, color: isCritical ? AppColors.danger : AppColors.warning, fontWeight: FontWeight.w900),
+                                ],
+                              ),
+                            );
+                          },
+                        ),
+                ),
               ],
             ),
           ),
-        ),
-        Expanded(
-          child: SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: SizedBox(
-              width: 40 + _colWidths.values.fold(0.0, (sum, w) => sum + w),
-              child: ListView.builder(
-                itemCount: products.length,
-                itemBuilder: (context, i) {
-                  final p = products[i];
-                  return Container(
-                    height: 40,
-                    decoration: BoxDecoration(color: i % 2 == 0 ? Colors.white : Colors.grey.shade50, border: Border(bottom: BorderSide(color: Colors.grey.shade100))),
-                    child: Row(
-                      children: [
-                        _Cell("${i + 1}", width: 40, align: TextAlign.center, color: Colors.grey),
-                        _Cell(p.name, width: _colWidths['name']!, fontWeight: FontWeight.w800, color: AppColors.primary),
-                        _Cell(cleanBatch(p.batch), width: _colWidths['batch']!, fontWeight: FontWeight.bold),
-                        _Cell(p.rack, width: _colWidths['rack']!, color: AppColors.accent, fontWeight: FontWeight.w900),
-                        _Cell(p.category, width: _colWidths['category']!),
-                        _Cell("${p.stock} units", width: _colWidths['stock']!, align: TextAlign.right, fontWeight: FontWeight.w900),
-                        _Cell(p.expiry, width: _colWidths['expiry']!, align: TextAlign.center, color: isCritical ? AppColors.danger : AppColors.warning, fontWeight: FontWeight.w900),
-                      ],
-                    ),
-                  );
-                },
-              ),
-            ),
-          ),
-        ),
-      ],
+        );
+      },
     );
   }
 

@@ -1,7 +1,7 @@
 ; Inno Setup Script for PharmaPro ERP (Windows Release)
 
 #define MyAppName "PharmaPro ERP"
-#define MyAppVersion "2.4.4"
+#define MyAppVersion "2.4.5"
 #define MyAppPublisher "PharmaPro"
 #define MyAppExeName "pharmacy_app.exe"
 #define MyAppIcon "windows\runner\resources\app_icon.ico"

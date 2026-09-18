@@ -136,9 +136,11 @@ class _StaffRegistrationScreenState extends State<StaffRegistrationScreen> {
         title: "Master Data Lock",
         message: "Enter Master PIN to delete staff member.",
       );
+      if (!mounted) return;
       if (!isUnlocked) return;
     }
 
+    if (!context.mounted) return;
     final confirm = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(

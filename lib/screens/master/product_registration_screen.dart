@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import '../../providers/pharmacy_provider.dart';
 import '../../providers/app_provider.dart';
 import '../../widgets/pin_unlock_dialog.dart';
+import '../../widgets/app_strict_autocomplete.dart';
 import '../../utils/theme_constants.dart';
 
 class ProductRegistrationScreen extends StatefulWidget {
@@ -21,18 +22,18 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
   final TextEditingController _reorderCtrl = TextEditingController();
   final TextEditingController _maxCtrl = TextEditingController();
   final TextEditingController _packingCtrl = TextEditingController();
-  final TextEditingController _leadTimeCtrl = TextEditingController(text: "2");
+  final TextEditingController _leadTimeCtrl = TextEditingController();
   final TextEditingController _discCtrl = TextEditingController();
   final TextEditingController _barcodeCtrl = TextEditingController();
   final TextEditingController _aliasCtrl = TextEditingController();
   final TextEditingController _searchCtrl = TextEditingController();
   final TextEditingController _genericCtrl = TextEditingController();
-  final TextEditingController _rackCtrl = TextEditingController(text: "A1");
-  final TextEditingController _categoryCtrl = TextEditingController(text: "Branded");
-  final TextEditingController _patentCtrl = TextEditingController(text: "Select Patent");
-  final TextEditingController _scheduleCtrl = TextEditingController(text: "Select");
-  final TextEditingController _gstCtrl = TextEditingController(text: "12");
-  final TextEditingController _wholesaleCtrl = TextEditingController(text: "Select Wholesale");
+  final TextEditingController _rackCtrl = TextEditingController();
+  final TextEditingController _categoryCtrl = TextEditingController();
+  final TextEditingController _patentCtrl = TextEditingController();
+  final TextEditingController _scheduleCtrl = TextEditingController();
+  final TextEditingController _gstCtrl = TextEditingController();
+  final TextEditingController _wholesaleCtrl = TextEditingController();
 
   // FOCUS NODES
   final FocusNode _nameFocus = FocusNode();
@@ -56,13 +57,13 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
 
   int _highlightedSearchIndex = 0;
 
-  String _selectedCategory = "Branded";
-  String _selectedRack = "A1";
+  String _selectedCategory = "";
+  String _selectedRack = "";
   String _selectedPatent = "Select Patent";
   String _selectedGeneric = "Select Generic";
-  String _selectedSchedule = "Select";
-  String _selectedGst = "12";
-  String _selectedWholesale = "Select Wholesale";
+  String _selectedSchedule = "Select Schedule";
+  String _selectedGst = "";
+  String _selectedWholesale = "";
 
   bool _isControlled = false;
   bool _isBanned = false;
@@ -145,7 +146,6 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
       if (p.rack.trim().isNotEmpty) set.add(p.rack.trim());
     }
     if (_selectedRack.isNotEmpty) set.add(_selectedRack.trim());
-    if (_rackCtrl.text.trim().isNotEmpty) set.add(_rackCtrl.text.trim());
     final list = set.toList();
     list.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
     return list;
@@ -167,9 +167,6 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
     if (_selectedPatent.isNotEmpty && _selectedPatent != "Select Patent") {
       set.add(_selectedPatent.trim());
     }
-    if (_patentCtrl.text.trim().isNotEmpty && _patentCtrl.text.trim() != "Select Patent") {
-      set.add(_patentCtrl.text.trim());
-    }
     final list = set.toList();
     list.remove("Select Patent");
     list.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
@@ -190,7 +187,6 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
     if (_selectedCategory.isNotEmpty) {
       set.add(_selectedCategory.trim());
     }
-    if (_categoryCtrl.text.trim().isNotEmpty) set.add(_categoryCtrl.text.trim());
     final list = set.toList();
     list.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
     return list;
@@ -210,9 +206,6 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
     if (_selectedGeneric.isNotEmpty && _selectedGeneric != "Select Generic") {
       set.add(_selectedGeneric.trim());
     }
-    if (_genericCtrl.text.trim().isNotEmpty && _genericCtrl.text.trim() != "Select Generic") {
-      set.add(_genericCtrl.text.trim());
-    }
     final list = set.toList();
     list.remove("Select Generic");
     list.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
@@ -220,23 +213,21 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
   }
 
   List<String> _getScheduleOptions(PharmacyProvider provider) {
-    final Set<String> set = {"Select", "H", "H1", "G", "X", "Narcotic"};
+    final Set<String> set = {"Select Schedule", "H", "H1", "G", "X", "Narcotic"};
     for (var p in provider.productMaster) {
       if (p.schedule.trim().isNotEmpty) set.add(p.schedule.trim());
     }
     for (var p in provider.products) {
       if (p.schedule.trim().isNotEmpty) set.add(p.schedule.trim());
     }
-    if (_selectedSchedule.isNotEmpty && _selectedSchedule != "Select") {
+    if (_selectedSchedule.isNotEmpty && _selectedSchedule != "Select Schedule" && _selectedSchedule != "Select") {
       set.add(_selectedSchedule.trim());
     }
-    if (_scheduleCtrl.text.trim().isNotEmpty && _scheduleCtrl.text.trim() != "Select") {
-      set.add(_scheduleCtrl.text.trim());
-    }
     final list = set.toList();
+    list.remove("Select Schedule");
     list.remove("Select");
     list.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
-    return ["Select", ...list];
+    return ["Select Schedule", ...list];
   }
 
   List<String> _getGstOptions(PharmacyProvider provider) {
@@ -248,14 +239,13 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
       if (p.gstPercent >= 0) set.add(p.gstPercent.toInt().toString());
     }
     if (_selectedGst.isNotEmpty) set.add(_selectedGst.trim());
-    if (_gstCtrl.text.trim().isNotEmpty) set.add(_gstCtrl.text.trim());
     final list = set.toList();
     list.sort((a, b) => (double.tryParse(a) ?? 0).compareTo(double.tryParse(b) ?? 0));
     return list;
   }
 
   List<String> _getWholesaleOptions(PharmacyProvider provider) {
-    final Set<String> set = {"Select Wholesale"};
+    final Set<String> set = {};
     for (var s in provider.suppliers) {
       if (s.trim().isNotEmpty) set.add(s.trim());
     }
@@ -268,13 +258,10 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
     if (_selectedWholesale.isNotEmpty && _selectedWholesale != "Select Wholesale") {
       set.add(_selectedWholesale.trim());
     }
-    if (_wholesaleCtrl.text.trim().isNotEmpty && _wholesaleCtrl.text.trim() != "Select Wholesale") {
-      set.add(_wholesaleCtrl.text.trim());
-    }
     final list = set.toList();
     list.remove("Select Wholesale");
     list.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
-    return ["Select Wholesale", ...list];
+    return list;
   }
 
   void _selectProduct(Product p) {
@@ -287,29 +274,34 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
       _hsnCtrl.text = p.hsnCode;
       _barcodeCtrl.text = p.batch;
       _aliasCtrl.text = p.alias;
-      _selectedRack = p.rack.isNotEmpty ? p.rack : "A1";
+      _selectedRack = p.rack;
       _rackCtrl.text = _selectedRack;
-      _selectedCategory = p.category.isNotEmpty ? p.category : "Branded";
+      _selectedCategory = p.category;
       _categoryCtrl.text = _selectedCategory;
       _selectedPatent = p.patent.isNotEmpty ? p.patent : (p.manufacturer.isNotEmpty ? p.manufacturer : "Select Patent");
-      _patentCtrl.text = _selectedPatent;
+      _patentCtrl.text = p.patent.isNotEmpty ? p.patent : p.manufacturer;
       _selectedGeneric = p.genericName.isEmpty ? "Select Generic" : p.genericName;
       _genericCtrl.text = p.genericName;
-      _selectedSchedule = p.schedule.isEmpty ? "Select" : p.schedule;
-      _scheduleCtrl.text = _selectedSchedule;
-      _selectedWholesale = p.preferredWholesale.isEmpty ? "Select Wholesale" : p.preferredWholesale;
-      _wholesaleCtrl.text = _selectedWholesale;
-      _reorderCtrl.text = p.reorderLevel.toString();
-      _maxCtrl.text = p.maxLevel.toString();
-      _leadTimeCtrl.text = p.leadTime.toString();
+      _selectedSchedule = p.schedule.isEmpty ? "Select Schedule" : p.schedule;
+      _scheduleCtrl.text = p.schedule;
+      _selectedWholesale = p.preferredWholesale;
+      _wholesaleCtrl.text = p.preferredWholesale;
+      _reorderCtrl.text = p.reorderLevel > 0 ? p.reorderLevel.toString() : "";
+      _maxCtrl.text = p.maxLevel > 0 ? p.maxLevel.toString() : "";
+      _leadTimeCtrl.text = p.leadTime > 0 ? p.leadTime.toString() : "";
 
       double gst = p.gstPercent;
-      if ([0.0, 5.0, 12.0, 18.0].contains(gst)) {
-        _selectedGst = gst.toInt().toString();
+      if (gst > 0) {
+        if ([0.0, 5.0, 12.0, 18.0].contains(gst)) {
+          _selectedGst = gst.toInt().toString();
+        } else {
+          _selectedGst = gst.toStringAsFixed(0);
+        }
+        _gstCtrl.text = _selectedGst;
       } else {
-        _selectedGst = gst.toStringAsFixed(0);
+        _selectedGst = "";
+        _gstCtrl.clear();
       }
-      _gstCtrl.text = _selectedGst;
 
       _packingCtrl.text = p.packSize.toString();
       _discCtrl.text = p.sDiscPercent.toStringAsFixed(1);
@@ -333,12 +325,14 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
     final provider = Provider.of<PharmacyProvider>(context, listen: false);
 
     if (provider.securityToggles['require_pin_edit_master'] == true) {
+      if (!mounted) return;
       bool isUnlocked = await PinUnlockDialog.show(
           context,
           provider,
           title: "Master Data Lock",
           message: "Enter Master PIN to modify product master data."
       );
+      if (!mounted) return;
       if (!isUnlocked) return;
     }
 
@@ -382,7 +376,9 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
       }
     }
 
+    if (!context.mounted) return;
     if (isDuplicate) {
+      if (!context.mounted) return;
       await showDialog(
         context: context,
         barrierDismissible: false,
@@ -459,10 +455,10 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
     }
 
     final rText = _rackCtrl.text.trim();
-    final rackVal = rText.isNotEmpty ? rText : (_selectedRack.isEmpty ? "A1" : _selectedRack);
+    final rackVal = rText.isNotEmpty ? rText : _selectedRack;
 
     final cText = _categoryCtrl.text.trim();
-    final categoryVal = cText.isNotEmpty ? cText : (_selectedCategory.isEmpty ? "Branded" : _selectedCategory);
+    final categoryVal = cText.isNotEmpty ? cText : _selectedCategory;
 
     final patentVal = (_patentCtrl.text.trim().isNotEmpty && _patentCtrl.text.trim() != "Select Patent")
         ? _patentCtrl.text.trim()
@@ -473,15 +469,15 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
         ? gText
         : (_selectedGeneric == "Select Generic" ? "" : _selectedGeneric);
 
-    final scheduleVal = (_scheduleCtrl.text.trim().isNotEmpty && _scheduleCtrl.text.trim() != "Select")
+    final scheduleVal = (_scheduleCtrl.text.trim().isNotEmpty && _scheduleCtrl.text.trim() != "Select Schedule" && _scheduleCtrl.text.trim() != "Select")
         ? _scheduleCtrl.text.trim()
-        : (_selectedSchedule == "Select" ? "" : _selectedSchedule);
+        : (_selectedSchedule == "Select Schedule" || _selectedSchedule == "Select" ? "" : _selectedSchedule);
 
     final wholesaleVal = (_wholesaleCtrl.text.trim().isNotEmpty && _wholesaleCtrl.text.trim() != "Select Wholesale")
         ? _wholesaleCtrl.text.trim()
         : (_selectedWholesale == "Select Wholesale" ? "" : _selectedWholesale);
 
-    final gstVal = double.tryParse(_gstCtrl.text.trim()) ?? double.tryParse(_selectedGst) ?? 12.0;
+    final gstVal = double.tryParse(_gstCtrl.text.trim()) ?? (double.tryParse(_selectedGst) ?? 0.0);
 
     final p = Product(
       id: _editingProduct?.id ?? _generatedId,
@@ -505,10 +501,11 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
       isActive: _isActive,
       isDiscLocked: _isDiscLocked,
       preferredWholesale: wholesaleVal,
-      leadTime: int.tryParse(_leadTimeCtrl.text) ?? 2,
+      leadTime: int.tryParse(_leadTimeCtrl.text) ?? 0,
       alias: _aliasCtrl.text.trim(),
     );
 
+    if (!mounted) return;
     if (_editingProduct != null) {
       provider.updateProduct(p);
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(backgroundColor: Colors.blue, content: Text("Product Updated!")));
@@ -519,6 +516,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
     provider.trackProductModified(p);
 
     if (widget.initialName != null) {
+      if (!mounted) return;
       final appProvider = Provider.of<AppProvider>(context, listen: false);
       if (appProvider.openTabs.any((t) => t.title == "PRODUCT REGISTRATION")) {
         appProvider.closeTab(appProvider.activeTabIndex);
@@ -541,18 +539,18 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
       _generatedId = _generate10DigitId();
       _nameCtrl.clear(); _hsnCtrl.clear(); _barcodeCtrl.clear(); _aliasCtrl.clear();
       _genericCtrl.clear();
-      _rackCtrl.text = "A1";
-      _categoryCtrl.text = "Branded";
-      _patentCtrl.text = "Select Patent";
-      _scheduleCtrl.text = "Select";
-      _gstCtrl.text = "12";
-      _wholesaleCtrl.text = "Select Wholesale";
+      _rackCtrl.clear();
+      _categoryCtrl.clear();
+      _patentCtrl.clear();
+      _scheduleCtrl.clear();
+      _gstCtrl.clear();
+      _wholesaleCtrl.clear();
       _packingCtrl.clear(); _reorderCtrl.clear(); _maxCtrl.clear();
-      _discCtrl.clear(); _leadTimeCtrl.text = "2";
-      _selectedCategory = "Branded"; _selectedRack = "A1";
+      _discCtrl.clear(); _leadTimeCtrl.clear();
+      _selectedCategory = ""; _selectedRack = "";
       _selectedPatent = "Select Patent"; _selectedGeneric = "Select Generic";
-      _selectedSchedule = "Select"; _selectedGst = "12";
-      _selectedWholesale = "Select Wholesale";
+      _selectedSchedule = "Select Schedule"; _selectedGst = "";
+      _selectedWholesale = "";
       _isControlled = false; _isBanned = false; _isNrx = false; _isActive = true;
       _isDiscLocked = false;
     });
@@ -1497,7 +1495,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
                       borderRadius: BorderRadius.circular(8),
                       border: Border.all(color: Colors.grey.shade300),
                     ),
-                    child: Text(_editingProduct != null ? _editingProduct!.id : _generatedId,
+                    child: Text(_editingProduct != null ? _editingProduct!.id : "",
                       style: TextStyle(fontWeight: FontWeight.w900, fontSize: 13, color: Colors.blue.shade700),
                       overflow: TextOverflow.ellipsis,
                       maxLines: 1,
@@ -1545,7 +1543,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
               focusNode: _rackFocus,
               nextFocus: _categoryFocus,
               getItems: _getRackOptions,
-              defaultOption: "A1",
+              defaultOption: "",
               provider: provider,
               onValueChanged: (v) => setState(() => _selectedRack = v),
             )),
@@ -1556,7 +1554,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
               focusNode: _categoryFocus,
               nextFocus: _genericFocus,
               getItems: _getCategoryOptions,
-              defaultOption: "Branded",
+              defaultOption: "",
               provider: provider,
               onValueChanged: (v) => setState(() => _selectedCategory = v),
             )),
@@ -1593,7 +1591,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
               focusNode: _scheduleFocus,
               nextFocus: _reorderFocus,
               getItems: _getScheduleOptions,
-              defaultOption: "Select",
+              defaultOption: "Select Schedule",
               provider: provider,
               onValueChanged: (v) => setState(() => _selectedSchedule = v),
             )),
@@ -1619,7 +1617,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
                 focusNode: _gstFocus,
                 nextFocus: _discFocus,
                 getItems: _getGstOptions,
-                defaultOption: "12",
+                defaultOption: "",
                 provider: provider,
                 onValueChanged: (v) => setState(() => _selectedGst = v),
               ),
@@ -1660,7 +1658,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
           focusNode: _wholesaleFocus,
           nextFocus: _barcodeFocus,
           getItems: _getWholesaleOptions,
-          defaultOption: "Select Wholesale",
+          defaultOption: "",
           provider: provider,
           onValueChanged: (v) => setState(() => _selectedWholesale = v),
         ),
@@ -1713,136 +1711,14 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
     required PharmacyProvider provider,
     required Function(String) onValueChanged,
   }) {
-    final List<String> allItems = getItems(provider);
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          label,
-          style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.blueGrey.shade600),
-        ),
-        const SizedBox(height: 4),
-        LayoutBuilder(
-          builder: (context, constraints) {
-            return RawAutocomplete<String>(
-              textEditingController: controller,
-              focusNode: focusNode,
-              optionsBuilder: (TextEditingValue textEditingValue) {
-                final text = textEditingValue.text.trim().toLowerCase();
-                if (text.isEmpty || text == defaultOption.toLowerCase()) {
-                  return allItems.take(50);
-                }
-                final matches = allItems.where((g) => g.toLowerCase().contains(text)).toList();
-                return matches.take(50);
-              },
-              onSelected: (String selection) {
-                onValueChanged(selection);
-                if (nextFocus != null) {
-                  nextFocus.requestFocus();
-                }
-              },
-              fieldViewBuilder: (context, textController, fieldFocusNode, onFieldSubmitted) {
-                return Container(
-                  height: 32,
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(6),
-                    border: Border.all(
-                      color: fieldFocusNode.hasFocus ? Colors.blue : Colors.grey.shade300,
-                      width: fieldFocusNode.hasFocus ? 1.5 : 1,
-                    ),
-                  ),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          controller: textController,
-                          focusNode: fieldFocusNode,
-                          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-                          decoration: InputDecoration(
-                            isDense: true,
-                            hintText: defaultOption,
-                            hintStyle: TextStyle(fontSize: 12, color: Colors.grey.shade500, fontWeight: FontWeight.w500),
-                            border: InputBorder.none,
-                            contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                          ),
-                          onChanged: (val) {
-                            onValueChanged(val.trim().isEmpty ? defaultOption : val.trim());
-                          },
-                          onSubmitted: (_) {
-                            if (nextFocus != null) {
-                              nextFocus.requestFocus();
-                            }
-                          },
-                        ),
-                      ),
-                      if (textController.text.isNotEmpty && textController.text != defaultOption)
-                        InkWell(
-                          onTap: () {
-                            textController.clear();
-                            onValueChanged(defaultOption);
-                          },
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 4),
-                            child: Icon(Icons.close, size: 14, color: Colors.grey.shade600),
-                          ),
-                        ),
-                      Icon(Icons.arrow_drop_down, size: 18, color: Colors.grey.shade600),
-                      const SizedBox(width: 4),
-                    ],
-                  ),
-                );
-              },
-              optionsViewBuilder: (context, onSelected, options) {
-                return Align(
-                  alignment: Alignment.topLeft,
-                  child: Material(
-                    elevation: 6.0,
-                    borderRadius: BorderRadius.circular(6),
-                    color: Colors.white,
-                    child: Container(
-                      constraints: const BoxConstraints(maxHeight: 200),
-                      width: constraints.maxWidth,
-                      decoration: BoxDecoration(
-                        color: Colors.white,
-                        borderRadius: BorderRadius.circular(6),
-                        border: Border.all(color: Colors.grey.shade300),
-                      ),
-                      child: ListView.separated(
-                        padding: EdgeInsets.zero,
-                        shrinkWrap: true,
-                        itemCount: options.length,
-                        separatorBuilder: (context, index) => Divider(height: 1, color: Colors.grey.shade100),
-                        itemBuilder: (context, index) {
-                          final option = options.elementAt(index);
-                          final isHighlighted = AutocompleteHighlightedOption.of(context) == index;
-                          return InkWell(
-                            onTap: () => onSelected(option),
-                            child: Container(
-                              color: isHighlighted ? Colors.blue.shade50 : Colors.white,
-                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                              child: Text(
-                                option,
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  fontWeight: isHighlighted ? FontWeight.bold : FontWeight.w600,
-                                  color: isHighlighted ? Colors.blue.shade900 : Colors.black87,
-                                ),
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-                    ),
-                  ),
-                );
-              },
-            );
-          },
-        ),
-      ],
+    return AppStrictAutocomplete(
+      label: label,
+      controller: controller,
+      focusNode: focusNode,
+      nextFocus: nextFocus,
+      getItems: () => getItems(provider),
+      defaultOption: defaultOption,
+      onValueChanged: onValueChanged,
     );
   }
 

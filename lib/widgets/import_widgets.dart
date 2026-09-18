@@ -783,6 +783,7 @@ class _ProductMappingDialogState extends State<ProductMappingDialog> {
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
                   ),
                   onPressed: () async {
+                    final nav = Navigator.of(context);
                     int mappedCount = 0;
                     int unmappedCount = 0;
 
@@ -839,6 +840,7 @@ class _ProductMappingDialogState extends State<ProductMappingDialog> {
                         ),
                       );
 
+                      if (!mounted) return;
                       if (proceed != true) {
                         return; // User chose to stay and map items
                       }
@@ -862,6 +864,7 @@ class _ProductMappingDialogState extends State<ProductMappingDialog> {
                           internalName: match.name,
                           productId: match.id,
                         ));
+                        if (!mounted) return;
 
                         mappedItems.add(PurchaseItem(
                           id: match.id,
@@ -910,15 +913,7 @@ class _ProductMappingDialogState extends State<ProductMappingDialog> {
                       }
                     }
 
-                    if (!mounted) return;
-
-                    // 1. Send data back to the purchase screen
-                    widget.onImportRequested(mappedItems);
-
-                    // 2. Only pop if this was opened inside showDialog, NEVER pop if hosted in MdiWindow
-                    if (Navigator.of(context).canPop()) {
-                      Navigator.of(context).pop(true);
-                    }
+                    _finishImport(mappedItems);
                   },
                   child: const Text("IMPORT MAPPED ITEMS", style: TextStyle(fontWeight: FontWeight.bold)),
                 ),
@@ -928,5 +923,13 @@ class _ProductMappingDialogState extends State<ProductMappingDialog> {
         ],
       ),
     );
+  }
+
+  void _finishImport(List<PurchaseItem> mappedItems) {
+    if (!mounted) return;
+    widget.onImportRequested(mappedItems);
+    if (Navigator.of(context).canPop()) {
+      Navigator.of(context).pop(true);
+    }
   }
 }

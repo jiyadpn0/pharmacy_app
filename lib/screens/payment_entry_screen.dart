@@ -15,6 +15,7 @@ class PaymentEntryScreen extends StatefulWidget {
 }
 
 class _PaymentEntryScreenState extends State<PaymentEntryScreen> {
+  bool isSaving = false;
   DateTime _startDate = DateTime(DateTime.now().year, DateTime.now().month, 1);
   DateTime _endDate = DateTime.now();
   String _supplierSearchQuery = "";
@@ -507,7 +508,6 @@ class _PaymentEntryScreenState extends State<PaymentEntryScreen> {
     DateTime paymentDate = isEdit ? existing.date : DateTime.now();
     String method = isEdit ? existing.paymentMethod : "CASH";
 
-    bool isSaving = false;
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
@@ -657,23 +657,28 @@ class _PaymentEntryScreenState extends State<PaymentEntryScreen> {
             TextButton(onPressed: () => Navigator.pop(ctx), child: Text("CANCEL", style: TextStyle(color: c.secondaryText))),
             ElevatedButton(
               onPressed: () async {
-                if (amountCtrl.text.isEmpty) return;
-                final provider = Provider.of<PharmacyProvider>(context, listen: false);
-                final cnObj = SupplierCreditNote(
-                  id: noCtrl.text,
-                  supplierName: _selectedSupplier!,
-                  date: cnDate,
-                  amount: double.tryParse(amountCtrl.text) ?? 0.0,
-                  invoiceNo: invoiceCtrl.text,
-                  remarks: remarksCtrl.text,
-                );
-                
-                if (isEdit) {
-                  await provider.updateSupplierCreditNote(cnObj);
-                } else {
-                  await provider.addSupplierCreditNote(cnObj);
+                if (amountCtrl.text.isEmpty || isSaving) return;
+                setDialogState(() => isSaving = true);
+                try {
+                  final provider = Provider.of<PharmacyProvider>(context, listen: false);
+                  final cnObj = SupplierCreditNote(
+                    id: noCtrl.text,
+                    supplierName: _selectedSupplier!,
+                    date: cnDate,
+                    amount: double.tryParse(amountCtrl.text) ?? 0.0,
+                    invoiceNo: invoiceCtrl.text,
+                    remarks: remarksCtrl.text,
+                  );
+                  
+                  if (isEdit) {
+                    await provider.updateSupplierCreditNote(cnObj);
+                  } else {
+                    await provider.addSupplierCreditNote(cnObj);
+                  }
+                  if (ctx.mounted) Navigator.pop(ctx);
+                } finally {
+                  setDialogState(() => isSaving = false);
                 }
-                Navigator.pop(ctx);
               },
               style: ElevatedButton.styleFrom(backgroundColor: Colors.orange.shade800, foregroundColor: Colors.white),
               child: Text(isEdit ? "UPDATE CREDIT NOTE" : "SAVE CREDIT NOTE"),

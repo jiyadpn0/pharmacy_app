@@ -13,6 +13,8 @@ import '../utils/theme_constants.dart';
 import '../utils/app_dialogs.dart';
 import '../utils/tax_calculator.dart';
 import '../widgets/draggable_modal.dart';
+import '../utils/watchdog_mixin.dart';
+import '../services/update_checker_service.dart';
 import 'printer_customization_screen.dart';
 import 'edited_invoices_screen.dart';
 
@@ -24,8 +26,8 @@ class SettingsScreen extends StatefulWidget {
   State<SettingsScreen> createState() => _SettingsScreenState();
 }
 
-class _SettingsScreenState extends State<SettingsScreen> {
-  static const String _currentAppVersion = "2.4.4";
+class _SettingsScreenState extends State<SettingsScreen> with WatchdogMixin<SettingsScreen> {
+  static String get _currentAppVersion => UpdateCheckerService.currentVersion;
   late TextEditingController _nameCtrl;
   late TextEditingController _addressCtrl;
   late TextEditingController _phoneCtrl;
@@ -454,13 +456,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     child: const Icon(Icons.system_update_rounded, color: Colors.blue, size: 28),
                   ),
                   const SizedBox(width: 20),
-                  const Expanded(
+                  Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text("Sahakar Medicals ERP", style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16)),
-                        SizedBox(height: 4),
-                        Text("Version $_currentAppVersion (Commercial Build • Stable)", style: TextStyle(fontSize: 12, color: Colors.blueGrey, fontWeight: FontWeight.w500)),
+                        const Text("Sahakar Medicals ERP", style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16)),
+                        const SizedBox(height: 4),
+                        Text("Version ${UpdateCheckerService.currentVersion} (Commercial Build • Stable)", style: const TextStyle(fontSize: 12, color: Colors.blueGrey, fontWeight: FontWeight.w500)),
                       ],
                     ),
                   ),
@@ -607,413 +609,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('github_repo_path', repoPath);
 
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => Center(
-        child: Container(
-          padding: const EdgeInsets.all(32),
-          decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const CircularProgressIndicator(),
-              const SizedBox(height: 24),
-              Text("Checking GitHub Releases ($repoPath)...", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-            ],
-          ),
-        ),
-      ),
-    );
-
-    try {
-      final client = HttpClient();
-      final url = Uri.parse('https://api.github.com/repos/$repoPath/releases/latest');
-      final request = await client.getUrl(url);
-      request.headers.set('User-Agent', 'PharmacyERP-Updater');
-      request.headers.set('Accept', 'application/vnd.github.v3+json');
-
-      final response = await request.close().timeout(const Duration(seconds: 10));
-
-      if (!mounted) return;
-      Navigator.pop(context); // Close loading dialog
-
-      if (response.statusCode == 200) {
-        final responseBody = await response.transform(utf8.decoder).join();
-        final Map<String, dynamic> releaseData = jsonDecode(responseBody);
-
-        final String tagName = releaseData['tag_name'] ?? '';
-        final String releaseName = releaseData['name'] ?? tagName;
-        final String htmlUrl = releaseData['html_url'] ?? '';
-        final String body = releaseData['body'] ?? 'No release notes provided.';
-        final String publishedAt = releaseData['published_at'] ?? '';
-
-        String directZipUrl = '';
-        if (releaseData['assets'] is List && (releaseData['assets'] as List).isNotEmpty) {
-          for (var asset in (releaseData['assets'] as List)) {
-            final String downloadUrl = asset['browser_download_url'] ?? '';
-            if (downloadUrl.toLowerCase().endsWith('.zip')) {
-              directZipUrl = downloadUrl;
-              break;
-            }
-          }
-        }
-        if (directZipUrl.isEmpty && releaseData['zipball_url'] != null) {
-          directZipUrl = releaseData['zipball_url'].toString();
-        }
-        if (directZipUrl.isEmpty) {
-          directZipUrl = 'https://github.com/$repoPath/archive/refs/tags/$tagName.zip';
-        }
-
-        if (_isVersionNewer(tagName, _currentAppVersion)) {
-          _showUpdateAvailableDialog(
-            latestVersion: tagName,
-            releaseName: releaseName,
-            htmlUrl: htmlUrl,
-            directZipUrl: directZipUrl,
-            body: body,
-            publishedAt: publishedAt,
-          );
-        } else {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text("Software is fully up to date! (Current version: v$_currentAppVersion)"),
-              backgroundColor: Colors.green,
-              behavior: SnackBarBehavior.floating,
-            ),
-          );
-        }
-      } else if (response.statusCode == 404) {
-        _showUpdateErrorDialog(
-          "GitHub Release Not Found",
-          "No published releases were found for repository '$repoPath'.\n\n"
-          "Please verify:\n"
-          "1. The GitHub repository is set to Public.\n"
-          "2. You have created and published at least one Release on GitHub.",
-        );
-      } else {
-        _showUpdateErrorDialog(
-          "GitHub API Error",
-          "GitHub returned status code ${response.statusCode}.\n"
-          "Please verify your repository path and try again later.",
-        );
-      }
-      client.close();
-    } catch (e) {
-      if (!mounted) return;
-      Navigator.pop(context); // Close loading dialog
-      _showUpdateErrorDialog(
-        "Connection Error",
-        "Unable to connect to GitHub Releases API.\n\n"
-        "Error details: ${e.toString().replaceAll('Exception: ', '')}\n\n"
-        "Please check your internet connection.",
-      );
-    }
-  }
-
-  bool _isVersionNewer(String latestTag, String currentVersion) {
-    String clean(String v) => v.replaceAll(RegExp(r'^[vV]'), '').split('-').first.trim();
-    final latestParts = clean(latestTag).split('.').map((e) => int.tryParse(e) ?? 0).toList();
-    final currentParts = clean(currentVersion).split('.').map((e) => int.tryParse(e) ?? 0).toList();
-
-    for (int i = 0; i < 3; i++) {
-      final l = i < latestParts.length ? latestParts[i] : 0;
-      final c = i < currentParts.length ? currentParts[i] : 0;
-      if (l > c) return true;
-      if (l < c) return false;
-    }
-    return false;
-  }
-
-  void _showUpdateAvailableDialog({
-    required String latestVersion,
-    required String releaseName,
-    required String htmlUrl,
-    required String directZipUrl,
-    required String body,
-    required String publishedAt,
-  }) {
-    String formattedDate = publishedAt;
-    try {
-      if (publishedAt.isNotEmpty) {
-        final dt = DateTime.parse(publishedAt);
-        formattedDate = DateFormat('MMM dd, yyyy').format(dt);
-      }
-    } catch (_) {}
-
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.all(8),
-              decoration: BoxDecoration(color: Colors.blue.withValues(alpha: 0.1), borderRadius: BorderRadius.circular(8)),
-              child: const Icon(Icons.system_update_rounded, color: Colors.blue),
-            ),
-            const SizedBox(width: 12),
-            const Expanded(
-              child: Text("New Update Available!", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-            ),
-          ],
-        ),
-        content: SizedBox(
-          width: 520,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Colors.blue.shade50,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.blue.shade200),
-                ),
-                child: Row(
-                  children: [
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text("Current: v$_currentAppVersion", style: TextStyle(fontWeight: FontWeight.w600, color: Colors.blueGrey)),
-                        const SizedBox(height: 4),
-                        Text("Latest: $latestVersion", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.blue.shade900)),
-                      ],
-                    ),
-                    const Spacer(),
-                    if (formattedDate.isNotEmpty)
-                      Chip(
-                        avatar: const Icon(Icons.calendar_today_rounded, size: 14),
-                        label: Text(formattedDate, style: const TextStyle(fontSize: 11)),
-                      ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 16),
-              Text(releaseName, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-              const SizedBox(height: 8),
-              const Text("RELEASE NOTES:", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.grey)),
-              const SizedBox(height: 6),
-              Container(
-                constraints: const BoxConstraints(maxHeight: 180),
-                width: double.infinity,
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: AppColors.background,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: AppColors.border),
-                ),
-                child: SingleChildScrollView(
-                  child: Text(
-                    body.isEmpty ? "No release details provided." : body,
-                    style: const TextStyle(fontSize: 12, height: 1.4),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text("LATER", style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold)),
-          ),
-          OutlinedButton.icon(
-            onPressed: () {
-              Navigator.pop(ctx);
-              if (htmlUrl.isNotEmpty) {
-                _openUrl(htmlUrl);
-              }
-            },
-            icon: const Icon(Icons.open_in_new_rounded, size: 14),
-            label: const Text("Open in Browser", style: TextStyle(fontSize: 12)),
-          ),
-          ElevatedButton.icon(
-            onPressed: () {
-              Navigator.pop(ctx);
-              _performDirectInAppUpdate(directZipUrl);
-            },
-            icon: const Icon(Icons.download_rounded, size: 16),
-            label: const Text("UPDATE DIRECTLY IN APP", style: TextStyle(fontWeight: FontWeight.bold)),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.blue.shade800,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _performDirectInAppUpdate(String zipUrl) async {
-    final progressNotifier = ValueNotifier<double>(0.0);
-    final statusNotifier = ValueNotifier<String>("Connecting to update server...");
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Row(
-          children: [
-            Icon(Icons.system_update_rounded, color: Colors.blue, size: 28),
-            SizedBox(width: 12),
-            Text("Updating PharmaPro ERP", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-          ],
-        ),
-        content: SizedBox(
-          width: 420,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              ValueListenableBuilder<String>(
-                valueListenable: statusNotifier,
-                builder: (context, statusText, _) => Text(statusText, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
-              ),
-              const SizedBox(height: 16),
-              ValueListenableBuilder<double>(
-                valueListenable: progressNotifier,
-                builder: (context, progress, _) => Column(
-                  children: [
-                    LinearProgressIndicator(value: progress > 0 ? progress : null, minHeight: 8, borderRadius: BorderRadius.circular(4)),
-                    const SizedBox(height: 8),
-                    Align(
-                      alignment: Alignment.centerRight,
-                      child: Text("${(progress * 100).toStringAsFixed(0)}%", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.blueGrey, fontSize: 11)),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-
-    try {
-      final client = http.Client();
-      Uri targetUri = Uri.parse(zipUrl);
-      http.StreamedResponse? response;
-
-      // Follow HTTP 301/302/307/308 redirects automatically up to 5 hops
-      int redirectCount = 0;
-      while (redirectCount < 5) {
-        final request = http.Request('GET', targetUri);
-        request.headers['User-Agent'] = 'PharmacyERP-Updater';
-        request.headers['Accept'] = 'application/octet-stream, application/zip, */*';
-
-        response = await client.send(request);
-
-        if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.containsKey('location')) {
-          targetUri = Uri.parse(response.headers['location']!);
-          redirectCount++;
-        } else {
-          break;
-        }
-      }
-
-      if (response == null || response.statusCode != 200) {
-        throw Exception("Download failed with HTTP status code ${response?.statusCode ?? 404}");
-      }
-
-      final contentLength = response.contentLength ?? 0;
-      final tempDir = Directory.systemTemp;
-      final zipFile = File('${tempDir.path}${Platform.pathSeparator}PharmaPro_Update.zip');
-      final extractDir = Directory('${tempDir.path}${Platform.pathSeparator}PharmaPro_Extracted');
-
-      if (await extractDir.exists()) {
-        await extractDir.delete(recursive: true);
-      }
-      await extractDir.create(recursive: true);
-
-      final sink = zipFile.openWrite();
-      int downloaded = 0;
-
-      await response.stream.forEach((chunk) {
-        sink.add(chunk);
-        downloaded += chunk.length;
-        if (contentLength > 0) {
-          progressNotifier.value = (downloaded / contentLength).toDouble();
-          statusNotifier.value = "Downloading update (${(downloaded / (1024 * 1024)).toStringAsFixed(1)} MB / ${(contentLength / (1024 * 1024)).toStringAsFixed(1)} MB)...";
-        } else {
-          statusNotifier.value = "Downloading update (${(downloaded / (1024 * 1024)).toStringAsFixed(1)} MB)...";
-        }
-      });
-
-      await sink.flush();
-      await sink.close();
-      client.close();
-
-      statusNotifier.value = "Unpacking update files...";
-      progressNotifier.value = 0.95;
-
-      final extractResult = await Process.run('powershell', [
-        '-Command',
-        'Expand-Archive -Path "${zipFile.path}" -DestinationPath "${extractDir.path}" -Force'
-      ]);
-
-      if (extractResult.exitCode != 0) {
-        throw Exception("Failed to extract update package: ${extractResult.stderr}");
-      }
-
-      // Check if extracted ZIP contains an inner root folder
-      String sourceFolderPath = extractDir.path;
-      final extractedItems = extractDir.listSync();
-      if (extractedItems.length == 1 && extractedItems.first is Directory) {
-        sourceFolderPath = extractedItems.first.path;
-      }
-
-      statusNotifier.value = "Applying update and restarting application...";
-      progressNotifier.value = 1.0;
-
-      final appExePath = Platform.resolvedExecutable;
-      final appDir = File(appExePath).parent.path;
-
-      final scriptFile = File('${tempDir.path}${Platform.pathSeparator}apply_pharmacy_update.bat');
-      final scriptContent = '''
-@echo off
-timeout /t 2 /nobreak > nul
-xcopy /E /Y /I "$sourceFolderPath\\*" "$appDir\\"
-start "" "$appExePath"
-del "%~f0"
-''';
-      await scriptFile.writeAsString(scriptContent);
-
-      await Process.start('cmd.exe', ['/c', scriptFile.path], mode: ProcessStartMode.detached);
-      exit(0);
-
-    } catch (e) {
-      if (mounted && Navigator.canPop(context)) {
-        Navigator.pop(context); // Close download dialog
-      }
-      _showUpdateErrorDialog("Direct Update Failed", "Unable to download or apply update directly.\n\nError: $e");
-    }
-  }
-
-  void _showUpdateErrorDialog(String title, String message) {
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Row(
-          children: [
-            const Icon(Icons.error_outline_rounded, color: Colors.orange),
-            const SizedBox(width: 8),
-            Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-          ],
-        ),
-        content: Text(message, style: const TextStyle(fontSize: 13, height: 1.4)),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text("OK", style: TextStyle(fontWeight: FontWeight.bold)),
-          ),
-        ],
-      ),
-    );
+    if (!mounted) return;
+    await UpdateCheckerService.checkForUpdates(context, silent: false, repoPath: repoPath);
   }
 
   Future<void> _openUrl(String url) async {
@@ -1346,20 +943,9 @@ del "%~f0"
 
                   if (res['success'] == true) {
                     await provider.loadFromDatabase();
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(
-                        backgroundColor: Colors.green,
-                        content: Text("Successfully imported ${res['invoices']} invoices (${res['items']} items) in seconds!"),
-                        duration: const Duration(seconds: 4),
-                      ),
-                    );
+                    _showSnackBar("Successfully imported ${res['invoices']} invoices (${res['items']} items) in seconds!");
                   } else {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(
-                        backgroundColor: Colors.red,
-                        content: Text(res['message'] ?? "Import failed."),
-                      ),
-                    );
+                    _showSnackBar(res['message']?.toString() ?? "Import failed.", isError: true);
                   }
                 }
               },
@@ -2926,14 +2512,14 @@ del "%~f0"
                                 style: ElevatedButton.styleFrom(backgroundColor: Colors.deepOrange, foregroundColor: Colors.white),
                                 child: const Text("RESTORE", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
                                 onPressed: () async {
+                                  Navigator.pop(ctx);
                                   final confirm = await AppDialogs.showConfirmDialog(
-                                    context: ctx,
+                                    context: context,
                                     title: "Confirm Restore?",
                                     content: "Restoring from '${b['name']}' will replace your active database. The app will reload instantly.",
                                   );
 
                                   if (confirm == true) {
-                                    Navigator.pop(ctx);
                                     try {
                                       await provider.restoreFromBackup(file);
                                       if (mounted) {
@@ -3141,6 +2727,17 @@ del "%~f0"
             child: const Text("OK", style: TextStyle(fontWeight: FontWeight.bold)),
           ),
         ],
+      ),
+    );
+  }
+
+  void _showSnackBar(String msg, {bool isError = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        backgroundColor: isError ? Colors.red : Colors.green,
+        content: Text(msg),
+        duration: const Duration(seconds: 4),
       ),
     );
   }

@@ -694,12 +694,13 @@ class _OrderConfirmationScreenState extends State<OrderConfirmationScreen> {
   }
 
   void _openMarkReceivedDialog(OrderConfirmation order) {
+    final provider = Provider.of<PharmacyProvider>(context, listen: false);
     DateTime pickedDate = DateTime.now();
 
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
+        builder: (dialogCtx2, setDialogState) => AlertDialog(
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
           title: Row(
             children: [
@@ -720,7 +721,7 @@ class _OrderConfirmationScreenState extends State<OrderConfirmationScreen> {
               InkWell(
                 onTap: () async {
                   final d = await showDatePicker(
-                    context: context,
+                    context: dialogCtx2,
                     initialDate: pickedDate,
                     firstDate: DateTime(2020),
                     lastDate: DateTime.now().add(const Duration(days: 30)),
@@ -758,8 +759,8 @@ class _OrderConfirmationScreenState extends State<OrderConfirmationScreen> {
             ElevatedButton(
               style: ElevatedButton.styleFrom(backgroundColor: Colors.green.shade700, foregroundColor: Colors.white),
               onPressed: () async {
-                final provider = Provider.of<PharmacyProvider>(context, listen: false);
                 final receivedDateStr = DateFormat('dd/MM/yyyy').format(pickedDate);
+                Navigator.pop(ctx);
 
                 await provider.updateOrderConfirmationStatus(
                   order.orderId,
@@ -768,7 +769,6 @@ class _OrderConfirmationScreenState extends State<OrderConfirmationScreen> {
                 );
 
                 if (mounted) {
-                  Navigator.pop(ctx);
                   ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(content: Text("Order ${order.orderId} marked as FULLY RECEIVED on $receivedDateStr"), backgroundColor: Colors.green),
                   );

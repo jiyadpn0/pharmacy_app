@@ -50,6 +50,7 @@ class MainDashboard extends StatelessWidget {
                 _buildDropdownMenu(context, "STOCK", [
                   _MenuAction("Stock Ledger", () => provider.openStockLedger()),
                   _MenuAction("Consolidate Stock Position", () => provider.openConsolidateStock()),
+                  _MenuAction("Wholesale Stock Directory", () => provider.openWholesaleStockDirectory()),
                 ]),
                 _buildDropdownMenu(context, "ORDER", [
                   _MenuAction("Order Book", () => provider.openOrderBook()),

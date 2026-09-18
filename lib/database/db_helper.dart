@@ -26,12 +26,13 @@ class DbHelper {
 
     final db = await openDatabase(
       path,
-      version: 76, // Incremented to 76 for staff management table migration
+      version: 77, // Incremented to 77 for purchase_return_entries gst_mode column migration
       onCreate: _createDB,
       onUpgrade: _onUpgrade,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON;');
         await db.execute('PRAGMA journal_mode = WAL;');
+        await db.execute('PRAGMA busy_timeout = 10000;');
         await db.execute('PRAGMA synchronous = NORMAL;');
         await db.execute('PRAGMA cache_size = -64000;'); // ~64MB Cache
         await db.execute('PRAGMA temp_store = MEMORY;');
@@ -44,11 +45,37 @@ class DbHelper {
   }
 
   Future<void> checkAndMigrateColumns(Database db) async {
-    // Safety check: ensure order_type column always exists on sales_invoices table
+    // Safety checks: ensure crucial columns exist on tables even if schema_v75_migrated_done is set
+    try {
+      await db.rawUpdate('UPDATE stock_batches SET current_stock = 0 WHERE current_stock < 0');
+    } catch (_) {}
+
     try {
       var saleCols = await db.rawQuery('PRAGMA table_info(sales_invoices)');
       if (!saleCols.any((c) => c['name'] == 'order_type')) {
         await db.execute("ALTER TABLE sales_invoices ADD COLUMN order_type INTEGER DEFAULT 0");
+      }
+    } catch (_) {}
+
+    try {
+      var preCols = await db.rawQuery('PRAGMA table_info(purchase_return_entries)');
+      if (!preCols.any((c) => c['name'] == 'gst_mode')) {
+        await db.execute("ALTER TABLE purchase_return_entries ADD COLUMN gst_mode INTEGER DEFAULT 1");
+      }
+      if (!preCols.any((c) => c['name'] == 'original_purchase_no')) {
+        await db.execute("ALTER TABLE purchase_return_entries ADD COLUMN original_purchase_no TEXT");
+      }
+      if (!preCols.any((c) => c['name'] == 'done_by')) {
+        await db.execute("ALTER TABLE purchase_return_entries ADD COLUMN done_by TEXT");
+      }
+      if (!preCols.any((c) => c['name'] == 'is_deleted')) {
+        await db.execute("ALTER TABLE purchase_return_entries ADD COLUMN is_deleted INTEGER DEFAULT 0");
+      }
+      if (!preCols.any((c) => c['name'] == 'is_imported')) {
+        await db.execute("ALTER TABLE purchase_return_entries ADD COLUMN is_imported INTEGER DEFAULT 0");
+      }
+      if (!preCols.any((c) => c['name'] == 'financial_year')) {
+        await db.execute("ALTER TABLE purchase_return_entries ADD COLUMN financial_year TEXT");
       }
     } catch (_) {}
 
@@ -622,6 +649,14 @@ class DbHelper {
         ''');
       } catch (_) {}
     }
+    if (oldVersion < 77) {
+      try {
+        var preCols = await db.rawQuery('PRAGMA table_info(purchase_return_entries)');
+        if (!preCols.any((c) => c['name'] == 'gst_mode')) {
+          await db.execute("ALTER TABLE purchase_return_entries ADD COLUMN gst_mode INTEGER DEFAULT 1");
+        }
+      } catch (_) {}
+    }
   }
 
   Future _createDB(Database db, int version) async {
@@ -850,7 +885,7 @@ class DbHelper {
     await db.execute('CREATE TABLE doctors (id TEXT PRIMARY KEY, name TEXT NOT NULL, mobile TEXT, specialization TEXT, reg_no TEXT, is_active INTEGER DEFAULT 1)');
     await db.execute('CREATE TABLE sales_return_invoices (entry_no TEXT PRIMARY KEY, date TEXT NOT NULL, customer_acc TEXT, patient TEXT, doctor TEXT, sub_total REAL DEFAULT 0.0, discount REAL DEFAULT 0.0, tax REAL DEFAULT 0.0, round_off REAL DEFAULT 0.0, grand_total REAL, narration TEXT, gst_mode INTEGER DEFAULT 1, original_invoice_no TEXT, is_deleted INTEGER DEFAULT 0, is_imported INTEGER DEFAULT 0, financial_year TEXT)');
     await db.execute('CREATE TABLE sales_return_items (id INTEGER PRIMARY KEY AUTOINCREMENT, return_no TEXT, product_id TEXT, product_name TEXT, batch_number TEXT, expiry_date TEXT, quantity INTEGER, mrp REAL, sale_rate REAL, disc_percent REAL DEFAULT 0.0, disc_amt REAL DEFAULT 0.0, hsn_code TEXT, total REAL, purchase_rate REAL DEFAULT 0.0, landing_cost REAL DEFAULT 0.0, supplier_name TEXT, packing INTEGER DEFAULT 1, gst_percent REAL DEFAULT 12.0, FOREIGN KEY (return_no) REFERENCES sales_return_invoices (entry_no))');
-    await db.execute('CREATE TABLE purchase_return_entries (entry_no TEXT PRIMARY KEY, date TEXT NOT NULL, supplier_name TEXT, original_purchase_no TEXT, done_by TEXT, grand_total REAL, is_deleted INTEGER DEFAULT 0, is_imported INTEGER DEFAULT 0, financial_year TEXT)');
+    await db.execute('CREATE TABLE purchase_return_entries (entry_no TEXT PRIMARY KEY, date TEXT NOT NULL, supplier_name TEXT, original_purchase_no TEXT, done_by TEXT, grand_total REAL, gst_mode INTEGER DEFAULT 1, is_deleted INTEGER DEFAULT 0, is_imported INTEGER DEFAULT 0, financial_year TEXT)');
     await db.execute('CREATE TABLE purchase_return_items (id INTEGER PRIMARY KEY AUTOINCREMENT, entry_no TEXT, product_name TEXT, batch TEXT, expiry TEXT, qty INTEGER, loose_qty INTEGER DEFAULT 0, f_qty INTEGER, unit TEXT, packin INTEGER, mrp REAL, p_rate REAL, s_rate REAL, disc_percent REAL, gst_percent REAL, total REAL, reason TEXT, supplier TEXT, hsn_code TEXT, sup_inv_no TEXT, FOREIGN KEY (entry_no) REFERENCES purchase_return_entries (entry_no))');
     await db.execute('CREATE TABLE prescriptions (id TEXT PRIMARY KEY, prescription_no INTEGER DEFAULT 0, patient_name TEXT, doctor_name TEXT, disease_name TEXT, mobile TEXT, days INTEGER, date TEXT, sale_entry_no TEXT, is_active INTEGER DEFAULT 1, is_imported INTEGER DEFAULT 0, financial_year TEXT)');
     await db.execute('CREATE TABLE prescription_items (id INTEGER PRIMARY KEY AUTOINCREMENT, prescription_id TEXT, name TEXT, qty REAL, FOREIGN KEY (prescription_id) REFERENCES prescriptions (id))');

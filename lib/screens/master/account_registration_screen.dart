@@ -98,6 +98,7 @@ class _AccountRegistrationScreenState extends State<AccountRegistrationScreen> {
         return;
     }
 
+    final provider = Provider.of<PharmacyProvider>(context, listen: false);
     final confirm = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -122,7 +123,6 @@ class _AccountRegistrationScreenState extends State<AccountRegistrationScreen> {
     );
 
     if (confirm == true) {
-      final provider = Provider.of<PharmacyProvider>(context, listen: false);
       await provider.deleteAccount(account.id);
       if (mounted) {
         _resetForm();

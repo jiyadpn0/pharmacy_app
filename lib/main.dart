@@ -16,86 +16,104 @@ import 'screens/main_shell.dart';
 import 'widgets/history_window_content.dart';
 import 'providers/app_provider.dart';
 import 'providers/pharmacy_provider.dart';
+import 'providers/master_data_provider.dart';
+import 'providers/inventory_provider.dart';
 import 'providers/mdi_controller.dart';
 import 'controllers/sales_controller.dart';
 import 'utils/theme_constants.dart';
 import 'database/db_helper.dart';
 import 'services/remote_logger_service.dart';
+import 'services/update_checker_service.dart';
 
 void setupMainIpcServer() {
   DesktopMultiWindow.setMethodHandler((call, fromWindowId) async {
-    final db = await DbHelper.instance.database;
+    try {
+      final db = await DbHelper.instance.database;
 
-    switch (call.method) {
-      case 'query_sales_history':
-      case 'query_product_history': {
-        final Map argsMap = call.arguments is Map ? call.arguments : {};
-        final String productName = argsMap['productName']?.toString() ?? '';
-        final String? productId = argsMap['productId']?.toString();
+      switch (call.method) {
+        case 'query_sales_history':
+        case 'query_product_history': {
+          final Map argsMap = call.arguments is Map ? call.arguments : {};
+          final String productName = argsMap['productName']?.toString() ?? '';
+          final String? productId = argsMap['productId']?.toString();
 
-        String whereClause = "WHERE (p.name = ? COLLATE NOCASE OR TRIM(i.product_name) = ? COLLATE NOCASE)";
-        List<dynamic> whereArgs = [productName, productName];
+          String whereClause = "WHERE (p.name = ? COLLATE NOCASE OR TRIM(i.product_name) = ? COLLATE NOCASE)";
+          List<dynamic> whereArgs = [productName, productName];
 
-        if (productId != null && productId.isNotEmpty) {
-          whereClause += " AND (p.id = ? OR i.product_id = ?)";
-          whereArgs.add(productId);
-          whereArgs.add(productId);
+          if (productId != null && productId.isNotEmpty) {
+            whereClause += " AND (p.id = ? OR i.product_id = ?)";
+            whereArgs.add(productId);
+            whereArgs.add(productId);
+          }
+
+          final List<Map<String, dynamic>> result = await db.rawQuery('''
+            SELECT i.invoice_no as entry_no, e.date, i.batch_number as batch, i.expiry_date as expiry, 
+                   i.qty, 0 as f_qty, i.mrp, i.s_rate, i.supplier_name, e.doctor, e.patient, i.disc_percent
+            FROM sales_items i
+            JOIN sales_invoices e ON i.invoice_no = e.entry_no
+            LEFT JOIN product_master p ON i.product_id = p.id
+            $whereClause
+            ORDER BY e.date DESC, CAST(e.entry_no AS INTEGER) DESC
+            LIMIT 30
+          ''', whereArgs);
+          return result;
         }
 
-        final List<Map<String, dynamic>> result = await db.rawQuery('''
-          SELECT i.invoice_no as entry_no, e.date, i.batch_number as batch, i.expiry_date as expiry, 
-                 i.qty, 0 as f_qty, i.mrp, i.s_rate, i.supplier_name, e.doctor, e.patient, i.disc_percent
-          FROM sales_items i
-          JOIN sales_invoices e ON i.invoice_no = e.entry_no
-          LEFT JOIN product_master p ON i.product_id = p.id
-          $whereClause
-          ORDER BY e.date DESC, CAST(e.entry_no AS INTEGER) DESC
-          LIMIT 30
-        ''', whereArgs);
-        return result;
+        case 'query_purchase_history': {
+          final Map argsMap = call.arguments is Map ? call.arguments : {};
+          final String productName = argsMap['productName']?.toString() ?? '';
+          final String? productId = argsMap['productId']?.toString();
+          final cleanName = productName.trim();
+
+          final List<Map<String, dynamic>> result = await db.rawQuery('''
+            SELECT e.entry_no, 
+                   e.date,
+                   e.supplier_name, 
+                   i.qty, 
+                   i.f_qty,
+                   i.p_rate, i.mrp, i.s_rate, i.batch, i.expiry, 
+                   i.l_cost, i.disc_percent, i.packin
+            FROM purchase_items i
+            JOIN purchase_entries e ON i.entry_no = e.entry_no
+            WHERE (TRIM(i.product_name) = ? COLLATE NOCASE 
+                   OR (i.product_id IS NOT NULL AND i.product_id != '' AND i.product_id = ?))
+              AND IFNULL(e.is_deleted, 0) = 0
+            ORDER BY e.date DESC, CAST(e.entry_no AS INTEGER) DESC
+            LIMIT 30
+          ''', [cleanName, productId ?? '']);
+          return result;
+        }
+
+        case 'fetch_invoice': {
+          final Map argsMap = call.arguments is Map ? call.arguments : {};
+          final String entryNo = argsMap['entryNo']?.toString() ?? '';
+          final res = await db.query('sales_invoices', where: 'entry_no = ?', whereArgs: [entryNo]);
+          return res.isNotEmpty ? res.first : null;
+        }
+
+        default:
+          throw UnsupportedError("Unrecognized IPC method: ${call.method}");
       }
-
-      case 'query_purchase_history': {
-        final Map argsMap = call.arguments is Map ? call.arguments : {};
-        final String productName = argsMap['productName']?.toString() ?? '';
-        final String? productId = argsMap['productId']?.toString();
-        final cleanName = productName.trim();
-
-        final List<Map<String, dynamic>> result = await db.rawQuery('''
-          SELECT e.entry_no, 
-                 e.date,
-                 e.supplier_name, 
-                 i.qty, 
-                 i.f_qty,
-                 i.p_rate, i.mrp, i.s_rate, i.batch, i.expiry, 
-                 i.l_cost, i.disc_percent, i.packin
-          FROM purchase_items i
-          JOIN purchase_entries e ON i.entry_no = e.entry_no
-          WHERE (TRIM(i.product_name) = ? COLLATE NOCASE 
-                 OR (i.product_id IS NOT NULL AND i.product_id != '' AND i.product_id = ?))
-            AND IFNULL(e.is_deleted, 0) = 0
-          ORDER BY e.date DESC, CAST(e.entry_no AS INTEGER) DESC
-          LIMIT 30
-        ''', [cleanName, productId ?? '']);
-        return result;
-      }
-
-      case 'fetch_invoice': {
-        final Map argsMap = call.arguments is Map ? call.arguments : {};
-        final String entryNo = argsMap['entryNo']?.toString() ?? '';
-        final res = await db.query('sales_invoices', where: 'entry_no = ?', whereArgs: [entryNo]);
-        return res.isNotEmpty ? res.first : null;
-      }
-
-      default:
-        throw UnsupportedError("Unrecognized IPC method: ${call.method}");
+    } catch (e, stack) {
+      RemoteLoggerService.instance.logError(
+        e,
+        stackTrace: stack,
+        library: 'IPC Server',
+        context: 'IPC call ${call.method}',
+      );
+      rethrow;
     }
   });
 }
 
 void main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
-  await RemoteLoggerService.instance.init();
+  try {
+    await RemoteLoggerService.instance.init();
+    await UpdateCheckerService.init();
+  } catch (e) {
+    debugPrint("Init failed safely: $e");
+  }
 
   // Handle all unhandled asynchronous / Future platform errors
   PlatformDispatcher.instance.onError = (error, stack) {
@@ -397,18 +415,22 @@ void main(List<String> args) async {
     );
 
     windowManager.waitUntilReadyToShow(windowOptions, () async {
-      if (useSavedPosition) {
-        await windowManager.setPosition(initialPosition);
-      } else {
-        await windowManager.center();
-      }
+      try {
+        if (useSavedPosition) {
+          await windowManager.setPosition(initialPosition);
+        } else {
+          await windowManager.center();
+        }
 
-      if (wasMaximized) {
-        await windowManager.maximize();
-      } else {
-        await windowManager.show();
+        if (wasMaximized) {
+          await windowManager.maximize();
+        } else {
+          await windowManager.show();
+        }
+        await windowManager.focus();
+      } catch (e) {
+        debugPrint("WindowManager initialization error handled: $e");
       }
-      await windowManager.focus();
     });
   }
 
@@ -417,6 +439,8 @@ void main(List<String> args) async {
       providers: [
         ChangeNotifierProvider(create: (_) => AppProvider()),
         ChangeNotifierProvider(create: (_) => PharmacyProvider()),
+        ChangeNotifierProvider(create: (_) => MasterDataProvider()..loadAllMasterData()),
+        ChangeNotifierProvider(create: (_) => InventoryProvider()..refreshInventoryValuation()),
         ChangeNotifierProvider(create: (_) => MdiController()),
         ChangeNotifierProvider(create: (_) => SalesController()),
       ],
@@ -467,17 +491,6 @@ class AppScrollBehavior extends MaterialScrollBehavior {
         PointerDeviceKind.trackpad,
         PointerDeviceKind.stylus,
       };
-
-  @override
-  Widget buildScrollbar(BuildContext context, Widget child, ScrollableDetails details) {
-    return Scrollbar(
-      controller: details.controller,
-      thumbVisibility: true,
-      thickness: 8.0,
-      radius: const Radius.circular(4),
-      child: child,
-    );
-  }
 }
 
 class PharmacyApp extends StatelessWidget {
@@ -530,36 +543,41 @@ class PharmacyApp extends StatelessWidget {
         ),
       ),
       builder: (context, child) {
-        return Focus(
-          autofocus: true,
-          onKeyEvent: (node, event) {
-            if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.escape) {
-              try {
-                final pharma = Provider.of<PharmacyProvider>(context, listen: false);
-                if (pharma.isImportInProgress) {
-                  pharma.cancelImport();
-                  return KeyEventResult.handled;
-                }
-              } catch (_) {}
+        return Builder(
+          builder: (innerContext) {
+            return CallbackShortcuts(
+              bindings: <ShortcutActivator, VoidCallback>{
+                const SingleActivator(LogicalKeyboardKey.escape): () {
+                  try {
+                    final pharma = Provider.of<PharmacyProvider>(innerContext, listen: false);
+                    if (pharma.isImportInProgress) {
+                      pharma.cancelImport();
+                      return;
+                    }
+                  } catch (_) {}
 
-              final primaryFocus = FocusManager.instance.primaryFocus;
-              if (primaryFocus != null && primaryFocus.context != null) {
-                final isEditable = primaryFocus.context!.findAncestorWidgetOfExactType<EditableText>() != null;
-                if (isEditable) {
-                  primaryFocus.unfocus();
-                  return KeyEventResult.handled;
-                }
-              }
+                  final primaryFocus = FocusManager.instance.primaryFocus;
+                  if (primaryFocus != null && primaryFocus.context != null) {
+                    final isEditable = primaryFocus.context!.findAncestorWidgetOfExactType<EditableText>() != null;
+                    if (isEditable) {
+                      primaryFocus.unfocus();
+                      return;
+                    }
+                  }
 
-              final navigatorState = Navigator.of(context);
-              if (navigatorState.canPop()) {
-                navigatorState.maybePop();
-                return KeyEventResult.handled;
-              }
-            }
-            return KeyEventResult.ignored;
+                  try {
+                    final navigatorState = Navigator.maybeOf(innerContext);
+                    if (navigatorState != null && navigatorState.canPop()) {
+                      navigatorState.maybePop();
+                    }
+                  } catch (e) {
+                    debugPrint('Safely caught ESC key navigation exception: $e');
+                  }
+                },
+              },
+              child: child ?? const SizedBox.shrink(),
+            );
           },
-          child: child ?? const SizedBox.shrink(),
         );
       },
       home: const MainShell(),
