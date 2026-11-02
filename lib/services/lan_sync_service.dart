@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'server_config_service.dart';
+import '../database/db_helper.dart';
 
 /// Ultra-low latency LAN Sync Engine combining 1ms UDP Broadcasts (Port 9999)
 /// and Direct TCP Socket Streams (Port 9998) for 1–3ms PC-to-PC shop network sync.
@@ -28,8 +29,8 @@ class LanSyncService {
 
   /// Issue 5.2: LAN + Cloud Deduplication Guard
   /// Maintains an in-memory LRU cache of up to 1000 processed event IDs
-  /// to prevent duplicate stock deductions when an event arrives over LAN (2ms)
-  /// and subsequently via Supabase WebSocket (200ms).
+  /// and persists into SQLite processed_sync_events to prevent duplicate stock deductions
+  /// across restarts and across multiple sync layers.
   void handleIncomingEvent(String eventId, Function() applyAction) {
     final cleanId = eventId.trim();
     if (cleanId.isEmpty) {
@@ -44,13 +45,15 @@ class LanSyncService {
     if (_processedEvents.length > 1000) {
       _processedEvents.remove(_processedEvents.first);
     }
+    unawaited(DbHelper.instance.markEventProcessed(cleanId, 'LAN_EVENT'));
     applyAction();
   }
 
-  bool isEventProcessed(String eventId) {
+  Future<bool> isEventProcessed(String eventId) async {
     final cleanId = eventId.trim();
     if (cleanId.isEmpty) return false;
-    return _processedEvents.contains(cleanId);
+    if (_processedEvents.contains(cleanId)) return true;
+    return await DbHelper.instance.isEventAlreadyProcessed(cleanId);
   }
 
   /// Initializes UDP Socket listener and Direct TCP Socket Server on shop network
