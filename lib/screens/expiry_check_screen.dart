@@ -3,7 +3,6 @@ import 'package:provider/provider.dart';
 import '../providers/pharmacy_provider.dart';
 import '../providers/app_provider.dart';
 import '../utils/theme_constants.dart';
-import 'damage_expiry_screen.dart';
 import '../widgets/erp_tooltip.dart';
 import '../utils/app_formatters.dart';
 import '../utils/report_pdf_generator.dart';
@@ -22,9 +21,93 @@ class _ExpiryCheckScreenState extends State<ExpiryCheckScreen> {
   final Map<String, Map<String, dynamic>> _activeFilters = {};
   double _headerHeight = 52.0;
 
+  late DateTime _fromDate;
+  late DateTime _toDate;
+  List<Product> _nonMovedProducts = [];
+  bool _isLoadingNonMoved = false;
+
   final Map<String, double> _colWidths = {
-    'name': 250, 'batch': 120, 'rack': 80, 'category': 120, 'stock': 80, 'expiry': 120
+    'name': 220, 'batch': 110, 'rack': 80, 'category': 110, 'stock': 80, 'expiry': 110, 'lastMoved': 130
   };
+
+  @override
+  void initState() {
+    super.initState();
+    _toDate = DateTime.now();
+    _fromDate = DateTime(_toDate.year, _toDate.month - _monthsLimit, _toDate.day);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _loadNonMovedData();
+    });
+  }
+
+  Future<void> _loadNonMovedData() async {
+    if (!mounted) return;
+    setState(() => _isLoadingNonMoved = true);
+    final pharma = Provider.of<PharmacyProvider>(context, listen: false);
+    final list = await pharma.getNonMovedProducts(fromDate: _fromDate, toDate: _toDate);
+    if (mounted) {
+      setState(() {
+        _nonMovedProducts = list;
+        _isLoadingNonMoved = false;
+      });
+    }
+  }
+
+  void _onRangePresetSelected(int months) {
+    final now = DateTime.now();
+    setState(() {
+      _monthsLimit = months;
+      _toDate = now;
+      _fromDate = DateTime(now.year, now.month - months, now.day);
+    });
+    if (_selectedStatus == "Non-Moved Stocks") {
+      _loadNonMovedData();
+    }
+  }
+
+  void _selectFromDate() async {
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: _fromDate,
+      firstDate: DateTime(2000),
+      lastDate: DateTime(2100),
+    );
+    if (picked != null) {
+      setState(() {
+        _fromDate = picked;
+      });
+      if (_selectedStatus == "Non-Moved Stocks") {
+        _loadNonMovedData();
+      }
+    }
+  }
+
+  void _selectToDate() async {
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: _toDate,
+      firstDate: DateTime(2000),
+      lastDate: DateTime(2100),
+    );
+    if (picked != null) {
+      setState(() {
+        _toDate = picked;
+      });
+      if (_selectedStatus == "Non-Moved Stocks") {
+        _loadNonMovedData();
+      }
+    }
+  }
+
+  void _onStatusTabChanged(String status) {
+    setState(() {
+      _selectedStatus = status;
+      _activeFilters.clear();
+    });
+    if (status == "Non-Moved Stocks") {
+      _loadNonMovedData();
+    }
+  }
 
   void _applyQuickFilter(String col, String condition, String value) {
     setState(() {
@@ -41,7 +124,14 @@ class _ExpiryCheckScreenState extends State<ExpiryCheckScreen> {
 
   void _openAdvancedFilter(String colKey, String title, Offset position) async {
     final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
-    final rawList = _selectedStatus == "Expired" ? pharmacy.getExpiredProducts() : pharmacy.getExpiringProducts(_monthsLimit);
+    List<Product> rawList;
+    if (_selectedStatus == "Expired") {
+      rawList = pharmacy.getExpiredProducts();
+    } else if (_selectedStatus == "Expiring Soon") {
+      rawList = pharmacy.getExpiringProducts(_monthsLimit);
+    } else {
+      rawList = _nonMovedProducts;
+    }
     
     List<String> uniqueVals = rawList.map((p) {
       if (colKey == 'name') return p.name;
@@ -50,6 +140,7 @@ class _ExpiryCheckScreenState extends State<ExpiryCheckScreen> {
       if (colKey == 'category') return p.category;
       if (colKey == 'stock') return p.stock.toString();
       if (colKey == 'expiry') return p.expiry;
+      if (colKey == 'lastMoved') return p.lastMovedDate ?? "No Activity";
       return "";
     }).toSet().toList();
     uniqueVals.sort();
@@ -116,14 +207,23 @@ class _ExpiryCheckScreenState extends State<ExpiryCheckScreen> {
     final expiring = pharmacy.getExpiringProducts(_monthsLimit);
     final expired = pharmacy.getExpiredProducts();
 
-    final rawList = _selectedStatus == "Expired" ? expired : expiring;
+    List<Product> rawList;
+    if (_selectedStatus == "Expired") {
+      rawList = expired;
+    } else if (_selectedStatus == "Expiring Soon") {
+      rawList = expiring;
+    } else {
+      rawList = _nonMovedProducts;
+    }
+
     final filtered = rawList.where((p) {
       return _matchesFilter(p.name, 'name') &&
              _matchesFilter(p.batch, 'batch') &&
              _matchesFilter(p.rack, 'rack') &&
              _matchesFilter(p.category, 'category') &&
              _matchesFilter(p.stock, 'stock') &&
-             _matchesFilter(p.expiry, 'expiry');
+             _matchesFilter(p.expiry, 'expiry') &&
+             (_selectedStatus == "Non-Moved Stocks" ? _matchesFilter(p.lastMovedDate ?? "No Activity", 'lastMoved') : true);
     }).toList();
 
     final c = AppColors.of(context);
@@ -141,7 +241,9 @@ class _ExpiryCheckScreenState extends State<ExpiryCheckScreen> {
                     margin: const EdgeInsets.fromLTRB(24, 0, 24, 24),
                     decoration: AppStyles.cardDecorationOf(context),
                     clipBehavior: Clip.antiAlias,
-                    child: _buildExpiryGrid(filtered, isCritical: _selectedStatus == "Expired"),
+                    child: _isLoadingNonMoved && _selectedStatus == "Non-Moved Stocks"
+                        ? const Center(child: CircularProgressIndicator())
+                        : _buildExpiryGrid(filtered, isCritical: _selectedStatus == "Expired"),
                   ),
                 ),
               ],
@@ -159,7 +261,7 @@ class _ExpiryCheckScreenState extends State<ExpiryCheckScreen> {
         color: c.sidebarBg,
         border: Border(right: BorderSide(color: c.border)),
       ),
-      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 32),
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -170,24 +272,39 @@ class _ExpiryCheckScreenState extends State<ExpiryCheckScreen> {
                 decoration: BoxDecoration(color: AppColors.danger.withValues(alpha: 0.1), borderRadius: BorderRadius.circular(12)),
                 child: const Icon(Icons.event_busy_rounded, color: AppColors.danger, size: 24),
               ),
-              const SizedBox(width: 16),
-              const Text("EXPIRY TRACK", style: TextStyle(fontWeight: FontWeight.w900, fontSize: 18, letterSpacing: 0.5)),
+              const SizedBox(width: 14),
+              const Expanded(
+                child: Text("EXPIRY / NON MOVING", style: TextStyle(fontWeight: FontWeight.w900, fontSize: 15, letterSpacing: 0.5)),
+              ),
             ],
           ),
-          const SizedBox(height: 40),
+          const SizedBox(height: 24),
           Text("INVENTORY STATUS", style: AppStyles.label),
-          const SizedBox(height: 16),
+          const SizedBox(height: 12),
           _buildFilterTab("Expiring Soon", Icons.timer_rounded, count: expiringCount.toString(), color: AppColors.warning),
           _buildFilterTab("Expired", Icons.report_problem_rounded, count: expiredCount.toString(), color: AppColors.danger),
-          const SizedBox(height: 40),
+          _buildFilterTab("Non-Moved Stocks", Icons.move_to_inbox_rounded, count: _nonMovedProducts.length.toString(), color: Colors.blue),
+
+          const SizedBox(height: 24),
+          Text("DATE RANGE", style: AppStyles.label),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(child: _buildDatePickerBox("From Date", _fromDate, _selectFromDate)),
+              const SizedBox(width: 8),
+              Expanded(child: _buildDatePickerBox("To Date", _toDate, _selectToDate)),
+            ],
+          ),
+
+          const SizedBox(height: 24),
           Text("ANALYTICS RANGE", style: AppStyles.label),
-          const SizedBox(height: 16),
+          const SizedBox(height: 8),
           _buildRangeTab(1),
           _buildRangeTab(3),
           _buildRangeTab(6),
           _buildRangeTab(12),
           const Spacer(),
-          _actionBtn("PRINT EXPIRY LIST", Icons.print_rounded, AppColors.primary, onTap: () => _printExpiryList(filteredItems)),
+          _actionBtn("PRINT REPORT", Icons.print_rounded, AppColors.primary, onTap: () => _printExpiryList(filteredItems)),
           if (_selectedStatus == "Expired" && filteredItems.isNotEmpty) ...[
             const SizedBox(height: 10),
             _actionBtn(
@@ -202,50 +319,133 @@ class _ExpiryCheckScreenState extends State<ExpiryCheckScreen> {
     );
   }
 
-  void _convertToPurchaseReturn(List<Product> items) {
+  Widget _buildDatePickerBox(String label, DateTime date, VoidCallback onTap) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          border: Border.all(color: Colors.grey.shade300),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(label, style: const TextStyle(fontSize: 10, color: Colors.grey, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 2),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    AppFormatters.formatDate(date),
+                    style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w800, color: AppColors.primary),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                const Icon(Icons.calendar_today_rounded, size: 12, color: AppColors.secondary),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _convertToPurchaseReturn(List<Product> items) async {
     if (items.isEmpty) return;
     final app = Provider.of<AppProvider>(context, listen: false);
+
+    final bool? confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        title: const Row(
+          children: [
+            Icon(Icons.assignment_return_rounded, color: Colors.orange, size: 28),
+            SizedBox(width: 10),
+            Text("Return Expired Items", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+          ],
+        ),
+        content: Text(
+          "Convert ${items.length} expired item(s) into a Purchase Return voucher?",
+          style: const TextStyle(fontSize: 14, height: 1.4),
+        ),
+        actions: [
+          OutlinedButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text("Cancel"),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.orange.shade800,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text("Create Return Voucher", style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+
     app.openPurchaseReturn(initialExpiredItems: items);
   }
 
   void _printExpiryList(List<Product> items) async {
     if (items.isEmpty) return;
     final pharma = Provider.of<PharmacyProvider>(context, listen: false);
-    
-    final headers = ["Name", "Batch", "Expiry", "Stock", "Rack", "Category"];
-    final data = items.map((p) => [
-      p.name,
-      p.batch,
-      p.expiry,
-      p.stock.toString(),
-      p.rack,
-      p.category,
-    ]).toList();
+
+    final isNonMoved = _selectedStatus == "Non-Moved Stocks";
+    final headers = isNonMoved
+        ? ["Name", "Batch", "Expiry", "Stock", "Rack", "Category", "Last Moved"]
+        : ["Name", "Batch", "Expiry", "Stock", "Rack", "Category"];
+
+    final data = items.map((p) {
+      final row = [
+        p.name,
+        p.batch,
+        p.expiry,
+        p.stock.toString(),
+        p.rack,
+        p.category,
+      ];
+      if (isNonMoved) {
+        row.add(p.lastMovedDate ?? "No Activity");
+      }
+      return row;
+    }).toList();
+
+    final title = isNonMoved ? "Non-Moving Inventory Report" : "Expiry Inventory Report";
+    final subtitle = isNonMoved
+        ? "Type: Non-Moved Stocks | Range: ${AppFormatters.formatDate(_fromDate)} to ${AppFormatters.formatDate(_toDate)} | Count: ${items.length}"
+        : "Type: $_selectedStatus | Range: $_monthsLimit Months | Count: ${items.length}";
 
     final doc = await ReportPdfGenerator.buildReportPdf(
-      title: "Expiry Inventory Report",
+      title: title,
       headers: headers,
       data: data,
       company: pharma.companyProfile,
-      subtitle: "Type: $_selectedStatus | Range: $_monthsLimit Months | Count: ${items.length}",
+      subtitle: subtitle,
     );
 
     if (!mounted) return;
     PrinterService.showProfessionalPreview(
       context: context,
       doc: doc,
-      title: "Expiry Report Preview",
+      title: "$title Preview",
     );
   }
 
   Widget _buildFilterTab(String label, IconData icon, {required String count, required Color color}) {
     bool isSelected = _selectedStatus == label;
     return InkWell(
-      onTap: () => setState(() => _selectedStatus = label),
+      onTap: () => _onStatusTabChanged(label),
       borderRadius: BorderRadius.circular(12),
       child: Container(
-        margin: const EdgeInsets.only(bottom: 8),
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        margin: const EdgeInsets.only(bottom: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         decoration: BoxDecoration(
           color: isSelected ? Colors.white : Colors.transparent,
           borderRadius: BorderRadius.circular(12),
@@ -254,8 +454,18 @@ class _ExpiryCheckScreenState extends State<ExpiryCheckScreen> {
         child: Row(
           children: [
             Icon(icon, size: 18, color: isSelected ? color : Colors.blueGrey.shade300),
-            const SizedBox(width: 16),
-            Expanded(child: Text(label, style: TextStyle(fontSize: 13, fontWeight: isSelected ? FontWeight.w900 : FontWeight.w600, color: isSelected ? AppColors.primary : Colors.blueGrey.shade600))),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                label,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: isSelected ? FontWeight.w900 : FontWeight.w600,
+                  color: isSelected ? AppColors.primary : Colors.blueGrey.shade600,
+                ),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
               decoration: BoxDecoration(color: color.withValues(alpha: 0.1), borderRadius: BorderRadius.circular(10)),
@@ -270,9 +480,9 @@ class _ExpiryCheckScreenState extends State<ExpiryCheckScreen> {
   Widget _buildRangeTab(int months) {
     bool isSelected = _monthsLimit == months;
     return InkWell(
-      onTap: () => setState(() => _monthsLimit = months),
+      onTap: () => _onRangePresetSelected(months),
       child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 8),
+        padding: const EdgeInsets.symmetric(vertical: 6),
         child: Row(
           children: [
             Icon(isSelected ? Icons.radio_button_checked_rounded : Icons.radio_button_off_rounded, size: 16, color: isSelected ? AppColors.secondary : Colors.grey),
@@ -285,29 +495,45 @@ class _ExpiryCheckScreenState extends State<ExpiryCheckScreen> {
   }
 
   Widget _buildExpiryHeader() {
+    String subtext;
+    if (_selectedStatus == 'Expired') {
+      subtext = "Reviewing products that are already beyond their shelf life.";
+    } else if (_selectedStatus == 'Expiring Soon') {
+      subtext = "Reviewing products approaching their expiry dates.";
+    } else {
+      subtext = "Reviewing products with zero sales or inventory transactions between ${AppFormatters.formatDate(_fromDate)} and ${AppFormatters.formatDate(_toDate)}.";
+    }
+
     return Container(
       padding: const EdgeInsets.all(24),
       child: Row(
         children: [
           const Icon(Icons.info_outline_rounded, size: 18, color: Colors.blueGrey),
           const SizedBox(width: 12),
-          Text(
-            "Reviewing products that are ${ _selectedStatus == 'Expired' ? 'already beyond their shelf life' : 'approaching their expiry dates' }.",
-            style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14, color: Colors.blueGrey.shade600),
+          Expanded(
+            child: Text(
+              subtext,
+              style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14, color: Colors.blueGrey.shade600),
+            ),
           ),
-          const Spacer(),
-          _actionBtn("REMOVE EXPIRED STOCK", Icons.delete_sweep_rounded, AppColors.danger, width: 220, onTap: () {
-            Navigator.push(context, MaterialPageRoute(builder: (context) => const DamageExpiryScreen()));
-          }),
         ],
       ),
     );
   }
 
   Widget _buildExpiryGrid(List<Product> products, {required bool isCritical}) {
+    final showLastMoved = _selectedStatus == "Non-Moved Stocks";
     return LayoutBuilder(
       builder: (context, constraints) {
-        final double calculatedWidth = 40 + _colWidths.values.fold(0.0, (sum, w) => sum + w);
+        final double calculatedWidth = 40 +
+            _colWidths['name']! +
+            _colWidths['batch']! +
+            _colWidths['rack']! +
+            _colWidths['category']! +
+            _colWidths['stock']! +
+            _colWidths['expiry']! +
+            (showLastMoved ? _colWidths['lastMoved']! : 0.0);
+
         final double tableWidth = calculatedWidth < constraints.maxWidth ? constraints.maxWidth : calculatedWidth;
 
         return SingleChildScrollView(
@@ -328,6 +554,8 @@ class _ExpiryCheckScreenState extends State<ExpiryCheckScreen> {
                       _hdr("CATEGORY", 'category', width: _colWidths['category']!),
                       _hdr("STOCK", 'stock', width: _colWidths['stock']!),
                       _hdr("EXPIRY DATE", 'expiry', width: _colWidths['expiry']!),
+                      if (showLastMoved)
+                        _hdr("LAST MOVED DATE", 'lastMoved', width: _colWidths['lastMoved']!),
                     ],
                   ),
                 ),
@@ -345,7 +573,10 @@ class _ExpiryCheckScreenState extends State<ExpiryCheckScreen> {
                             final p = products[i];
                             return Container(
                               height: 40,
-                              decoration: BoxDecoration(color: i % 2 == 0 ? Colors.white : Colors.grey.shade50, border: Border(bottom: BorderSide(color: Colors.grey.shade100))),
+                              decoration: BoxDecoration(
+                                color: isCritical ? const Color(0xFFFEF3C7) : (i % 2 == 0 ? Colors.white : Colors.grey.shade50),
+                                border: Border(bottom: BorderSide(color: Colors.grey.shade100)),
+                              ),
                               child: Row(
                                 children: [
                                   _Cell("${i + 1}", width: 40, align: TextAlign.center, color: Colors.grey),
@@ -355,6 +586,8 @@ class _ExpiryCheckScreenState extends State<ExpiryCheckScreen> {
                                   _Cell(p.category, width: _colWidths['category']!),
                                   _Cell("${p.stock} units", width: _colWidths['stock']!, align: TextAlign.right, fontWeight: FontWeight.w900),
                                   _Cell(p.expiry, width: _colWidths['expiry']!, align: TextAlign.center, color: isCritical ? AppColors.danger : AppColors.warning, fontWeight: FontWeight.w900),
+                                  if (showLastMoved)
+                                    _Cell(p.lastMovedDate ?? "No Activity", width: _colWidths['lastMoved']!, align: TextAlign.center, color: Colors.indigo.shade800, fontWeight: FontWeight.bold),
                                 ],
                               ),
                             );
@@ -378,6 +611,32 @@ class _ExpiryCheckScreenState extends State<ExpiryCheckScreen> {
       onAdvancedTap: (pos) => _openAdvancedFilter(key, title, pos),
       onResize: (v) => setState(() => _colWidths[key] = v.clamp(40, 500)),
       onHeightResize: (v) => setState(() => _headerHeight = v.clamp(40, 150)),
+    );
+  }
+
+  Widget _actionBtn(String title, IconData icon, Color color, {required VoidCallback onTap}) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(10),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        decoration: BoxDecoration(
+          color: color,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, color: Colors.white, size: 18),
+            const SizedBox(width: 8),
+            Text(
+              title,
+              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -604,57 +863,68 @@ class _AdvancedFilterPopupState extends State<_AdvancedFilterPopup> {
       decoration: BoxDecoration(color: Colors.white, border: Border.all(color: Colors.grey.shade400), borderRadius: BorderRadius.circular(4)),
       child: Column(
         children: [
-          Container(padding: const EdgeInsets.all(8), color: Colors.blueGrey.shade50, child: Row(children: [Text(widget.columnName, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12))])),
+          Container(
+            padding: const EdgeInsets.all(8),
+            color: Colors.grey.shade100,
+            child: Row(
+              children: [
+                Expanded(child: Text("Filter: ${widget.columnName}", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12))),
+                InkWell(
+                  onTap: () => Navigator.pop(context, {'condition': 'Clear'}),
+                  child: const Text("Clear", style: TextStyle(color: Colors.red, fontSize: 11, fontWeight: FontWeight.bold)),
+                )
+              ],
+            ),
+          ),
           Padding(
             padding: const EdgeInsets.all(8.0),
             child: TextField(
               controller: _searchCtrl,
-              decoration: const InputDecoration(hintText: "Search values...", prefixIcon: Icon(Icons.search, size: 16), isDense: true, border: OutlineInputBorder()),
-              onChanged: (v) => setState(() => _filteredValues = widget.uniqueValues.where((e) => e.toLowerCase().contains(v.toLowerCase())).toList()),
+              decoration: const InputDecoration(hintText: "Search values...", isDense: true, border: OutlineInputBorder()),
+              onChanged: (v) {
+                setState(() {
+                  _filteredValues = widget.uniqueValues.where((element) => element.toLowerCase().contains(v.toLowerCase())).toList();
+                });
+              },
             ),
           ),
           Expanded(
             child: ListView.builder(
               itemCount: _filteredValues.length,
-              itemBuilder: (ctx, i) => CheckboxListTile(
-                title: Text(_filteredValues[i], style: const TextStyle(fontSize: 11)),
-                value: _selectedValues.contains(_filteredValues[i]),
-                onChanged: (v) => setState(() => v! ? _selectedValues.add(_filteredValues[i]) : _selectedValues.remove(_filteredValues[i])),
-                dense: true, visualDensity: VisualDensity.compact,
-              ),
+              itemBuilder: (ctx, i) {
+                final val = _filteredValues[i];
+                final isChecked = _selectedValues.contains(val);
+                return CheckboxListTile(
+                  title: Text(val, style: const TextStyle(fontSize: 12)),
+                  value: isChecked,
+                  dense: true,
+                  onChanged: (chk) {
+                    setState(() {
+                      if (chk == true) {
+                        _selectedValues.add(val);
+                      } else {
+                        _selectedValues.remove(val);
+                      }
+                    });
+                  },
+                );
+              },
             ),
           ),
-          const Divider(height: 1),
           Padding(
             padding: const EdgeInsets.all(8.0),
-            child: Row(
-              children: [
-                TextButton(onPressed: () => Navigator.pop(context, {'condition': 'Clear'}), child: const Text("Clear")),
-                const Spacer(),
-                ElevatedButton(onPressed: () => Navigator.pop(context, {'condition': 'Values', 'selected': _selectedValues.toList()}), child: const Text("Apply")),
-              ],
+            child: ElevatedButton(
+              onPressed: () {
+                Navigator.pop(context, {
+                  'condition': 'Values',
+                  'selected': _selectedValues.toList(),
+                });
+              },
+              child: const Text("Apply"),
             ),
           )
         ],
       ),
     );
   }
-}
-
-Widget _actionBtn(String label, IconData icon, Color color, {VoidCallback? onTap, double? width}) {
-  return SizedBox(
-    width: width ?? double.infinity,
-    child: ElevatedButton.icon(
-      onPressed: onTap,
-      icon: Icon(icon, size: 18),
-      label: Text(label, style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 11, letterSpacing: 1)),
-      style: ElevatedButton.styleFrom(
-        backgroundColor: color,
-        foregroundColor: Colors.white,
-        padding: const EdgeInsets.symmetric(vertical: 20),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        elevation: 0,
-      ),
-    ),
-  );
 }

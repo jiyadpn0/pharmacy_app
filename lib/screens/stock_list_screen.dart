@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../providers/pharmacy_provider.dart';
 import '../providers/app_provider.dart';
-import '../utils/app_dialogs.dart';
 import '../utils/theme_constants.dart';
 import '../widgets/erp_tooltip.dart';
 import '../utils/report_pdf_generator.dart';
@@ -43,6 +43,15 @@ class _StockListScreenState extends State<StockListScreen> {
 
   // CODE MASTER FIX: RAM Cache for filtered products to stop Build-Loop UI Freezing
   List<Product> _filteredProducts = [];
+  final ScrollController _horizScrollCtrl = ScrollController();
+  final ScrollController _vertScrollCtrl = ScrollController();
+
+  @override
+  void dispose() {
+    _horizScrollCtrl.dispose();
+    _vertScrollCtrl.dispose();
+    super.dispose();
+  }
 
   String _getColValue(Product p, int colIdx, PharmacyProvider provider) {
     switch (colIdx) {
@@ -401,16 +410,68 @@ class _StockListScreenState extends State<StockListScreen> {
     );
   }
 
-  Widget _summaryStat(String label, String value, Color color) => Column(crossAxisAlignment: CrossAxisAlignment.end, children: [Text(label, style: AppStyles.label.copyWith(fontSize: 9)), const SizedBox(height: 2), Text(value, style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900, color: color))]);
+  Widget _summaryStat(String label, String value, Color color) {
+    return GestureDetector(
+      onSecondaryTapDown: (details) => _showCopyMenu(details.globalPosition, value),
+      onTapDown: (details) => _showCopyMenu(details.globalPosition, value),
+      child: ERPTooltip(
+        message: "$label: $value",
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            Text(label, style: AppStyles.label.copyWith(fontSize: 9)),
+            const SizedBox(height: 2),
+            Text(value, style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900, color: color)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showCopyMenu(Offset position, String text) {
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
+    showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(position.dx, position.dy, 0, 0),
+        Offset.zero & overlay.size,
+      ),
+      items: [
+        PopupMenuItem<String>(
+          value: "COPY",
+          height: 32,
+          child: Row(
+            children: [
+              const Icon(Icons.copy, size: 14, color: Colors.blue),
+              const SizedBox(width: 8),
+              Text("Copy ($text)", style: const TextStyle(fontSize: 11)),
+            ],
+          ),
+        ),
+      ],
+    ).then((val) {
+      if (val == "COPY") {
+        Clipboard.setData(ClipboardData(text: text));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Copied $text to clipboard"), duration: const Duration(seconds: 1)),
+          );
+        }
+      }
+    });
+  }
 
   Widget _buildStockGrid(List<Product> products, List<Product> allProducts) {
     double totalWidth = 45 + 80 + _colWidths.values.fold<double>(0.0, (sum, w) => sum + w);
     final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
 
     return Scrollbar(
+      controller: _horizScrollCtrl,
       thumbVisibility: true,
       trackVisibility: true,
       child: SingleChildScrollView(
+        controller: _horizScrollCtrl,
         scrollDirection: Axis.horizontal,
         child: SizedBox(
           width: totalWidth,
@@ -445,8 +506,10 @@ class _StockListScreenState extends State<StockListScreen> {
               ),
               Expanded(
                 child: Scrollbar(
+                  controller: _vertScrollCtrl,
                   thumbVisibility: true,
                   child: ListView.builder(
+                    controller: _vertScrollCtrl,
                     itemExtent: 40.0,
                     itemCount: products.length,
                     itemBuilder: (context, i) {
@@ -525,21 +588,6 @@ class _StockListScreenState extends State<StockListScreen> {
       ),
     ),
   );
-
-  void _confirmDeleteProduct(Product p) async {
-    final curContext = context;
-    final provider = Provider.of<PharmacyProvider>(curContext, listen: false);
-    final confirmed = await AppDialogs.showConfirmDialog(
-      context: curContext,
-      title: "Delete Product",
-      content: "Permanently delete '${p.name}' from master data?",
-      isDangerous: true,
-    );
-    if (confirmed == true) {
-      await provider.deleteProduct(p.id);
-      _recalculateFilters(provider);
-    }
-  }
 }
 
 class _Hdr extends StatefulWidget {

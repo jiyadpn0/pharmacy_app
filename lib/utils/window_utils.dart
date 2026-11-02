@@ -2,6 +2,10 @@ import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 
+class AppCloseHandler {
+  static bool isClosing = false;
+}
+
 /// Helper function to spawn a native OS window with a specific route and arguments.
 Future<void> openUntrappedWindow({
   required String routeName, 

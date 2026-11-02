@@ -1,27 +1,39 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/gestures.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:printing/printing.dart';
 import '../services/pdf_worker_service.dart';
 import '../services/print_spooler_service.dart';
 import '../services/whatsapp_service.dart';
+import '../services/lan_sync_service.dart';
+import '../services/sync_event_bus.dart';
+import '../services/server_config_service.dart';
+import '../services/supabase_sync_service.dart';
+import '../services/delta_sync_service.dart';
+import '../services/app_notification_service.dart';
+import '../database/db_helper.dart';
 
 // Providers & Controllers
 import '../providers/pharmacy_provider.dart';
 import '../providers/app_provider.dart';
 
 // Models & Utils
+import '../models/product_ranking.dart';
 import '../utils/tax_calculator.dart';
 import '../utils/theme_constants.dart';
 import '../utils/app_dialogs.dart';
 import '../utils/app_formatters.dart';
+import '../utils/app_logger.dart';
 import '../widgets/app_date_picker.dart';
 import '../widgets/erp_tooltip.dart';
+import '../widgets/fluent_nav_button.dart';
 import '../utils/app_sounds.dart';
 import '../utils/printer_service.dart';
 import '../utils/invoice_pdf_generator.dart';
@@ -32,10 +44,8 @@ import '../utils/unsaved_handler.dart';
 import '../widgets/pin_unlock_dialog.dart';
 import '../widgets/schedule_h1_compliance_dialog.dart';
 import '../widgets/sales/wholesale_availability_dialog.dart';
-import '../widgets/window_controls_bar.dart';
-import 'reports/order_book_screen.dart';
-import 'reports/sales_history_screen.dart';
-import 'reports/purchase_history_screen.dart';
+import '../widgets/sales/dynamic_upi_qr_dialog.dart';
+import '../widgets/erp_grid_text_field.dart';
 import '../windows/window_spawner.dart';
 
 
@@ -46,14 +56,17 @@ import '../windows/window_spawner.dart';
 
 class SalesScreen extends StatefulWidget {
   final String? initialInvoiceNo;
+  final String? highlightProduct;
   final bool isDialog;
-  const SalesScreen({super.key, this.initialInvoiceNo, this.isDialog = false});
+  const SalesScreen({super.key, this.initialInvoiceNo, this.highlightProduct, this.isDialog = false});
 
   @override
   State<SalesScreen> createState() => _SalesScreenState();
 }
 
 class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
+  final Set<int> _highlightedRowIndices = {};
+
   // Variables for Headless Barcode Scanning
   String _barcodeBuffer = "";
   DateTime _lastKeyPress = DateTime.now();
@@ -63,15 +76,19 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
   final List<SaleItem> _items = [];
   String _entryNo = "";
+  String _rawEntryNo = "";
+  final TextEditingController _entryNoCtrl = TextEditingController();
+  bool _isBlankRecord = false;
   Timer? _draftTimer;
   String _customerAcc = "Cash";
   String _selectedAgent = "";
   int _lastSyncedSessionIdx = -1;
   String _lastYear = "";
   String _activeNotificationTab = "none";
+  bool _isNotificationHubMinimized = false;
+  String _drawerSearchQuery = "";
+  final TextEditingController _drawerSearchCtrl = TextEditingController();
   String _orderFilter = "PENDING";
-  int _alertPage = 1;
-  final List<String> _agents = ["Suresh", "Ramesh", "Admin", "Staff 1", "Staff 2"];
 
   final TextEditingController _customerAccCtrl = TextEditingController(text: "Cash");
   final TextEditingController _agentCtrl = TextEditingController();
@@ -85,16 +102,18 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   bool _isExistingEntry = false; // Tracks if we are viewing a saved record or a new one
   bool _isDirty = false; // NEW: Tracks if any changes were made to an existing entry
   bool _isDeleted = false; // NEW: Tracks if the loaded entry is marked as deleted
+  bool _isImported = false; // NEW: Tracks if record was imported from historical data
   bool _isResetting = false; // Prevents recursive re-entrant reset loops
   bool _hasNewMobileOrder = false;
   bool _showProfitColumn = false; 
   SaleInvoice? _originalLoadedInvoice; 
+  String _loadedInvoiceUpdatedAt = "";
   final Map<SaleItem, Map<String, dynamic>> _originalItemSnapshots = {};
   bool _highlightEdits = false;
 
-  // ---> 3D Red Box Theme (Matching Photo 2 Date Box Style) <---
-  static const Color _editHighlightBg = Color(0xFFFFF0F0); // Soft pastel red fill
-  static const Color _editHighlightBorder = Color(0xFFE57373); // Crisp 3D border outline
+  // ---> Real-Time Edit Highlighting Theme (Soft Amber & Soft Green) <---
+  static const Color _editHighlightBg = Color(0xFFFEF3C7); // Soft Amber fill
+  static const Color _editHighlightBorder = Color(0xFFF59E0B); // Amber border outline
 
   // Agent Watermark Variables
   bool _showAgentWatermark = false;
@@ -140,6 +159,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   final ScrollController _verticalGridScrollCtrl = ScrollController();
   final ScrollController _dropdownScrollCtrl = ScrollController();
   final ScrollController _topScrollCtrl = ScrollController();
+  final ScrollController _tierListScrollCtrl = ScrollController();
+  final ScrollController _notifListScrollCtrl = ScrollController();
 
   final Map<int, double> _colWidths = {
     0: 35, 1: 75, 2: 280, 3: 90, 4: 140, 5: 60, 6: 60, 7: 60, 8: 60,
@@ -147,6 +168,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   };
 
   bool _hasCustomColWidths = false;
+  bool _isLayoutReady = true;
 
   Future<void> _loadColumnWidths() async {
     try {
@@ -169,7 +191,22 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       }
     } catch (e) {
       debugPrint("Error loading column widths: $e");
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLayoutReady = true;
+        });
+      }
     }
+  }
+
+  Timer? _saveColWidthsTimer;
+
+  void _debouncedSaveColumnWidths() {
+    _saveColWidthsTimer?.cancel();
+    _saveColWidthsTimer = Timer(const Duration(milliseconds: 300), () {
+      _saveColumnWidths();
+    });
   }
 
   Future<void> _saveColumnWidths() async {
@@ -201,6 +238,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   final FocusNode _patientFocus = FocusNode();
   final FocusNode _mobileFocus = FocusNode();
   final FocusNode _doctorFocus = FocusNode();
+  bool _isPatientTyping = false;
+  bool _isDoctorTyping = false;
   final FocusNode _doctorRegNoFocus = FocusNode();
   final FocusNode _daysFocus = FocusNode();
   final FocusNode _specialSearchFocus = FocusNode();
@@ -223,6 +262,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   final ValueNotifier<double> _roundOffNotifier = ValueNotifier(0.0);
   final ValueNotifier<double> _balanceNotifier = ValueNotifier(0.0);
   final ValueNotifier<int> _summaryNotifier = ValueNotifier(0);
+  final bool _enableAutoRoundOff = true;
 
   String _fmt(double val) => val.toStringAsFixed(2);
 
@@ -240,8 +280,6 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   final ValueNotifier<List<Product>> _specialSearchList = ValueNotifier([]);
   final ValueNotifier<List<dynamic>> _patientSearchList = ValueNotifier([]);
   final ValueNotifier<List<dynamic>> _doctorSearchList = ValueNotifier([]);
-  String? _focusedPatientText;
-  String? _focusedDoctorText;
   final ValueNotifier<int> _searchIdx = ValueNotifier(0);
 
   Timer? _scrollTimer;
@@ -253,9 +291,14 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   final SearchDebouncer _barcodeDebouncer = SearchDebouncer(milliseconds: 80);
   final ValueNotifier<String> _timeNotifier = ValueNotifier<String>("");
   bool _lastDraftSavedStateDirty = true;
+  bool _isRcvdAmtConfirmed = false;
 
   bool _isLoading = false;
+  bool _isNavigating = false; // Multi-tap and rapid navigation debounce lock
   bool _isSaving = false; // ---> Hard guard against rapid double-clicks & hotkey spam
+  bool _isDeleting = false;
+  String? _cachedValidationError; // ---> Eager reactive validation cache for 0ms save overhead
+  final FocusNode _dummyFocusNode = FocusNode();
   bool _isSelectingBatch = false;
   bool _isSelectingFromDropdown = false;
 
@@ -277,35 +320,45 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   Color _getBatchBgColor(String expiryStr) {
     String trimmed = expiryStr.trim();
     if (trimmed.isEmpty || trimmed == "--/--" || !trimmed.contains('/')) {
-      return Colors.green.shade800;
+      return Colors.white;
     }
     DateTime expDate = _parseExpiry(expiryStr);
-    DateTime now = DateTime.now();
-    DateTime today = DateTime(now.year, now.month, now.day);
+    DateTime ref = DateTime(_date.year, _date.month, _date.day);
 
-    if (expDate.isBefore(today)) {
-      return Colors.black;
+    if (expDate.isBefore(ref)) {
+      return Colors.black; // Expired relative to invoice date
     }
 
-    int months = (expDate.year - now.year) * 12 + (expDate.month - now.month);
+    int months = (expDate.year - _date.year) * 12 + (expDate.month - _date.month);
 
     if (months <= 3) {
-      return Colors.red.shade700;
+      return Colors.red.shade700; // Critical near expiry
     } else if (months <= 6) {
-      return Colors.orange.shade800;
-    } else if (months <= 12) {
-      return Colors.amber.shade700;
-    } else if (months <= 18) {
-      return Colors.lightGreen.shade700;
-    } else if (months <= 24) {
-      return Colors.green.shade700;
+      return Colors.orange.shade800; // Caution near expiry
     } else {
-      return Colors.teal.shade800;
+      return Colors.white; // > 6 months: Normal white background
     }
   }
 
   Color _getBatchTextColor(String expiryStr) {
-    return Colors.white;
+    String trimmed = expiryStr.trim();
+    if (trimmed.isEmpty || trimmed == "--/--" || !trimmed.contains('/')) {
+      return Colors.black;
+    }
+    DateTime expDate = _parseExpiry(expiryStr);
+    DateTime ref = DateTime(_date.year, _date.month, _date.day);
+
+    if (expDate.isBefore(ref)) {
+      return Colors.white; // White text on black background for expired
+    }
+
+    int months = (expDate.year - _date.year) * 12 + (expDate.month - _date.month);
+
+    if (months <= 6) {
+      return Colors.white; // White text on red/orange background
+    } else {
+      return Colors.black; // Normal black text for > 6 months
+    }
   }
 
 
@@ -341,9 +394,36 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   }
 
 
+  Future<void> _initializeNewBillNumber() async {
+    final p = Provider.of<PharmacyProvider>(context, listen: false);
+    if (_entryNo.isNotEmpty) {
+      p.releaseEntryNo(_entryNo);
+    }
+    if (mounted) {
+      setState(() {
+        _entryNo = "";
+        _entryNoCtrl.text = "...";
+      });
+    }
+
+    final nextNo = await p.getNextSaleEntryNo();
+
+    if (mounted && !_isExistingEntry) {
+      setState(() {
+        _entryNo = cleanEntryNo(nextNo);
+        _entryNoCtrl.text = formatSaleDisplayNo(_entryNo);
+        p.reserveEntryNo(_entryNo);
+      });
+    }
+  }
+
+  StreamSubscription<AppNotification>? _watchdogSub;
+  StreamSubscription? _syncBusSub;
+
   @override
   void initState() {
     super.initState();
+    DbHelper.setBillingActive(true);
     UnsavedChangesRegistry.register("SALES ENTRY", this);
 
     _loadColumnWidths();
@@ -352,31 +432,126 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     _lastYear = p.selectedFinancialYear;
     _isExistingEntry = widget.initialInvoiceNo != null;
 
+    if (_isExistingEntry) {
+      _entryNo = cleanEntryNo(widget.initialInvoiceNo!);
+      _entryNoCtrl.text = formatSaleDisplayNo(_entryNo);
+    } else {
+      _entryNo = "";
+      _entryNoCtrl.text = "...";
+    }
+
+    _watchdogSub = AppNotificationService.instance.watchdogStream.listen((notif) {
+      if (!mounted) return;
+      final cat = notif.detectedCategory;
+      if (cat == 'STOCK' || cat == 'CATALOG' || cat == 'SALES' || cat == 'PURCHASE') {
+        final prov = Provider.of<PharmacyProvider>(context, listen: false);
+        prov.refreshLiveStock();
+      }
+
+      if (_isExistingEntry && _entryNo.isNotEmpty) {
+        final bool matchesCurrentEntry = notif.message.contains('#$_entryNo') ||
+            (notif.actionPayload != null &&
+                notif.actionPayload!['entryNo'].toString().trim() == _entryNo.trim());
+
+        if (matchesCurrentEntry) {
+          ScaffoldMessenger.of(context).hideCurrentMaterialBanner();
+          ScaffoldMessenger.of(context).showMaterialBanner(
+            MaterialBanner(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              content: Text(
+                "⚡ Live Notice: Invoice #$_entryNo was updated on another PC (${notif.terminalName ?? 'Cloud Server'}).",
+                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
+              ),
+              leading: const Icon(Icons.bolt_rounded, color: Colors.amberAccent),
+              backgroundColor: Colors.purple.shade900,
+              actions: [
+                TextButton(
+                  onPressed: () {
+                    ScaffoldMessenger.of(context).hideCurrentMaterialBanner();
+                    _loadSaleData(_entryNo);
+                  },
+                  child: const Text("RELOAD INVOICE", style: TextStyle(color: Colors.amberAccent, fontWeight: FontWeight.bold, fontSize: 11)),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close_rounded, color: Colors.white, size: 16),
+                  onPressed: () => ScaffoldMessenger.of(context).hideCurrentMaterialBanner(),
+                ),
+              ],
+            ),
+          );
+        }
+      }
+    });
+
+    _syncBusSub = SyncEventBus.instance.stream.listen((event) {
+      if (!mounted) return;
+      final table = (event is TableChangedEvent) ? event.tableName : event.toString();
+      if (table == 'stock_batches' || table == 'product_master' || table == 'sales_invoices' || table == 'sales_items' || table == 'patients') {
+        final p = Provider.of<PharmacyProvider>(context, listen: false);
+        p.syncInventoryFromDb();
+        if (!_isExistingEntry && _items.isEmpty && !_isDirty) {
+          _checkAndRefreshEntryNo();
+        }
+        setState(() {});
+      }
+    });
+
     // ASYNC INITIALIZATION
     Future.microtask(() async {
-      final next = await p.getNextSaleEntryNo();
-      if (!mounted) return;
-      if (mounted) setState(() => _entryNo = next);
+      if (!_isExistingEntry) {
+        await _initializeNewBillNumber();
+      }
       _loadNotificationData();
     });
 
-    // ---> START AUTO-SAVE TIMER (Every 5 seconds) <---
-    _draftTimer = Timer.periodic(const Duration(seconds: 5), (timer) {
+    // ---> START AUTO-SAVE TIMER (Every 30 seconds) <---
+    _draftTimer = Timer.periodic(const Duration(seconds: 30), (timer) {
       if (mounted) _triggerAutoSaveDraft();
     });
 
-    _timeNotifier.value = DateFormat('hh:mm a').format(DateTime.now());
+    _timeNotifier.value = DateFormat('hh:mm a').format(_date);
     _timeTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (mounted) {
+      if (mounted && !_isExistingEntry) {
         _timeNotifier.value = DateFormat('hh:mm a').format(DateTime.now());
       }
     });
 
     p.addListener(_onProviderChanged);
+    ServerConfigService.instance.addListener(_onConfigChanged);
     _lastSyncedSessionIdx = p.activeSessionIdx;
 
+    LanSyncService.instance.initLanListener(
+      onLanEvent: (event) {
+        if (event['action'] == 'SALE_COMPLETED' || event['action'] == 'SALE_SAVED') {
+          // If PC 2 is currently sitting on an empty, unsaved bill:
+          if (!_isExistingEntry && _items.isEmpty && mounted) {
+            final p = Provider.of<PharmacyProvider>(context, listen: false);
+            p.getNextSaleEntryNo().then((freshNext) {
+              if (mounted && !_isExistingEntry && _items.isEmpty) {
+                setState(() {
+                  _entryNo = cleanEntryNo(freshNext);
+                  _entryNoCtrl.text = formatSaleDisplayNo(_entryNo);
+                });
+              }
+            });
+          }
+        }
+      },
+    );
+
     // --- THE FIX: ADD FOCUS & DAYS LISTENER ---
+    _patientFocus.addListener(() {
+      if (!_patientFocus.hasFocus) {
+        _isPatientTyping = false;
+      }
+    });
+    _doctorFocus.addListener(() {
+      if (!_doctorFocus.hasFocus) {
+        _isDoctorTyping = false;
+      }
+    });
     _daysCtrl.addListener(_onDaysChanged);
+    _searchIdx.addListener(_onSearchIdxChanged);
     _focusNotifier.addListener(() {
       if (!mounted) return;
     });
@@ -400,21 +575,27 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   void _focusProductFirstBox() {
     if (!mounted) return;
     _moveFocus(0, 2, autoOpen: false);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      final fn = _getGridFocusNode(0, 2);
-      if (fn.canRequestFocus) {
-        fn.requestFocus();
-        final ctrl = _getGridCtrl(0, 2);
-        if (ctrl.text.isNotEmpty) {
-          ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
-        }
-      }
-    });
+    final fn = _getGridFocusNode(0, 2);
+    FocusScope.of(context).requestFocus(fn);
+    final ctrl = _getGridCtrl(0, 2);
+    if (ctrl.text.isNotEmpty) {
+      ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
+    }
   }
+
+  void _onConfigChanged() {
+    if (mounted) setState(() {});
+  }
+
+  bool _isDisposed = false;
 
   @override
   void dispose() {
+    _isDisposed = true;
+    _watchdogSub?.cancel();
+    ServerConfigService.instance.removeListener(_onConfigChanged);
+    _saveColWidthsTimer?.cancel();
+    DbHelper.setBillingActive(false);
     UnsavedChangesRegistry.unregister("SALES ENTRY");
     _daysCtrl.removeListener(_onDaysChanged);
     _draftTimer?.cancel(); // Clean up timer
@@ -429,6 +610,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     _verticalGridScrollCtrl.dispose();
     _dropdownScrollCtrl.dispose();
     _topScrollCtrl.dispose();
+    _tierListScrollCtrl.dispose();
+    _notifListScrollCtrl.dispose();
     _rootFocus.dispose();
     _patientFocus.dispose();
     _itemSearchFocusNode.dispose();
@@ -442,11 +625,13 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     _specialCustomerPhoneFocus.dispose();
     _expectingDateFocus.dispose();
     _saveSpecialOrderFocus.dispose();
+    _drawerSearchCtrl.dispose();
     _rcvdAmtFocus.dispose();
     _focusNotifier.dispose();
     _timeNotifier.dispose();
     _searchList.dispose();
     _batchList.dispose();
+    _searchIdx.removeListener(_onSearchIdxChanged);
     _searchIdx.dispose();
     _specialOrderCtrls.forEach((k, v) => v.dispose());
     _gridCtrls.forEach((k, v) => v.forEach((k2, v2) => v2.dispose()));
@@ -458,6 +643,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       f.dispose();
     }
 
+    _syncBusSub?.cancel();
     // Remove listener from provider
     try {
       Provider.of<PharmacyProvider>(context, listen: false).removeListener(_onProviderChanged);
@@ -549,7 +735,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       return _nextRowNodes[col]!;
     }
 
-    if (row < 0 || row > _items.length) return FocusNode();
+    if (row < 0 || row > _items.length) return _dummyFocusNode;
 
     // Bind strictly to the memory address of the SaleItem
     final it = _items[row];
@@ -591,6 +777,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   }
 
   void _saveAndPrintBill() {
+    if (_isSaving || _isLoading || _isDialogOpen) return;
     _promptSave();
   }
 
@@ -599,24 +786,42 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     final cleanCode = barcode.trim().toUpperCase();
     Product? found;
 
+    // Check GS1 / DataMatrix parsing ((01)GTIN(17)EXP(10)BATCH)
+    final gs1 = _parseGs1Barcode(barcode);
+    if (gs1 != null && (gs1['gtin']!.isNotEmpty || gs1['batch']!.isNotEmpty)) {
+      final targetBatch = gs1['batch']!.trim().toUpperCase();
+      final targetGtin = gs1['gtin']!.trim();
+
+      try {
+        found = p.products.firstWhere(
+          (it) => (targetBatch.isNotEmpty && it.batch.trim().toUpperCase() == targetBatch) ||
+                  (targetGtin.isNotEmpty && it.id == targetGtin),
+        );
+      } catch (_) {}
+    }
+
     // 1. PRIORITY: Check if barcode identifies a specific active batch
-    try {
-      found = p.products.firstWhere(
-        (it) => it.batch.trim().toUpperCase() == cleanCode && it.stock > 0,
-      );
-    } catch (_) {}
+    if (found == null) {
+      try {
+        found = p.products.firstWhere(
+          (it) => (it.batch.trim().toUpperCase() == cleanCode || it.id.trim().toUpperCase() == cleanCode) && it.stock > 0,
+        );
+      } catch (_) {}
+    }
 
     // 2. Fallback: Check if barcode matches a Product Master ID
     if (found == null) {
-      final master = p.productMaster.cast<Product?>().firstWhere(
-        (pm) => pm != null && (pm.id.trim().toUpperCase() == cleanCode || pm.batch.trim().toUpperCase() == cleanCode),
-        orElse: () => null,
-      );
+      Product? matchedMaster;
+      try {
+        matchedMaster = p.productMaster.firstWhere(
+          (pm) => pm.id.trim().toUpperCase() == cleanCode || pm.hsnCode.trim().toUpperCase() == cleanCode,
+        );
+      } catch (_) {}
 
-      if (master != null) {
+      if (matchedMaster != null) {
         // Only trigger FEFO search when scanning the product generally (not a specific batch)
-        final fefoBatch = p.getAutoFefoBatch(master.name);
-        found = fefoBatch ?? master;
+        final fefoBatch = p.getAutoFefoBatch(matchedMaster.name);
+        found = fefoBatch ?? matchedMaster;
       }
     }
 
@@ -626,6 +831,22 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           it.product.id == found!.id && it.product.batch == found.batch);
 
       if (existingRowIndex != -1) {
+        int usedInOtherRows = _getCrossRowStockUsed(found, existingRowIndex);
+        int origQty = _originalInvoiceBatchQtys["${found.id}|${found.batch.trim().toUpperCase()}"] ?? 0;
+        int avail = found.stock + origQty - usedInOtherRows;
+        int currentQty = _items[existingRowIndex].qty;
+
+        if (currentQty + 1 > avail) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text("STOCK SHORTAGE: Cannot add more ${found.name}. Available: $avail"),
+              backgroundColor: Colors.red.shade800,
+              duration: const Duration(seconds: 2),
+            ),
+          );
+          return;
+        }
+
         setState(() {
           _items[existingRowIndex].qty += 1;
           _getGridCtrl(existingRowIndex, 7).text = _items[existingRowIndex].qty.toString();
@@ -634,12 +855,26 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text("UPDATED: ${found.name} (Qty: ${_items[existingRowIndex].qty})"),
+            content: Text("RAPID DISPATCH UPDATED: ${found.name} (Qty: ${_items[existingRowIndex].qty})"),
             backgroundColor: Colors.blue.shade800,
             duration: const Duration(milliseconds: 700),
           ),
         );
       } else {
+        int usedInOtherRows = _getCrossRowStockUsed(found, -1);
+        int origQty = _originalInvoiceBatchQtys["${found.id}|${found.batch.trim().toUpperCase()}"] ?? 0;
+        int avail = found.stock + origQty - usedInOtherRows;
+        if (avail <= 0) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text("ZERO STOCK: ${found.name} (Batch: ${found.batch}) has no available stock."),
+              backgroundColor: Colors.red.shade800,
+              duration: const Duration(seconds: 2),
+            ),
+          );
+          return;
+        }
+
         int row = _focusedRowIndex;
         if (row < 0 || (row < _items.length && _items[row].product.name.isNotEmpty && _focusedColIndex != 3)) {
           row = _items.length;
@@ -649,7 +884,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text("SCANNED: ${found.name}"),
+            content: Text("RAPID DISPATCH SCANNED: ${found.name}"),
             backgroundColor: Colors.green,
             duration: const Duration(milliseconds: 700),
           ),
@@ -660,6 +895,40 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         SnackBar(content: Text("Barcode Not Found: $barcode"), backgroundColor: Colors.red),
       );
     }
+  }
+
+  Map<String, String>? _parseGs1Barcode(String rawBarcode) {
+    try {
+      String code = rawBarcode;
+      String? gtin;
+      String? expiry;
+      String? batch;
+
+      if (code.contains('(01)')) {
+        int idx = code.indexOf('(01)');
+        int start = idx + 4;
+        if (code.length >= start + 14) {
+          gtin = code.substring(start, start + 14);
+        }
+      }
+      if (code.contains('(17)')) {
+        int idx = code.indexOf('(17)');
+        int start = idx + 4;
+        if (code.length >= start + 6) {
+          expiry = code.substring(start, start + 6);
+        }
+      }
+      if (code.contains('(10)')) {
+        int idx = code.indexOf('(10)');
+        int start = idx + 4;
+        batch = code.substring(start).replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '');
+      }
+
+      if (gtin != null || batch != null || expiry != null) {
+        return {'gtin': gtin ?? '', 'expiry': expiry ?? '', 'batch': batch ?? ''};
+      }
+    } catch (_) {}
+    return null;
   }
 
   void _onBlur(int row, int col, String value) {
@@ -676,29 +945,19 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         if (value.trim().isNotEmpty && it.product.id.isEmpty) {
           final p = Provider.of<PharmacyProvider>(context, listen: false);
           final matches = p.searchProducts(value.trim(), includeGenerics: false);
-          if (matches.length == 1 && Product.cleanProductName(matches.first.name).toLowerCase() == Product.cleanProductName(value).toLowerCase()) {
-            final best = matches.first;
-            int pack = best.packSize > 0 ? best.packSize : 1;
-            it.product = Product(
-              id: best.id, name: best.name, hsnCode: best.hsnCode, packSize: pack,
-              mrp: best.mrp, salePrice: best.salePrice > 0 ? best.salePrice : best.mrp,
-              purchaseRate: best.purchaseRate, gstPercent: best.gstPercent,
-              genericName: best.genericName, rack: best.rack, batch: best.batch, expiry: best.expiry,
+          if (matches.isNotEmpty) {
+            final best = matches.firstWhere(
+              (m) => Product.cleanProductName(m.name).toLowerCase() == Product.cleanProductName(value).toLowerCase(),
+              orElse: () => matches.first,
             );
-            it.packin = pack;
-            it.mrp = best.mrp / pack.toDouble();
-            it.sRate = (best.salePrice > 0 ? best.salePrice : best.mrp) / pack.toDouble();
-            _getGridCtrl(row, 2).text = best.name;
-            _getGridCtrl(row, 3).text = best.rack;
-            _getGridCtrl(row, 4).text = _cleanBatch(best.batch);
-            _getGridCtrl(row, 5).text = best.expiry;
-            _updateFooter(it.product);
+            _commitSelection(row, best, stayOnProduct: true);
           } else {
-            it.product.name = value;
+            it.product = Product(id: "", name: "");
+            _getGridCtrl(row, 2).clear();
             _updateFooter(it.product);
           }
-        } else {
-          it.product.name = value;
+        } else if (value.trim().isEmpty) {
+          it.product = Product(id: "", name: "");
           _updateFooter(it.product);
         }
       }
@@ -711,10 +970,12 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
           // Only auto-fill unexpired batches with stock (O(1) Fast Lookup)
           final candidateBatches = p.getBatchesForProduct(it.product.id, it.product.name);
-          final availableBatches = candidateBatches.where((prod) =>
-              prod.stock > 0 &&
-              !_parseExpiry(prod.expiry).isBefore(now)
-          ).toList();
+          final availableBatches = candidateBatches.where((prod) {
+            int origQty = _originalInvoiceBatchQtys["${prod.id}|${prod.batch.trim().toUpperCase()}"] ?? 0;
+            int usedInOtherRows = _getCrossRowStockUsed(prod, row);
+            int trueAvailable = prod.stock + origQty - usedInOtherRows;
+            return trueAvailable > 0 && !_parseExpiry(prod.expiry).isBefore(now);
+          }).toList();
 
           if (availableBatches.isNotEmpty) {
             availableBatches.sort((a, b) => _parseExpiry(a.expiry).compareTo(_parseExpiry(b.expiry)));
@@ -776,8 +1037,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           it.discAmt = amt;
           double gross = it.sRate * it.qty;
           it.discPercent = gross > 0 ? ((amt / gross) * 100.0) : 0.0;
-          if (!_getGridFocusNode(row, 10).hasFocus) {
-            _getGridCtrl(row, 10).text = it.discPercent.toStringAsFixed(2);
+          if (!_getGridFocusNode(row, 11).hasFocus) {
+            _getGridCtrl(row, 11).text = it.discPercent.toStringAsFixed(2);
           }
         }
         _calculateItem(row);
@@ -793,6 +1054,13 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     _specialSearchList.value = [];
     _patientSearchList.value = [];
     _doctorSearchList.value = [];
+    _searchIdx.value = 0;
+    int row = _focusedRowIndex;
+    if (row >= 0 && row < _items.length) {
+      _updateFooter(_items[row].product);
+    } else {
+      _updateFooter(Product(id: "", name: ""));
+    }
   }
 
   void _moveFocus(int row, int col, {bool autoOpen = false}) {
@@ -826,7 +1094,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     }
 
     if (safeRow != -1) {
-      _getGridFocusNode(safeRow, safeCol).requestFocus();
+      final fn = _getGridFocusNode(safeRow, safeCol);
+      FocusScope.of(context).requestFocus(fn);
     }
 
     if (safeRow >= 0 && _showSpecialOrderSidebar && !_isSpecialOrderMinimized) {
@@ -840,7 +1109,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
       bool wasFocused = fn.hasFocus;
       if (!wasFocused) {
-        fn.requestFocus();
+        FocusScope.of(context).requestFocus(fn);
         ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
       }
     } else {
@@ -848,14 +1117,14 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       final ctrl = _getGridCtrl(safeRow, safeCol);
       final initialText = ctrl.text;
 
-      fn.requestFocus();
+      FocusScope.of(context).requestFocus(fn);
       
       if (initialText.isNotEmpty) {
         ctrl.selection = TextSelection(baseOffset: 0, extentOffset: initialText.length);
       }
 
-      // Open the dropdown table upon focus if autoOpen is true
-      if (autoOpen || safeCol == 4) {
+      // Open the dropdown table upon focus
+      if (autoOpen) {
         if (safeCol == 2 && initialText.trim().isEmpty) {
           _startProductSearch("");
         } else if (safeCol == 4) {
@@ -889,6 +1158,17 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     );
   }
 
+  void _onSearchIdxChanged() {
+    if (!mounted) return;
+    if (_searchList.value.isNotEmpty && _batchList.value.isEmpty) {
+      final safeIdx = _searchIdx.value.clamp(0, _searchList.value.length - 1);
+      final p = _searchList.value[safeIdx];
+      if (p.id != "NEW") {
+        _updateFooter(p);
+      }
+    }
+  }
+
   void _updateFooter(Product p) {
     if (!mounted) return;
 
@@ -896,26 +1176,42 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       if (!mounted) return;
       final provider = Provider.of<PharmacyProvider>(context, listen: false);
 
+      final cleanName = Product.cleanProductName(p.name).trim();
+
+      // Only show generic availability helper if a valid product with a non-empty name is selected!
+      if (cleanName.isEmpty || p.id == "NEW") {
+        _activeGenericName = "";
+        _lastSyncedProdName = "";
+        if (mounted) {
+          setState(() {
+            _footerAlts = [];
+            _productHistory = [];
+          });
+        }
+        return;
+      }
+
       String genName = p.genericName.trim();
-      if (genName.isEmpty && p.name.trim().isNotEmpty) {
-        genName = provider.resolveGenericName(p.name, productId: p.id);
+      if (genName.isEmpty) {
+        genName = provider.resolveGenericName(cleanName, productId: p.id);
       }
       _activeGenericName = genName;
 
-      if (p.name.trim().isNotEmpty && p.name != _lastSyncedProdName) {
-        _lastSyncedProdName = p.name;
-        _updateHistory(p.name);
-      } else if (p.name.trim().isEmpty) {
-        _lastSyncedProdName = "";
-        if (mounted) setState(() => _productHistory = []);
+      if (cleanName != _lastSyncedProdName) {
+        _lastSyncedProdName = cleanName;
+        _updateHistory(cleanName);
       }
 
       if (genName.isNotEmpty) {
         final query = genName.toUpperCase();
         final alts = provider.searchProducts(query, isSalesWindow: true)
-            .where((alt) => alt.name.trim().toUpperCase() != p.name.trim().toUpperCase())
-            .take(50)
+            .where((alt) => alt.name.trim().toUpperCase() != cleanName.toUpperCase())
+            .where((alt) => alt.stock > 0) // Only show products with stock > 0
+            .take(50) // Take top 50 first to prevent heavy RegExp sorting thrashing on thousands of items
             .toList();
+
+        _sortGenericAlternatives(alts, p, genName, provider);
+
         if (mounted) {
           setState(() {
             _footerAlts = alts;
@@ -926,6 +1222,154 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           setState(() => _footerAlts = []);
         }
       }
+    });
+  }
+
+  List<String> _getAltGenericSegments(String genName) {
+    if (genName.trim().isEmpty) return [];
+    return genName
+        .split(RegExp(r'[-+/,]'))
+        .map((s) => s.trim().toUpperCase())
+        .where((s) => s.isNotEmpty)
+        .toList();
+  }
+
+  int _getAltGenericContentCount(String genName) {
+    final segs = _getAltGenericSegments(genName);
+    return segs.isEmpty ? 1 : segs.length;
+  }
+
+  Set<String> _extractStrengthTokens(String text) {
+    if (text.trim().isEmpty) return {};
+    final String upper = text.toUpperCase();
+    final Set<String> tokens = {};
+
+    // 1. Explicit unit regex: matches e.g. 125MG, 125 MG, 0.5MG, 2.5MG, 500MCG, 1GM, 60000IU, 2%
+    final unitRegExp = RegExp(
+      r'\b(\d+(?:\.\d+)?)\s*(MG|MCG|GM|G|IU|UG|PERCENT|%)\b',
+      caseSensitive: false,
+    );
+    final unitMatches = unitRegExp.allMatches(upper);
+
+    bool foundExplicit = false;
+    for (final m in unitMatches) {
+      final numStr = m.group(1)!;
+      final unitStr = m.group(2)!.toLowerCase();
+
+      final double? dVal = double.tryParse(numStr);
+      final String cleanNum = (dVal != null && dVal == dVal.toInt())
+          ? dVal.toInt().toString()
+          : numStr;
+
+      tokens.add('$cleanNum$unitStr');
+      tokens.add(cleanNum);
+      foundExplicit = true;
+    }
+
+    // If explicit strength units (MG, MCG, GM, IU, etc.) were found, return them directly.
+    if (foundExplicit) {
+      return tokens;
+    }
+
+    // 2. Standalone strength numbers (e.g., DOLO 650, PAN 40, CALPOL 500, FLUMOL 650)
+    final numRegExp = RegExp(r'\b\d+(?:\.\d+)?\b');
+    final numMatches = numRegExp.allMatches(upper);
+
+    for (final m in numMatches) {
+      final valStr = m.group(0)!;
+      final double? val = double.tryParse(valStr);
+      if (val == null) continue;
+
+      final int start = m.start;
+      final int end = m.end;
+      final String after = upper.substring(end, (end + 6).clamp(0, upper.length)).trimLeft();
+      final String before = upper.substring((start - 6).clamp(0, upper.length), start).trimRight();
+
+      // Skip liquid volume numbers like "60 ML", "100 ML", "30 ML" if standalone
+      if (after.startsWith('ML') || after.startsWith(' L') || after.startsWith('BOTTLE')) {
+        continue;
+      }
+
+      // Skip pack sizes / counts like "10 TAB", "10 CAP", "10 S", "10'S", "10T", "10C", "1X10", "10X10"
+      bool isLikelyPackSize = (after.startsWith('TAB') || after.startsWith('CAP') || after.startsWith('STRIP') ||
+              after.startsWith('PACK') || after.startsWith('S ') || after.startsWith("'S") ||
+              after.startsWith('T ') || after.startsWith('C ') || before.endsWith('X') || after.startsWith('X')) &&
+          (val < 20 && val == val.toInt());
+
+      if (isLikelyPackSize) {
+        continue;
+      }
+
+      if (val >= 0.1) {
+        String cleanNum = val == val.toInt() ? val.toInt().toString() : val.toString();
+        tokens.add(cleanNum);
+        tokens.add('${cleanNum}mg');
+      }
+    }
+
+    return tokens;
+  }
+
+  void _sortGenericAlternatives(List<Product> alts, Product selectedProd, String selectedGenName, PharmacyProvider provider) {
+    final selectedSaltCount = _getAltGenericContentCount(selectedGenName);
+    final selectedStrengths = _extractStrengthTokens(selectedProd.name);
+
+    alts.sort((a, b) {
+      // 1st Priority: Same Dosage / Strength Match
+      if (selectedStrengths.isNotEmpty) {
+        final aStrengths = _extractStrengthTokens(a.name);
+        final bStrengths = _extractStrengthTokens(b.name);
+        final bool aDosageMatch = aStrengths.intersection(selectedStrengths).isNotEmpty;
+        final bool bDosageMatch = bStrengths.intersection(selectedStrengths).isNotEmpty;
+
+        if (aDosageMatch != bDosageMatch) {
+          return aDosageMatch ? -1 : 1;
+        }
+      }
+
+      // 2nd Priority: Salt / Content Count Match
+      final aGenName = a.genericName.isNotEmpty ? a.genericName : selectedGenName;
+      final bGenName = b.genericName.isNotEmpty ? b.genericName : selectedGenName;
+      final aSaltCount = _getAltGenericContentCount(aGenName);
+      final bSaltCount = _getAltGenericContentCount(bGenName);
+      final bool aExactSalt = (aSaltCount == selectedSaltCount);
+      final bool bExactSalt = (bSaltCount == selectedSaltCount);
+
+      if (aExactSalt != bExactSalt) {
+        return aExactSalt ? -1 : 1;
+      }
+
+      // 3rd Priority: Available Stock (Stock > 0 first)
+      final bool aHasStock = a.stock > 0;
+      final bool bHasStock = b.stock > 0;
+      if (aHasStock != bHasStock) {
+        return aHasStock ? -1 : 1;
+      }
+
+      // 4th Priority: Category & Profit Margin Priority
+      // Rank 0 = Generic Category (Green)
+      // Rank 1 = Profit Margin > 40% (Blue)
+      // Rank 2 = Others
+      int getCategoryRank(Product prod) {
+        if (provider.isGenericProduct(prod)) return 0;
+        final margin = prod.purchaseRate > 0
+            ? (((prod.mrp > 0 ? prod.mrp : prod.salePrice) - prod.purchaseRate) / prod.purchaseRate) * 100
+            : 0.0;
+        if (margin > 40.0) return 1;
+        return 2;
+      }
+
+      final aRank = getCategoryRank(a);
+      final bRank = getCategoryRank(b);
+      if (aRank != bRank) {
+        return aRank.compareTo(bRank);
+      }
+
+      // 5th Priority: Stock Quantity (Highest Stock First)
+      final stockCmp = b.stock.compareTo(a.stock);
+      if (stockCmp != 0) return stockCmp;
+
+      return a.name.compareTo(b.name);
     });
   }
 
@@ -944,13 +1388,19 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     });
   }
 
-  void _onHeaderSearch(String query, ValueNotifier<List<dynamic>> targetList, List<dynamic> Function(PharmacyProvider) source) {
+  void _onHeaderSearch(String query, ValueNotifier<List<dynamic>> targetList, List<dynamic> Function(PharmacyProvider) source, {bool showAllIfEmpty = false}) {
+    final p = Provider.of<PharmacyProvider>(context, listen: false);
+
     if (query.trim().isEmpty) {
-      targetList.value = [];
+      if (showAllIfEmpty) {
+        final all = source(p);
+        targetList.value = all.take(20).toList();
+        _searchIdx.value = 0;
+      } else {
+        targetList.value = [];
+      }
       return;
     }
-
-    final p = Provider.of<PharmacyProvider>(context, listen: false);
     final String cleanQuery = query.trim().toUpperCase();
 
     final all = source(p);
@@ -1008,6 +1458,39 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
 
 
+  void _abortAllActiveSearches() {
+    _productSearchDebouncer.cancel();
+    _historyDebouncer.cancel();
+    _footerDebouncer.cancel();
+    _footerUpdateDebouncer.cancel();
+    _barcodeDebouncer.cancel();
+
+    _searchList.value = [];
+    _batchList.value = [];
+    _specialSearchList.value = [];
+    _patientSearchList.value = [];
+    _doctorSearchList.value = [];
+    _closeAllDropdowns();
+    _isSelectingFromDropdown = false;
+    _isSelectingBatch = false;
+  }
+
+  void _rebindGridFocusPostFrame() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      int r = _focusedRowIndex.clamp(0, _items.length);
+      int c = _focusNotifier.value?.col ?? 2;
+      if (!_navCols.contains(c)) c = 2;
+
+      final fn = _getGridFocusNode(r, c);
+      FocusScope.of(context).requestFocus(fn);
+      final ctrl = _getGridCtrl(r, c);
+      if (ctrl.text.isNotEmpty) {
+        ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
+      }
+    });
+  }
+
   bool _handleGlobalKeys(KeyEvent event) {
     if (_isDialogOpen) return false;
 
@@ -1042,17 +1525,18 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       final list = _patientSearchList.value.isNotEmpty ? _patientSearchList.value
           : _doctorSearchList.value.isNotEmpty ? _doctorSearchList.value
           : _specialSearchList.value.isNotEmpty ? _specialSearchList.value
-          : (_batchList.value.isNotEmpty ? _batchList.value : _searchList.value);
+          : ((_isSelectingBatch || _focusedColIndex == 4) && _batchList.value.isNotEmpty ? _batchList.value
+          : (_searchList.value.isNotEmpty ? _searchList.value : _batchList.value));
 
       // Allow vertical arrows to navigate the list properly even if focus is inside the TextField
       if (key == LogicalKeyboardKey.arrowDown) {
         if (list.isEmpty) return true;
-        _searchIdx.value = (_searchIdx.value + 1) % list.length;
+        _searchIdx.value = (_searchIdx.value + 1).clamp(0, list.length - 1);
         _scrollToIdx(_searchIdx.value);
         return true;
       } else if (key == LogicalKeyboardKey.arrowUp) {
         if (list.isEmpty) return true;
-        _searchIdx.value = (_searchIdx.value - 1 + list.length) % list.length;
+        _searchIdx.value = (_searchIdx.value - 1).clamp(0, list.length - 1);
         _scrollToIdx(_searchIdx.value);
         return true;
       }
@@ -1101,52 +1585,80 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       }
 
       if (event.logicalKey == LogicalKeyboardKey.escape) {
-        if (_searchList.value.isNotEmpty ||
-            _batchList.value.isNotEmpty ||
-            _specialSearchList.value.isNotEmpty ||
-            _patientSearchList.value.isNotEmpty ||
-            _doctorSearchList.value.isNotEmpty) {
-          _closeAllDropdowns();
+        if (_searchList.value.isNotEmpty || _batchList.value.isNotEmpty) {
+          _abortAllActiveSearches();
+          _rebindGridFocusPostFrame();
           return true;
         }
+        if (widget.isDialog) {
+          Navigator.of(context).maybePop();
+          return true;
+        }
+        _abortAllActiveSearches();
+        _rebindGridFocusPostFrame();
+        return true;
       }
 
+      if (_isDialogOpen) return false;
+
+      // F1: New Sale (or Shift/Ctrl + F1: Cheat Sheet)
       if (event.logicalKey == LogicalKeyboardKey.f1) {
-        _resetPage(); // F1: New Entry
+        if (isShift || isCtrl) {
+          _showShortcutsDialog(); // Shift/Ctrl + F1: Cheat Sheet
+        } else {
+          _resetPage(); // F1: New Sale
+        }
         return true;
       }
+      // F2: Generic / Substitute Search
       if (event.logicalKey == LogicalKeyboardKey.f2) {
-        _openGenericSearchDialog(); // F2: Generic Search
+        _openGenericSearchDialog();
         return true;
       }
+      // F3: Wholesale Availability Directory
       if (event.logicalKey == LogicalKeyboardKey.f3) {
-        _openWholesaleAvailability(); // F3: Wholesale Availability
+        _openWholesaleAvailability();
         return true;
       }
+      // F4: Jump directly to Product Grid / Item Search
+      if (event.logicalKey == LogicalKeyboardKey.f4) {
+        _itemSearchFocusNode.requestFocus();
+        return true;
+      }
+      // F5: Generic / Substitute Search
       if (event.logicalKey == LogicalKeyboardKey.f5) {
-        _saveAndPrintBill();
+        _openGenericSearchDialog();
         return true;
       }
+      // F6: Save Invoice or Edit
+      if (event.logicalKey == LogicalKeyboardKey.f6) {
+        _isExistingEntry && !_isDeleted ? _editSale() : _saveSale(isEdit: false);
+        return true;
+      }
+      // F7: Focus Customer / Patient Name
       if (event.logicalKey == LogicalKeyboardKey.f7) {
         _patientFocus.requestFocus();
         return true;
       }
+      // F8: Focus Cash Received Amount (Pay)
       if (event.logicalKey == LogicalKeyboardKey.f8) {
         _rcvdAmtFocus.requestFocus();
         return true;
       }
+      // F9: Export / Preview Invoice PDF
       if (event.logicalKey == LogicalKeyboardKey.f9) {
-        _exportToPdf(); // F9 Preview / PDF
+        _exportToPdf();
         return true;
       }
+      // F10: Save Invoice or Edit
       if (event.logicalKey == LogicalKeyboardKey.f10) {
-        _isExistingEntry && !_isDeleted ? _editSale() : _saveSale(isEdit: false); // F10 Save/Invoice
+        _isExistingEntry && !_isDeleted ? _editSale() : _saveSale(isEdit: false);
         return true;
       }
+      // F11: Hold current billing session and switch workspace
       if (event.logicalKey == LogicalKeyboardKey.f11) {
-        // F11: Hold current billing session and switch to next
         if (_isExistingEntry && _isDirty) {
-          _showFastDialog(title: "Workspace Locked", content: "You have unsaved edits. Please save or press F2 to clear before switching workspaces.");
+          _showFastDialog(title: "Workspace Locked", content: "You have unsaved edits. Please save or press F1 to clear before switching workspaces.");
           return true;
         }
         final pharma = Provider.of<PharmacyProvider>(context, listen: false);
@@ -1158,6 +1670,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         );
         return true;
       }
+      // F12: Express Save & Print
       if (event.logicalKey == LogicalKeyboardKey.f12) {
         _saveAndPrintBill();
         return true;
@@ -1177,12 +1690,11 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       }
     }
 
-    // --- UPDATED: F6 SHORTCUT ROUTES TO SAVE OR EDIT AUTOMATICALLY ---
-    if (key == LogicalKeyboardKey.f6) {
-      _isExistingEntry && !_isDeleted ? _editSale() : _saveSale(isEdit: false);
+    // === Ctrl + Q FOR DYNAMIC UPI QR PAYMENT ===
+    if (isCtrl && key == LogicalKeyboardKey.keyQ) {
+      _triggerDynamicUpiQrPayment();
       return true;
     }
-
 
     // === NEW: Ctrl + 1 FOR PURCHASE HISTORY ===
     if (isCtrl && key == LogicalKeyboardKey.digit1) {
@@ -1211,14 +1723,90 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       return true;
     }
 
+    // === Alt + Down Arrow to open dropdown list in grid ===
+    if (HardwareKeyboard.instance.isAltPressed && key == LogicalKeyboardKey.arrowDown) {
+      if (_focusedColIndex == 2) {
+        _startProductSearch(_getGridCtrl(_focusedRowIndex, 2).text);
+        return true;
+      } else if (_focusedColIndex == 4) {
+        _startBatchSearch(_focusedRowIndex, "");
+        return true;
+      }
+    }
+
+    // === Home / End Keys to Jump First / Last Row in Table ===
+    if (key == LogicalKeyboardKey.home) {
+      if (_items.isNotEmpty) {
+        _moveFocus(0, 1);
+      }
+      return true;
+    }
+    if (key == LogicalKeyboardKey.end) {
+      if (_items.isNotEmpty) {
+        _moveFocus((_items.length - 1).clamp(0, 999), 1);
+      }
+      return true;
+    }
+
+    if (HardwareKeyboard.instance.isAltPressed) {
+      if (key == LogicalKeyboardKey.arrowLeft || key == LogicalKeyboardKey.pageUp) { _navigateEntry("prev"); return true; }
+      if (key == LogicalKeyboardKey.arrowRight || key == LogicalKeyboardKey.pageDown) { _navigateEntry("next"); return true; }
+    }
+
+    // PageUp / PageDown: Scroll grid or navigate entries
+    if (key == LogicalKeyboardKey.pageUp) {
+      if (HardwareKeyboard.instance.isAltPressed) {
+        _navigateEntry("prev");
+      } else if (_focusedRowIndex >= 0) {
+        int targetRow = (_focusedRowIndex - 5).clamp(0, _items.length);
+        _moveFocus(targetRow, _focusedColIndex > 0 ? _focusedColIndex : 1);
+      } else {
+        _navigateEntry("prev");
+      }
+      return true;
+    }
+    if (key == LogicalKeyboardKey.pageDown) {
+      if (HardwareKeyboard.instance.isAltPressed) {
+        _navigateEntry("next");
+      } else if (_focusedRowIndex >= 0) {
+        int targetRow = (_focusedRowIndex + 5).clamp(0, _items.length);
+        _moveFocus(targetRow, _focusedColIndex > 0 ? _focusedColIndex : 1);
+      } else {
+        _navigateEntry("next");
+      }
+      return true;
+    }
+
+    // Delete key: Ctrl + Del = Delete Row, Standalone Del = Clear Focused Field
+    if (key == LogicalKeyboardKey.delete) {
+      if (HardwareKeyboard.instance.isControlPressed) {
+        if (_focusedRowIndex >= 0 && _focusedRowIndex < _items.length) {
+          _safeDeleteRow(_focusedRowIndex); // CODE MASTER FIX
+          _moveFocus(_focusedRowIndex, 1);
+          return true;
+        }
+      } else {
+        if (_focusedRowIndex >= 0) {
+          final ctrl = _getGridCtrl(_focusedRowIndex, _focusedColIndex);
+          if (ctrl.text.isNotEmpty) {
+            ctrl.clear();
+            _markDirty();
+            _calculateFooter();
+            return true;
+          }
+        } else if (_patientFocus.hasFocus) {
+          _patientCtrl.clear();
+          return true;
+        } else if (_doctorFocus.hasFocus) {
+          _doctorCtrl.clear();
+          return true;
+        }
+      }
+    }
+
     if (HardwareKeyboard.instance.isControlPressed) {
       if (key == LogicalKeyboardKey.keyZ) {
         _performUndo();
-        return true;
-      }
-      if (key == LogicalKeyboardKey.delete && _focusedRowIndex >= 0 && _focusedRowIndex < _items.length) {
-        _safeDeleteRow(_focusedRowIndex); // CODE MASTER FIX
-        _moveFocus(_focusedRowIndex, 1);
         return true;
       }
     }
@@ -1239,8 +1827,6 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       }
     }
 
-    final ctrl = _getGridCtrl(row, col);
-
     // FAST BACKWARD OPTION: Shift + Tab or Shift + Enter
     if ((key == LogicalKeyboardKey.tab || key == LogicalKeyboardKey.enter || key == LogicalKeyboardKey.numpadEnter) && isShift) {
       int curIdx = _navCols.indexOf(col);
@@ -1258,46 +1844,13 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       return true;
     }
 
-    // BOUNDARY CHECK: Left Arrow (Universal Undo behavior)
-    if (key == LogicalKeyboardKey.arrowLeft) {
-      int curIdx = _navCols.indexOf(col);
-      if (curIdx > 0) {
-        _moveFocus(row, _navCols[curIdx - 1], autoOpen: _navCols[curIdx - 1] == 4);
-        return true;
-      } else if (curIdx == 0 && row > 0) {
-        _moveFocus(row - 1, _navCols.last);
-        return true;
-      }
+    // Allow native Left and Right arrow keys to move the cursor character-by-character inside the text field
+    if (key == LogicalKeyboardKey.arrowLeft || key == LogicalKeyboardKey.arrowRight) {
       return false;
     }
 
-    // BOUNDARY CHECK: Right Arrow
-    if (key == LogicalKeyboardKey.arrowRight) {
-      if (!ctrl.selection.isValid || ctrl.selection.baseOffset >= ctrl.text.length) {
-
-        // ---> THE FIX: Right arrow on empty row jumps to Rcvd Amt <---
-        if (row == _items.length && _getGridCtrl(row, 2).text.trim().isEmpty) {
-          _closeAllDropdowns();
-          _focusNotifier.value = null;
-          _rcvdAmtFocus.requestFocus();
-          _rcvdAmtCtrl.selection = TextSelection(baseOffset: 0, extentOffset: _rcvdAmtCtrl.text.length);
-          return true;
-        }
-
-        int curIdx = _navCols.indexOf(col);
-        if (curIdx != -1 && curIdx < _navCols.length - 1) {
-          _moveFocus(row, _navCols[curIdx + 1], autoOpen: _navCols[curIdx + 1] == 4);
-          return true;
-        } else if (curIdx == _navCols.length - 1 && row < _items.length) {
-          _moveFocus(_items.length, _navCols.first, autoOpen: true);
-          return true;
-        }
-      }
-      return false; // Let the cursor move through the text normally
-    }
-
     if (key == LogicalKeyboardKey.arrowDown) {
-      if (row < _items.length - 1) {
+      if (row < _items.length) {
         int nextCol = _navCols.contains(col) ? col : 1;
         _moveFocus(row + 1, nextCol);
       } else {
@@ -1365,20 +1918,51 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
 
   String _getBatchUniqueKey(dynamic item) {
+    Product? p;
     if (item is SaleItem) {
-      return "${item.product.id}_${item.product.batch}_${item.product.expiry}_${item.mrp}_${item.packin}_${item.landingCost}_${item.gstPercent}_${item.purchaseRate}_${item.supplier}";
+      p = item.product;
     } else if (item is Product) {
-      return "${item.id}_${item.batch}_${item.expiry}_${item.mrp}_${item.packSize}_${item.landingCost}_${item.gstPercent}_${item.purchaseRate}_${item.supplier}";
+      p = item;
     }
-    return "";
+    if (p == null) return "";
+    String idOrName = p.id.isNotEmpty ? p.id.trim().toUpperCase() : Product.cleanProductName(p.name).toLowerCase();
+    String cleanB = cleanBatch(p.batch).trim().toUpperCase();
+    return "${idOrName}_${cleanB}_${p.expiry.trim()}_${p.mrp}_${p.packSize > 0 ? p.packSize : 1}_${p.landingCost}_${p.gstPercent}_${p.purchaseRate}_${p.supplier.trim().toUpperCase()}";
   }
 
   int _getCrossRowStockUsed(dynamic target, int excludeRow) {
     int used = 0;
     String targetKey = _getBatchUniqueKey(target);
+    if (targetKey.isEmpty) return 0;
     for (int i = 0; i < _items.length; i++) {
       if (i != excludeRow && _getBatchUniqueKey(_items[i]) == targetKey) {
         used += _items[i].qty + _items[i].fQty;
+      }
+    }
+    return used;
+  }
+
+  int _getCrossRowStockUsedForProduct(dynamic target, int excludeRow) {
+    int used = 0;
+    String targetName = "";
+    String targetId = "";
+    if (target is SaleItem) {
+      targetName = Product.cleanProductName(target.product.name).toLowerCase();
+      targetId = target.product.id;
+    } else if (target is Product) {
+      targetName = Product.cleanProductName(target.name).toLowerCase();
+      targetId = target.id;
+    }
+    if (targetName.isEmpty && targetId.isEmpty) return 0;
+
+    for (int i = 0; i < _items.length; i++) {
+      if (i != excludeRow) {
+        final itemProd = _items[i].product;
+        bool nameMatch = targetName.isNotEmpty && Product.cleanProductName(itemProd.name).toLowerCase() == targetName;
+        bool idMatch = targetId.isNotEmpty && itemProd.id.isNotEmpty && itemProd.id == targetId;
+        if (nameMatch || idMatch) {
+          used += _items[i].qty + _items[i].fQty;
+        }
       }
     }
     return used;
@@ -1506,7 +2090,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                                         ElevatedButton(
                                             style: ElevatedButton.styleFrom(
                                               backgroundColor: focusedIdx == 2 ? Colors.blue.shade800 : Colors.grey.shade100,
-                                              foregroundColor: focusedIdx == 2 ? Colors.white : Colors.black87,
+                                              foregroundColor: focusedIdx == 2 ? Colors.white : Colors.black,
                                               side: focusedIdx == 2 ? const BorderSide(color: Colors.black26, width: 2) : null,
                                               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
                                               padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
@@ -1519,7 +2103,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                                       ElevatedButton(
                                           style: ElevatedButton.styleFrom(
                                             backgroundColor: focusedIdx == 1 ? Colors.blue.shade800 : Colors.grey.shade300,
-                                            foregroundColor: focusedIdx == 1 ? Colors.white : Colors.black87,
+                                            foregroundColor: focusedIdx == 1 ? Colors.white : Colors.black,
                                             side: focusedIdx == 1 ? const BorderSide(color: Colors.black26, width: 2) : null,
                                             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
                                             padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
@@ -1539,12 +2123,17 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           );
         }
     ).then((val) {
-      if (mounted) setState(() => _isDialogOpen = false);
+      if (mounted) {
+        setState(() => _isDialogOpen = false);
+        if (_focusedRowIndex >= 0 && _focusedRowIndex <= _items.length) {
+          _moveFocus(_focusedRowIndex, 2);
+        }
+      }
       return val;
     });
   }
 
-  void _onFieldSubmitted(int row, int col) {
+  void _onFieldSubmitted(int row, int col) async {
     // If on the blank row and Product is empty, ANY 'Enter' or 'Tab' jumps to Rcvd Amt
     if (row == _items.length && _getGridCtrl(row, 2).text.trim().isEmpty) {
       _closeAllDropdowns();
@@ -1580,8 +2169,34 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       } else {
         _moveFocus(row, 4, autoOpen: true);
       }
-    } else {
-      if (col == 7 && row < _items.length) {
+    } else if (col == 4) {
+      String typed = _getGridCtrl(row, 4).text.trim().toUpperCase();
+
+      if (_batchList.value.isNotEmpty) {
+        int safeIdx = _searchIdx.value.clamp(0, _batchList.value.length - 1);
+        final selected = _batchList.value[safeIdx];
+        final exactIdx = _batchList.value.indexWhere((b) => _cleanBatch(b.batch).toUpperCase() == typed);
+        _handleBatchSelection(row: row, product: exactIdx != -1 ? _batchList.value[exactIdx] : selected);
+      } else {
+        final p = Provider.of<PharmacyProvider>(context, listen: false);
+        String prodName = row < _items.length ? _items[row].product.name : _getGridCtrl(row, 2).text;
+        final availableBatches = p.products.where((it) => it.name.toLowerCase() == prodName.toLowerCase() && it.stock > 0).toList();
+        final match = availableBatches.where((b) => _cleanBatch(b.batch).toUpperCase() == typed).toList();
+
+        if (match.isNotEmpty) {
+          _handleBatchSelection(row: row, product: match.first);
+        } else if (availableBatches.isNotEmpty) {
+          // AUTO-SELECT BEST NON-EXPIRED FEFO BATCH IF SKIPPED OR MISMATCHED
+          availableBatches.sort((a, b) => _parseExpiry(a.expiry).compareTo(_parseExpiry(b.expiry)));
+          _commitSelection(row, availableBatches.first, stayOnProduct: false);
+        } else {
+          _moveFocus(row, 7);
+        }
+      }
+    } else if (col == 7) {
+      if (_getGridCtrl(row, 7).text.isEmpty) _getGridCtrl(row, 7).text = "0";
+
+      if (row < _items.length) {
         final it = _items[row];
         final val = _getGridCtrl(row, 7).text.trim();
         int typedQty = int.tryParse(val) ?? 0;
@@ -1598,7 +2213,11 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         }
       }
 
-      // Standard column navigation step
+      _moveFocus(row, 11);
+    } else if (col == 11) {
+      if (_getGridCtrl(row, 11).text.isEmpty) _getGridCtrl(row, 11).text = "0";
+      _moveFocus(_items.length, 2, autoOpen: true);
+    } else {
       int curIdx = _navCols.indexOf(col);
       if (curIdx != -1 && curIdx < _navCols.length - 1) {
         _moveFocus(row, _navCols[curIdx + 1], autoOpen: _navCols[curIdx + 1] == 4);
@@ -1611,6 +2230,27 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   void _handleAutoSplit(int startRow, int totalRequested, int availableInCurrent) async {
     _saveUndoState();
 
+    String prodName = _items[startRow].product.name;
+    String prodId = _items[startRow].product.id;
+
+    // Purge subsequent automatic split rows for that same product
+    while (startRow + 1 < _items.length) {
+      final nextItem = _items[startRow + 1];
+      bool isSameProduct = (nextItem.product.id.isNotEmpty && nextItem.product.id == prodId) ||
+          (prodName.isNotEmpty && nextItem.product.name.trim().toLowerCase() == prodName.trim().toLowerCase());
+      if (isSameProduct) {
+        final removed = _items.removeAt(startRow + 1);
+        if (_gridCtrls.containsKey(removed)) {
+          for (var c in _gridCtrls[removed]!.values) {
+            c.dispose();
+          }
+          _gridCtrls.remove(removed);
+        }
+      } else {
+        break;
+      }
+    }
+
     int startingQty = availableInCurrent < 0 ? 0 : availableInCurrent;
     int remaining = totalRequested - startingQty;
 
@@ -1618,8 +2258,6 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     _getGridCtrl(startRow, 7, startingQty.toString()).text = startingQty.toString();
 
     final p = Provider.of<PharmacyProvider>(context, listen: false);
-    String prodName = _items[startRow].product.name;
-    String prodId = _items[startRow].product.id;
     final String currentBatchKey = _getBatchUniqueKey(_items[startRow].product);
     final candidateBatches = p.getBatchesForProduct(prodId, prodName);
     final otherBatches = candidateBatches.where((it) =>
@@ -1707,13 +2345,11 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       _orderType = 1;
       _showSpecialOrderSidebar = true;
       _isSpecialOrderMinimized = false;
-      _activeNotificationTab = "special";
       _isProductSyncEnabled = false; // Turn off sync so it acts as an independent order
       _isSpecialSyncEnabled = false;
 
-      if (!_extraSpecialItems.contains(pName)) {
-        _extraSpecialItems.add(pName);
-      }
+      _extraSpecialItems.remove(pName);
+      _extraSpecialItems.insert(0, pName);
       _specialOrderQtys[pName] = (_specialOrderQtys[pName] ?? 0) + qty;
 
       if (_specialOrderCtrls.containsKey(pName)) {
@@ -1747,6 +2383,12 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     if (query.isEmpty) {
       _searchList.value = [];
       _searchIdx.value = 0;
+      int row = _focusedRowIndex;
+      if (row >= 0 && row < _items.length) {
+        _updateFooter(_items[row].product);
+      } else {
+        _updateFooter(Product(id: "", name: ""));
+      }
       return;
     }
 
@@ -1763,6 +2405,16 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
       _searchList.value = list;
       _searchIdx.value = 0;
+      if (list.isNotEmpty) {
+        final first = list[0];
+        if (first.id != "NEW") {
+          _updateFooter(first);
+        } else if (list.length > 1) {
+          _updateFooter(list[1]);
+        }
+      } else {
+        _updateFooter(Product(id: "", name: ""));
+      }
     });
   }
 
@@ -1783,7 +2435,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     // Instant O(1) hashmap lookup returning pre-consolidated & pre-sorted FEFO batches with stock
     final candidateBatches = p.getBatchesForProduct(prodId, prodName).where((prod) {
       int origQty = _originalInvoiceBatchQtys["${prod.id}|${prod.batch.trim().toUpperCase()}"] ?? 0;
-      return (prod.stock + origQty) > 0;
+      int usedInOtherRows = _getCrossRowStockUsed(prod, row);
+      return (prod.stock + origQty - usedInOtherRows) > 0;
     }).toList();
 
     if (query.isEmpty) {
@@ -1843,7 +2496,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   void _onSpecialProductSelected(Product p, {int? qty}) {
     final int itemQty = qty ?? int.tryParse(_specialSearchQtyCtrl.text.trim()) ?? 1;
     setState(() {
-      _extraSpecialItems.add(p.name);
+      _extraSpecialItems.remove(p.name);
+      _extraSpecialItems.insert(0, p.name);
       _specialOrderQtys[p.name] = itemQty;
       _specialMainCtrl.clear();
       _specialSearchList.value = [];
@@ -1894,10 +2548,16 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       row = _items.length;
     }
 
-    if (p.stock <= 0) {
+    final pharma = Provider.of<PharmacyProvider>(context, listen: false);
+    int totalProductStock = pharma.getTotalStockForProduct(p.name);
+    if (totalProductStock <= 0 && p.stock > 0) totalProductStock = p.stock;
+    int usedInBill = _getCrossRowStockUsedForProduct(p, row);
+    int availableProductStock = totalProductStock - usedInBill;
+
+    if (availableProductStock <= 0) {
       final res = await _showFastDialog(
         title: "Zero Stock",
-        content: "This item currently has no available stock.",
+        content: "This item currently has no available stock ($totalProductStock total stock, $usedInBill used in this entry).",
         showSpecialOrder: true,
         initialFocusIdx: 1, 
       );
@@ -1912,15 +2572,23 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           _orderType = 1;
           _showSpecialOrderSidebar = true;
           _isSpecialOrderMinimized = false;
-          _activeNotificationTab = "special";
         });
         _triggerSpecialOrderFocus(p.name, 1);
       } else {
         if (!mounted) return;
-        final pharma = Provider.of<PharmacyProvider>(context, listen: false);
         pharma.logStockEnquiry(productName: p.name, productId: p.id, requestedQty: 1, agent: _agentCtrl.text);
         if (res == true) {
           _commitSelection(row, p, stayOnProduct: true);
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) {
+              final fn = _getGridFocusNode(row, 2);
+              FocusScope.of(context).requestFocus(fn);
+              final ctrl = _getGridCtrl(row, 2);
+              if (ctrl.text.isNotEmpty) {
+                ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
+              }
+            }
+          });
         }
       }
       _isSelectingFromDropdown = false;
@@ -1936,10 +2604,14 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     _batchList.value = [];
     _searchList.value = [];
 
-    if (product.stock <= 0) {
+    int usedInOtherRows = _getCrossRowStockUsed(product, row);
+    int origQty = _originalInvoiceBatchQtys["${product.id}|${product.batch.trim().toUpperCase()}"] ?? 0;
+    int available = product.stock + origQty - usedInOtherRows;
+
+    if (available <= 0) {
       final res = await _showFastDialog(
         title: "Zero Stock",
-        content: "This item currently has no available stock.",
+        content: "This batch (${product.batch}) currently has no available stock across this invoice.",
         showSpecialOrder: true,
         initialFocusIdx: 1, 
       );
@@ -1954,11 +2626,25 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           _orderType = 1;
           _showSpecialOrderSidebar = true;
           _isSpecialOrderMinimized = false;
-          _activeNotificationTab = "special";
         });
         _triggerSpecialOrderFocus(product.name, 1);
-      } else if (res == true) {
-        _commitSelection(row, product, stayOnProduct: true);
+      } else {
+        if (!mounted) return;
+        final pharma = Provider.of<PharmacyProvider>(context, listen: false);
+        pharma.logStockEnquiry(productName: product.name, productId: product.id, requestedQty: 1, agent: _agentCtrl.text);
+        if (res == true) {
+          _commitSelection(row, product, stayOnProduct: true);
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) {
+              final fn = _getGridFocusNode(row, 2);
+              FocusScope.of(context).requestFocus(fn);
+              final ctrl = _getGridCtrl(row, 2);
+              if (ctrl.text.isNotEmpty) {
+                ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
+              }
+            }
+          });
+        }
       }
       return;
     }
@@ -1967,26 +2653,43 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   }
 
   void _checkExpiryAndCommit(int row, Product product) async {
-    if (_isSelectingBatch && _parseExpiry(product.expiry).isBefore(DateTime.now())) {
+    final expDate = _parseExpiry(product.expiry);
+    final now = DateTime.now();
+    if (expDate.isBefore(now)) {
+      await _showFastDialog(
+        title: "EXPIRED STOCK BLOCKED",
+        content: "Batch '${product.batch}' expired on ${product.expiry}. Expired inventory cannot be billed.",
+        isYesNo: false,
+        initialFocusIdx: 1,
+      );
+      return; // Strictly block selection
+    }
+
+    final daysRemaining = expDate.difference(now).inDays;
+    if (daysRemaining <= 60 && daysRemaining > 0) {
       bool? proceed = await _showFastDialog(
-          title: "Stock Is Expired",
-          content: "This batch has passed its expiry date. Proceed anyway?",
-          isYesNo: true,
-          initialFocusIdx: 2
+        title: "NEAR EXPIRY WARNING",
+        content: "Batch '${product.batch}' expires in $daysRemaining days (${product.expiry}). Proceed with billing?",
+        isYesNo: true,
+        initialFocusIdx: 2,
       );
       if (!mounted) return;
-      if (proceed == true) _commitSelection(row, product);
-    } else {
-      _commitSelection(row, product);
+      if (proceed != true) return; // User chose not to proceed
     }
+
+    _commitSelection(row, product);
   }
 
   void _finalizeBatchSelection(Product p) async {
-    // ---> RESTORE ZERO STOCK BLOCKING FOR BATCHES <---
-    if (p.stock <= 0) {
+    final row = _focusedRowIndex;
+    int usedInOtherRows = _getCrossRowStockUsed(p, row);
+    int origQty = _originalInvoiceBatchQtys["${p.id}|${p.batch.trim().toUpperCase()}"] ?? 0;
+    int available = p.stock + origQty - usedInOtherRows;
+
+    if (available <= 0) {
       final res = await _showFastDialog(
         title: "Zero Stock",
-        content: "This batch currently has no available stock.",
+        content: "Batch '${p.batch}' currently has no available stock (${p.stock} total, $usedInOtherRows used in this entry).",
         showSpecialOrder: true,
         initialFocusIdx: 1, 
       );
@@ -1994,7 +2697,6 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
       if (res == "special") {
         setState(() {
-          final row = _focusedRowIndex;
           _getGridCtrl(row, 1).clear();
           if (row < _items.length) {
             _items.removeAt(row);
@@ -2002,7 +2704,6 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           _orderType = 1;
           _showSpecialOrderSidebar = true;
           _isSpecialOrderMinimized = false;
-          _activeNotificationTab = "special";
         });
         _triggerSpecialOrderFocus(p.name, 1);
       } else {
@@ -2027,13 +2728,15 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         it.product.batch = p.batch;
         it.product.expiry = p.expiry;
         it.product.stock = p.stock;
+        it.product.packSize = p.packSize > 0 ? p.packSize : it.product.packSize;
+        it.packin = p.packSize > 0 ? p.packSize : (it.packin > 0 ? it.packin : 1);
 
         if (p.mrp > 0) it.product.mrp = p.mrp;
         if (p.salePrice > 0) it.product.salePrice = p.salePrice;
-        double ps = p.packSize == 0 ? 1 : p.packSize.toDouble();
-        it.mrp = it.product.mrp/ps;
-        it.sRate = it.product.mrp/ps;
-        it.taxableSP = it.product.mrp/ps;
+        double ps = it.packin.toDouble();
+        it.mrp = it.product.mrp / ps;
+        it.sRate = (it.product.salePrice > 0 ? it.product.salePrice : it.product.mrp) / ps;
+        it.taxableSP = it.sRate;
         it.gstPercent = p.gstPercent;
         _calculateItem(row);
       }
@@ -2055,7 +2758,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     _isSelectingFromDropdown = true; // LOCKS FOCUS
     _saveUndoState();
 
-    if (p.schedule.toUpperCase().contains('H1') || p.schedule.toUpperCase() == 'H') {
+    if (p.schedule.toUpperCase().contains('H1')) {
       _showH1DrugWarningDialog(p.name, p.schedule);
     }
 
@@ -2091,6 +2794,10 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           it.landingCost = unitLCost;
           it.gstPercent = p.gstPercent;
           it.supplier = p.supplier;
+          if (p.sDiscPercent > 0 && (it.discPercent == 0 || it.discPercent == 0.0)) {
+            it.discPercent = p.sDiscPercent;
+            it.discAmt = (unitSRate * it.qty * p.sDiscPercent) / 100.0;
+          }
 
           if (it.qty <= 0) it.qty = 1;
 
@@ -2115,34 +2822,65 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         _moveFocus(row, 7); // Move smoothly to Qty column
       }
     } else {
+      final pharma = Provider.of<PharmacyProvider>(context, listen: false);
+
+      // AUTO-FETCH BEST FEFO BATCH IF SELECTED ITEM IS FROM PRODUCT MASTER (p.batch IS EMPTY)
+      Product targetProduct = p;
+      if (targetProduct.batch.trim().isEmpty) {
+        final fefo = pharma.getAutoFefoBatch(p.name) ??
+            pharma.getBatchesForProduct(p.id, p.name).where((b) => b.stock > 0).firstOrNull;
+        if (fefo != null) {
+          targetProduct = fefo;
+        }
+      }
+
+      final masterMatch = pharma.masterNameMap[targetProduct.name.trim().toUpperCase()];
+      String resRack = targetProduct.rack.trim().isNotEmpty 
+          ? targetProduct.rack.trim() 
+          : (masterMatch?.rack.trim() ?? "");
+      double resDisc = targetProduct.sDiscPercent > 0 
+          ? targetProduct.sDiscPercent 
+          : (masterMatch?.sDiscPercent ?? 0.0);
+
+      int trueLooseStock = targetProduct.stock;
+      int packSize = targetProduct.packSize > 0 ? targetProduct.packSize : (masterMatch?.packSize ?? 1);
+      double pack = packSize.toDouble();
+      double unitMrp = targetProduct.mrp > 0 ? (targetProduct.mrp / pack) : ((masterMatch?.mrp ?? 0.0) / pack);
+      double unitSRate = targetProduct.salePrice > 0 ? (targetProduct.salePrice / pack) : unitMrp;
+      double unitLCost = targetProduct.landingCost > 0 ? (targetProduct.landingCost / pack) : (targetProduct.purchaseRate / pack);
+
       setState(() {
-        _getGridCtrl(row, 2, p.name).text = p.name;
-        _getGridCtrl(row, 3).text = p.rack;
-        _getGridCtrl(row, 4).text = _cleanBatch(p.batch);
-        _getGridCtrl(row, 5).text = p.expiry;
+        _getGridCtrl(row, 2, targetProduct.name).text = targetProduct.name;
+        _getGridCtrl(row, 3).text = resRack;
+        _getGridCtrl(row, 4).text = _cleanBatch(targetProduct.batch);
+        _getGridCtrl(row, 5).text = targetProduct.expiry;
 
         if (row == _items.length) {
           final newItem = SaleItem(
             product: Product(
-              id: p.id,
-              name: p.name,
-              batch: p.batch,
-              expiry: p.expiry,
-              packSize: p.packSize > 0 ? p.packSize : 1,
-              mrp: p.mrp,
-              salePrice: p.salePrice > 0 ? p.salePrice : p.mrp,
-              purchaseRate: p.purchaseRate,
-              landingCost: p.landingCost,
-              gstPercent: p.gstPercent,
-              rack: p.rack,
-              category: p.category,
-              manufacturer: p.manufacturer,
-              genericName: p.genericName,
-              stock: p.stock,
+              id: targetProduct.id,
+              name: targetProduct.name,
+              batch: targetProduct.batch,
+              expiry: targetProduct.expiry,
+              packSize: packSize,
+              mrp: targetProduct.mrp > 0 ? targetProduct.mrp : (masterMatch?.mrp ?? 0.0),
+              salePrice: targetProduct.salePrice > 0 ? targetProduct.salePrice : targetProduct.mrp,
+              purchaseRate: targetProduct.purchaseRate,
+              landingCost: targetProduct.landingCost,
+              gstPercent: targetProduct.gstPercent > 0 ? targetProduct.gstPercent : (masterMatch?.gstPercent ?? 12.0),
+              rack: resRack,
+              sDiscPercent: resDisc,
+              category: targetProduct.category,
+              manufacturer: targetProduct.manufacturer,
+              genericName: targetProduct.genericName,
+              stock: trueLooseStock,
             ),
             qty: 1, packin: packSize, mrp: unitMrp, sRate: unitSRate, taxableSP: unitSRate,
-            discPercent: 0, discAmt: 0, gstPercent: p.gstPercent, total: unitSRate,
-            landingCost: unitLCost, purchaseRate: p.purchaseRate / pack,
+            discPercent: resDisc > 0 ? resDisc : 0,
+            discAmt: resDisc > 0 ? ((unitSRate * resDisc) / 100.0) : 0,
+            gstPercent: targetProduct.gstPercent > 0 ? targetProduct.gstPercent : (masterMatch?.gstPercent ?? 12.0),
+            total: unitSRate,
+            landingCost: unitLCost, purchaseRate: targetProduct.purchaseRate / pack,
           );
           _items.add(newItem);
 
@@ -2157,25 +2895,27 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         } else {
           final it = _items[row];
           it.product = Product(
-            id: p.id,
-            name: p.name,
-            batch: p.batch,
-            expiry: p.expiry,
-            packSize: p.packSize > 0 ? p.packSize : 1,
-            mrp: p.mrp,
-            salePrice: p.salePrice > 0 ? p.salePrice : p.mrp,
-            purchaseRate: p.purchaseRate,
-            landingCost: p.landingCost,
-            gstPercent: p.gstPercent,
-            rack: p.rack,
-            category: p.category,
-            manufacturer: p.manufacturer,
-            genericName: p.genericName,
-            stock: p.stock,
+            id: targetProduct.id,
+            name: targetProduct.name,
+            batch: targetProduct.batch,
+            expiry: targetProduct.expiry,
+            packSize: packSize,
+            mrp: targetProduct.mrp > 0 ? targetProduct.mrp : (masterMatch?.mrp ?? 0.0),
+            salePrice: targetProduct.salePrice > 0 ? targetProduct.salePrice : targetProduct.mrp,
+            purchaseRate: targetProduct.purchaseRate,
+            landingCost: targetProduct.landingCost,
+            gstPercent: targetProduct.gstPercent > 0 ? targetProduct.gstPercent : (masterMatch?.gstPercent ?? 12.0),
+            rack: resRack,
+            category: targetProduct.category,
+            manufacturer: targetProduct.manufacturer,
+            genericName: targetProduct.genericName,
+            stock: trueLooseStock,
           );
           it.packin = packSize; it.mrp = unitMrp; it.sRate = unitSRate;
           it.taxableSP = unitSRate; it.landingCost = unitLCost;
-          it.purchaseRate = p.purchaseRate / pack; it.gstPercent = p.gstPercent;
+          it.purchaseRate = targetProduct.purchaseRate / pack;
+          it.gstPercent = targetProduct.gstPercent > 0 ? targetProduct.gstPercent : (masterMatch?.gstPercent ?? 12.0);
+          if (resDisc > 0 && it.discPercent == 0) it.discPercent = resDisc;
           if (it.qty <= 0) it.qty = 1;
 
           if (_getGridCtrl(row, 7).text.isEmpty) {
@@ -2188,6 +2928,16 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       _searchList.value = [];
       if (stayOnProduct) {
         _moveFocus(row, 2);
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) {
+            final fn = _getGridFocusNode(row, 2);
+            FocusScope.of(context).requestFocus(fn);
+            final ctrl = _getGridCtrl(row, 2);
+            if (ctrl.text.isNotEmpty) {
+              ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
+            }
+          }
+        });
       } else {
         _moveFocus(row, 4, autoOpen: true);
       }
@@ -2208,28 +2958,36 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
     _recalculateItemSilent(it, isGstMode: _gstType == 1);
 
+    String formatMoney(double val) => (val * 1000) % 10 == 0 ? val.toStringAsFixed(2) : val.toStringAsFixed(3);
+
     // Only update read-only display cells, avoid touching active input controllers during typing
     if (!_getGridFocusNode(row, 9).hasFocus) {
-      _getGridCtrl(row, 9).text = it.product.mrp.toStringAsFixed(2);
+      _getGridCtrl(row, 9).text = formatMoney(it.product.mrp);
     }
     if (!_getGridFocusNode(row, 10).hasFocus) {
-      _getGridCtrl(row, 10).text = it.mrp.toStringAsFixed(2);
+      _getGridCtrl(row, 10).text = formatMoney(it.mrp);
+    }
+    if (!_getGridFocusNode(row, 11).hasFocus) {
+      _getGridCtrl(row, 11).text = it.discPercent.toStringAsFixed(2);
     }
     if (!_getGridFocusNode(row, 12).hasFocus) {
-      _getGridCtrl(row, 12).text = it.discAmt.toStringAsFixed(2);
+      _getGridCtrl(row, 12).text = formatMoney(it.discAmt);
     }
-    double gVal = TaxCalculator.roundGstPercent(it.gstPercent);
+    double gVal = _gstType == 1 ? TaxCalculator.roundGstPercent(it.gstPercent) : 0.0;
     if (!_getGridFocusNode(row, 13).hasFocus) {
       _getGridCtrl(row, 13).text = gVal % 1 == 0 ? gVal.toInt().toString() : gVal.toStringAsFixed(1);
     }
     if (!_getGridFocusNode(row, 14).hasFocus) {
-      _getGridCtrl(row, 14).text = it.total.toStringAsFixed(2);
+      _getGridCtrl(row, 14).text = formatMoney(it.total);
     }
 
     _calculateFooter();
   }
 
   void _recalculateItem(SaleItem item, {bool isGstMode = false}) {
+    if (item.packin <= 0) {
+      item.packin = item.product.packSize > 0 ? item.product.packSize : 1;
+    }
     double pack = (item.packin > 0) ? item.packin.toDouble() : 1.0;
 
     // Set Pack MRP and Unit MRP
@@ -2254,6 +3012,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     if (item.discPercent > 0) {
       int discAmtPaise = ((grossPaise * item.discPercent) / 100.0).round();
       item.discAmt = discAmtPaise / 100.0;
+    } else if (item.discAmt > 0 && grossPaise > 0) {
+      item.discPercent = (item.discAmt / (grossPaise / 100.0)) * 100.0;
     } else {
       item.discAmt = 0.0;
     }
@@ -2278,17 +3038,41 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       item.taxableSP = item.qty > 0 ? (netTaxablePaise / (item.qty * 100.0)) : (netTaxablePaise / 100.0);
     }
 
-    // Unit Landing Cost & Profit in Paise
-    double effectivePackLCost = item.product.landingCost > 0
-        ? item.product.landingCost
-        : (item.product.purchaseRate > 0 ? item.product.purchaseRate : item.purchaseRate);
+    // Minimum line total requirement: Only force if total is 0 and no selling rate/price was provided
+    if (item.total <= 0 && item.sRate <= 0 && (item.qty > 0 || item.fQty > 0)) {
+      item.total = 1.00;
+    }
 
-    int landingCostPaise = effectivePackLCost > 0 ? ((effectivePackLCost / pack) * 100).round() : 0;
-    item.landingCost = landingCostPaise / 100.0;
-    int totalCostPaise = landingCostPaise * (item.qty + item.fQty);
-    int totalPaise = TaxCalculator.toPaise(item.total);
+    // Unit Landing Cost Calculation:
+    // Effective pack landed cost divided by packing size = landed cost per single tablet
+    int netSalesTaxablePaise = (isGstMode && item.gstPercent > 0)
+        ? TaxCalculator.calculateInclusivePaise(netTaxablePaise, item.gstPercent).taxablePaise
+        : netTaxablePaise;
 
-    item.profit = (totalPaise - totalCostPaise) / 100.0;
+    double netSalesTaxable = netSalesTaxablePaise / 100.0;
+
+    double packLCost = item.product.landingCost > 0 
+        ? item.product.landingCost 
+        : (item.product.purchaseRate > 0 ? item.product.purchaseRate : 0.0);
+    double unitLCost = pack > 0 ? (packLCost / pack) : packLCost;
+
+    item.landingCost = unitLCost;
+
+    // RULE 1: If item has explicit imported/saved profit, keep it 1:1
+    if (item.profit != 0) {
+      if ((item.qty + item.fQty) > 0) {
+        double totalCost = netSalesTaxable - item.profit;
+        if (totalCost > 0) {
+          item.landingCost = totalCost / (item.qty + item.fQty);
+        }
+      }
+    } else if (item.landingCost > 0) {
+      // RULE 2: Profit = Actual Selling Price (Net Taxable) - Total Acquisition Cost
+      double totalCost = item.landingCost * (item.qty + item.fQty);
+      item.profit = netSalesTaxable - totalCost;
+    } else {
+      item.profit = 0.0;
+    }
   }
 
   void _saveSpecialOrderOnly() async {
@@ -2361,7 +3145,19 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
 
 
-  Future<bool> _loadSaleData(String invNo) async {
+  double _getFirstDouble(Map<dynamic, dynamic> m, List<String> keys, [double fallback = 0.0]) {
+    for (var k in keys) {
+      if (m.containsKey(k) && m[k] != null) {
+        final v = (m[k] as num?)?.toDouble();
+        if (v != null) return v;
+      }
+    }
+    return fallback;
+  }
+
+  Future<bool> _loadSaleData(String invNo, {Map<String, dynamic>? initialData}) async {
+    AppLogger.instance.info("UI_NAVIGATION", "[ENTRY_OPENED] Opened Sales Entry #${formatSaleDisplayNo(invNo)} ($invNo)");
+
     // ---> THE FIX: Strictly discard draft when navigating <---
     if (!_isExistingEntry) {
       final p = Provider.of<PharmacyProvider>(context, listen: false);
@@ -2375,43 +3171,67 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
     final p = Provider.of<PharmacyProvider>(context, listen: false);
     try {
-      final data = await p.navigateInvoice(invNo, 'find', isPurchase: false);
+      final data = initialData ?? await p.navigateInvoice(invNo, 'find', isPurchase: false);
       if (!mounted) return false;
 
       // 1. If data is found (active or deleted), load it normally
       if (data != null && mounted) {
+        if (data['is_blank'] == true) {
+          FocusScope.of(context).unfocus();
+          setState(() {
+            _clearGridMaps();
+            _isExistingEntry = false;
+            _isBlankRecord = true;
+            _isDeleted = false;
+            _isImported = false;
+            _isDirty = false;
+            _items.clear();
+            _rawEntryNo = data['entry_no']?.toString() ?? invNo;
+            _entryNo = cleanEntryNo(_rawEntryNo);
+            _entryNoCtrl.text = formatSaleDisplayNo(_entryNo);
+            _date = DateTime.now();
+            _timeNotifier.value = DateFormat('hh:mm a').format(_date);
+            _customerAcc = 'Cash';
+            _customerAccCtrl.text = _customerAcc;
+            _patientCtrl.text = 'P1';
+            _mobileCtrl.text = '';
+            _doctorCtrl.text = 'D1';
+            _doctorRegNoCtrl.text = '';
+            _daysCtrl.text = '0';
+            _subTotalCtrl.text = '0.00';
+            _netTotalCtrl.text = '0.00';
+            _rcvdAmtCtrl.text = '0';
+            _balanceCtrl.text = '0.00';
+            _footerDiscAmtCtrl.text = '0.00';
+            _footerDiscPctCtrl.text = '0';
+            _isLoading = false;
+          });
+          return true;
+        }
+
         // --- SAFE FOCUS TRANSITION ---
         FocusScope.of(context).unfocus();
-        await Future.delayed(Duration.zero);
         if (!mounted) return false;
 
-        final items = await p.getInvoiceItems(invNo, isPurchase: false);
+        final loadedEntryNo = data['entry_no']?.toString() ?? data['invoice_no']?.toString() ?? invNo;
+        _rawEntryNo = loadedEntryNo;
+        final items = await p.getInvoiceItems(loadedEntryNo, isPurchase: false, financialYear: p.selectedFinancialYear);
         if (!mounted) return false;
         if (!mounted) return false;
 
-        // Pre-build O(1) maps for fast batch & master product lookup
-        final productBatchMap = <String, Product>{};
-        for (final pItem in p.products) {
-          productBatchMap["${pItem.id}|${pItem.batch.trim().toUpperCase()}"] = pItem;
-        }
-
-        final masterIdMap = <String, Product>{};
-        final masterNameMap = <String, Product>{};
-        for (final pm in p.productMaster) {
-          if (pm.id.isNotEmpty) masterIdMap[pm.id] = pm;
-          final upper = pm.name.trim().toUpperCase();
-          if (upper.isNotEmpty && !masterNameMap.containsKey(upper)) {
-            masterNameMap[upper] = pm;
-          }
-        }
+        // Use O(1) cached maps for fast batch & master product lookup
+        final productBatchMap = p.productBatchMap;
+        final masterIdMap = p.masterIdMap;
+        final masterNameMap = p.masterNameMap;
 
         setState(() {
           // RESET TO DEFAULTS FIRST to avoid data bleeding
-          _gridCtrls.clear();
-          _gridFocusNodes.clear();
+          _clearGridMaps();
           _isExistingEntry = true;
+          _isBlankRecord = false;
           _isDirty = false; // Reset dirty flag on load
           _isDeleted = (data['is_deleted'] == 1 || data['is_deleted'] == true || data['is_deleted'] == '1'); // Check if deleted
+          _isImported = (data['is_imported'] == 1 || data['is_imported'] == true || data['is_imported'] == '1');
           _orderType = 0;
           _showSpecialOrderSidebar = false;
           _isSpecialOrderMinimized = false;
@@ -2425,22 +3245,29 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           _originalInvoiceBatchQtys.clear();
 
           // LOAD ACTUAL HEADER DATA
-          String rawEntry = data['entry_no']?.toString() ?? "";
-          if (rawEntry.startsWith("ORD-")) {
-            rawEntry = rawEntry.substring(4);
-          }
-          if (rawEntry.contains('_')) {
-            rawEntry = rawEntry.substring(rawEntry.indexOf('_') + 1);
-          }
-          _entryNo = rawEntry.isNotEmpty ? rawEntry : (invNo.startsWith("ORD-") ? invNo.substring(4) : invNo);
+          final actualDbEntry = data['entry_no']?.toString() ?? invNo;
+          _rawEntryNo = actualDbEntry;
+          String rawEntry = cleanEntryNo(actualDbEntry);
+          _entryNo = rawEntry;
+          _entryNoCtrl.text = formatSaleDisplayNo(_entryNo);
           _date = DateTime.tryParse(data['date'].toString()) ?? DateTime.now();
+          _timeNotifier.value = DateFormat('hh:mm a').format(_date);
           _customerAcc = data['customer_acc']?.toString() ?? 'Cash';
           _customerAccCtrl.text = _customerAcc;
           _gstType = (data['tax_type'] == "Gst") ? 1 : 2;
 
-          _patientCtrl.text = data['patient']?.toString() ?? 'P1';
+          String rawPat = data['patient']?.toString().trim() ?? '';
+          if (rawPat.isEmpty || rawPat.toLowerCase() == 'general' || rawPat.toLowerCase() == 'unknown') {
+            rawPat = 'P1';
+          }
+          _patientCtrl.text = rawPat;
           _mobileCtrl.text = data['mobile']?.toString() ?? '';
-          _doctorCtrl.text = data['doctor']?.toString() ?? 'D1';
+
+          String rawDoc = data['doctor']?.toString().trim() ?? '';
+          if (rawDoc.isEmpty || rawDoc.toLowerCase() == 'unknown' || rawDoc.toLowerCase() == 'dr. unknown') {
+            rawDoc = 'D1';
+          }
+          _doctorCtrl.text = rawDoc;
           _doctorRegNoCtrl.text = data['doctor_reg_no']?.toString() ?? '';
           _daysCtrl.text = data['days']?.toString() ?? "0";
 
@@ -2479,26 +3306,90 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           }
 
           for (var m in items) {
-            int packin = (m['packin'] as num?)?.toInt() ?? (m['packing'] as num?)?.toInt() ?? 1;
+            String pId = m['product_id']?.toString() ?? "";
+            String pName = (m['product_name'] ?? '').toString().trim().toUpperCase();
+            String pBatch = m['batch_number']?.toString().trim().toUpperCase() ?? "";
+            String key = "$pId|$pBatch";
+
+            final batchMatch = productBatchMap[key] ?? productBatchMap["$pName|$pBatch"];
+            final masterMatch = masterIdMap[pId] ?? masterNameMap[pName];
+
+            int packin = (m['packin'] as num?)?.toInt() ?? (m['packing'] as num?)?.toInt() ?? 0;
+            if (packin <= 0) {
+              packin = batchMatch?.packSize ?? masterMatch?.packSize ?? 1;
+            }
             if (packin <= 0) packin = 1;
             double pack = packin.toDouble();
 
             double packMrp = (m['mrp'] as num?)?.toDouble() ?? 0.0;
-            double sRateVal = (m['s_rate'] as num?)?.toDouble() ?? (m['sale_rate'] as num?)?.toDouble() ?? 0.0;
-
-            // If sRateVal is equal to packMrp, it's a pack price -> convert to unit price
-            double unitSRate = (sRateVal > 0 && sRateVal == packMrp && packin > 1)
-                ? (sRateVal / pack)
-                : (sRateVal > 0 ? sRateVal : (packMrp / pack));
-
             double pRateVal = (m['purchase_rate'] as num?)?.toDouble() ?? 0.0;
             double lCostVal = (m['landing_cost'] as num?)?.toDouble() ?? 0.0;
 
-            String pId = m['product_id']?.toString() ?? "";
-            String pBatch = m['batch_number']?.toString().trim().toUpperCase() ?? "";
-            String key = "$pId|$pBatch";
+            // Rates stored in sales_items are per loose unit; convert to pack rate for consistent evaluation against batch/master fallbacks
+            if (pRateVal > 0 && m['purchase_rate'] != null) {
+              pRateVal = pRateVal * pack;
+            }
+            if (lCostVal > 0 && m['landing_cost'] != null) {
+              lCostVal = lCostVal * pack;
+            }
 
-            final prod = productBatchMap[key] ?? Product(
+            // Fallback for missing/zero rates from batch or product master
+            if (packMrp <= 0) {
+              packMrp = batchMatch?.mrp ?? masterMatch?.mrp ?? 0.0;
+            }
+            if (pRateVal <= 0) {
+              pRateVal = batchMatch?.purchaseRate ?? masterMatch?.purchaseRate ?? 0.0;
+            }
+            if (lCostVal <= 0) {
+              lCostVal = batchMatch?.landingCost ?? (pRateVal > 0 ? pRateVal : (masterMatch?.purchaseRate ?? 0.0));
+            }
+
+            double sRateVal = (m['s_rate'] as num?)?.toDouble() ?? (m['sale_rate'] as num?)?.toDouble() ?? 0.0;
+            double unitSRate = sRateVal > 0 ? sRateVal : (packMrp > 0 ? (packMrp / pack) : (batchMatch?.salePrice ?? 0.0) / pack);
+            double unitMrp = packMrp > 0 ? (packMrp / pack) : unitSRate;
+            double profitVal = (m['profit'] as num?)?.toDouble() ?? 0.0;
+
+            double itemGst = _getFirstDouble(m, [
+              'gst_percent', 'tax_percent', 'gst_rate', 'gst_perc', 'gst_per',
+              'gst_pct', 'tax_rate', 'vat_percent', 'vat_rate', 'gst', 'tax'
+            ], -1.0);
+
+            if (itemGst < 0 || (itemGst == 0.0 && _gstType == 1 && (batchMatch?.gstPercent ?? masterMatch?.gstPercent ?? 0) > 0)) {
+              itemGst = batchMatch?.gstPercent ?? masterMatch?.gstPercent ?? 0.0;
+            }
+            if (itemGst < 0) itemGst = 0.0;
+
+            double itemDiscPct = _getFirstDouble(m, [
+              'disc_percent', 'discount_percent', 's_disc_percent', 'disc_perc',
+              'disc_per', 'disc_pct', 'dis_percent', 'dis_per', 's_disc', 'trade_disc'
+            ], 0.0);
+
+            double itemDiscAmt = _getFirstDouble(m, [
+              'disc_amt', 'discount_amount', 'disc_amount', 'dis_amt', 'discount'
+            ], 0.0);
+
+            double grossForDisc = unitSRate * ((m['qty'] as num?)?.toInt() ?? (m['quantity'] as num?)?.toInt() ?? 1);
+            if (itemDiscPct > 0 && (itemDiscPct == itemDiscAmt || (itemDiscAmt > 0 && itemDiscPct > 50)) && grossForDisc > 0 && itemDiscAmt < grossForDisc) {
+              itemDiscPct = (itemDiscAmt / grossForDisc) * 100.0;
+            } else if (itemDiscPct > 0 && itemDiscAmt == 0.0 && grossForDisc > 0) {
+              if (itemDiscPct > 50 && itemDiscPct <= grossForDisc) {
+                itemDiscAmt = itemDiscPct;
+                itemDiscPct = (itemDiscAmt / grossForDisc) * 100.0;
+              } else {
+                itemDiscAmt = (grossForDisc * itemDiscPct) / 100.0;
+              }
+            } else if (itemDiscPct == 0.0 && itemDiscAmt > 0 && grossForDisc > 0) {
+              itemDiscPct = (itemDiscAmt / grossForDisc) * 100.0;
+            } else if (itemDiscPct == 0.0 && itemDiscAmt == 0.0) {
+              itemDiscPct = batchMatch?.sDiscPercent ?? masterMatch?.sDiscPercent ?? 0.0;
+              if (itemDiscPct > 0 && grossForDisc > 0) {
+                itemDiscAmt = (grossForDisc * itemDiscPct) / 100.0;
+              }
+            }
+
+
+
+            final prod = batchMatch ?? Product(
               id: pId,
               name: m['product_name']?.toString() ?? "",
               batch: m['batch_number']?.toString() ?? "",
@@ -2508,21 +3399,41 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
               packSize: packin,
               purchaseRate: pRateVal,
               landingCost: lCostVal,
-              gstPercent: (m['gst_percent'] as num?)?.toDouble() ?? 12.0,
+              gstPercent: TaxCalculator.roundGstPercent(itemGst),
               supplier: m['supplier_name']?.toString() ?? "",
             );
 
-            // Attach master generic name if batch product lacks it
-            if (prod.genericName.isEmpty) {
-              final masterMatch = masterIdMap[pId] ?? masterNameMap[prod.name.trim().toUpperCase()];
-              if (masterMatch != null) prod.genericName = masterMatch.genericName;
+            // Prefer saved invoice product name if present
+            String savedItemName = (m['product_name'] ?? '').toString().trim();
+            if (savedItemName.isNotEmpty) {
+              prod.name = savedItemName;
+            }
+
+            // Attach master generic name and rack if batch product lacks them
+            if (prod.genericName.isEmpty && masterMatch != null) {
+              prod.genericName = masterMatch.genericName;
+            }
+
+            String itemRack = (m['rack'] ?? m['master_rack'] ?? m['master_rack_id'] ?? '').toString().trim();
+            if (itemRack.isNotEmpty) {
+              prod.rack = itemRack;
+            } else if (prod.rack.isEmpty) {
+              prod.rack = (batchMatch?.rack.trim().isNotEmpty == true) ? batchMatch!.rack : (masterMatch?.rack.trim() ?? '');
             }
 
             // Ensure prod has pack-level MRP stored
             prod.mrp = packMrp;
             prod.packSize = packin;
-            if (prod.expiry.isEmpty && m['expiry_date'] != null) {
-              prod.expiry = m['expiry_date'].toString();
+
+            String itemExpiry = (m['expiry_date'] ?? m['expiry'] ?? m['exp_date'] ?? '').toString().trim();
+            if (itemExpiry.isNotEmpty && itemExpiry != 'MM/YY') {
+              prod.expiry = itemExpiry;
+            } else if (prod.expiry.isEmpty || prod.expiry == 'MM/YY') {
+              prod.expiry = (batchMatch?.expiry.trim().isNotEmpty == true && batchMatch!.expiry != 'MM/YY') ? batchMatch.expiry : '';
+            }
+
+            if (prod.sDiscPercent <= 0 && itemDiscPct > 0) {
+              prod.sDiscPercent = itemDiscPct;
             }
 
             // CRITICAL: Clone product so each row owns an isolated copy in memory
@@ -2535,16 +3446,17 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
               product: isolatedProd, // <--- Use the isolated copy
               qty: (m['qty'] as num?)?.toInt() ?? (m['quantity'] as num?)?.toInt() ?? 0,
               packin: packin,
-              mrp: packMrp / pack, // Unit MRP (e.g. 2.68)
-              sRate: unitSRate,     // Unit Selling Rate (e.g. 2.42)
-              taxableSP: unitSRate,
-              discPercent: (m['disc_percent'] as num?)?.toDouble() ?? 0.0,
-              discAmt: (m['disc_amt'] as num?)?.toDouble() ?? 0.0,
-              gstPercent: TaxCalculator.roundGstPercent((m['gst_percent'] as num?)?.toDouble() ?? (m['tax_percent'] as num?)?.toDouble() ?? 0.0),
+              mrp: unitMrp,
+              sRate: unitSRate,
+              taxableSP: (m['taxable_sp'] as num?)?.toDouble() ?? unitSRate,
+              discPercent: itemDiscPct,
+              discAmt: itemDiscAmt,
+              gstPercent: TaxCalculator.roundGstPercent(itemGst),
               gstAmt: (m['gst_amt'] as num?)?.toDouble() ?? 0.0,
               cgstAmt: (m['cgst_amt'] as num?)?.toDouble() ?? 0.0,
               sgstAmt: (m['sgst_amt'] as num?)?.toDouble() ?? 0.0,
               total: (m['total'] as num?)?.toDouble() ?? 0.0,
+              profit: profitVal,
               purchaseRate: pRateVal / pack,
               landingCost: lCostVal > 0 ? (lCostVal / pack) : (pRateVal / pack),
               supplier: m['supplier_name']?.toString() ?? "",
@@ -2588,46 +3500,41 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
             paymentRemarks: data['payment_remarks'] ?? "",
             isPaid: (data['is_paid'] as int?) == 1,
           );
+          _loadedInvoiceUpdatedAt = data['updated_at']?.toString() ?? data['date']?.toString() ?? DateTime.now().toIso8601String();
+
+          _highlightedRowIndices.clear();
+          if (widget.highlightProduct != null && widget.highlightProduct!.trim().isNotEmpty) {
+            final target = widget.highlightProduct!.trim().toUpperCase();
+            for (int i = 0; i < _items.length; i++) {
+              final pName = _items[i].product.name.trim().toUpperCase();
+              if (pName.isNotEmpty && (pName == target || pName.contains(target) || target.contains(pName))) {
+                _highlightedRowIndices.add(i);
+              }
+            }
+          }
         });
 
-        if (_isDeleted && mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text("🗑️ DELETED ENTRY: Sales Invoice #$_entryNo is marked as DELETED."),
-              backgroundColor: const Color(0xFF7F1D1D),
-              duration: const Duration(seconds: 4),
-            ),
-          );
+        if (_highlightedRowIndices.isNotEmpty) {
+          _focusNotifier.value = IntPair(_highlightedRowIndices.first, 2);
+        } else {
+          // Remove focus so nothing is highlighted when viewing history
+          _focusNotifier.value = null;
         }
-
-        // Remove focus so nothing is highlighted when viewing history
-        _focusNotifier.value = null;
         return true;
       }
-      // 2. ENTRY NOT FOUND IN DATABASE
+      // 2. BLANK OR UNUSED ENTRY NUMBER
       else if (mounted) {
         FocusScope.of(context).unfocus();
+        if (mounted) setState(() => _isLoading = false);
         await Future.delayed(Duration.zero);
         if (!mounted) return false;
 
-        final nextEntryNoStr = await p.getNextSaleEntryNo();
-        if (!mounted) return false;
-        final String cleanInvNo = invNo.contains('_') ? invNo.substring(invNo.indexOf('_') + 1) : invNo;
-        final int? reqNo = int.tryParse(cleanInvNo);
-        final int? nextNo = int.tryParse(nextEntryNoStr);
-
-        if (reqNo != null && nextNo != null && reqNo > nextNo) {
-          _showFastDialog(
-            title: "Navigation Error",
-            content: "Entry #$cleanInvNo does not exist.\n\nThe next available new entry is #$nextEntryNoStr.",
-          );
-        } else {
-          _showFastDialog(
-            title: "Invoice Not Found",
-            content: "Entry #$cleanInvNo does not exist.",
-          );
-        }
-        return false;
+        _resetPage();
+        _entryNo = cleanEntryNo(invNo);
+        _isExistingEntry = false;
+        _isDeleted = false;
+        setState(() {});
+        return true;
       }
       return false;
     } catch (e) {
@@ -2645,6 +3552,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   }
 
   void _promptSave() async {
+    if (_isSaving || _isLoading || _isDialogOpen) return;
+
     // PRE-COMMIT HOOK: Validate mandatory fields before prompting for payment
     final String currentAcc = _customerAccCtrl.text.trim().isNotEmpty ? _customerAccCtrl.text.trim() : _customerAcc.trim();
     final String currentPatient = _patientCtrl.text.trim();
@@ -2692,6 +3601,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     );
     final TextEditingController amt2Ctrl = TextEditingController(text: "0.00");
 
+    _isDialogOpen = true;
     final res = await showDialog<bool>(
         context: context,
         barrierDismissible: false,
@@ -2735,7 +3645,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                           _isExistingEntry
                               ? "Do you want to update this existing Sales Entry?"
                               : "Do you want to save this new Sales Entry?",
-                          style: const TextStyle(fontSize: 14, color: Colors.black87),
+                          style: const TextStyle(fontSize: 14, color: Colors.black),
                         ),
                         const SizedBox(height: 24),
 
@@ -2861,6 +3771,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           );
         }
     );
+    if (mounted) setState(() => _isDialogOpen = false);
 
     if (res == true) {
       final double p1Amt = double.tryParse(amt1Ctrl.text) ?? 0.0;
@@ -2883,257 +3794,96 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     if (clean.startsWith("SO-")) clean = clean.substring(3);
     if (clean.startsWith("ORD-")) clean = clean.substring(4);
     if (clean.contains('_')) clean = clean.substring(clean.indexOf('_') + 1);
+    clean = clean.replaceAll(RegExp(r'^\d{4}[-/]\d{2,4}[-/_]'), '');
+    clean = clean.replaceAll(RegExp(r'^\d{2}[-/]\d{2}[-/_]'), '');
     return clean;
   }
 
   void _navigateEntry(String dir) async {
-    // 1. Unsaved edits protection
-    if (_isExistingEntry && _isDirty) {
-      bool? discard = await _promptDiscardChanges();
+    // 0. Mutex lock against rapid clicks, ghost touch, and multi-triggers
+    if (_isNavigating || _isLoading || _isSaving || _isDeleting) return;
+    _isNavigating = true;
+    if (mounted) setState(() {});
+
+    try {
+      // 1. Unsaved edits protection
+      if (hasUnsavedChanges()) {
+        bool? discard = await _promptDiscardChanges();
+        if (!mounted || discard != true) {
+          return; // User chose to stay
+        }
+      }
       if (!mounted) return;
-      if (discard != true) return; // User chose to stay
-    }
-    if (!mounted) return;
 
-    _closeAllDropdowns();
-    final p = Provider.of<PharmacyProvider>(context, listen: false);
+      _closeAllDropdowns();
+      final p = Provider.of<PharmacyProvider>(context, listen: false);
 
-    final cleanCurrentNo = cleanEntryNo(_entryNo);
-    final int? currentNum = int.tryParse(cleanCurrentNo);
-
-    // 2. Hard sequence boundary checks
-    if (dir == 'prev') {
-      if (currentNum != null && currentNum <= 1) {
-        _showFastDialog(title: "Navigation", content: "FIRST RECORD REACHED (#1).");
-        return;
+      if (dir == 'next') {
+        // If currently looking at an unsaved new entry, do not allow jumping further
+        if (!_isExistingEntry) {
+          _showFastDialog(
+            title: "Navigation Blocked", 
+            content: "Save Entry #${formatSaleDisplayNo(_entryNo)} first to unlock the next entry number.",
+          );
+          return;
+        }
       }
-    } else if (dir == 'next') {
-      // If currently looking at an unsaved new entry, do not allow jumping further
-      if (!_isExistingEntry) {
-        _showFastDialog(
-          title: "Navigation Blocked", 
-          content: "Save Entry #$_entryNo first to unlock the next entry number.",
-        );
-        return;
-      }
-    }
 
-    // 3. Database navigation step
-    final data = await p.navigateInvoice(_entryNo, dir, isPurchase: false);
-    if (!mounted) return;
-    if (data != null) {
-      _loadSaleData(data['entry_no'].toString());
-    } else if (dir == 'next') {
-      if (_isExistingEntry) {
-        _resetPage(); // Jump directly to the next unlocked blank draft
-      } else {
-        _showFastDialog(title: "Navigation", content: "NO MORE RECORDS TO SHOW");
-      }
-    } else if (dir == 'prev') {
-      _showFastDialog(title: "Navigation", content: "FIRST RECORD REACHED");
-    }
-  }
-
-  // --- GENERATE DETAILED EDIT DIFF SPANS FOR RE-WRITE DIALOG ---
-  List<InlineSpan> _generateDiffSpans() {
-    final List<InlineSpan> diffSpans = [];
-
-    if (!_isExistingEntry || _originalLoadedInvoice == null) {
-      return diffSpans;
-    }
-
-    const redStyle = TextStyle(color: Colors.red, fontWeight: FontWeight.bold, fontSize: 13);
-    const normalStyle = TextStyle(color: Colors.black87, fontSize: 13, height: 1.5);
-
-    void addDiffLine(List<InlineSpan> parts) {
-      diffSpans.add(const TextSpan(text: "• ", style: normalStyle));
-      diffSpans.addAll(parts);
-      diffSpans.add(const TextSpan(text: "\n", style: normalStyle));
-    }
-
-    // 1. HEADER COMPARISONS
-    // Patient Name
-    final currentPatient = _patientCtrl.text.trim();
-    final origPatient = _originalLoadedInvoice!.patient.trim();
-    if (currentPatient.toUpperCase() != origPatient.toUpperCase()) {
-      addDiffLine([
-        const TextSpan(text: "patient name ", style: normalStyle),
-        TextSpan(text: origPatient.isEmpty ? "(blank)" : origPatient, style: redStyle),
-        const TextSpan(text: " to ", style: normalStyle),
-        TextSpan(text: currentPatient.isEmpty ? "(blank)" : currentPatient, style: redStyle),
-        const TextSpan(text: ".", style: normalStyle),
-      ]);
-    }
-
-    // Doctor Name
-    final currentDoctor = _doctorCtrl.text.trim();
-    final origDoctor = _originalLoadedInvoice!.doctor.trim();
-    if (currentDoctor.toUpperCase() != origDoctor.toUpperCase()) {
-      addDiffLine([
-        const TextSpan(text: "doctor name ", style: normalStyle),
-        TextSpan(text: origDoctor.isEmpty ? "(blank)" : origDoctor, style: redStyle),
-        const TextSpan(text: " to ", style: normalStyle),
-        TextSpan(text: currentDoctor.isEmpty ? "(blank)" : currentDoctor, style: redStyle),
-        const TextSpan(text: ".", style: normalStyle),
-      ]);
-    }
-
-    // Customer Account / Payment Mode
-    final currentAcc = _customerAccCtrl.text.trim();
-    final origAcc = _originalLoadedInvoice!.customerAcc.trim();
-    if (currentAcc.toUpperCase() != origAcc.toUpperCase() && currentAcc.isNotEmpty) {
-      addDiffLine([
-        const TextSpan(text: "payment account ", style: normalStyle),
-        TextSpan(text: origAcc.isEmpty ? "(blank)" : origAcc, style: redStyle),
-        const TextSpan(text: " to ", style: normalStyle),
-        TextSpan(text: currentAcc, style: redStyle),
-        const TextSpan(text: ".", style: normalStyle),
-      ]);
-    }
-
-    // Footer Discount
-    final currentDiscAmt = double.tryParse(_footerDiscAmtCtrl.text) ?? 0.0;
-    final origDiscAmt = _originalLoadedInvoice!.discount;
-    if ((currentDiscAmt - origDiscAmt).abs() > 0.01) {
-      addDiffLine([
-        const TextSpan(text: "footer discount ", style: normalStyle),
-        TextSpan(text: "₹${origDiscAmt.toStringAsFixed(2)}", style: redStyle),
-        const TextSpan(text: " to ", style: normalStyle),
-        TextSpan(text: "₹${currentDiscAmt.toStringAsFixed(2)}", style: redStyle),
-        const TextSpan(text: ".", style: normalStyle),
-      ]);
-    }
-
-    // 2. ITEM LEVEL COMPARISONS
-    final origItems = _originalLoadedInvoice!.items;
-    final currentValidItems = _items.where((it) => it.product.name.trim().isNotEmpty).toList();
-
-    int maxLen = origItems.length > currentValidItems.length ? origItems.length : currentValidItems.length;
-
-    for (int i = 0; i < maxLen; i++) {
-      if (i < origItems.length && i < currentValidItems.length) {
-        final orig = origItems[i];
-        final curr = currentValidItems[i];
-
-        // Check Product Name
-        final origName = orig.product.name.trim();
-        final currName = curr.product.name.trim();
-        if (origName.toUpperCase() != currName.toUpperCase()) {
-          addDiffLine([
-            const TextSpan(text: "product name ", style: normalStyle),
-            TextSpan(text: origName, style: redStyle),
-            const TextSpan(text: " to ", style: normalStyle),
-            TextSpan(text: currName, style: redStyle),
-            const TextSpan(text: ".", style: normalStyle),
-          ]);
-        }
-
-        // Check Batch Number
-        final origBatch = orig.product.batch.trim();
-        final currBatch = curr.product.batch.trim();
-        if (origBatch.toUpperCase() != currBatch.toUpperCase()) {
-          addDiffLine([
-            TextSpan(text: "batch ($currName) changed from ", style: normalStyle),
-            TextSpan(text: '"$origBatch"', style: redStyle),
-            const TextSpan(text: " to ", style: normalStyle),
-            TextSpan(text: '"$currBatch"', style: redStyle),
-            const TextSpan(text: ".", style: normalStyle),
-          ]);
-        }
-
-        // Check Quantity
-        if (orig.qty != curr.qty) {
-          addDiffLine([
-            TextSpan(text: "qty ($currName) changed from ", style: normalStyle),
-            TextSpan(text: "${orig.qty}", style: redStyle),
-            const TextSpan(text: " to ", style: normalStyle),
-            TextSpan(text: "${curr.qty}", style: redStyle),
-            const TextSpan(text: ".", style: normalStyle),
-          ]);
-        }
-
-        // Check Discount %
-        if ((orig.discPercent - curr.discPercent).abs() > 0.01) {
-          addDiffLine([
-            TextSpan(text: "discount ($currName) changed from ", style: normalStyle),
-            TextSpan(text: "${orig.discPercent.toStringAsFixed(1)}%", style: redStyle),
-            const TextSpan(text: " to ", style: normalStyle),
-            TextSpan(text: "${curr.discPercent.toStringAsFixed(1)}%", style: redStyle),
-            const TextSpan(text: ".", style: normalStyle),
-          ]);
-        }
-
-        // Check Sale Price / Rate
-        if ((orig.sRate - curr.sRate).abs() > 0.01) {
-          addDiffLine([
-            TextSpan(text: "sale rate ($currName) changed from ", style: normalStyle),
-            TextSpan(text: "₹${orig.sRate.toStringAsFixed(2)}", style: redStyle),
-            const TextSpan(text: " to ", style: normalStyle),
-            TextSpan(text: "₹${curr.sRate.toStringAsFixed(2)}", style: redStyle),
-            const TextSpan(text: ".", style: normalStyle),
-          ]);
-        }
-      } else if (i < currentValidItems.length) {
-        // Item added
-        final curr = currentValidItems[i];
-        addDiffLine([
-          const TextSpan(text: "added product ", style: normalStyle),
-          TextSpan(text: curr.product.name.trim(), style: redStyle),
-          const TextSpan(text: " (qty: ", style: normalStyle),
-          TextSpan(text: "${curr.qty}", style: redStyle),
-          if (curr.product.batch.isNotEmpty) ...[
-            const TextSpan(text: ', batch: "', style: normalStyle),
-            TextSpan(text: curr.product.batch.trim(), style: redStyle),
-            const TextSpan(text: '"', style: normalStyle),
-          ],
-          const TextSpan(text: ").", style: normalStyle),
-        ]);
-      } else if (i < origItems.length) {
-        // Item removed
-        final orig = origItems[i];
-        addDiffLine([
-          const TextSpan(text: "removed product ", style: normalStyle),
-          TextSpan(text: orig.product.name.trim(), style: redStyle),
-          const TextSpan(text: " (qty: ", style: normalStyle),
-          TextSpan(text: "${orig.qty}", style: redStyle),
-          const TextSpan(text: ").", style: normalStyle),
-        ]);
-      }
-    }
-
-    return diffSpans;
-  }
-
-  // --- NEW: EDIT CONFIRMATION METHOD ---
-  void _editSale() async {
-    final diffSpans = _generateDiffSpans();
-
-    if (diffSpans.isEmpty) {
-      await showDialog(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-          title: const Row(
-            children: [
-              Icon(Icons.info_outline_rounded, color: Colors.blue, size: 26),
-              SizedBox(width: 8),
-              Text("No Changes Found", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-            ],
-          ),
-          content: Text(
-            "No modifications were detected on Entry #$_entryNo.\nThere are no changes to save.",
-            style: const TextStyle(fontSize: 13, height: 1.4),
-          ),
-          actions: [
-            ElevatedButton(
-              onPressed: () => Navigator.pop(ctx),
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
-              child: const Text("OK", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-            ),
-          ],
-        ),
+      // 2. Database navigation step with exact target financial year
+      final String currentNavKey = _rawEntryNo.isNotEmpty ? _rawEntryNo : _entryNo;
+      final String targetFy = _originalLoadedInvoice?.financialYear ?? p.selectedFinancialYear;
+      final data = await p.navigateInvoice(
+        currentNavKey, 
+        dir, 
+        isPurchase: false, 
+        targetFinancialYear: targetFy,
+        isExistingEntry: _isExistingEntry,
       );
       if (!mounted) return;
+      if (data != null) {
+        if (data['is_blank'] == true) {
+          _resetPage();
+          _rawEntryNo = data['entry_no'].toString();
+          _entryNo = cleanEntryNo(_rawEntryNo);
+          _entryNoCtrl.text = formatSaleDisplayNo(_entryNo);
+          setState(() {});
+        } else {
+          await _loadSaleData(data['entry_no'].toString(), initialData: data);
+        }
+      } else if (dir == 'next') {
+        _showFastDialog(title: "Navigation Limit", content: "MAX ENTRY LIMIT REACHED");
+      } else if (dir == 'prev') {
+        _showFastDialog(title: "Navigation Limit", content: "FIRST RECORD REACHED (Entry #${formatSaleDisplayNo(_entryNo)})");
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isNavigating = false);
+      }
+    }
+  }
+
+
+
+  // --- EDIT CONFIRMATION METHOD ---
+  void _editSale() async {
+    AppLogger.instance.info("USER_ACTION", "[EDIT_CLICKED] Edit/Update initiated for Sales Entry #${formatSaleDisplayNo(_entryNo)} ($_entryNo)");
+
+    if (!ServerConfigService.instance.isConnected) {
+      _showFastDialog(
+        title: "Server Disconnected",
+        content: "SERVER DISCONNECTED — WORKING IN OFFLINE READ-ONLY MODE\n\nCannot update sales invoice while disconnected from Supabase Cloud Server.",
+      );
+      return;
+    }
+
+    final p = Provider.of<PharmacyProvider>(context, listen: false);
+    final String? origTerminalId = _originalLoadedInvoice?.agent; // Or terminal context
+
+    if (!p.canEditCrossTerminalEntry(origTerminalId)) {
+      _showFastDialog(
+        title: "Online Connection Required",
+        content: "This invoice was created on another counter.\n\nEditing entries from other counters requires an active internet connection to prevent edit conflicts.",
+      );
       return;
     }
 
@@ -3142,66 +3892,30 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-        title: Row(
+        title: const Row(
           children: [
-            const Icon(Icons.edit_note_rounded, color: Colors.orange, size: 28),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Text(
-                "Re-write Entry #$_entryNo?",
-                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-              ),
-            ),
+            Icon(Icons.save_rounded, color: Colors.blue, size: 28),
+            SizedBox(width: 10),
+            Text("Update Sales Invoice", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
           ],
         ),
-        content: SizedBox(
-          width: 480,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                "The following changes will be applied to this entry:",
-                style: TextStyle(fontSize: 13, color: Colors.grey, fontWeight: FontWeight.w600),
-              ),
-              const SizedBox(height: 12),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 250),
-                child: Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: Colors.grey.shade50,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: Colors.grey.shade300),
-                  ),
-                  child: SingleChildScrollView(
-                    child: SelectableText.rich(
-                      TextSpan(children: diffSpans),
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 14),
-              Text(
-                "Are you sure you want to overwrite Entry #$_entryNo? Stock and ledger will be updated accordingly.",
-                style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: Colors.black87),
-              ),
-            ],
-          ),
+        content: Text(
+          "Are you sure you want to update Entry #${formatSaleDisplayNo(_entryNo)}?\nAll modifications will be saved to your stock and customer ledger.",
+          style: const TextStyle(fontSize: 14, height: 1.4),
         ),
         actions: [
-          TextButton(
+          OutlinedButton(
             onPressed: () => Navigator.pop(ctx, false),
-            child: const Text("NO", style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold)),
+            child: const Text("Cancel"),
           ),
           ElevatedButton(
             onPressed: () => Navigator.pop(ctx, true),
             style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.orange.shade800,
+              backgroundColor: Colors.blue.shade800,
+              foregroundColor: Colors.white,
               padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
             ),
-            child: const Text("YES, RE-WRITE", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+            child: const Text("Update Invoice", style: TextStyle(fontWeight: FontWeight.bold)),
           ),
         ],
       ),
@@ -3341,8 +4055,6 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       );
 
       if (result != null) {
-        // We'll use a generic export or just show a message for now if single export isn't ready
-        // But let's try to use the provider's export if it supports filtering
         await p.exportSalesToExcel(result);
         if (!mounted) return;
         if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Exported successfully!")));
@@ -3351,6 +4063,295 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       _showFastDialog(title: "Export Error", content: e.toString());
     }
   }
+
+  void _copySalesGridToClipboard() async {
+    final validItems = _items.where((it) => it.product.name.trim().isNotEmpty).toList();
+    if (validItems.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("No items in sales grid to copy."), duration: Duration(seconds: 2)),
+      );
+      return;
+    }
+
+    final StringBuffer sb = StringBuffer();
+    for (var it in validItems) {
+      sb.writeln("${it.product.name.trim()}\t${it.qty}");
+    }
+
+    await Clipboard.setData(ClipboardData(text: sb.toString()));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text("Copied ${validItems.length} items to clipboard!"),
+        backgroundColor: Colors.blue.shade800,
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  void _pasteSalesGridFromClipboard() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    if (!mounted) return;
+    final text = data?.text?.trim() ?? "";
+    if (text.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Clipboard is empty or contains no text."), duration: Duration(seconds: 2)),
+      );
+      return;
+    }
+
+    final p = Provider.of<PharmacyProvider>(context, listen: false);
+    final lines = text.split(RegExp(r'[\r\n]+'));
+
+    List<Map<String, dynamic>> addedItems = [];
+    List<Map<String, dynamic>> shortageItems = [];
+    List<String> unavailableItems = [];
+
+    for (var line in lines) {
+      String cleanLine = line.trim();
+      if (cleanLine.isEmpty) continue;
+
+      String name = "";
+      int requestedQty = 1;
+
+      if (cleanLine.contains('\t')) {
+        final parts = cleanLine.split('\t');
+        name = parts[0].trim();
+        if (parts.length > 1) requestedQty = int.tryParse(parts[1].trim()) ?? 1;
+      } else if (cleanLine.contains('|')) {
+        final parts = cleanLine.split('|');
+        name = parts[0].trim();
+        if (parts.length > 1) requestedQty = int.tryParse(parts[1].trim()) ?? 1;
+      } else if (cleanLine.contains(',')) {
+        final parts = cleanLine.split(',');
+        name = parts[0].trim();
+        if (parts.length > 1) requestedQty = int.tryParse(parts[1].trim()) ?? 1;
+      } else {
+        name = cleanLine;
+        requestedQty = 1;
+      }
+
+      if (name.isEmpty) continue;
+      if (requestedQty <= 0) requestedQty = 1;
+
+      final matches = p.searchProducts(name, includeGenerics: false);
+      if (matches.isEmpty) {
+        unavailableItems.add("$name (Requested: $requestedQty)");
+        continue;
+      }
+
+      final matchedProd = matches.first;
+      final batches = p.getBatchesForProduct(matchedProd.id, matchedProd.name);
+      int totalLiveStock = batches.isNotEmpty
+          ? batches.fold(0, (sum, b) => sum + b.stock)
+          : matchedProd.stock;
+
+      if (totalLiveStock <= 0) {
+        unavailableItems.add("${matchedProd.name} (0 Stock Available, Requested: $requestedQty)");
+        continue;
+      }
+
+      int actualAddedQty = requestedQty;
+      if (requestedQty > totalLiveStock) {
+        actualAddedQty = totalLiveStock;
+        shortageItems.add({
+          'name': matchedProd.name,
+          'requested': requestedQty,
+          'added': totalLiveStock,
+          'missing': requestedQty - totalLiveStock,
+        });
+      }
+
+      final candidateBatch = batches.isNotEmpty
+          ? (p.getAutoFefoBatch(matchedProd.name) ?? batches.first)
+          : matchedProd;
+
+      _addItemToGridFromPaste(candidateBatch, actualAddedQty);
+      addedItems.add({
+        'name': candidateBatch.name,
+        'batch': candidateBatch.batch,
+        'qty': actualAddedQty,
+      });
+    }
+
+    if (addedItems.isNotEmpty) {
+      _calculateFooter();
+      setState(() {});
+    }
+
+    if (shortageItems.isNotEmpty || unavailableItems.isNotEmpty) {
+      _showClipboardStockShortageDialog(
+        addedCount: addedItems.length,
+        shortageItems: shortageItems,
+        unavailableItems: unavailableItems,
+      );
+    } else if (addedItems.isNotEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text("Successfully pasted ${addedItems.length} items from clipboard into sales bill!"),
+          backgroundColor: Colors.green.shade800,
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("No matching products with available stock were found in clipboard text."),
+          backgroundColor: Colors.orange,
+          duration: Duration(seconds: 3),
+        ),
+      );
+    }
+  }
+
+  void _addItemToGridFromPaste(Product p, int qty) {
+    int pack = p.packSize > 0 ? p.packSize : 1;
+    double unitMrp = p.mrp / pack;
+    double unitSRate = (p.salePrice > 0 ? p.salePrice : p.mrp) / pack;
+    double unitLCost = p.landingCost / pack;
+
+    SaleItem newItem = SaleItem(
+      product: Product(
+        id: p.id,
+        name: p.name,
+        batch: p.batch,
+        expiry: p.expiry,
+        packSize: p.packSize > 0 ? p.packSize : 1,
+        mrp: p.mrp,
+        salePrice: p.salePrice > 0 ? p.salePrice : p.mrp,
+        purchaseRate: p.purchaseRate,
+        landingCost: p.landingCost,
+        gstPercent: p.gstPercent,
+        rack: p.rack,
+        category: p.category,
+        manufacturer: p.manufacturer,
+        genericName: p.genericName,
+        stock: p.stock,
+      ),
+      qty: qty,
+      packin: pack,
+      mrp: unitMrp,
+      sRate: unitSRate,
+      taxableSP: unitSRate,
+      discPercent: 0,
+      discAmt: 0,
+      gstPercent: p.gstPercent,
+      total: unitSRate * qty,
+      landingCost: unitLCost,
+      purchaseRate: p.purchaseRate / pack,
+    );
+
+    _recalculateItemSilent(newItem, isGstMode: _gstType == 1);
+    _items.add(newItem);
+    int newRowIdx = _items.length - 1;
+    _getGridCtrl(newRowIdx, 1).text = newItem.product.name;
+    _getGridCtrl(newRowIdx, 2).text = newItem.product.batch;
+    _getGridCtrl(newRowIdx, 3).text = newItem.product.expiry;
+    _getGridCtrl(newRowIdx, 4).text = newItem.product.rack;
+    _getGridCtrl(newRowIdx, 5).text = newItem.packin.toString();
+    _getGridCtrl(newRowIdx, 7).text = newItem.qty.toString();
+  }
+
+  void _showClipboardStockShortageDialog({
+    required int addedCount,
+    required List<Map<String, dynamic>> shortageItems,
+    required List<String> unavailableItems,
+  }) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        title: Row(
+          children: [
+            Icon(Icons.inventory_2_outlined, color: Colors.orange.shade800, size: 26),
+            const SizedBox(width: 10),
+            const Text("Clipboard Paste Stock Report", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+          ],
+        ),
+        content: SizedBox(
+          width: 520,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                "Added $addedCount item(s) to sales bill. Below are stock shortages and unavailable items:",
+                style: const TextStyle(fontSize: 13, color: Colors.black87),
+              ),
+              const SizedBox(height: 12),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 280),
+                child: SingleChildScrollView(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      if (shortageItems.isNotEmpty) ...[
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(color: Colors.orange.shade100, borderRadius: BorderRadius.circular(4)),
+                          child: Text("PARTIAL STOCK SHORTAGES (${shortageItems.length})",
+                              style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.orange.shade900)),
+                        ),
+                        const SizedBox(height: 6),
+                        ...shortageItems.map((s) => Padding(
+                          padding: const EdgeInsets.only(bottom: 6, left: 4),
+                          child: Row(
+                            children: [
+                              const Icon(Icons.warning_amber_rounded, size: 16, color: Colors.orange),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  "${s['name']} — Requested: ${s['requested']}, Added: ${s['added']} (Shortage: ${s['missing']})",
+                                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                                ),
+                              ),
+                            ],
+                          ),
+                        )),
+                        const SizedBox(height: 12),
+                      ],
+                      if (unavailableItems.isNotEmpty) ...[
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(color: Colors.red.shade100, borderRadius: BorderRadius.circular(4)),
+                          child: Text("NOT AVAILABLE IN STOCK (${unavailableItems.length})",
+                              style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.red.shade900)),
+                        ),
+                        const SizedBox(height: 6),
+                        ...unavailableItems.map((u) => Padding(
+                          padding: const EdgeInsets.only(bottom: 6, left: 4),
+                          child: Row(
+                            children: [
+                              const Icon(Icons.cancel_outlined, size: 16, color: Colors.red),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  u,
+                                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.red.shade900),
+                                ),
+                              ),
+                            ],
+                          ),
+                        )),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.blue.shade800),
+            child: const Text("OK, GOT IT", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+  }
+
   void _saveSale({
     bool isEdit = false,
     String? primaryAcc,
@@ -3358,55 +4359,56 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     String? secondaryAcc,
     double? secondaryAmt,
   }) async {
+    AppLogger.instance.info("USER_ACTION", "[SAVE_CLICKED] Save button clicked for Sales Entry #${formatSaleDisplayNo(_entryNo)} ($_entryNo) [IsEdit: $isEdit]");
+
     // 1. Hard Re-entrancy Guard (Stops duplicate saves)
     if (_isSaving || _isLoading) return;
+
+    // === STRICT OFFLINE SAVE BLOCK ===
+    if (!ServerConfigService.instance.isConnected) {
+      _isSaving = false;
+      if (mounted) setState(() {});
+      AppDialogs.showFastDialog(
+        context: context,
+        title: "Server Disconnected",
+        content: "SERVER DISCONNECTED — WORKING IN OFFLINE READ-ONLY MODE\n\nCannot save sales invoice while disconnected from Supabase Cloud Server.",
+      );
+      return;
+    }
+
     _isSaving = true;
+    if (mounted) setState(() {});
 
-    // --- MANDATORY FIELDS CHECK (Account Name, Patient Name, Doctor Name) ---
-    final String chosenPrimaryAcc = (primaryAcc != null && primaryAcc.trim().isNotEmpty)
-        ? primaryAcc.trim()
-        : (_customerAccCtrl.text.trim().isNotEmpty
-            ? _customerAccCtrl.text.trim()
-            : _customerAcc.trim());
-    final String chosenPatient = _patientCtrl.text.trim();
-    final String chosenDoctor = _doctorCtrl.text.trim();
+    final p = Provider.of<PharmacyProvider>(context, listen: false);
 
-    if (chosenPrimaryAcc.isEmpty) {
-      _isSaving = false;
-      _customerAccFocus.requestFocus();
-      _showFastDialog(
-        title: "Validation Error",
-        content: "Account Name is mandatory. Please enter Account Name before saving.",
-      );
-      return;
-    }
+      // --- MANDATORY FIELDS CHECK (Account Name, Patient Name, Doctor Name) ---
+      final String chosenPrimaryAcc = (primaryAcc != null && primaryAcc.trim().isNotEmpty)
+          ? primaryAcc.trim()
+          : (_customerAccCtrl.text.trim().isNotEmpty
+              ? _customerAccCtrl.text.trim()
+              : (_customerAcc.trim().isNotEmpty ? _customerAcc.trim() : "Cash"));
+      final String chosenPatient = _patientCtrl.text.trim().isNotEmpty ? _patientCtrl.text.trim() : "P1";
+      final String chosenDoctor = _doctorCtrl.text.trim().isNotEmpty ? _doctorCtrl.text.trim() : "D1";
 
-    if (chosenPatient.isEmpty) {
-      _isSaving = false;
-      _patientFocus.requestFocus();
-      _showFastDialog(
-        title: "Validation Error",
-        content: "Patient Name is mandatory. Please enter Patient Name before saving.",
-      );
-      return;
-    }
+      if (chosenPrimaryAcc.isEmpty) {
+        _customerAccFocus.requestFocus();
+        _isSaving = false;
+        if (mounted) setState(() {});
+        _showFastDialog(
+          title: "Validation Error",
+          content: "Account Name is mandatory. Please enter Account Name before saving.",
+        );
+        return;
+      }
 
-    if (chosenDoctor.isEmpty) {
-      _isSaving = false;
-      _doctorFocus.requestFocus();
-      _showFastDialog(
-        title: "Validation Error",
-        content: "Doctor Name is mandatory. Please enter Doctor Name before saving.",
-      );
-      return;
-    }
-
-    final validItems = _items.where((it) => it.product.name.trim().isNotEmpty).toList();
-    if (validItems.isEmpty) {
-      _isSaving = false;
-      _showFastDialog(title: "No Items", content: "Please add at least one valid item before saving.");
-      return;
-    }
+      final validItems = _items.where((it) => it.product.name.trim().isNotEmpty).toList();
+      if (validItems.isEmpty || _cachedValidationError != null) {
+        _isSaving = false;
+        if (mounted) setState(() {});
+        final errText = _cachedValidationError ?? "Please add at least one valid item before saving.";
+        _showFastDialog(title: "Incomplete Data", content: errText);
+        return;
+      }
 
     // --- Statutory Schedule H1 / Schedule X / Narcotic Compliance Guard ---
     final regulatedItems = validItems.where((it) {
@@ -3416,6 +4418,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
     if (regulatedItems.isNotEmpty) {
       List<String> restrictedNames = regulatedItems.map((it) => "${it.product.name} (Schedule: ${it.product.schedule})").toList();
+      _isSaving = false;
+      if (mounted) setState(() {});
       final complianceResult = await showDialog<ScheduleH1ComplianceResult>(
         context: context,
         barrierDismissible: false,
@@ -3426,15 +4430,12 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         ),
       );
       if (!mounted) return;
-      if (!mounted) return;
 
       if (complianceResult == null) {
-        _isSaving = false;
         return; // User cancelled statutory compliance entry
       }
 
       if (complianceResult.doctorName.trim().isEmpty) {
-        _isSaving = false;
         _showFastDialog(
           title: "Validation Error",
           content: "Doctor Name is mandatory before saving.",
@@ -3443,7 +4444,6 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       }
 
       if (complianceResult.patientName.trim().isEmpty) {
-        _isSaving = false;
         _showFastDialog(
           title: "Validation Error",
           content: "Patient Name is mandatory before saving.",
@@ -3454,6 +4454,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       _doctorCtrl.text = complianceResult.doctorName;
       _doctorRegNoCtrl.text = complianceResult.doctorRegNo;
       _patientCtrl.text = complianceResult.patientName;
+      _isSaving = true;
+      if (mounted) setState(() {});
     }
 
     if (!mounted) return;
@@ -3468,14 +4470,115 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     // Build combined batch usage map across ALL rows before saving
     Map<String, int> combinedBillBatchUsage = {};
     for (var it in validItems) {
-      if (it.product.id.isEmpty || it.product.batch.isEmpty) continue;
-      String key = "${it.product.id}|${it.product.batch.trim().toUpperCase()}";
+      String resolvedProdId = it.product.id.trim();
+      if (resolvedProdId.isEmpty) {
+        resolvedProdId = p.getProductMasterByName(it.product.name)?.id.trim() ?? "";
+        if (resolvedProdId.isNotEmpty) {
+          it.product = it.product.copyWith(id: resolvedProdId);
+        }
+      }
+      if (resolvedProdId.isEmpty || it.product.batch.trim().isEmpty) continue;
+      
+      String key = "$resolvedProdId|${it.product.batch.trim().toUpperCase()}";
       combinedBillBatchUsage[key] = (combinedBillBatchUsage[key] ?? 0) + it.qty;
+    }
+
+    // --- PRE-SAVE BATCH STOCK INTEGRITY GATE ---
+    List<String> zeroStockViolations = [];
+    for (var entry in combinedBillBatchUsage.entries) {
+      final parts = entry.key.split('|');
+      final pId = parts[0];
+      final batchNo = parts[1];
+      final requiredQty = entry.value;
+
+      int availableStock = 0;
+      final matchingProduct = p.products.cast<Product?>().firstWhere(
+        (prod) => prod != null && prod.id == pId && prod.batch.trim().toUpperCase() == batchNo,
+        orElse: () => null,
+      );
+      if (matchingProduct != null) {
+        availableStock = matchingProduct.stock;
+      }
+
+      if (availableStock < requiredQty) {
+        final prodName = matchingProduct?.name ?? p.getProductMasterByName(pId)?.name ?? "Product";
+        zeroStockViolations.add("• $prodName (Batch: $batchNo) — Required: $requiredQty, Available Stock in Batch: $availableStock");
+      }
+    }
+
+    if (zeroStockViolations.isNotEmpty) {
+      _isSaving = false;
+      if (mounted) setState(() {});
+      await showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+          title: const Row(
+            children: [
+              Icon(Icons.warning_amber_rounded, color: Colors.red, size: 28),
+              SizedBox(width: 10),
+              Text("Insufficient Batch Stock", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+            ],
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  "The following item(s) selected a batch with zero or insufficient stock:\n",
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                ),
+                Text(
+                  zeroStockViolations.join("\n\n"),
+                  style: const TextStyle(fontSize: 12, color: Colors.red, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 12),
+                const Text(
+                  "Please select an active batch with available stock before saving.",
+                  style: TextStyle(fontSize: 12, color: Colors.blueGrey),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.blue.shade800, foregroundColor: Colors.white),
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text("OK, I WILL FIX BATCH", style: TextStyle(fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+      );
+      return;
     }
 
     double discAmt = double.tryParse(_footerDiscAmtCtrl.text) ?? 0.0;
     double otherAmt = double.tryParse(_otherChargeAmtCtrl.text) ?? 0.0;
     double lessCr = double.tryParse(_salesReturnCtrl.text) ?? 0.0;
+
+    // --- Role-Based Discount Threshold Protection ---
+    if (sub > 0 && discAmt > 0) {
+      double discPct = (discAmt / sub) * 100.0;
+      if (discPct > 10.0 && p.securityToggles['require_pin_high_discount'] != false) {
+        if (!p.isAdminSessionActive()) {
+          _isSaving = false;
+          if (mounted) setState(() {});
+          bool isUnlocked = await PinUnlockDialog.show(
+            context,
+            p,
+            title: "High Discount Protection (${discPct.toStringAsFixed(1)}%)",
+            message: "Enter Master Password to approve discount exceeding 10%.",
+          );
+          if (!mounted) return;
+          if (!isUnlocked) {
+            return;
+          }
+          _isSaving = true;
+          if (mounted) setState(() {});
+        }
+      }
+    }
 
     double finalVal = sub - discAmt + otherAmt - lessCr;
     double roundedNet = finalVal.roundToDouble();
@@ -3493,6 +4596,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     double finalGrandTotal = roundedNet;
     if (finalGrandTotal < 1.0) {
       _isSaving = false;
+      if (mounted) setState(() {});
       _showFastDialog(
         title: "Invalid Amount",
         content: "The Grand Total must be at least ₹1.00. Please verify quantities and discounts before saving.",
@@ -3508,8 +4612,6 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         chosenPrimaryAcc == "UPI" ||
         chosenPrimaryAcc == "Card" ||
         (chosenRcvdAmt >= (finalGrandTotal - 0.05));
-
-    final p = Provider.of<PharmacyProvider>(context, listen: false);
 
     int getTotalLiveStockForBatch(Product prod) {
       final candidateBatches = p.getBatchesForProduct(prod.id, prod.name);
@@ -3530,11 +4632,14 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       final it = _items[i];
       if (it.product.name.trim().isEmpty) continue; // Skip blank trailing rows
 
-      // 1. Verify Product Name exists in Product Master
-      bool isValidProduct = p.getProductMasterByName(it.product.name) != null;
+      // 1. Verify Product Name exists in Product Master or RAM
+      bool isValidProduct = it.product.name.trim().isNotEmpty &&
+          (p.getProductMasterByName(it.product.name) != null ||
+           p.products.any((prod) => prod.name.trim().toLowerCase() == it.product.name.trim().toLowerCase()) ||
+           p.productMaster.any((pm) => pm.name.trim().toLowerCase() == it.product.name.trim().toLowerCase()));
       if (!isValidProduct) {
         _errorCells.putIfAbsent(i, () => {}).add(1); // Column 1: Product Name
-        validationErrors.add("Row ${i + 1}: '${it.product.name}' is not selected or fully typed from the dropdown list.");
+        validationErrors.add("Row ${i + 1}: '${it.product.name}' is missing or invalid product name.");
       }
 
       // 2. Verify Batch Selection & Expiry Format (MM/YY)
@@ -3564,7 +4669,11 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       }
 
       // 4. Verify Stock Availability Constraint
-      String batchKey = "${it.product.id}|${it.product.batch.trim().toUpperCase()}";
+      String resolvedProdId = it.product.id.trim();
+      if (resolvedProdId.isEmpty) {
+        resolvedProdId = p.getProductMasterByName(it.product.name)?.id.trim() ?? "";
+      }
+      String batchKey = "$resolvedProdId|${it.product.batch.trim().toUpperCase()}";
       int existingInvoiceQty = isEdit ? (_originalInvoiceBatchQtys[batchKey] ?? 0) : 0;
       int liveStock = getTotalLiveStockForBatch(it.product) + existingInvoiceQty;
       if (liveStock <= 0) {
@@ -3579,13 +4688,62 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     // If any rule fails, highlight the cells in soft red and block saving entirely
     if (validationErrors.isNotEmpty) {
       _isSaving = false;
-      setState(() {});
+      if (mounted) setState(() {});
       AppDialogs.showFastDialog(
         context: context, 
         title: "Save Blocked: Incomplete Data", 
         content: validationErrors.join("\n")
       );
       return;
+    }
+
+    // 4. CONCURRENT EDIT LOCK CHECK
+    if ((_isExistingEntry || isEdit) && _loadedInvoiceUpdatedAt.isNotEmpty && ServerConfigService.instance.isConnected) {
+      final bool hasConflict = await p.checkConcurrentInvoiceEditConflict(
+        entryNo: _entryNo,
+        loadedUpdatedAt: _loadedInvoiceUpdatedAt,
+      );
+      if (hasConflict) {
+        _isSaving = false;
+        if (mounted) setState(() {});
+        _showFastDialog(
+          title: "Concurrent Edit Lock",
+          content: "Invoice #$_entryNo was updated on PC1 while you were editing. Please reload.",
+        );
+        return;
+      }
+    }
+
+    // 3. PRE-SAVE STOCK COLLISION GUARD
+    if (ServerConfigService.instance.isConnected) {
+      final verificationFutures = combinedBillBatchUsage.entries.map((entry) async {
+        final parts = entry.key.split('|');
+        final prodId = parts[0];
+        final batchNo = parts[1];
+        final reqQty = entry.value;
+
+        final stockCheck = await p.verifyStockOnlineFirst(
+          productId: prodId,
+          batchNumber: batchNo,
+          requestedQty: reqQty,
+        );
+        return MapEntry(entry.key, stockCheck);
+      }).toList();
+
+      final verificationResults = await Future.wait(verificationFutures);
+      for (var res in verificationResults) {
+        if (!res.value.isAvailable) {
+          final parts = res.key.split('|');
+          final batchNo = parts[1];
+          _isSaving = false;
+          if (mounted) setState(() {});
+          _showFastDialog(
+            title: "Stock Conflict Warning",
+            content: "Stock Conflict Warning: Batch '$batchNo' stock was recently sold on another counter. Only ${res.value.serverStock.toInt()} remaining.",
+          );
+          return;
+        }
+      }
     }
 
     if (!isEdit) {
@@ -3598,6 +4756,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
       if (isDuplicate) {
         if (!mounted) return;
+        _isSaving = false;
+        if (mounted) setState(() {});
         bool confirmSave = await showDialog(
           context: context,
           builder: (ctx) => AlertDialog(
@@ -3630,92 +4790,42 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           ),
         ) ?? false;
         if (!mounted) return;
-        if (!mounted) return;
 
-        if (!confirmSave) {
-          _isSaving = false;
-          return;
-        }
+        if (!confirmSave) return;
+        _isSaving = true;
+        if (mounted) setState(() {});
       }
     }
 
     setState(() => _errorCells.clear());
-    bool hasError = false;
-    String validationError = "";
-
-    // === ⚡ HIGH-SPEED VALIDATION LOOP (Fixes Analysis #5, #6) ===
-    // Validate accumulated quantities against live shelf stock
-    for (int i = 0; i < _items.length; i++) {
-      final it = _items[i];
-      if (it.product.name.trim().isEmpty) continue;
-
-      if (it.qty <= 0) {
-        _errorCells.putIfAbsent(i, () => {}).add(6);
-        hasError = true;
-        validationError = "Quantity for ${it.product.name} is zero. Please enter a valid quantity.";
-        continue;
-      }
-
-      if (it.product.batch.trim().isEmpty) {
-        _errorCells.putIfAbsent(i, () => {}).add(3);
-        hasError = true;
-        validationError = "One or more items are missing Batch selection.";
-        continue;
-      }
-
-      // Expiry validation (kept from original)
-      final parts = it.product.expiry.split(RegExp(r'[-/]'));
-      if (parts.length == 2) {
-        int? month = int.tryParse(parts[0].trim());
-        int? year = int.tryParse(parts[1].trim());
-
-        if (month == null || month < 1 || month > 12 || year == null) {
-          _errorCells.putIfAbsent(i, () => {}).add(4);
-          hasError = true;
-          validationError = "Row ${i+1}: Invalid expiry month (${it.product.expiry}). Must be between 01 and 12.";
-          continue;
-        }
-      } else {
-        _errorCells.putIfAbsent(i, () => {}).add(4);
-        hasError = true;
-        validationError = "Row ${i+1}: Expiry must follow MM/YY format.";
-        continue;
-      }
-
-      String key = "${it.product.id}|${it.product.batch.trim().toUpperCase()}";
-      int totalAggregatedQty = combinedBillBatchUsage[key] ?? it.qty;
-      int existingInvoiceQty = isEdit ? (_originalInvoiceBatchQtys[key] ?? 0) : 0;
-      int availableLiveStock = getTotalLiveStockForBatch(it.product) + existingInvoiceQty;
-
-      if (totalAggregatedQty > availableLiveStock) {
-        _errorCells.putIfAbsent(i, () => {}).add(6);
-        hasError = true;
-        validationError = "Total billed quantity for '${it.product.name}' (Batch: ${it.product.batch}) is $totalAggregatedQty, which exceeds the available stock of $availableLiveStock.";
-      }
-
-      if (it.total < 0.001) {
-        _errorCells.putIfAbsent(i, () => {}).add(13);
-        hasError = true;
-        validationError = "Row ${i+1}: Item sale value must be at least ₹0.001";
-      }
-    }
-
-    if (hasError) {
-      _isSaving = false;
-      setState(() {});
-      await _showFastDialog(title: "Validation Error", content: validationError);
-      if (!mounted) return;
-      return;
-    }
-
-    // =================================================
-
-    setState(() => _isLoading = true);
 
     try {
       final days = int.tryParse(_daysCtrl.text) ?? 0;
-      final String finalEntryNo = isEdit ? _entryNo : "";
+      // 1. DYNAMIC NUMBER CLAIMING & OVERWRITE PROTECTION (Only for NEW bills, not when editing)
+      String finalEntryNo = isEdit ? _entryNo : "";
+      if (!isEdit) {
+        _date = DateTime.now();
+        final requested = (_entryNo.isNotEmpty && _entryNo != "...") ? _entryNo : await p.getNextSaleEntryNo();
+        final resolvedNo = await p.resolveGuaranteedNextEntryNo('sales_invoices', requested, excludePrefix: 'SO-');
+        if (resolvedNo != requested && requested.isNotEmpty) {
+          if (mounted) {
+            final dispReq = formatSaleDisplayNo(requested);
+            final dispRes = formatSaleDisplayNo(resolvedNo);
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text("Bill #$dispReq already taken. Automatically saved as Bill #$dispRes"),
+                backgroundColor: Colors.blue.shade800,
+                duration: const Duration(seconds: 4),
+              ),
+            );
+          }
+        }
+        finalEntryNo = resolvedNo;
+        _entryNo = resolvedNo;
+        _entryNoCtrl.text = formatSaleDisplayNo(_entryNo);
+      }
 
+      // 2. Build the invoice object with the confirmed number and terminal ID
       final sale = SaleInvoice(
         entryNo: finalEntryNo, 
         date: _date,
@@ -3745,6 +4855,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         specialCustomerPhone: _specialCustomerPhoneCtrl.text,
         salesReturn: double.tryParse(_salesReturnCtrl.text) ?? 0.0,
         orderType: _orderType,
+        financialYear: p.selectedFinancialYear,
       );
 
       // Patient Registration Check (Ignores defaults and whitespace)
@@ -3785,65 +4896,120 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         }
       }
 
-      await p.saveSale(sale);
-      if (!mounted) return;
-      await p.clearSaleDraft();
-      if (!mounted) return;
-
-      // Write edit history only after the database transaction succeeds
-      if (isEdit && _originalLoadedInvoice != null) {
-        List<Map<String, dynamic>> completeOldSnapshot = _originalLoadedInvoice!.items.map((i) => {
-          'name': i.product.name,
-          'batch': i.product.batch,
-          'expiry': i.product.expiry,
-          'qty': i.qty,
-          'pack': i.product.packSize,
-          'mrp': i.mrp,
-          's_rate': i.sRate,
-          'disc_percent': i.discPercent,
-          'disc_amt': i.discAmt,
-          'gst_percent': i.gstPercent,
-          'total': i.total,
-        }).toList();
-
-        List<Map<String, dynamic>> completeNewSnapshot = validItems.map((i) => {
-          'name': i.product.name,
-          'batch': i.product.batch,
-          'expiry': i.product.expiry,
-          'qty': i.qty,
-          'pack': i.product.packSize,
-          'mrp': i.mrp,
-          's_rate': i.sRate,
-          'disc_percent': i.discPercent,
-          'disc_amt': i.discAmt,
-          'gst_percent': i.gstPercent,
-          'total': i.total,
-        }).toList();
-
-        await p.logEditHistory(
-          entryNo: finalEntryNo,
-          oldTotal: _originalLoadedInvoice!.grandTotal,
-          oldItemsJson: jsonEncode(completeOldSnapshot),
-          newItemsJson: jsonEncode(completeNewSnapshot),
-          reason: "Manual Edit",
-        );
+      // Save to database
+      try {
+        await p.saveSaleOnlineFirst(sale, isEditMode: isEdit);
+      } catch (e) {
         if (!mounted) return;
+        await AppDialogs.showFastDialog(
+          context: context,
+          title: "Pure Cloud Live Save Failed",
+          content: "Unable to save bill to Cloud Server.\n\n${e.toString().replaceAll('Exception: ', '')}",
+        );
+        return; // Abort clearing form so user's typed items are preserved
+      }
+      if (!mounted) return;
+
+      // Broadcast instant 1ms local network update to PC 2 and PC 3
+      final eventId = "EVT_${DateTime.now().microsecondsSinceEpoch}_${Random().nextInt(100000)}";
+      final invoiceMap = {
+        'entry_no': finalEntryNo,
+        'terminal_id': ServerConfigService.instance.terminalId,
+        'event_id': eventId,
+      };
+      final deductions = validItems.map((it) => {
+        'batch_id': it.product.batch,
+        'product_id': it.product.id,
+        'quantity_deducted': (it.qty + it.fQty) * it.packin,
+      }).toList();
+
+      LanSyncService.instance.broadcastEvent('SALE_SAVED', {
+        'event_id': eventId,
+        'entry_no': finalEntryNo,
+        'invoice': invoiceMap,
+        'batch_deductions': deductions,
+      });
+      LanSyncService.instance.broadcastEvent('SALE_COMPLETED', {
+        'event_id': eventId,
+        'entry_no': finalEntryNo,
+        'terminal_id': ServerConfigService.instance.terminalId,
+        'invoice': invoiceMap,
+        'batch_deductions': deductions,
+        'items': validItems.map((it) => {
+          'product_id': it.product.id,
+          'product_name': it.product.name,
+          'batch_number': it.product.batch,
+          'qty': it.qty,
+        }).toList(),
+      });
+
+      unawaited(p.clearSaleDraft());
+
+      // Write edit history asynchronously in background without blocking UI thread
+      if (isEdit && _originalLoadedInvoice != null) {
+        unawaited(() async {
+          List<Map<String, dynamic>> completeOldSnapshot = _originalLoadedInvoice!.items.map((i) => {
+            'name': i.product.name,
+            'batch': i.product.batch,
+            'expiry': i.product.expiry,
+            'qty': i.qty,
+            'pack': i.product.packSize,
+            'mrp': i.mrp,
+            's_rate': i.sRate,
+            'disc_percent': i.discPercent,
+            'disc_amt': i.discAmt,
+            'gst_percent': i.gstPercent,
+            'total': i.total,
+          }).toList();
+
+          List<Map<String, dynamic>> completeNewSnapshot = validItems.map((i) => {
+            'name': i.product.name,
+            'batch': i.product.batch,
+            'expiry': i.product.expiry,
+            'qty': i.qty,
+            'pack': i.product.packSize,
+            'mrp': i.mrp,
+            's_rate': i.sRate,
+            'disc_percent': i.discPercent,
+            'disc_amt': i.discAmt,
+            'gst_percent': i.gstPercent,
+            'total': i.total,
+          }).toList();
+
+          await p.logEditHistory(
+            entryNo: finalEntryNo,
+            oldTotal: _originalLoadedInvoice!.grandTotal,
+            oldItemsJson: jsonEncode(completeOldSnapshot),
+            newItemsJson: jsonEncode(completeNewSnapshot),
+            reason: "Manual Edit",
+          );
+        }());
       }
 
       SystemSound.play(SystemSoundType.alert);
 
+      AppLogger.instance.info("BUSINESS", "[SAVE_COMPLETED] Sales Entry #${formatSaleDisplayNo(finalEntryNo)} ($finalEntryNo) saved successfully.");
+
+      final bool bgSyncEnabled = ServerConfigService.instance.bgSyncOnSave;
+      if (bgSyncEnabled) {
+        DeltaSyncService.instance.triggerBackgroundSync(forcePostSave: true);
+        SupabaseSyncService.instance.triggerInstantSync();
+      }
+
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
+        _isDirty = false;
+        final messenger = ScaffoldMessenger.of(context);
+        await _resetPage(force: true);
+        if (!mounted) return;
+        messenger.showSnackBar(
           SnackBar(
             content: const Text("Entry Saved", style: TextStyle(fontWeight: FontWeight.bold)),
             backgroundColor: Colors.green.shade800,
             behavior: SnackBarBehavior.floating,
             margin: const EdgeInsets.only(bottom: 50, left: 10, right: 1000),
-            duration: const Duration(seconds: 3),
+            duration: const Duration(seconds: 2),
           ),
         );
-        _isDirty = false;
-        _resetPage(force: true);
       }
     } catch (e) {
       if (mounted) {
@@ -3853,66 +5019,94 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         );
       }
     } finally {
-      _isSaving = false;
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted) {
+        setState(() {
+          _isSaving = false;
+          _isLoading = false;
+        });
+      } else {
+        _isSaving = false;
+        _isLoading = false;
+      }
     }
   }
 
 
   // --- NEW: DELETE SALE METHOD ---
   void _deleteSale() async {
-    if (!_isExistingEntry) {
-      _showFastDialog(title: "Invalid Operation", content: "Cannot delete a new, unsaved entry.");
-      return;
-    }
+    AppLogger.instance.info("USER_ACTION", "[DELETE_CLICKED] Delete requested for Sales Entry #${formatSaleDisplayNo(_entryNo)} ($_entryNo)");
 
-    final p = Provider.of<PharmacyProvider>(context, listen: false);
+    if (_isDeleting || _isSaving || _isLoading) return;
+    _isDeleting = true;
 
-    // 1. SECURITY CHECK: PIN for Deleting Sales
-    if (p.securityToggles['require_pin_delete_sales'] == true) {
-      if (!p.isAdminSessionActive()) {
-        bool isUnlocked = await PinUnlockDialog.show(
-            context,
-            p,
-            title: "Confirm Deletion",
-            message: "Enter Master Password to permanently delete Entry $_entryNo."
-        );
-        if (!mounted) return;
-        if (!isUnlocked) return;
-        p.refreshAdminSession();
+    try {
+      if (!_isExistingEntry) {
+        _showFastDialog(title: "Invalid Operation", content: "Cannot delete a new, unsaved entry.");
+        return;
       }
-    }
 
-    // PREVIOUS DAY LOCK CHECK REMOVED AS PER USER REQUEST
+      final p = Provider.of<PharmacyProvider>(context, listen: false);
 
-    final confirmed = await _showFastDialog(
-        title: "Delete Entry?",
-        content: "Are you sure you want to delete Sales Entry $_entryNo? This will restore the stock and mark the entry as deleted.",
-        isYesNo: true,
-        initialFocusIdx: 2
-    );
-    if (!mounted) return;
-
-    if (confirmed == true) {
-      setState(() => _isLoading = true);
-      try {
-        _isExistingEntry = false;
-        _originalLoadedInvoice = null;
-        await p.deleteSale(_entryNo);
-        if (!mounted) return;
-        p.logAudit('DELETE_SALE', 'Sales Entry $_entryNo deleted by ${_agentCtrl.text.isNotEmpty ? _agentCtrl.text : "Admin"}.', userId: _agentCtrl.text.isNotEmpty ? _agentCtrl.text : "Admin");
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text("Entry Deleted Successfully"), backgroundColor: Colors.red)
+      // 1. SECURITY CHECK: PIN for Deleting Sales
+      if (p.securityToggles['require_pin_delete_sales'] == true) {
+        if (!p.isAdminSessionActive()) {
+          bool isUnlocked = await PinUnlockDialog.show(
+              context,
+              p,
+              title: "Confirm Deletion",
+              message: "Enter Master Password to permanently delete Entry $_entryNo."
           );
-          _isDirty = false;
-          await _resetPage(force: true);
+          if (!mounted) return;
+          if (!isUnlocked) return;
+          p.refreshAdminSession();
         }
-      } catch (e) {
-        if (mounted) _showFastDialog(title: "Delete Failed", content: "Error: $e");
-      } finally {
-        if (mounted) setState(() => _isLoading = false);
       }
+
+      final confirmed = await _showFastDialog(
+          title: "Delete Entry?",
+          content: "Are you sure you want to delete Sales Entry $_entryNo? This will restore the stock and mark the entry as deleted.",
+          isYesNo: true,
+          initialFocusIdx: 2
+      );
+      if (!mounted) return;
+
+      if (confirmed == true) {
+        setState(() => _isLoading = true);
+        try {
+          final oldItems = await p.getCurrentInvoiceItems(_entryNo);
+          final oldItemsJson = jsonEncode(oldItems);
+          final oldTotal = double.tryParse(_netTotalCtrl.text) ?? 0.0;
+          final staffId = _agentCtrl.text.trim().isNotEmpty ? _agentCtrl.text.trim() : "Admin";
+
+          await p.logEditHistory(
+            entryNo: _entryNo,
+            oldTotal: oldTotal,
+            oldItemsJson: oldItemsJson,
+            newItemsJson: jsonEncode([]),
+            reason: "DELETED by $staffId: Sales Entry #$_entryNo marked as deleted",
+          );
+
+          _isExistingEntry = false;
+          _originalLoadedInvoice = null;
+          _loadedInvoiceUpdatedAt = "";
+          await p.deleteSale(_entryNo);
+          AppLogger.instance.info("BUSINESS", "[DELETE_COMPLETED] Sales Entry #${formatSaleDisplayNo(_entryNo)} ($_entryNo) marked as DELETED.");
+          if (!mounted) return;
+          p.logAudit('DELETE_SALE', 'Sales Entry $_entryNo deleted by $staffId.', userId: staffId);
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text("Entry Deleted Successfully"), backgroundColor: Colors.red)
+            );
+            _isDirty = false;
+            await _resetPage(force: true);
+          }
+        } catch (e) {
+          if (mounted) _showFastDialog(title: "Delete Failed", content: "Error: $e");
+        }
+      }
+    } finally {
+      _isDeleting = false;
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
@@ -4011,9 +5205,19 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       int targetDays = userTypedDays > 0 ? userTypedDays : selected.days;
 
       setState(() {
-        _patientCtrl.text = selected.patientName;
+        _items.clear();
+        String patStr = selected.patientName.trim();
+        if (patStr.isEmpty || patStr.toLowerCase() == 'general' || patStr.toLowerCase() == 'unknown') {
+          patStr = 'P1';
+        }
+        _patientCtrl.text = patStr;
         _mobileCtrl.text = selected.mobile;
-        _doctorCtrl.text = selected.doctorName;
+
+        String docStr = selected.doctorName.trim();
+        if (docStr.isEmpty || docStr.toLowerCase() == 'unknown' || docStr.toLowerCase() == 'dr. unknown') {
+          docStr = 'D1';
+        }
+        _doctorCtrl.text = docStr;
         if (targetDays > 0) {
           _daysCtrl.text = targetDays.toString();
         } else {
@@ -4075,7 +5279,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
               product: Product(
                   id: batch.id, name: batch.name, batch: batch.batch, expiry: batch.expiry,
                   packSize: batch.packSize, mrp: batch.mrp, salePrice: batch.salePrice,
-                  purchaseRate: batch.purchaseRate, gstPercent: batch.gstPercent,
+                  purchaseRate: batch.purchaseRate, landingCost: batch.landingCost, gstPercent: batch.gstPercent,
                   rack: batch.rack, category: batch.category, manufacturer: batch.manufacturer,
                   genericName: batch.genericName
               )..stock = totalLoose,
@@ -4088,6 +5292,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
               discAmt: 0,
               gstPercent: batch.gstPercent,
               total: unitSRate * qtyToTake,
+              purchaseRate: batch.purchaseRate / ps,
+              landingCost: batch.landingCost > 0 ? (batch.landingCost / ps) : (batch.purchaseRate / ps),
               dailyDosage: dailyDosage,
               originalExportQty: exportQty,
             ));
@@ -4115,10 +5321,20 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       return;
     }
 
+    String docStr = _doctorCtrl.text.trim();
+    if (docStr.isEmpty || docStr.toLowerCase() == 'unknown' || docStr.toLowerCase() == 'dr. unknown') {
+      docStr = 'D1';
+    }
+
+    String patStr = _patientCtrl.text.trim();
+    if (patStr.isEmpty || patStr.toLowerCase() == 'general' || patStr.toLowerCase() == 'unknown') {
+      patStr = 'P1';
+    }
+
     final p = Prescription(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
-      patientName: _patientCtrl.text,
-      doctorName: _doctorCtrl.text,
+      patientName: patStr,
+      doctorName: docStr,
       mobile: _mobileCtrl.text,
       days: int.tryParse(_daysCtrl.text) ?? 0,
       date: _date,
@@ -4183,37 +5399,32 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       _originalLoadedInvoice = null;
       _isDirty = false;
       _isDeleted = false;
+      _isImported = false;
 
       final p = Provider.of<PharmacyProvider>(context, listen: false);
+      p.clearReservedEntryNumbers();
       p.clearSaleDraft();
       p.clearSalesSession(p.activeSessionIdx); // Clear the global RAM session
       p.saveSalesDrafts(); // Persist the cleared state so it doesn't return on restart
 
       _closeAllDropdowns();
       FocusScope.of(context).unfocus();
-      await Future.delayed(Duration.zero);
-      if (!mounted) return;
+
+      // Clear & recycle all grid controllers including active next row
+      _clearGridMaps();
 
       setState(() {
-        // 1. MASS DISPOSAL (Stops RAM Leaks)
-        for (var m in _gridCtrls.values) { for (var c in m.values) { c.dispose(); } }
-        for (var m in _gridFocusNodes.values) { for (var f in m.values) { f.dispose(); } }
-        for (var c in _nextRowCtrls.values) { c.dispose(); }
-        for (var f in _nextRowNodes.values) { f.dispose(); }
-
-        _gridCtrls.clear();
-        _gridFocusNodes.clear();
-        _nextRowCtrls.clear();
-        _nextRowNodes.clear();
-
         _lastSyncedProdName = "";
         _footerAlts = [];
         _activeGenericName = "";
         _productHistory = [];
 
         _isExistingEntry = false;
+        _isBlankRecord = false;
+        _isRcvdAmtConfirmed = false;
         _isDirty = false; // Reset dirty flag on new
         _isDeleted = false;
+        _isImported = false;
         _items.clear();
         _errorCells.clear();
         _discountInteractedRows.clear();
@@ -4224,6 +5435,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         _showSpecialOrderSidebar = false;
         _isSpecialOrderMinimized = false;
         _date = DateTime.now();
+        _timeNotifier.value = DateFormat('hh:mm a').format(_date);
         _patientCtrl.text = "P1";
         _mobileCtrl.clear();
         _doctorCtrl.text = "D1";
@@ -4240,19 +5452,20 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         _footerDiscAmtCtrl.text = "0.00";
         _originalInvoiceBatchQtys.clear();
         _originalLoadedInvoice = null;
+        _loadedInvoiceUpdatedAt = "";
         _originalItemSnapshots.clear();
         _highlightEdits = false;
         _specialOrderQtys.clear();
         _extraSpecialItems.clear();
+        _entryNo = "";
+        _rawEntryNo = "";
+        _entryNoCtrl.text = "...";
+        _calculateFooter();
       });
 
-      final nextNo = await p.getNextSaleEntryNo();
-      if (!mounted) return;
+      await _initializeNewBillNumber();
+
       if (mounted) {
-        setState(() {
-          _entryNo = nextNo;
-          _calculateFooter();
-        });
         _focusProductFirstBox();
       }
     } finally {
@@ -4289,7 +5502,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   }
 
   void _triggerAutoSaveDraft() async {
-    if (_isExistingEntry) return;
+    if (_isDisposed || !mounted || _isExistingEntry) return;
 
     final p = Provider.of<PharmacyProvider>(context, listen: false);
 
@@ -4297,7 +5510,9 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       if (_lastDraftSavedStateDirty) {
         p.clearSaleDraft();
         p.clearSalesSession(p.activeSessionIdx);
-        await p.saveSalesDrafts();
+        try {
+          await p.saveSalesDrafts().timeout(const Duration(seconds: 3));
+        } catch (_) {}
         if (!mounted) return;
         _lastDraftSavedStateDirty = false;
       }
@@ -4306,7 +5521,9 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
     if (_lastDraftSavedStateDirty) {
       _syncToGlobalSession();
-      await p.saveSalesDrafts();
+      try {
+        await p.saveSalesDrafts().timeout(const Duration(seconds: 3));
+      } catch (_) {}
       if (!mounted) return;
       _lastDraftSavedStateDirty = false;
     }
@@ -4328,11 +5545,27 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
            });
         }
 
-        return Focus(
-          focusNode: _rootFocus,
-          onKeyEvent: (node, event) => _handleGlobalKeys(event) ? KeyEventResult.handled : KeyEventResult.ignored,
-          child: FocusScope(
-          child: Scaffold(
+        return PopScope(
+          canPop: _items.isEmpty,
+          onPopInvokedWithResult: (didPop, result) async {
+            if (didPop) return;
+            if (_items.isNotEmpty) {
+              bool? exit = await _showFastDialog(
+                title: "Unsaved Invoice Items",
+                content: "You have unsaved items in the sales grid. Exit without saving?",
+                isYesNo: true,
+                initialFocusIdx: 2,
+              );
+              if (exit == true && context.mounted) {
+                Navigator.of(context).pop();
+              }
+            }
+          },
+          child: Focus(
+            focusNode: _rootFocus,
+            onKeyEvent: (node, event) => _handleGlobalKeys(event) ? KeyEventResult.handled : KeyEventResult.ignored,
+            child: FocusScope(
+            child: Scaffold(
             backgroundColor: AppColors.of(context).background,
             body: Stack(
               clipBehavior: Clip.none,
@@ -4341,6 +5574,54 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                   children: [
                     // Top Section: Toolbar, Header & Right Side Order Box / Notification Hub
                     _buildTopSection(),
+
+                    if (!ServerConfigService.instance.isConnected)
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        color: const Color(0xFF991B1B),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.cloud_off_rounded, color: Colors.amberAccent, size: 20),
+                            const SizedBox(width: 10),
+                            const Expanded(
+                              child: Text(
+                                "SERVER DISCONNECTED — WORKING IN OFFLINE READ-ONLY MODE",
+                                style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13, letterSpacing: 0.5),
+                              ),
+                            ),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              decoration: BoxDecoration(color: const Color(0xFF450A0A), borderRadius: BorderRadius.circular(4), border: Border.all(color: Colors.amberAccent)),
+                              child: const Text("OFFLINE", style: TextStyle(color: Colors.amberAccent, fontWeight: FontWeight.bold, fontSize: 11)),
+                            ),
+                          ],
+                        ),
+                      ),
+
+                    if (_isImported)
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        color: const Color(0xFF1E3A8A),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.lock_rounded, color: Colors.cyanAccent, size: 20),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                "🔒 HISTORICAL IMPORTED ENTRY: Sales Invoice #$_entryNo is locked (Read-Only). Use Stock Adjustment for inventory changes.",
+                                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13, letterSpacing: 0.5),
+                              ),
+                            ),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              decoration: BoxDecoration(color: const Color(0xFF1E1B4B), borderRadius: BorderRadius.circular(4), border: Border.all(color: Colors.cyanAccent)),
+                              child: const Text("READ-ONLY", style: TextStyle(color: Colors.cyanAccent, fontWeight: FontWeight.bold, fontSize: 11)),
+                            ),
+                          ],
+                        ),
+                      ),
 
                     if (_isDeleted)
                       Container(
@@ -4361,6 +5642,30 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                               decoration: BoxDecoration(color: const Color(0xFF450A0A), borderRadius: BorderRadius.circular(4), border: Border.all(color: Colors.amberAccent)),
                               child: const Text("READ-ONLY", style: TextStyle(color: Colors.amberAccent, fontWeight: FontWeight.bold, fontSize: 11)),
+                            ),
+                          ],
+                        ),
+                      ),
+
+                    if (_isBlankRecord)
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        color: const Color(0xFF1E293B),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.info_outline_rounded, color: Colors.lightBlueAccent, size: 20),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                "ℹ️ UNCREATED / BLANK ENTRY: Entry #$_entryNo has no saved invoice data in the database.",
+                                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13, letterSpacing: 0.5),
+                              ),
+                            ),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              decoration: BoxDecoration(color: const Color(0xFF0F172A), borderRadius: BorderRadius.circular(4), border: Border.all(color: Colors.lightBlueAccent)),
+                              child: const Text("BLANK DRAFT", style: TextStyle(color: Colors.lightBlueAccent, fontWeight: FontWeight.bold, fontSize: 11)),
                             ),
                           ],
                         ),
@@ -4406,19 +5711,23 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                         _colWidths.forEach((_, v) => finalTw += v);
                         if (finalTw < availableWidth) finalTw = availableWidth;
 
-                        return Scrollbar(
-                            controller: _gridScrollCtrl, thumbVisibility: true,
-                            child: SingleChildScrollView(
-                                scrollDirection: Axis.horizontal, controller: _gridScrollCtrl,
-                                child: SizedBox(
-                                    width: finalTw, height: con.maxHeight,
-                                    child: Column(children: [
-                                      _buildGridHeader(),
-                                      Expanded(child: _buildGrid()),
-                                      _buildTotalsRow(finalTw),
-                                    ])
-                                )
-                            )
+                        return AnimatedOpacity(
+                          opacity: _isLayoutReady ? 1.0 : 0.0,
+                          duration: const Duration(milliseconds: 100),
+                          child: _safeScrollbar(
+                              controller: _gridScrollCtrl, thumbVisibility: true,
+                              child: SingleChildScrollView(
+                                  scrollDirection: Axis.horizontal, controller: _gridScrollCtrl,
+                                  child: SizedBox(
+                                      width: finalTw, height: con.maxHeight,
+                                      child: Column(children: [
+                                        _buildGridHeader(),
+                                        Expanded(child: _buildGrid()),
+                                        _buildTotalsRow(finalTw),
+                                      ])
+                                  )
+                              )
+                          ),
                         );
                       }),
                     ),
@@ -4429,11 +5738,16 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                 Positioned.fill(child: _buildOverlay()),
                 _buildAgentWatermark(),
                 if (_showSpecialOrderSidebar && !_isSpecialOrderMinimized) _buildSpecialOrderPanel(),
+                if (_activeNotificationTab != "none")
+                  _isNotificationHubMinimized
+                      ? _buildMinimizedNotificationBadge()
+                      : _buildOrderDrawerPanel(),
                 if (_isLoading) Container(color: Colors.black12, child: const Center(child: CircularProgressIndicator())),
               ],
             ),
           ),
         ),
+      ),
       );
       },
     );
@@ -4442,24 +5756,32 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   // ---> NEW: SMART EDIT TRACKING <---
 
   bool _hasMeaningfulEdits() {
-    if (!_isExistingEntry || _originalLoadedInvoice == null) return false;
+    if (!_isExistingEntry) return false;
+    if (_originalLoadedInvoice == null) return _isDirty;
 
     if (_patientCtrl.text.trim().toUpperCase() != _originalLoadedInvoice!.patient.trim().toUpperCase()) return true;
     if (_doctorCtrl.text.trim().toUpperCase() != _originalLoadedInvoice!.doctor.trim().toUpperCase()) return true;
+    if (_mobileCtrl.text.trim() != _originalLoadedInvoice!.mobile.trim()) return true;
+    if (_customerAcc != _originalLoadedInvoice!.customerAcc) return true;
 
     double currentDiscAmt = double.tryParse(_footerDiscAmtCtrl.text) ?? 0.0;
     if ((currentDiscAmt - _originalLoadedInvoice!.discount).abs() > 0.01) return true;
 
     final validItems = _items.where((it) => it.product.name.trim().isNotEmpty).toList();
-    if (validItems.length != _originalItemSnapshots.length) return true;
+    final origItems = _originalLoadedInvoice!.items;
+    if (validItems.length != origItems.length) return true;
 
-    for (var it in validItems) {
-      if (!_originalItemSnapshots.containsKey(it)) return true;
-      final snap = _originalItemSnapshots[it]!;
-      if (it.qty != snap['qty']) return true;
-      if (it.product.batch.trim().toUpperCase() != snap['batch']) return true;
-      if ((it.discPercent - (snap['discPercent'] as double)).abs() > 0.01) return true;
-      if (it.product.name.trim().toUpperCase() != snap['name']) return true;
+    for (int i = 0; i < validItems.length; i++) {
+      final it = validItems[i];
+      final orig = origItems[i];
+
+      if (it.product.name.trim().toUpperCase() != orig.product.name.trim().toUpperCase()) return true;
+      if (it.product.batch.trim().toUpperCase() != orig.product.batch.trim().toUpperCase()) return true;
+      if (it.qty != orig.qty) return true;
+      if (it.fQty != orig.fQty) return true;
+      if ((it.mrp - orig.mrp).abs() > 0.01) return true;
+      if ((it.sRate - orig.sRate).abs() > 0.01) return true;
+      if ((it.discPercent - orig.discPercent).abs() > 0.01) return true;
     }
 
     return false;
@@ -4477,10 +5799,20 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
   @override
   bool hasUnsavedChanges() {
+    double total = _grandTotalNotifier.value;
+    if (total <= 0) {
+      total = double.tryParse(_netTotalCtrl.text) ?? 0.0;
+    }
+    if (total <= 0) {
+      total = _items.fold(0.0, (s, i) => s + i.total);
+    }
+    // If grand total is 0 or less, NEVER show unsaved changes popup
+    if (total <= 0) return false;
+
     if (_isExistingEntry) {
-      return _hasMeaningfulEdits() || _isDirty;
+      return _hasMeaningfulEdits();
     } else {
-      return _grandTotalNotifier.value > 1.0;
+      return total > 1.0;
     }
   }
 
@@ -4498,10 +5830,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
     final result = await showUnsavedChangesDialog(context);
     if (!mounted) return false;
-    if (result == UnsavedDialogResult.showDifference) {
-      showDifferences();
-      return false;
-    } else if (result == UnsavedDialogResult.discard) {
+    if (result == UnsavedDialogResult.discard) {
       return true;
     } else {
       return false;
@@ -4509,9 +5838,11 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   }
 
   Widget _buildTopToolbar() {
-    bool canSave = !_isExistingEntry && !_isDeleted;
-    bool canEdit = _isExistingEntry && !_isDeleted;
-    bool canDelete = _isExistingEntry && !_isDeleted;
+    final bool isConnected = ServerConfigService.instance.isConnected;
+    bool hasEdits = hasUnsavedChanges();
+    bool canSave = isConnected && !_isDeleted && !_isImported && (!_isExistingEntry || hasEdits);
+    bool canEdit = isConnected && _isExistingEntry && !_isDeleted && !_isImported && !hasEdits;
+    bool canDelete = isConnected && _isExistingEntry && !_isDeleted && !_isImported;
 
     final c = AppColors.of(context);
     return Container(
@@ -4553,7 +5884,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                       Icon(Icons.biotech_rounded, size: 16, color: Colors.amber.shade900),
                       const SizedBox(width: 4),
                       Text(
-                        "Generic (F3)",
+                        "Generic (F2)",
                         style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.amber.shade900),
                       ),
                     ],
@@ -4577,24 +5908,20 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    _topActionBtn(Icons.add_box_rounded, "New", const Color(0xFF2196F3), onTap: _resetPage),
+                    _topActionBtn(Icons.add_box_rounded, "New (F1)", const Color(0xFF2196F3), onTap: _resetPage),
                     _topActionBtn(
                       Icons.check_circle_rounded,
-                      "Save",
+                      "Save (F6)",
                       canSave ? const Color(0xFF4CAF50) : Colors.grey.shade400,
                       textColor: canSave ? null : Colors.grey.shade400,
-                      onTap: canSave ? () => _saveSale(isEdit: false) : () {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text("Add at least one product item to save sale."), duration: Duration(seconds: 2)),
-                        );
-                      },
+                      onTap: canSave ? () => (_isExistingEntry ? _editSale() : _saveSale(isEdit: false)) : null,
                     ),
                     _topActionBtn(
                       Icons.edit_document,
                       "Edit",
-                      (canEdit && _isDirty) ? Colors.orange : Colors.grey.shade400,
-                      textColor: (canEdit && _isDirty) ? null : Colors.grey.shade400,
-                      onTap: (canEdit && _isDirty) ? _editSale : () {
+                      canEdit ? Colors.orange : Colors.grey.shade400,
+                      textColor: canEdit ? null : Colors.grey.shade400,
+                      onTap: canEdit ? _editSale : () {
                         ScaffoldMessenger.of(context).showSnackBar(
                           SnackBar(content: Text(_isExistingEntry ? "No changes made to edit." : "Select an existing sale to edit."), duration: const Duration(seconds: 2)),
                         );
@@ -4607,7 +5934,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                       onTap: _showFindDialog,
                     ),
                     _topActionBtn(Icons.storefront_rounded, "Wholesale (F3)", const Color(0xFF3F51B5), onTap: _openWholesaleAvailability),
-                    _topActionBtn(Icons.print_rounded, "Print", const Color(0xFF607D8B), onTap: _printSale),
+                    _topActionBtn(Icons.print_rounded, "Print (F12)", const Color(0xFF607D8B), onTap: _printSale),
                     _topActionBtn(
                       Icons.delete_forever_rounded,
                       "Del",
@@ -4619,6 +5946,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                         );
                       },
                     ),
+                    _topActionBtn(Icons.sync_rounded, "Sync Settings", Colors.teal, onTap: _showSyncSettingsDialog),
                     _topActionBtn(Icons.info_outline_rounded, "Info & Guide", Colors.indigo, onTap: _showSalesManualAndLegendDialog),
                     const SizedBox(width: 4),
                     PopupMenuButton<String>(
@@ -4628,8 +5956,10 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                         if (val == 'pdf') _exportToPdf();
                         if (val == 'whatsapp') _shareInvoiceWhatsApp();
                         if (val == 'export') _exportToExcel();
-                        if (val == 'import') {}
-                        if (val == 'paste') {}
+                        if (val == 'copy') _copySalesGridToClipboard();
+                        if (val == 'paste') _pasteSalesGridFromClipboard();
+                        if (val == 'import') _importPrescription();
+                        if (val == 'sync_settings') _showSyncSettingsDialog();
                       },
                       itemBuilder: (ctx) => [
                         const PopupMenuItem(
@@ -4654,6 +5984,27 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                         ),
                         const PopupMenuDivider(),
                         const PopupMenuItem(
+                          value: 'copy',
+                          child: Row(
+                            children: [
+                              Icon(Icons.copy_rounded, color: Colors.blue, size: 20),
+                              SizedBox(width: 10),
+                              Text("Copy Grid to Clipboard", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                            ],
+                          ),
+                        ),
+                        const PopupMenuItem(
+                          value: 'paste',
+                          child: Row(
+                            children: [
+                              Icon(Icons.paste_rounded, color: Colors.teal, size: 20),
+                              SizedBox(width: 10),
+                              Text("Paste Clipboard (Smart Stock)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                            ],
+                          ),
+                        ),
+                        const PopupMenuDivider(),
+                        const PopupMenuItem(
                           value: 'export',
                           child: Row(
                             children: [
@@ -4670,17 +6021,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                             children: [
                               Icon(Icons.file_upload_outlined, color: Colors.blueGrey, size: 20),
                               SizedBox(width: 10),
-                              Text("Import Excel", style: TextStyle(fontSize: 13)),
-                            ],
-                          ),
-                        ),
-                        const PopupMenuItem(
-                          value: 'paste',
-                          child: Row(
-                            children: [
-                              Icon(Icons.paste_rounded, color: Colors.blueGrey, size: 20),
-                              SizedBox(width: 10),
-                              Text("Paste Clipboard", style: TextStyle(fontSize: 13)),
+                              Text("Import Prescription / Excel", style: TextStyle(fontSize: 13)),
                             ],
                           ),
                         ),
@@ -4696,21 +6037,31 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     );
   }
 
-
-
-
+  Widget _safeScrollbar({
+    required ScrollController controller,
+    required Widget child,
+    bool thumbVisibility = false,
+    double? thickness,
+  }) {
+    if (!controller.hasClients) return child;
+    return Scrollbar(
+      controller: controller,
+      thumbVisibility: thumbVisibility,
+      thickness: thickness,
+      child: child,
+    );
+  }
 
   Widget _buildTopSection() {
-    final pharma = Provider.of<PharmacyProvider>(context);
-    if (pharma.prescriptions.any((pr) => !pr.isImported) && !_activeNotificationTab.contains("mobile")) {
-      // Logic to auto-set if needed, but for now we'll stick to provider source
-    }
-    bool showMobileBadge = pharma.prescriptions.any((pr) => !pr.isImported) && _hasNewMobileOrder;
+    return Consumer<PharmacyProvider>(
+      builder: (context, p, _) {
+        final hasNewMobileOrder = p.prescriptions.any((pr) => !pr.isImported);
+        bool showMobileBadge = hasNewMobileOrder && _hasNewMobileOrder;
 
-    return Container(
-      height: 132,
-      color: Colors.white,
-      child: Row(
+        return Container(
+          height: 132,
+          color: Colors.white,
+          child: Row(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           // LEFT SIDE: Toolbar & Billing Inputs (Responsive)
@@ -4724,16 +6075,20 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
             ),
           ),
 
-          const SizedBox(width: 1, child: VerticalDivider(width: 1, thickness: 1, color: Color(0xFFE0E0E0))),
+          // CENTER-RIGHT: Priority Reorder & Urgent Dock
+          _buildPriorityReorderColumn(),
 
-          // MIDDLE: The 4 Vertical Notification Buttons (Yellow Box Column)
+          const VerticalDivider(width: 1, thickness: 1, color: Color(0xFFE0E0E0)),
+
+          // FAR-RIGHT: The 4 Vertically Aligned Notification Hub Toggle Buttons
           Container(
-            width: 135,
+            width: 125,
             decoration: const BoxDecoration(
               color: Colors.white,
               border: Border(
-                bottom: BorderSide(color: Colors.grey, width: 0.5)
-              )
+                left: BorderSide(color: Color(0xFFE0E0E0), width: 0.5),
+                bottom: BorderSide(color: Colors.grey, width: 0.5),
+              ),
             ),
             padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
             child: Column(
@@ -4746,27 +6101,263 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
               ],
             ),
           ),
+        ],
+      ),
+    );
+      },
+    );
+  }
 
-          // RIGHT SIDE: The Notification Hub
+  Widget _buildPriorityReorderColumn() {
+    // 1. Tier 1: Urgent Orders (Retain all items including ordered)
+    final tier1Urgent = List<Map<String, dynamic>>.from(_urgentOrders);
+
+    // 2. Tier 2: Special Orders (Retain all items including ordered)
+    final tier2Special = List<Map<String, dynamic>>.from(_specialOrdersList);
+
+    // Zero stock items
+    final zeroStockItems = _lowStockOrders.where((i) => ((i['stock'] as num?)?.toInt() ?? 0) <= 0).toList();
+
+    // 3. Tier 3: High Rank (> 3) Zero Stock - Sorted High to Low
+    final tier3HighRank = zeroStockItems.where((i) {
+      final double r = (i['rank'] as num?)?.toDouble() ?? 0.0;
+      return r > 3.0;
+    }).toList()..sort((a, b) => ((b['rank'] as num?)?.toDouble() ?? 0.0).compareTo((a['rank'] as num?)?.toDouble() ?? 0.0));
+
+    // 4. Tier 4: Medium Rank (3 to 4) Zero Stock
+    final tier4MedRank = zeroStockItems.where((i) {
+      final double r = (i['rank'] as num?)?.toDouble() ?? 0.0;
+      return r >= 3.0 && r <= 4.0 && !tier3HighRank.contains(i);
+    }).toList()..sort((a, b) => ((b['rank'] as num?)?.toDouble() ?? 0.0).compareTo((a['rank'] as num?)?.toDouble() ?? 0.0));
+
+    // 5. Tier 5: Low Rank (< 3) Zero Stock
+    final tier5LowRank = zeroStockItems.where((i) {
+      final double r = (i['rank'] as num?)?.toDouble() ?? 0.0;
+      return r < 3.0 && !tier3HighRank.contains(i) && !tier4MedRank.contains(i);
+    }).toList()..sort((a, b) => ((b['rank'] as num?)?.toDouble() ?? 0.0).compareTo((a['rank'] as num?)?.toDouble() ?? 0.0));
+
+    int totalPriorityCount = tier1Urgent.length + tier2Special.length + tier3HighRank.length + tier4MedRank.length + tier5LowRank.length;
+
+    return Container(
+      width: 380,
+      height: 132,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border(
+          left: BorderSide(color: Colors.grey.shade300, width: 1.0),
+          bottom: const BorderSide(color: Colors.grey, width: 0.5),
+        ),
+      ),
+      child: Column(
+        children: [
+          // LIGHT SLATE TABLE COLUMN HEADERS
           Container(
-            width: 420,
+            height: 32,
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
             decoration: BoxDecoration(
-              color: Colors.white,
-              border: Border(
-                left: BorderSide(color: Colors.blueGrey.shade200),
-                bottom: const BorderSide(color: Colors.grey, width: 0.5)
-              ),
+              color: const Color(0xFFF1F5F9),
+              border: Border(bottom: BorderSide(color: Colors.grey.shade300)),
             ),
-            child: _buildOverlayContent(),
+            child: const Row(
+              children: [
+                Expanded(
+                  child: Center(
+                    child: Text(
+                      "PRODUCT NAME",
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF334155)),
+                    ),
+                  ),
+                ),
+                SizedBox(
+                  width: 52,
+                  child: Center(
+                    child: Text(
+                      "PHYSICAL\nQTY",
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Color(0xFF334155), height: 1.1),
+                    ),
+                  ),
+                ),
+                SizedBox(
+                  width: 52,
+                  child: Center(
+                    child: Text(
+                      "ORDER\nQTY",
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Color(0xFF334155), height: 1.1),
+                    ),
+                  ),
+                ),
+                SizedBox(
+                  width: 52,
+                  child: Center(
+                    child: Text(
+                      "ORDERED\nQTY",
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Color(0xFF334155), height: 1.1),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // TIERS LIST BODY
+          Expanded(
+            child: totalPriorityCount == 0
+                ? Center(
+                    child: Text(
+                      _isLoadingNotifications ? "Loading priorities..." : "No zero stock alerts found.",
+                      style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold, color: Color(0xFF0F172A)),
+                    ),
+                  )
+                : _safeScrollbar(
+                    controller: _tierListScrollCtrl,
+                    thumbVisibility: true,
+                    thickness: 4,
+                    child: ListView(
+                      controller: _tierListScrollCtrl,
+                      padding: EdgeInsets.zero,
+                      children: [
+                        if (tier1Urgent.isNotEmpty)
+                          ...tier1Urgent.map((item) => _priorityItemTile(item, badgeText: "URGENT", badgeColor: Colors.red.shade700)),
+                        if (tier2Special.isNotEmpty)
+                          ...tier2Special.map((item) => _priorityItemTile(item, badgeText: "SPECIAL", badgeColor: Colors.purple.shade700)),
+                        if (tier3HighRank.isNotEmpty)
+                          ...tier3HighRank.map((item) {
+                            final double r = (item['rank'] as num?)?.toDouble() ?? 0.0;
+                            return _priorityItemTile(item, badgeText: r > 0 ? "R${r.toStringAsFixed(1)}" : "HIGH", badgeColor: Colors.orange.shade800);
+                          }),
+                        if (tier4MedRank.isNotEmpty)
+                          ...tier4MedRank.map((item) {
+                            final double r = (item['rank'] as num?)?.toDouble() ?? 0.0;
+                            return _priorityItemTile(item, badgeText: r > 0 ? "R${r.toStringAsFixed(1)}" : "MED", badgeColor: Colors.amber.shade800);
+                          }),
+                        if (tier5LowRank.isNotEmpty)
+                          ...tier5LowRank.map((item) {
+                            final double r = (item['rank'] as num?)?.toDouble() ?? 0.0;
+                            return _priorityItemTile(item, badgeText: r > 0 ? "R${r.toStringAsFixed(1)}" : "LOW", badgeColor: Colors.blueGrey.shade700);
+                          }),
+                      ],
+                    ),
+                  ),
           ),
         ],
       ),
     );
   }
 
-  Future<void> _loadNotificationData() async {
+  Widget _priorityItemTile(Map<String, dynamic> item, {required String badgeText, required Color badgeColor}) {
+    final int stockQty = (item['stock'] as num?)?.toInt() ?? 0;
+    final int orderQty = (item['qty'] as num?)?.toInt() ?? 10;
+    final bool isOrdered = item['ordered'] == true;
+    final dynamic orderedQtyVal = item['ordered_qty'] ?? (isOrdered ? orderQty : null);
+
+    return Container(
+      height: 26,
+      padding: const EdgeInsets.symmetric(horizontal: 3),
+      decoration: BoxDecoration(
+        color: isOrdered ? Colors.blue.shade50.withValues(alpha: 0.3) : Colors.white,
+        border: Border(bottom: BorderSide(color: Colors.grey.shade200)),
+      ),
+      child: Row(
+        children: [
+          // 1. PRODUCT NAME
+          Expanded(
+            child: Text(
+              item['name'] ?? '',
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+                color: isOrdered ? Colors.grey.shade700 : Colors.black,
+                decoration: isOrdered ? TextDecoration.lineThrough : TextDecoration.none,
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+
+          // 2. PHYSICAL QTY
+          SizedBox(
+            width: 52,
+            child: Center(
+              child: Text(
+                "$stockQty",
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                  color: stockQty <= 0 ? Colors.red.shade700 : Colors.blueGrey.shade700,
+                ),
+              ),
+            ),
+          ),
+
+          // 3. ORDER QTY
+          SizedBox(
+            width: 52,
+            child: Center(
+              child: Text(
+                "$orderQty",
+                style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.blue.shade900),
+              ),
+            ),
+          ),
+
+          // 4. ORDERED QTY (Editable field)
+          SizedBox(
+            width: 52,
+            child: Center(
+              child: Container(
+                height: 20,
+                width: 38,
+                padding: const EdgeInsets.symmetric(horizontal: 1),
+                decoration: BoxDecoration(
+                  color: isOrdered ? Colors.white : Colors.grey.shade100,
+                  borderRadius: BorderRadius.circular(3),
+                  border: Border.all(color: isOrdered ? Colors.blue.shade400 : Colors.grey.shade300),
+                ),
+                child: TextField(
+                  key: ValueKey('ord_qty_${item['id']}_$orderedQtyVal'),
+                  controller: TextEditingController(text: orderedQtyVal != null ? "$orderedQtyVal" : ""),
+                  keyboardType: TextInputType.number,
+                  style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black),
+                  textAlign: TextAlign.center,
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    contentPadding: EdgeInsets.zero,
+                    border: InputBorder.none,
+                  ),
+                  onSubmitted: (v) {
+                    final int? val = int.tryParse(v.trim());
+                    setState(() {
+                      if (val != null && val > 0) {
+                        item['ordered_qty'] = val;
+                        item['ordered'] = true;
+                        item['pending'] = false;
+                      } else {
+                        item['ordered_qty'] = null;
+                        item['ordered'] = false;
+                        item['pending'] = true;
+                      }
+                    });
+                  },
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _loadNotificationData({bool forceRefresh = false}) async {
     if (!mounted) return;
-    setState(() => _isLoadingNotifications = true);
+    if (_urgentOrders.isEmpty && _lowStockOrders.isEmpty && _specialOrdersList.isEmpty) {
+      setState(() => _isLoadingNotifications = true);
+    } else if (forceRefresh) {
+      // Background update without blocking UI loader
+    }
     try {
       final p = Provider.of<PharmacyProvider>(context, listen: false);
       final reorderList = await p.getReorderSuggestions();
@@ -4774,21 +6365,61 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
       final rawSpecial = await p.fetchSpecialOrders();
       if (!mounted) return;
+
+      final Map<String, ProductRanking> rankingsMap = await p.getProductRankingsMap();
+
+      // Existing maps to preserve user toggles & order quantities
+      final Map<dynamic, bool> existingUrgentOrdered = {for (var i in _urgentOrders) i['id']: i['ordered'] ?? false};
+      final Map<dynamic, bool> existingUrgentPending = {for (var i in _urgentOrders) i['id']: i['pending'] ?? false};
+      final Map<dynamic, int> existingUrgentQty = {for (var i in _urgentOrders) i['id']: i['qty']};
+      final Map<dynamic, dynamic> existingUrgentOrderedQty = {for (var i in _urgentOrders) i['id']: i['ordered_qty']};
+
+      final Map<dynamic, bool> existingLowStockOrdered = {for (var i in _lowStockOrders) i['id']: i['ordered'] ?? false};
+      final Map<dynamic, bool> existingLowStockPending = {for (var i in _lowStockOrders) i['id']: i['pending'] ?? false};
+      final Map<dynamic, int> existingLowStockQty = {for (var i in _lowStockOrders) i['id']: i['qty']};
+      final Map<dynamic, dynamic> existingLowStockOrderedQty = {for (var i in _lowStockOrders) i['id']: i['ordered_qty']};
+
+      final Map<dynamic, bool> existingSpecialOrdered = {for (var i in _specialOrdersList) i['id']: i['ordered'] ?? false};
+      final Map<dynamic, bool> existingSpecialPending = {for (var i in _specialOrdersList) i['id']: i['pending'] ?? false};
+      final Map<dynamic, dynamic> existingSpecialOrderedQty = {for (var i in _specialOrdersList) i['id']: i['ordered_qty']};
+
+      final Set<String> validMasterNames = {};
+      for (var pm in p.productMaster) {
+        if (pm.isActive && p.isValidProductName(pm.name)) {
+          final trimmed = pm.name.trim().toLowerCase();
+          if (trimmed.isNotEmpty) validMasterNames.add(trimmed);
+        }
+      }
+
       List<Map<String, dynamic>> specialItems = [];
       for (var s in rawSpecial) {
         try {
           List<dynamic> list = jsonDecode(s['special_order_json']);
           for (var item in list) {
+            final String prodName = (item['name'] ?? '').toString().trim();
+            if (prodName.isEmpty) continue;
+            if (!p.isValidProductName(prodName)) continue;
+            // Only include in Order Book if product exists in Product Master catalog!
+            if (!validMasterNames.contains(prodName.toLowerCase())) continue;
+
+            final String itemId = '${s['entry_no']}_$prodName';
+            final bool wasOrdered = existingSpecialOrdered[itemId] ?? false;
+            final bool wasPending = existingSpecialPending[itemId] ?? !wasOrdered;
+            final dynamic wasOrderedQty = existingSpecialOrderedQty[itemId] ?? (wasOrdered ? (item['qty'] ?? 1) : null);
+
             specialItems.add({
               'entry_no': s['entry_no'],
-              'name': item['name'] ?? 'Product',
+              'id': itemId,
+              'name': prodName,
               'qty': item['qty'] ?? 1,
+              'ordered_qty': wasOrderedQty,
               'stock': item['stock'] ?? 0,
+              'p_rate': (item['p_rate'] as num?)?.toDouble() ?? (item['purchase_rate'] as num?)?.toDouble() ?? 0.0,
               'patient': (s['special_customer_name']?.toString().isNotEmpty ?? false)
                   ? s['special_customer_name']
                   : s['patient'] ?? '',
-              'ordered': false,
-              'pending': true,
+              'ordered': wasOrdered,
+              'pending': wasPending,
             });
           }
         } catch (_) {}
@@ -4798,25 +6429,63 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       List<Map<String, dynamic>> lowStock = [];
 
       for (var item in reorderList) {
-        final String name = item['product_name'] ?? item['name'] ?? 'Product';
+        final dynamic id = item['id'];
+        final String pId = item['id']?.toString() ?? '';
+        final String name = (item['product_name'] ?? item['name'] ?? 'Product').toString().trim();
+        if (name.isEmpty) continue;
+        if (!p.isValidProductName(name)) continue;
+        if (!validMasterNames.contains(name.toLowerCase())) continue;
         final int currentStock = (item['current_stock'] as num?)?.toInt() ?? 0;
         final int reorderLevel = (item['reorder_level'] as num?)?.toInt() ?? 10;
         final int suggestedQty = (item['suggested_qty'] as num?)?.toInt() ?? 10;
+        final double pRate = (item['purchase_rate'] as num?)?.toDouble() ?? (item['p_rate'] as num?)?.toDouble() ?? 0.0;
 
-        final mapObj = {
-          'id': item['id'],
+        double rankScore = 0.0;
+        final pr = rankingsMap[pId] ?? rankingsMap[name.toUpperCase().trim()];
+        if (pr != null) {
+          rankScore = pr.weightedScore;
+        }
+
+        final bool wasUrgentOrdered = existingUrgentOrdered[id] ?? false;
+        final bool wasUrgentPending = existingUrgentPending[id] ?? (currentStock <= reorderLevel);
+        final int urgentQty = existingUrgentQty[id] ?? (suggestedQty > 0 ? suggestedQty : (reorderLevel - currentStock > 0 ? reorderLevel - currentStock : 10));
+        final dynamic wasUrgentOrderedQty = existingUrgentOrderedQty[id] ?? (wasUrgentOrdered ? urgentQty : null);
+
+        final bool wasLowStockOrdered = existingLowStockOrdered[id] ?? false;
+        final bool wasLowStockPending = existingLowStockPending[id] ?? (currentStock <= reorderLevel);
+        final int lowStockQty = existingLowStockQty[id] ?? (suggestedQty > 0 ? suggestedQty : (reorderLevel - currentStock > 0 ? reorderLevel - currentStock : 10));
+        final dynamic wasLowStockOrderedQty = existingLowStockOrderedQty[id] ?? (wasLowStockOrdered ? lowStockQty : null);
+
+        final mapUrgentObj = {
+          'id': id,
           'name': name,
-          'qty': suggestedQty > 0 ? suggestedQty : (reorderLevel - currentStock > 0 ? reorderLevel - currentStock : 10),
+          'qty': urgentQty,
+          'ordered_qty': wasUrgentOrderedQty,
           'stock': currentStock,
           'reorder_level': reorderLevel,
-          'ordered': false,
-          'pending': currentStock <= reorderLevel,
+          'p_rate': pRate,
+          'rank': rankScore,
+          'ordered': wasUrgentOrdered,
+          'pending': wasUrgentPending,
+        };
+
+        final mapLowStockObj = {
+          'id': id,
+          'name': name,
+          'qty': lowStockQty,
+          'ordered_qty': wasLowStockOrderedQty,
+          'stock': currentStock,
+          'reorder_level': reorderLevel,
+          'p_rate': pRate,
+          'rank': rankScore,
+          'ordered': wasLowStockOrdered,
+          'pending': wasLowStockPending,
         };
 
         if (currentStock <= reorderLevel) {
-          lowStock.add(mapObj);
+          lowStock.add(mapLowStockObj);
         }
-        urgent.add(mapObj);
+        urgent.add(mapUrgentObj);
       }
 
       if (mounted) {
@@ -4834,29 +6503,25 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   }
 
   Widget _hubToggleBtn({required String id, required IconData icon, required String label, required int count, required Color color, Color? badgeColor}) {
-    bool isSel = _activeNotificationTab == id;
+    bool isSel = _activeNotificationTab == id && !_isNotificationHubMinimized;
     return InkWell(
       onTap: () {
         setState(() {
-          if (_activeNotificationTab == id) {
+          if (_activeNotificationTab == id && !_isNotificationHubMinimized) {
             _activeNotificationTab = "none";
           } else {
             _activeNotificationTab = id;
-            _alertPage = 1;
+            _isNotificationHubMinimized = false;
             if (id == "mobile") _hasNewMobileOrder = false;
-            if (id == "special") {
-              _showSpecialOrderSidebar = true;
-              _isSpecialOrderMinimized = false;
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                _specialSearchFocus.requestFocus();
-              });
-            }
           }
         });
-        _loadNotificationData();
+        if (_urgentOrders.isEmpty && _lowStockOrders.isEmpty && _specialOrdersList.isEmpty) {
+          _loadNotificationData();
+        }
       },
       child: Container(
-        height: 28,
+        height: 29,
+        padding: const EdgeInsets.symmetric(horizontal: 4),
         decoration: BoxDecoration(
           color: isSel ? Colors.blue.shade50 : Colors.transparent,
           border: Border.all(color: isSel ? Colors.blue : Colors.transparent),
@@ -4864,110 +6529,40 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         ),
         child: Row(
           children: [
+            Icon(icon, size: 19, color: isSel ? Colors.blue : color),
             const SizedBox(width: 6),
-            Icon(icon, size: 15, color: isSel ? Colors.blue : color),
-            const SizedBox(width: 6),
-            Expanded(child: Text(label, style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: isSel ? Colors.blue : Colors.black87))),
+            Expanded(
+              child: Text(
+                label,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  color: isSel ? Colors.blue : Colors.black,
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
             if (count > 0)
               Container(
-                margin: const EdgeInsets.only(right: 4),
-                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                decoration: BoxDecoration(color: badgeColor ?? Colors.red, borderRadius: BorderRadius.circular(10)),
-                child: Text(count.toString(), style: const TextStyle(color: Colors.white, fontSize: 8.5, fontWeight: FontWeight.bold)),
+                margin: const EdgeInsets.only(left: 2),
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
+                decoration: BoxDecoration(
+                  color: badgeColor ?? Colors.red,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  count.toString(),
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 9.5,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
               ),
           ],
         ),
       ),
-    );
-  }
-
-  Widget _buildPagination(int totalItems) {
-    int totalPages = (totalItems / 10).ceil();
-    if (totalPages <= 1) return const SizedBox();
-
-    List<Widget> pages = [];
-    for (int i = 1; i <= totalPages; i++) {
-      bool isSel = _alertPage == i;
-      pages.add(InkWell(
-        onTap: () => setState(() => _alertPage = i),
-        child: Container(
-          margin: const EdgeInsets.symmetric(horizontal: 2),
-          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-          decoration: BoxDecoration(
-            color: isSel ? Colors.blue.shade700 : Colors.white,
-            borderRadius: BorderRadius.circular(4),
-            border: Border.all(color: isSel ? Colors.blue.shade800 : Colors.grey.shade300),
-          ),
-          child: Text(i.toString(), style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: isSel ? Colors.white : Colors.blueGrey)),
-        )
-      ));
-    }
-    return Row(mainAxisSize: MainAxisSize.min, children: pages);
-  }
-
-  Widget _buildOverlayContent() {
-    List<Map<String, dynamic>> currentData = [];
-    if (_activeNotificationTab == "urgent") {
-      currentData = _urgentOrders;
-    } else if (_activeNotificationTab == "stock") {
-      currentData = _lowStockOrders;
-    } else if (_activeNotificationTab == "special") {
-      currentData = _specialOrdersList;
-    }
-
-    if (_orderFilter == "ORDERED") {
-      currentData = currentData.where((i) => i['ordered'] == true).toList();
-    } else if (_orderFilter == "PENDING") {
-      currentData = currentData.where((i) => i['pending'] == true || i['ordered'] != true).toList();
-    }
-
-    int totalAlertItems = currentData.length;
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-          decoration: BoxDecoration(
-              color: Colors.blueGrey.shade50,
-              border: Border(bottom: BorderSide(color: Colors.grey.shade200))
-          ),
-          child: Row(
-            children: [
-              Text(
-                  _activeNotificationTab == "none" ? "Notifications Center" :
-                  _activeNotificationTab == "mobile" ? "Incoming Mobile Orders" :
-                  _activeNotificationTab == "urgent" ? "Urgent Order Book" :
-                  _activeNotificationTab == "special" ? "Special Orders List" : "Low Stock Alerts",
-                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF334155))
-              ),
-              const Spacer(),
-
-              if (_activeNotificationTab != "none") ...[
-                _buildPagination(totalAlertItems),
-                const SizedBox(width: 12),
-              ],
-
-              if (_activeNotificationTab == "none") ...[
-                _buildFilterOption("ORDERED"),
-                const SizedBox(width: 8),
-                _buildFilterOption("PENDING"),
-                const SizedBox(width: 8),
-              ],
-              if (_activeNotificationTab != "none")
-                InkWell(
-                  onTap: () => setState(() => _activeNotificationTab = "none"),
-                  child: const Icon(Icons.close, size: 18, color: Colors.red),
-                )
-            ],
-          ),
-        ),
-        Expanded(
-          child: _activeNotificationTab == "none"
-              ? const Center(child: Text("Select a tab on the left to view data.", style: TextStyle(color: Colors.grey, fontSize: 12)))
-              : _buildAlertList(_activeNotificationTab, currentData),
-        ),
-      ],
     );
   }
 
@@ -4978,190 +6573,410 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
         decoration: BoxDecoration(
-          color: isSelected ? const Color(0xFF334155) : Colors.white,
+          color: isSelected ? Colors.black : Colors.white,
           borderRadius: BorderRadius.circular(4),
-          border: Border.all(color: isSelected ? const Color(0xFF334155) : Colors.grey.shade400),
+          border: Border.all(color: isSelected ? Colors.black : Colors.grey.shade400),
         ),
         child: Text(
           label,
           style: TextStyle(
             fontSize: 9,
             fontWeight: FontWeight.bold,
-            color: isSelected ? Colors.white : const Color(0xFF334155),
+            color: isSelected ? Colors.white : Colors.black,
           ),
         ),
       ),
     );
   }
 
-  Widget _buildAlertList(String type, List<Map<String, dynamic>> currentData) {
-    if (_isLoadingNotifications) {
-      return const Center(
-        child: Padding(
-          padding: EdgeInsets.all(20),
-          child: CircularProgressIndicator(strokeWidth: 2),
+  Widget _drawerTabChip(String id, String label, int count, Color color) {
+    bool isSel = _activeNotificationTab == id;
+    return InkWell(
+      onTap: () => setState(() => _activeNotificationTab = id),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(
+          color: isSel ? color : Colors.white,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: isSel ? color : Colors.grey.shade300),
         ),
-      );
-    }
-
-    if (currentData.isEmpty) {
-      return Center(
-        child: Text(
-          "No ${type.toUpperCase()} items found.",
-          style: const TextStyle(color: Colors.grey, fontSize: 12),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              label,
+              style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: isSel ? Colors.white : Colors.black),
+            ),
+            if (count > 0) ...[
+              const SizedBox(width: 4),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                decoration: BoxDecoration(
+                  color: isSel ? Colors.white : color,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  "$count",
+                  style: TextStyle(fontSize: 8.5, fontWeight: FontWeight.bold, color: isSel ? color : Colors.white),
+                ),
+              ),
+            ]
+          ],
         ),
-      );
+      ),
+    );
+  }
+
+  Widget _buildMinimizedNotificationBadge() {
+    String label = "Order Alerts";
+    int count = 0;
+    if (_activeNotificationTab == "stock") {
+      label = "Low Stock Alerts";
+      count = _lowStockOrders.length;
+    } else if (_activeNotificationTab == "urgent") {
+      label = "Urgent Orders";
+      count = _urgentOrders.length;
+    } else if (_activeNotificationTab == "special") {
+      label = "Special Orders";
+      count = _specialOrdersList.length;
+    } else if (_activeNotificationTab == "mobile") {
+      label = "Mobile Orders";
+      count = 1;
     }
 
-    int startIdx = (_alertPage - 1) * 10;
-    int endIdx = startIdx + 10;
-    if (endIdx > currentData.length) endIdx = currentData.length;
-    if (startIdx >= currentData.length) {
-      startIdx = 0;
-      endIdx = currentData.length < 10 ? currentData.length : 10;
-    }
-
-    List<Map<String, dynamic>> pageData = currentData.sublist(startIdx, endIdx);
-
-    return Column(
-      children: [
-        // List Header
-        Container(
-          height: 24,
-          color: Colors.grey.shade100,
+    return Positioned(
+      top: 140,
+      right: 12,
+      child: InkWell(
+        onTap: () => setState(() => _isNotificationHubMinimized = false),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1E293B),
+            borderRadius: BorderRadius.circular(20),
+            boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 10, offset: Offset(0, 4))],
+            border: Border.all(color: Colors.blue.shade400, width: 1.5),
+          ),
           child: Row(
+            mainAxisSize: MainAxisSize.min,
             children: [
-              Container(width: 30, alignment: Alignment.center, child: const Text("SL", style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Colors.blueGrey))),
-              const Expanded(child: Padding(padding: EdgeInsets.only(left: 8), child: Text("PRODUCT", style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Colors.blueGrey)))),
-              Container(width: 40, alignment: Alignment.center, child: const Text("QTY", style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Colors.blueGrey))),
-              Container(width: 55, alignment: Alignment.center, child: const Text("ORDERED", style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Colors.blueGrey))),
-              Container(width: 55, alignment: Alignment.center, child: const Text("PENDING", style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Colors.blueGrey))),
+              const Icon(Icons.inventory_2_rounded, color: Colors.lightBlueAccent, size: 16),
+              const SizedBox(width: 8),
+              Text(
+                "$label ($count)",
+                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11),
+              ),
+              const SizedBox(width: 8),
+              const Icon(Icons.open_in_full_rounded, color: Colors.white, size: 14),
             ],
           ),
         ),
-        // List Body
-        Expanded(
-          child: Scrollbar(
-            thumbVisibility: true,
-            thickness: 4,
-            child: ListView.builder(
-              itemCount: pageData.length,
-              padding: EdgeInsets.zero,
-              itemBuilder: (ctx, i) {
-                final item = pageData[i];
-                final actualIdx = startIdx + i;
+      ),
+    );
+  }
 
-                void toggleOrdered() {
-                  setState(() {
-                    item['ordered'] = !(item['ordered'] ?? false);
-                    if (item['ordered'] == true) item['pending'] = false;
-                  });
-                }
+  Widget _buildOrderDrawerPanel() {
+    List<Map<String, dynamic>> currentData = [];
+    if (_activeNotificationTab == "urgent") {
+      currentData = _urgentOrders;
+    } else if (_activeNotificationTab == "stock") {
+      currentData = _lowStockOrders;
+    } else if (_activeNotificationTab == "special") {
+      currentData = _specialOrdersList;
+    } else {
+      currentData = [];
+    }
 
-                void togglePending() {
-                  setState(() {
-                    item['pending'] = !(item['pending'] ?? false);
-                    if (item['pending'] == true) item['ordered'] = false;
-                  });
-                }
+    if (_orderFilter == "ORDERED") {
+      currentData = currentData.where((i) => i['ordered'] == true).toList();
+    } else if (_orderFilter == "PENDING") {
+      currentData = currentData.where((i) => i['pending'] == true || i['ordered'] != true).toList();
+    }
 
-                final int stockQty = (item['stock'] as num?)?.toInt() ?? 0;
+    if (_drawerSearchQuery.trim().isNotEmpty) {
+      String q = _drawerSearchQuery.trim().toLowerCase();
+      currentData = currentData.where((i) {
+        String name = (i['name'] ?? '').toString().toLowerCase();
+        return name.contains(q);
+      }).toList();
+    }
 
-                return InkWell(
-                  onTap: toggleOrdered,
-                  child: Container(
-                    height: 38,
-                    decoration: BoxDecoration(border: Border(bottom: BorderSide(color: Colors.grey.shade200))),
-                    child: Row(
-                      children: [
-                        // Serial Number Box
-                        Container(
-                          width: 30,
-                          alignment: Alignment.center,
-                          decoration: BoxDecoration(border: Border(right: BorderSide(color: Colors.grey.shade100))),
-                          child: Text("${actualIdx + 1}", style: const TextStyle(fontSize: 10, color: Colors.grey, fontWeight: FontWeight.bold)),
-                        ),
-                        // Product Name & Stock Quantity Below
-                        Expanded(
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                            child: Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  item['name'] ?? '',
-                                  style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold),
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                                const SizedBox(height: 1),
-                                Text(
-                                  "Stock Qty: $stockQty",
-                                  style: TextStyle(
-                                    fontSize: 8.5,
-                                    fontWeight: FontWeight.w600,
-                                    color: stockQty <= 0 ? Colors.red : Colors.blueGrey.shade700,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        // Qty
-                        Container(
-                          width: 40,
-                          alignment: Alignment.center,
-                          child: Text(
-                            item['qty'].toString(),
-                            style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.blue),
-                          ),
-                        ),
-                        // Ordered Checkbox
-                        SizedBox(
-                          width: 55,
-                          child: Center(
-                            child: IconButton(
-                              padding: EdgeInsets.zero,
-                              constraints: const BoxConstraints(),
-                              icon: Icon(
-                                (item['ordered'] ?? false) ? Icons.check_box : Icons.check_box_outline_blank,
-                                size: 16,
-                                color: (item['ordered'] ?? false) ? Colors.blue : Colors.grey,
-                              ),
-                              onPressed: toggleOrdered,
-                            ),
-                          ),
-                        ),
-                        // Pending Checkbox
-                        SizedBox(
-                          width: 55,
-                          child: Center(
-                            child: IconButton(
-                              padding: EdgeInsets.zero,
-                              constraints: const BoxConstraints(),
-                              icon: Icon(
-                                (item['pending'] ?? false) ? Icons.check_box : Icons.check_box_outline_blank,
-                                size: 16,
-                                color: (item['pending'] ?? false) ? Colors.blue : Colors.grey,
-                              ),
-                              onPressed: togglePending,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
+    String tabTitle = "LOW STOCK ALERTS";
+    switch (_activeNotificationTab) {
+      case "urgent":
+        tabTitle = "URGENT ORDER BOOK";
+        break;
+      case "special":
+        tabTitle = "SPECIAL ORDERS LIST";
+        break;
+      case "mobile":
+        tabTitle = "MOBILE ORDERS";
+        break;
+    }
+
+    return Positioned(
+      top: 10,
+      right: 10,
+      bottom: 10,
+      width: 550,
+      child: GestureDetector(
+        onTap: () {}, // Consume clicks
+        child: Material(
+          elevation: 16,
+          borderRadius: BorderRadius.circular(10),
+          color: Colors.white,
+          child: Container(
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.blueGrey.shade300, width: 1.5),
+              boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 15, offset: Offset(0, 5))],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // PANEL HEADER WITH MINIMIZE & CLOSE BUTTONS
+                Container(
+                  height: 40,
+                  decoration: const BoxDecoration(
+                    color: Color(0xFF1E293B),
+                    borderRadius: BorderRadius.vertical(top: Radius.circular(8)),
                   ),
-                );
-              },
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.inventory_2_rounded, color: Colors.lightBlueAccent, size: 18),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          "$tabTitle (${currentData.length})",
+                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12, letterSpacing: 0.5),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      // MINIMIZE BUTTON
+                      InkWell(
+                        onTap: () => setState(() => _isNotificationHubMinimized = true),
+                        child: Container(
+                          padding: const EdgeInsets.all(4),
+                          decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.15), borderRadius: BorderRadius.circular(4)),
+                          child: const Icon(Icons.remove, color: Colors.white, size: 16),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      // CLOSE BUTTON
+                      InkWell(
+                        onTap: () => setState(() => _activeNotificationTab = "none"),
+                        child: Container(
+                          padding: const EdgeInsets.all(4),
+                          decoration: BoxDecoration(color: Colors.red.shade600, borderRadius: BorderRadius.circular(4)),
+                          child: const Icon(Icons.close, color: Colors.white, size: 16),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+
+                // TAB SWITCHER CHIPS & SEARCH BAR
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  color: Colors.blueGrey.shade50,
+                  child: Column(
+                    children: [
+                      Row(
+                        children: [
+                          _drawerTabChip("stock", "Low Stock", _lowStockOrders.length, Colors.blue),
+                          const SizedBox(width: 6),
+                          _drawerTabChip("urgent", "Urgent", _urgentOrders.length, Colors.orange.shade800),
+                          const SizedBox(width: 6),
+                          _drawerTabChip("special", "Special", _specialOrdersList.length, Colors.purple),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Container(
+                              height: 32,
+                              decoration: BoxDecoration(
+                                color: Colors.white,
+                                borderRadius: BorderRadius.circular(6),
+                                border: Border.all(color: Colors.grey.shade300),
+                              ),
+                              child: TextField(
+                                controller: _drawerSearchCtrl,
+                                onChanged: (v) => setState(() => _drawerSearchQuery = v),
+                                style: const TextStyle(fontSize: 11),
+                                decoration: InputDecoration(
+                                  hintText: "Search items in list...",
+                                  hintStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: Color(0xFF334155)),
+                                  prefixIcon: const Icon(Icons.search, size: 16, color: Colors.grey),
+                                  suffixIcon: _drawerSearchQuery.isNotEmpty
+                                      ? InkWell(
+                                          onTap: () {
+                                            _drawerSearchCtrl.clear();
+                                            setState(() => _drawerSearchQuery = "");
+                                          },
+                                          child: const Icon(Icons.clear, size: 14, color: Colors.grey),
+                                        )
+                                      : null,
+                                  border: InputBorder.none,
+                                  contentPadding: const EdgeInsets.symmetric(vertical: 8),
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          _buildFilterOption("PENDING"),
+                          const SizedBox(width: 4),
+                          _buildFilterOption("ORDERED"),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+
+                // TABLE HEADERS (REQUESTED SPECIFIC HEADINGS)
+                Container(
+                  height: 28,
+                  decoration: BoxDecoration(
+                    color: Colors.grey.shade200,
+                    border: Border(bottom: BorderSide(color: Colors.grey.shade300)),
+                  ),
+                  child: Row(
+                    children: [
+                      Container(width: 40, alignment: Alignment.center, child: const Text("SL NO", style: TextStyle(fontSize: 9.5, fontWeight: FontWeight.bold, color: Color(0xFF334155)))),
+                      const Expanded(child: Center(child: Text("ITEM NAME", textAlign: TextAlign.center, style: TextStyle(fontSize: 9.5, fontWeight: FontWeight.bold, color: Color(0xFF334155))))),
+                      Container(width: 80, alignment: Alignment.center, child: const Text("GENERATED ORDER QTY", textAlign: TextAlign.center, style: TextStyle(fontSize: 8.5, fontWeight: FontWeight.bold, color: Color(0xFF334155)))),
+                      Container(width: 70, alignment: Alignment.center, child: const Text("ORDERED QTY", textAlign: TextAlign.center, style: TextStyle(fontSize: 8.5, fontWeight: FontWeight.bold, color: Color(0xFF334155)))),
+                      Container(width: 70, alignment: Alignment.center, child: const Text("ORDER STATUS", textAlign: TextAlign.center, style: TextStyle(fontSize: 8.5, fontWeight: FontWeight.bold, color: Color(0xFF334155)))),
+                      Container(width: 70, alignment: Alignment.center, child: const Text("P.RATE", textAlign: TextAlign.center, style: TextStyle(fontSize: 9.5, fontWeight: FontWeight.bold, color: Color(0xFF334155)))),
+                    ],
+                  ),
+                ),
+
+                // FULL-HEIGHT SCROLLABLE LIST BODY
+                Expanded(
+                  child: currentData.isEmpty
+                      ? Center(
+                          child: Text(
+                            _isLoadingNotifications ? "Loading alerts..." : "No items found in list.",
+                            style: const TextStyle(color: Colors.grey, fontSize: 12),
+                          ),
+                        )
+                      : _safeScrollbar(
+                          controller: _notifListScrollCtrl,
+                          thumbVisibility: true,
+                          thickness: 6,
+                          child: ListView.builder(
+                            controller: _notifListScrollCtrl,
+                            itemCount: currentData.length,
+                            padding: EdgeInsets.zero,
+                            itemBuilder: (ctx, i) {
+                              final item = currentData[i];
+                              return _NotificationItemRow(
+                                key: ValueKey(item['id'] ?? i),
+                                item: item,
+                                index: i,
+                                onChanged: () => setState(() {}),
+                              );
+                            },
+                          ),
+                        ),
+                ),
+              ],
             ),
           ),
         ),
-      ],
+      ),
     );
   }
 
 
+
+  void _showSyncSettingsDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDlgState) {
+          final config = ServerConfigService.instance;
+          return AlertDialog(
+            title: const Row(
+              children: [
+                Icon(Icons.sync_rounded, color: Colors.teal),
+                SizedBox(width: 8),
+                Text("Save & Cloud Sync Settings"),
+              ],
+            ),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text(
+                    "Instant Storage + Background Cloud Sync",
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                  ),
+                  subtitle: const Text(
+                    "Saves entries to local storage immediately and syncs to cloud in background without showing loading screen.",
+                    style: TextStyle(fontSize: 11),
+                  ),
+                  value: config.bgSyncOnSave,
+                  activeThumbColor: Colors.teal,
+                  onChanged: (val) async {
+                    await config.setBgSyncOnSave(val);
+                    setDlgState(() {});
+                  },
+                ),
+                const Divider(),
+                const Text(
+                  "CLOUD STATUS",
+                  style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey),
+                ),
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    Icon(
+                      config.isConnected ? Icons.cloud_done_rounded : Icons.cloud_off_rounded,
+                      color: config.isConnected ? Colors.green : Colors.orange,
+                      size: 20,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      config.isConnected ? "Cloud Server Connected" : "Offline / Standby Mode",
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 13,
+                        color: config.isConnected ? Colors.green.shade800 : Colors.orange.shade800,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+            actions: [
+              TextButton.icon(
+                icon: const Icon(Icons.refresh_rounded, size: 16),
+                label: const Text("Sync Pending Records Now"),
+                onPressed: () {
+                  SupabaseSyncService.instance.triggerInstantSync();
+                  Navigator.pop(ctx);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text("Sync cycle triggered in background")),
+                  );
+                },
+              ),
+              ElevatedButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text("Close"),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
 
   void _showSalesManualAndLegendDialog() {
     showDialog(
@@ -5220,7 +7035,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         children: [
           Text(title, style: TextStyle(fontWeight: FontWeight.bold, color: fg, fontSize: 12)),
           const SizedBox(width: 12),
-          Expanded(child: Text(desc, style: const TextStyle(fontSize: 11, color: Colors.black87))),
+          Expanded(child: Text(desc, style: const TextStyle(fontSize: 11, color: Colors.black))),
         ],
       ),
     );
@@ -5301,42 +7116,36 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
         children: [
-          Text(label, style: TextStyle(fontSize: 12, fontWeight: isBold ? FontWeight.bold : FontWeight.normal, color: color ?? Colors.black87)),
+          Text(label, style: TextStyle(fontSize: 12, fontWeight: isBold ? FontWeight.bold : FontWeight.normal, color: color ?? Colors.black)),
           const Spacer(),
-          Text(value, style: TextStyle(fontSize: 12, fontWeight: isBold ? FontWeight.bold : FontWeight.w600, color: color ?? Colors.black87)),
+          Text(value, style: TextStyle(fontSize: 12, fontWeight: isBold ? FontWeight.bold : FontWeight.w600, color: color ?? Colors.black)),
         ],
       ),
     );
   }
 
-  Widget _entryNavBtn(String txt, {VoidCallback? onTap}) => InkWell(
-    onTap: onTap,
-    child: Container(
-      width: 22, height: 26, alignment: Alignment.center,
-      decoration: BoxDecoration(color: Colors.grey.shade200, border: Border.all(color: Colors.grey.shade400)),
-      child: Text(txt, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-    ),
-  );
-
-  Widget _topActionBtn(dynamic icon, String label, Color color, {Color? textColor, VoidCallback? onTap}) => Padding(
-    padding: const EdgeInsets.symmetric(horizontal: 4),
-    child: Tooltip(
-      message: label,
-      child: MouseRegion(
-        cursor: SystemMouseCursors.click,
-        child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(6),
-          child: Container(
-            padding: const EdgeInsets.all(4),
-            child: icon is IconData
-                ? Icon(icon, size: 26, color: color)
-                : SizedBox(width: 26, height: 26, child: icon),
+  Widget _topActionBtn(dynamic icon, String label, Color color, {Color? textColor, VoidCallback? onTap}) {
+    bool isBusy = _isSaving || _isLoading || _isDeleting;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      child: Tooltip(
+        message: label,
+        child: MouseRegion(
+          cursor: isBusy ? SystemMouseCursors.basic : SystemMouseCursors.click,
+          child: InkWell(
+            onTap: isBusy ? null : onTap,
+            borderRadius: BorderRadius.circular(6),
+            child: Container(
+              padding: const EdgeInsets.all(4),
+              child: icon is IconData
+                  ? Icon(icon, size: 26, color: isBusy ? Colors.grey : color)
+                  : SizedBox(width: 26, height: 26, child: icon),
+            ),
           ),
         ),
       ),
-    ),
-  );
+    );
+  }
 
   Widget _buildWhatsAppLogo({double size = 28}) {
     return Container(
@@ -5423,12 +7232,44 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
 
 
-  void _loadGlobalSession(Map<String, dynamic> s) {
-    _items.clear();
+  void _clearGridMaps() {
+    final oldCtrls = Map.from(_gridCtrls);
+    final oldNodes = Map.from(_gridFocusNodes);
     _gridCtrls.clear();
     _gridFocusNodes.clear();
+
+    for (var ctrl in _nextRowCtrls.values) {
+      ctrl.clear();
+      try { ctrl.dispose(); } catch (_) {}
+    }
+    _nextRowCtrls.clear();
+
+    for (var node in _nextRowNodes.values) {
+      try { node.dispose(); } catch (_) {}
+    }
+    _nextRowNodes.clear();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      for (var m in oldCtrls.values) {
+        for (var c in m.values) {
+          try { c.dispose(); } catch (_) {}
+        }
+      }
+      for (var m in oldNodes.values) {
+        for (var f in m.values) {
+          try { f.dispose(); } catch (_) {}
+        }
+      }
+    });
+  }
+
+  void _loadGlobalSession(Map<String, dynamic> s) {
+    _items.clear();
+    _clearGridMaps();
     _isExistingEntry = false;
     _isDeleted = false;
+    _date = DateTime.now();
+    _timeNotifier.value = DateFormat('hh:mm a').format(_date);
     _items.addAll(List<SaleItem>.from(s['items']));
     _selectedAgent = s['agent'];
     _agentCtrl.text = _selectedAgent;
@@ -5437,7 +7278,11 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     _customerAccCtrl.text = _customerAcc;
     _patientCtrl.text = s['patient'];
     _mobileCtrl.text = s['mobile'];
-    _doctorCtrl.text = s['doctor'];
+    String docRestored = s['doctor']?.toString().trim() ?? '';
+    if (docRestored.isEmpty || docRestored.toLowerCase() == 'unknown' || docRestored.toLowerCase() == 'dr. unknown') {
+      docRestored = 'D1';
+    }
+    _doctorCtrl.text = docRestored;
     _gstType = s['taxType'];
     _orderType = s['orderType'] ?? 0;
     _calculateFooter();
@@ -5472,6 +7317,38 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     }, notify: notify);
   }
 
+  bool _isCheckingEntryNo = false;
+
+  Future<void> _checkAndRefreshEntryNo() async {
+    if (_isCheckingEntryNo || _isExistingEntry || _items.isNotEmpty || _isDirty || _isDisposed || !mounted) return;
+    _isCheckingEntryNo = true;
+    try {
+      final p = Provider.of<PharmacyProvider>(context, listen: false);
+      final bool currentTaken = await p.isEntryTaken('sales_invoices', _entryNo);
+      final String freshNext = await p.getNextSaleEntryNo();
+
+      if (!mounted || _isExistingEntry || _items.isNotEmpty || _isDirty || _isDisposed) return;
+
+      int currentNum = p.parseSequenceNumber(_entryNo);
+      int freshNum = p.parseSequenceNumber(freshNext);
+
+      // Refresh if current entry was taken OR if server has a higher entry sequence
+      if ((currentTaken || freshNum > currentNum) && freshNext.isNotEmpty && _entryNo != freshNext) {
+        if (!_isDisposed && mounted) {
+          setState(() {
+            p.releaseEntryNo(_entryNo);
+            _entryNo = freshNext;
+            _entryNoCtrl.text = formatSaleDisplayNo(_entryNo);
+            p.reserveEntryNo(_entryNo);
+          });
+        }
+      }
+    } catch (_) {
+    } finally {
+      _isCheckingEntryNo = false;
+    }
+  }
+
   void _onProviderChanged() {
     if (!mounted || _isResetting) return;
     final p = Provider.of<PharmacyProvider>(context, listen: false);
@@ -5486,22 +7363,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       }
     }
 
-    if (_isExistingEntry) {
-      if (_originalLoadedInvoice != null && !p.hasSalesInvoice(_originalLoadedInvoice!.entryNo)) {
-        _resetPage();
-        return;
-      }
-    } else if (yearChanged) {
-      // Only query SQLite if the financial year actually changed, NOT on every keystroke
-      Future.microtask(() async {
-        String next = await p.getNextSaleEntryNo();
-        if (!mounted) return;
-        if (_entryNo != next && mounted) {
-          setState(() {
-            _entryNo = next;
-          });
-        }
-      });
+    if (!_isExistingEntry && _items.isEmpty && !_isDirty) {
+      _checkAndRefreshEntryNo();
     }
 
     // ---> ENTERPRISE FIX: WORKSPACE SHIELD <---
@@ -5537,7 +7400,9 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
 
   Widget _buildCustomerField() {
-    final provider = Provider.of<PharmacyProvider>(context);
+    final p = Provider.of<PharmacyProvider>(context, listen: false);
+    final accountMaster = p.accountMaster;
+    final accounts = p.accounts;
 
     // Dynamic Styling based on stored Account colors
     Color baseColor = const Color(0xFF94A3B8); // Default Slate
@@ -5545,7 +7410,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     // Find the matching account object to get its assigned color
     final String currentAccName = _customerAcc.toUpperCase().trim();
     try {
-      final account = provider.accountMaster.firstWhere(
+      final account = accountMaster.firstWhere(
         (a) => a.name.toUpperCase().trim() == currentAccName,
       );
       baseColor = Color(int.parse(account.color));
@@ -5553,9 +7418,13 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       // Fallback logic for common legacy names if not found in master
       if (currentAccName == "CASH") {
         baseColor = const Color(0xFF4CAF50);
-      } else if (currentAccName == "UPI") baseColor = const Color(0xFF2196F3);
-      else if (currentAccName == "NOT RECIEVED" || currentAccName == "NOT RECEIVED") baseColor = const Color(0xFFEF5350);
-      else if (currentAccName == "PREVIOUS DAY") baseColor = const Color(0xFFFBC02D);
+      } else if (currentAccName == "UPI") {
+        baseColor = const Color(0xFF2196F3);
+      } else if (currentAccName == "NOT RECIEVED" || currentAccName == "NOT RECEIVED") {
+        baseColor = const Color(0xFFEF5350);
+      } else if (currentAccName == "PREVIOUS DAY") {
+        baseColor = const Color(0xFFFBC02D);
+      }
     }
 
     bool isEmptyErr = _customerAccCtrl.text.trim().isEmpty && _customerAcc.trim().isEmpty;
@@ -5579,10 +7448,10 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           
           // Always return accounts so clicking the box shows the list
           if (query.isEmpty) {
-            return provider.accounts;
+            return accounts;
           }
 
-          return provider.accounts.where((acc) => acc.toLowerCase().contains(query));
+          return accounts.where((acc) => acc.toLowerCase().contains(query));
         },
         onSelected: (String selection) {
           setState(() {
@@ -5697,65 +7566,112 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-            // ROW 1: Entry No, Patient, Mob, Days
-            SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  SizedBox(
-                    width: 160,
-                    child: _headerColumn("Entry No:", Row(
+            // ROW 1: Left (Entry No, Patient, Mob, Dues Badge) -> Right (Days, Import, Export, TAX TYPE)
+            LayoutBuilder(
+              builder: (context, constraints) {
+                return SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(minWidth: constraints.maxWidth),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        _entryNavBtn("<", onTap: () => _navigateEntry('prev')),
-                        Container(
-                          width: 70, height: 26,
-                          padding: const EdgeInsets.symmetric(horizontal: 2),
-                          alignment: Alignment.center,
-                          decoration: BoxDecoration(
-                            color: _isDeleted ? const Color(0xFFFEF2F2) : Colors.white,
-                            border: Border.all(color: _isDeleted ? const Color(0xFF7F1D1D) : Colors.grey.shade400, width: _isDeleted ? 1.5 : 1.0)
-                          ),
-                          child: FittedBox(
-                            fit: BoxFit.scaleDown,
-                            child: Text(
-                              _entryNo.startsWith("ORD-")
-                                  ? _entryNo.substring(4)
-                                  : (_entryNo.contains('_') ? _entryNo.substring(_entryNo.indexOf('_') + 1) : _entryNo),
-                              style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: _isDeleted ? const Color(0xFF7F1D1D) : Colors.black87),
-                              maxLines: 1,
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            SizedBox(
+                              width: 165,
+                              child: _headerColumn("Entry No:", Row(
+                                children: [
+                                  FluentNavButton(
+                                    icon: Icons.chevron_left_rounded,
+                                    tooltip: "Previous Entry (Page Up / Left)",
+                                    isBusy: _isNavigating,
+                                    onTap: _isNavigating ? null : () => _navigateEntry('prev'),
+                                  ),
+                                  const SizedBox(width: 3),
+                                  Container(
+                                    width: 70, height: 26,
+                                    padding: const EdgeInsets.symmetric(horizontal: 2),
+                                    alignment: Alignment.center,
+                                    decoration: BoxDecoration(
+                                      color: _isDeleted ? const Color(0xFFFEF2F2) : (_isBlankRecord ? const Color(0xFFEFF6FF) : Colors.white),
+                                      border: Border.all(
+                                        color: _isNavigating ? Colors.blue.shade600 : (_isDeleted ? const Color(0xFF7F1D1D) : (_isBlankRecord ? Colors.lightBlue : Colors.grey.shade400)), 
+                                        width: (_isDeleted || _isBlankRecord || _isNavigating) ? 1.5 : 1.0,
+                                      ),
+                                      borderRadius: BorderRadius.circular(3),
+                                    ),
+                                    child: _isNavigating
+                                        ? SizedBox(
+                                            width: 14,
+                                            height: 14,
+                                            child: CircularProgressIndicator(strokeWidth: 1.8, valueColor: AlwaysStoppedAnimation<Color>(Colors.blue.shade700)),
+                                          )
+                                        : TextField(
+                                            controller: _entryNoCtrl,
+                                            textAlign: TextAlign.center,
+                                            style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: _isDeleted ? const Color(0xFF7F1D1D) : Colors.black87),
+                                            decoration: const InputDecoration(
+                                              border: InputBorder.none,
+                                              isDense: true,
+                                              contentPadding: EdgeInsets.zero,
+                                            ),
+                                            onSubmitted: (typedNo) {
+                                              final clean = typedNo.trim();
+                                              if (clean.isNotEmpty) {
+                                                _loadSaleData(clean);
+                                              }
+                                            },
+                                          ),
+                                  ),
+                                  const SizedBox(width: 3),
+                                  FluentNavButton(
+                                    icon: Icons.chevron_right_rounded,
+                                    tooltip: "Next Entry (Page Down / Right)",
+                                    isBusy: _isNavigating,
+                                    onTap: _isNavigating ? null : () => _navigateEntry('next'),
+                                  ),
+                                ],
+                              )),
                             ),
-                          ),
-                        ),
-                        _entryNavBtn(">", onTap: () => _navigateEntry('next')),
-                      ],
-                    )),
-                  ),
-                  const SizedBox(width: 12),
+                            const SizedBox(width: 12),
 
-                  _headerColumn("Patient", _buildPatientAutocomplete()),
-                  const SizedBox(width: 8),
-                  _headerColumn("Mob", _headerInp(1, width: 90, height: 26, onSubmitted: (_) => _moveFocus(-1, 2))),
-                  const SizedBox(width: 8),
-                  _headerColumn("Days", _headerInp(3, width: 35, height: 26, onSubmitted: (_) => _moveFocus(_items.length, 1))),
-                  const SizedBox(width: 8),
-                  Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const SizedBox(height: 12),
-                      Row(
-                        children: [
-                          _btnWithIcon(Icons.file_download_rounded, "Import", Colors.blue.shade700, onTap: _importPrescription),
-                          const SizedBox(width: 4),
-                          _btnWithIcon(Icons.file_upload_rounded, "Export", Colors.green.shade700, onTap: _exportPrescription),
-                        ],
-                      ),
-                    ],
+                            _headerColumn("Patient", _buildPatientAutocomplete()),
+                            const SizedBox(width: 8),
+                            _headerColumn("Mob", _headerInp(1, width: 90, height: 26, onSubmitted: (_) => _moveFocus(-1, 2))),
+                            const SizedBox(width: 4),
+                            _buildPatientLedgerBadge(),
+                          ],
+                        ),
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            _headerColumn("Days", _headerInp(3, width: 35, height: 26, onSubmitted: (_) => _moveFocus(_items.length, 1))),
+                            const SizedBox(width: 8),
+                            Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const SizedBox(height: 12),
+                                Row(
+                                  children: [
+                                    _btnWithIcon(Icons.file_download_rounded, "Import", Colors.blue.shade700, onTap: _importPrescription),
+                                    const SizedBox(width: 4),
+                                    _btnWithIcon(Icons.file_upload_rounded, "Export", Colors.green.shade700, onTap: _exportPrescription),
+                                  ],
+                                ),
+                              ],
+                            ),
+                            const SizedBox(width: 12),
+                            _headerColumn("TAX TYPE", Row(children: [_radio("Gst", 1), _radio("No", 2)]), align: CrossAxisAlignment.center),
+                          ],
+                        ),
+                      ],
+                    ),
                   ),
-                  const SizedBox(width: 8),
-                  _headerColumn("TAX TYPE", Row(children: [_radio("Gst", 1), _radio("No", 2)]), align: CrossAxisAlignment.center),
-                ],
-              ),
+                );
+              },
             ),
 
             const SizedBox(height: 4),
@@ -5784,7 +7700,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                                     width: 80, height: 26, padding: const EdgeInsets.symmetric(horizontal: 4),
                                     decoration: BoxDecoration(color: const Color(0xFFFFF0E0), border: Border.all(color: Colors.orange.shade300), borderRadius: BorderRadius.circular(4)),
                                     child: Row(children: [
-                                      Text(DateFormat('d/M/yy').format(_date), style: const TextStyle(fontSize: 9, fontWeight: FontWeight.bold)),
+                                      Text(DateFormat('dd/MM/yyyy').format(_date), style: const TextStyle(fontSize: 9, fontWeight: FontWeight.bold)),
                                       const Spacer(), const Icon(Icons.calendar_month, size: 10, color: Colors.orange),
                                     ]),
                                   )),
@@ -5805,6 +7721,49 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                             _headerColumn("Doctor", _buildDoctorAutocomplete()),
                             const SizedBox(width: 12),
                             _headerColumn("ORDER", _buildOrderTypeToggle(), align: CrossAxisAlignment.center),
+                            const SizedBox(width: 8),
+                            Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const SizedBox(height: 12),
+                                InkWell(
+                                  onTap: () {
+                                    setState(() {
+                                      _orderType = 1; // Special Order
+                                      _showSpecialOrderSidebar = true;
+                                      _isSpecialOrderMinimized = false;
+                                      _isProductSyncEnabled = false;
+                                      _isSpecialSyncEnabled = false;
+                                      _specialOrderQtys.clear();
+                                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                                        _specialSearchFocus.requestFocus();
+                                      });
+                                    });
+                                  },
+                                  borderRadius: BorderRadius.circular(6),
+                                  child: Container(
+                                    height: 28,
+                                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                                    decoration: BoxDecoration(
+                                      color: Colors.green.shade700,
+                                      borderRadius: BorderRadius.circular(6),
+                                      boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 4, offset: Offset(0, 2))],
+                                    ),
+                                    child: const Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(Icons.add_shopping_cart_rounded, size: 15, color: Colors.white),
+                                        SizedBox(width: 5),
+                                        Text(
+                                          "+ Add Special Order",
+                                          style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.bold, color: Colors.white),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
                           ],
                         ),
                       ],
@@ -5897,8 +7856,14 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     List<Map<String, dynamic>> list = [];
     Set<String> uniqueNames = {};
 
+    for (var name in _extraSpecialItems) {
+      if (uniqueNames.contains(name)) continue;
+      uniqueNames.add(name);
+      list.add({'name': name, 'qty': _specialOrderQtys[name] ?? 0});
+    }
+
     if (_isProductSyncEnabled) {
-      for (var it in _items) {
+      for (var it in _items.reversed) {
         if (it.product.name.isEmpty || uniqueNames.contains(it.product.name)) continue;
         uniqueNames.add(it.product.name);
         int defaultQty = _isSpecialSyncEnabled ? it.qty : 0;
@@ -5906,11 +7871,6 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       }
     }
 
-    for (var name in _extraSpecialItems) {
-      if (uniqueNames.contains(name)) continue;
-      uniqueNames.add(name);
-      list.add({'name': name, 'qty': _specialOrderQtys[name] ?? 0});
-    }
     return list;
   }
 
@@ -6001,91 +7961,6 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                 ]),
               ),
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: CompositedTransformTarget(
-                        link: _specialCustomerLayer,
-                        child: TextField(
-                          controller: _specialCustomerNameCtrl,
-                          focusNode: _specialCustomerNameFocus,
-                          onChanged: (v) => _onHeaderSearch(v, _patientSearchList, (p) => p.patients),
-                          onSubmitted: (_) => _specialCustomerPhoneFocus.requestFocus(),
-                          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
-                          textCapitalization: TextCapitalization.characters,
-                          inputFormatters: [UpperCaseTextFormatter()],
-                          decoration: InputDecoration(
-                            hintText: "CUSTOMER NAME", isDense: true, filled: true, fillColor: Colors.blue.shade50,
-                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(4), borderSide: BorderSide.none),
-                            contentPadding: const EdgeInsets.all(8),
-                          ),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 4),
-                    Expanded(
-                      child: TextField(
-                        controller: _specialCustomerPhoneCtrl,
-                        focusNode: _specialCustomerPhoneFocus,
-                        onSubmitted: (_) => _agentFocus.requestFocus(),
-                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
-                        textCapitalization: TextCapitalization.characters,
-                        inputFormatters: [UpperCaseTextFormatter()],
-                        decoration: InputDecoration(
-                          hintText: "CUSTOMER PHONE", isDense: true, filled: true, fillColor: Colors.blue.shade50,
-                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(4), borderSide: BorderSide.none),
-                          contentPadding: const EdgeInsets.all(8),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: _agentCtrl,
-                        focusNode: _agentFocus,
-                        onSubmitted: (_) {
-                          _expectingDateFocus.requestFocus();
-                          _pickExpectingDate();
-                        },
-                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
-                        textCapitalization: TextCapitalization.characters,
-                        inputFormatters: [UpperCaseTextFormatter()],
-                        decoration: InputDecoration(
-                          hintText: "AGENT NAME", isDense: true, filled: true, fillColor: Colors.blue.shade50,
-                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(4), borderSide: BorderSide.none),
-                          contentPadding: const EdgeInsets.all(8),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 4),
-                    Expanded(
-                      child: TextField(
-                        controller: _expectingDateCtrl,
-                        focusNode: _expectingDateFocus,
-                        readOnly: true,
-                        enableInteractiveSelection: false,
-                        onSubmitted: (_) => _pickExpectingDate(),
-                        onTap: _pickExpectingDate,
-                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
-                        decoration: InputDecoration(
-                          hintText: "EXPECTING DATE", isDense: true, filled: true, fillColor: Colors.blue.shade50,
-                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(4), borderSide: BorderSide.none),
-                          contentPadding: const EdgeInsets.all(8),
-                          suffixIcon: const Icon(Icons.calendar_month, size: 14, color: Colors.blueGrey),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              Padding(
                 padding: const EdgeInsets.all(8),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
@@ -6099,14 +7974,17 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                                 final list = _specialSearchList.value;
                                 if (event is KeyDownEvent || event is KeyRepeatEvent) {
                                   if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
-                                    _searchIdx.value = (_searchIdx.value + 1) % list.length;
+                                    _searchIdx.value = (_searchIdx.value + 1).clamp(0, list.length - 1);
                                     _scrollToIdx(_searchIdx.value);
                                     return KeyEventResult.handled;
                                   } else if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
-                                    _searchIdx.value = (_searchIdx.value - 1 + list.length) % list.length;
+                                    _searchIdx.value = (_searchIdx.value - 1).clamp(0, list.length - 1);
                                     _scrollToIdx(_searchIdx.value);
                                     return KeyEventResult.handled;
                                   } else if (event is KeyDownEvent && (event.logicalKey == LogicalKeyboardKey.enter || event.logicalKey == LogicalKeyboardKey.numpadEnter)) {
+                                    final idx = _searchIdx.value.clamp(0, list.length - 1);
+                                    _specialMainCtrl.text = list[idx].name;
+                                    _specialSearchList.value = []; // CLOSE DROPDOWN IMMEDIATELY
                                     _specialSearchQtyFocus.requestFocus();
                                     _specialSearchQtyCtrl.selection = TextSelection(baseOffset: 0, extentOffset: _specialSearchQtyCtrl.text.length);
                                     return KeyEventResult.handled;
@@ -6120,7 +7998,15 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                               focusNode: _specialSearchFocus,
                               onChanged: _startSpecialProductSearch,
                               onSubmitted: (v) {
-                                if (v.trim().isEmpty) {
+                                if (_specialSearchList.value.isNotEmpty) {
+                                  final list = _specialSearchList.value;
+                                  final idx = _searchIdx.value.clamp(0, list.length - 1);
+                                  _specialMainCtrl.text = list[idx].name;
+                                  _specialSearchList.value = []; // CLOSE DROPDOWN IMMEDIATELY
+                                } else {
+                                  _specialSearchList.value = [];
+                                }
+                                if (_specialMainCtrl.text.trim().isEmpty) {
                                   _specialCustomerNameFocus.requestFocus();
                                   _specialCustomerNameCtrl.selection = TextSelection(baseOffset: 0, extentOffset: _specialCustomerNameCtrl.text.length);
                                 } else {
@@ -6150,22 +8036,21 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                             focusNode: _specialSearchQtyFocus,
                             keyboardType: TextInputType.number,
                             inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                            onTap: () {
+                              _specialSearchList.value = []; // CLOSE DROPDOWN IF QTY IS TAPPED
+                            },
                             onSubmitted: (_) {
                               final String v = _specialMainCtrl.text.trim();
                               final int qtyVal = int.tryParse(_specialSearchQtyCtrl.text.trim()) ?? 1;
                               if (v.isNotEmpty) {
-                                if (_specialSearchList.value.isNotEmpty) {
-                                  final idx = _searchIdx.value.clamp(0, _specialSearchList.value.length - 1);
-                                  _onSpecialProductSelected(_specialSearchList.value[idx], qty: qtyVal);
-                                } else {
-                                  setState(() {
-                                    _extraSpecialItems.add(v);
-                                    _specialOrderQtys[v] = qtyVal;
-                                    _specialMainCtrl.clear();
-                                    _specialSearchList.value = [];
-                                    _specialSearchQtyCtrl.text = "1";
-                                  });
-                                }
+                                setState(() {
+                                  _extraSpecialItems.remove(v);
+                                  _extraSpecialItems.insert(0, v);
+                                  _specialOrderQtys[v] = qtyVal;
+                                  _specialMainCtrl.clear();
+                                  _specialSearchList.value = [];
+                                  _specialSearchQtyCtrl.text = "1";
+                                });
                               }
                               _specialSearchFocus.requestFocus();
                             },
@@ -6232,7 +8117,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                                                 flex: 3,
                                                 child: Text(
                                                   p.name,
-                                                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: sel ? Colors.blue.shade900 : Colors.black87),
+                                                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: sel ? Colors.blue.shade900 : Colors.black),
                                                   overflow: TextOverflow.ellipsis,
                                                 ),
                                               ),
@@ -6336,6 +8221,92 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                   },
                 ),
               ),
+              const Divider(height: 1),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: CompositedTransformTarget(
+                        link: _specialCustomerLayer,
+                        child: TextField(
+                          controller: _specialCustomerNameCtrl,
+                          focusNode: _specialCustomerNameFocus,
+                          onChanged: (v) => _onHeaderSearch(v, _patientSearchList, (p) => p.patients),
+                          onSubmitted: (_) => _specialCustomerPhoneFocus.requestFocus(),
+                          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+                          textCapitalization: TextCapitalization.characters,
+                          inputFormatters: [UpperCaseTextFormatter()],
+                          decoration: InputDecoration(
+                            hintText: "CUSTOMER NAME", isDense: true, filled: true, fillColor: Colors.blue.shade50,
+                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(4), borderSide: BorderSide.none),
+                            contentPadding: const EdgeInsets.all(8),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Expanded(
+                      child: TextField(
+                        controller: _specialCustomerPhoneCtrl,
+                        focusNode: _specialCustomerPhoneFocus,
+                        onSubmitted: (_) => _agentFocus.requestFocus(),
+                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+                        textCapitalization: TextCapitalization.characters,
+                        inputFormatters: [UpperCaseTextFormatter()],
+                        decoration: InputDecoration(
+                          hintText: "CUSTOMER PHONE", isDense: true, filled: true, fillColor: Colors.blue.shade50,
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(4), borderSide: BorderSide.none),
+                          contentPadding: const EdgeInsets.all(8),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _agentCtrl,
+                        focusNode: _agentFocus,
+                        onSubmitted: (_) {
+                          _expectingDateFocus.requestFocus();
+                          _pickExpectingDate();
+                        },
+                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+                        textCapitalization: TextCapitalization.characters,
+                        inputFormatters: [UpperCaseTextFormatter()],
+                        decoration: InputDecoration(
+                          hintText: "AGENT NAME", isDense: true, filled: true, fillColor: Colors.blue.shade50,
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(4), borderSide: BorderSide.none),
+                          contentPadding: const EdgeInsets.all(8),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Expanded(
+                      child: TextField(
+                        controller: _expectingDateCtrl,
+                        focusNode: _expectingDateFocus,
+                        readOnly: true,
+                        enableInteractiveSelection: false,
+                        onSubmitted: (_) => _pickExpectingDate(),
+                        onTap: _pickExpectingDate,
+                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+                        decoration: InputDecoration(
+                          hintText: "EXPECTING DATE", isDense: true, filled: true, fillColor: Colors.blue.shade50,
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(4), borderSide: BorderSide.none),
+                          contentPadding: const EdgeInsets.all(8),
+                          suffixIcon: const Icon(Icons.calendar_month, size: 14, color: Colors.blueGrey),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
               Container(
                 decoration: BoxDecoration(
                     color: Colors.grey.shade50,
@@ -6384,6 +8355,56 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
 
 
+  Widget _buildPatientLedgerBadge() {
+    String patientName = _patientCtrl.text.trim();
+    if (patientName.isEmpty ||
+        patientName.toUpperCase() == 'P1' ||
+        patientName.toUpperCase() == 'GENERAL' ||
+        patientName.toUpperCase() == 'CASH') {
+      return const SizedBox.shrink();
+    }
+
+    final provider = Provider.of<PharmacyProvider>(context, listen: false);
+
+    return FutureBuilder<double>(
+      future: provider.getPatientNetBalance(patientName),
+      builder: (context, snapshot) {
+        if (!snapshot.hasData || snapshot.data == 0.0) {
+          return const SizedBox.shrink();
+        }
+        double prevDues = snapshot.data!;
+        return Container(
+          margin: const EdgeInsets.only(left: 4, top: 12),
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+          decoration: BoxDecoration(
+            color: prevDues > 0 ? Colors.red.shade50 : Colors.green.shade50,
+            border: Border.all(color: prevDues > 0 ? Colors.red.shade300 : Colors.green.shade300),
+            borderRadius: BorderRadius.circular(4),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                prevDues > 0 ? Icons.account_balance_wallet_outlined : Icons.check_circle_outline,
+                size: 11,
+                color: prevDues > 0 ? Colors.red.shade800 : Colors.green.shade800,
+              ),
+              const SizedBox(width: 3),
+              Text(
+                "Prev: ₹${prevDues.toStringAsFixed(2)}",
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.bold,
+                  color: prevDues > 0 ? Colors.red.shade900 : Colors.green.shade900,
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
   Widget _buildPatientAutocomplete() {
     bool isMod = _isPatientModified();
     bool isEmptyErr = _patientCtrl.text.trim().isEmpty;
@@ -6401,7 +8422,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         textEditingController: _patientCtrl,
         focusNode: _patientFocus,
         optionsBuilder: (TextEditingValue textEditingValue) {
-          if (textEditingValue.text.isEmpty) return const Iterable<String>.empty();
+          if (!_isPatientTyping || textEditingValue.text.trim().isEmpty) return const Iterable<String>.empty();
           final query = textEditingValue.text.toLowerCase().trim();
           final provider = Provider.of<PharmacyProvider>(context, listen: false);
 
@@ -6418,6 +8439,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           return matches;
         },
         onSelected: (String selection) async {
+          _isPatientTyping = false;
           final provider = Provider.of<PharmacyProvider>(context, listen: false);
           if (selection.startsWith('ADD NEW NAME: ')) {
             final newName = selection.replaceAll('ADD NEW NAME: ', '').trim();
@@ -6454,12 +8476,14 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
             controller: controller,
             focusNode: focusNode,
             readOnly: readOnly,
-            onTap: () {
-              if (focusNode.hasFocus) {
-                _focusedPatientText = controller.text;
+            onEditingComplete: onEditingComplete,
+            onChanged: (val) {
+              if (!_isPatientTyping) {
+                setState(() {
+                  _isPatientTyping = true;
+                });
               }
             },
-            onEditingComplete: onEditingComplete,
             style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
             decoration: const InputDecoration(
               isDense: true, border: InputBorder.none,
@@ -6499,7 +8523,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                           style: TextStyle(
                             fontSize: 12,
                             fontWeight: shouldHighlight || isNew ? FontWeight.bold : FontWeight.w600,
-                            color: shouldHighlight ? Colors.blue.shade900 : (isNew ? Colors.blue.shade700 : Colors.black87),
+                            color: shouldHighlight ? Colors.blue.shade900 : (isNew ? Colors.blue.shade700 : Colors.black),
                           ),
                         ),
                       ),
@@ -6534,7 +8558,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         textEditingController: _doctorCtrl,
         focusNode: _doctorFocus,
         optionsBuilder: (TextEditingValue textEditingValue) {
-          if (textEditingValue.text.isEmpty) {
+          if (!_isDoctorTyping || textEditingValue.text.trim().isEmpty) {
             return const Iterable<String>.empty();
           }
           final query = textEditingValue.text.toLowerCase().trim();
@@ -6553,6 +8577,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           return matches;
         },
         onSelected: (String selection) async {
+          _isDoctorTyping = false;
           final provider = Provider.of<PharmacyProvider>(context, listen: false);
           if (selection.startsWith('ADD NEW NAME: ')) {
             final newName = selection.replaceAll('ADD NEW NAME: ', '').trim();
@@ -6583,12 +8608,14 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
             controller: controller,
             focusNode: focusNode,
             readOnly: readOnly,
-            onTap: () {
-              if (focusNode.hasFocus) {
-                _focusedDoctorText = controller.text;
+            onEditingComplete: onEditingComplete,
+            onChanged: (val) {
+              if (!_isDoctorTyping) {
+                setState(() {
+                  _isDoctorTyping = true;
+                });
               }
             },
-            onEditingComplete: onEditingComplete,
             style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
             decoration: const InputDecoration(
               isDense: true,
@@ -6628,7 +8655,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                           style: TextStyle(
                             fontSize: 13,
                             fontWeight: shouldHighlight || isNew ? FontWeight.bold : FontWeight.w600,
-                            color: shouldHighlight ? Colors.blue.shade900 : (isNew ? Colors.blue.shade700 : Colors.black87),
+                            color: shouldHighlight ? Colors.blue.shade900 : (isNew ? Colors.blue.shade700 : Colors.black),
                           ),
                         ),
                       ),
@@ -6662,9 +8689,11 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       height: 22,
       child: Radio<int>(
           value: value,
+          // ignore: deprecated_member_use
           groupValue: _gstType,
           visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
           materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          // ignore: deprecated_member_use
           onChanged: (v) {
             setState(() {
               _gstType = v!;
@@ -6727,7 +8756,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                   _colWidths[i] = v;
                   _hasCustomColWidths = true;
                 });
-                _saveColumnWidths();
+                _debouncedSaveColumnWidths();
               },
               align: _getColAlign(i),
               onTap: i == 15 ? () => setState(() => _showProfitColumn = !_showProfitColumn) : null,
@@ -6738,7 +8767,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
   String _getColName(int i) => [
         "Slr", "BALANCE", "Product", "Rack", "Batch", "Expiry", "Pack", "Qty",
-        "Strips / Loose", "MRP", "1 /MRP", "Disc%", "Disc Amt", "GST%", "Total",
+        "Strips", "MRP", "1 /MRP", "Disc%", "Disc Amt", "GST%", "Total",
         _showProfitColumn ? "👁️ Profit" : "👁️", ""
       ][i];
 
@@ -6766,24 +8795,26 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
   Widget _buildGrid() {
     final billQuantities = _getBillQuantitiesMap();
-    return Scrollbar(
-      controller: _verticalGridScrollCtrl,
-      child: ListView.builder(
+    return RepaintBoundary(
+      child: _safeScrollbar(
         controller: _verticalGridScrollCtrl,
-        padding: EdgeInsets.zero,
-        itemExtent: 30.0,
-        itemCount: _items.length + (_isDeleted ? 0 : 1),
-        itemBuilder: (ctx, i) => RepaintBoundary(
-          child: i < _items.length ? _buildRow(i, billQuantities) : _buildEmptyRow(i),
+        child: ListView.builder(
+          controller: _verticalGridScrollCtrl,
+          padding: EdgeInsets.zero,
+          itemExtent: 30.0,
+          itemCount: _items.length + (_isDeleted ? 0 : 1),
+          itemBuilder: (ctx, i) => RepaintBoundary(
+            child: i < _items.length ? _buildRow(i, billQuantities) : _buildEmptyRow(i),
+          ),
         ),
       ),
     );
   }
 
   // ---> FALLBACK GETTERS PREVENT SCOPE ERRORS <---
-  Color get defaultColor => Colors.black87;
-  Color get nameColor => Colors.black87;
-  Color get expiryColor => Colors.black87;
+  Color get defaultColor => Colors.black;
+  Color get nameColor => Colors.black;
+  Color get expiryColor => Colors.black;
 
   // Pre-computes bill quantities in a single pass to eliminate O(N^2) frame lag
   Map<String, int> _getBillQuantitiesMap() {
@@ -6823,13 +8854,13 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     final it = _items[row];
     double profit = it.profit;
 
-    bool isExpired = it.product.expiry.isNotEmpty && _parseExpiry(it.product.expiry).isBefore(DateTime.now());
+    bool isExpired = it.product.expiry.isNotEmpty && _parseExpiry(it.product.expiry).isBefore(DateTime(_date.year, _date.month, _date.day));
     bool isH1 = it.product.schedule.toUpperCase() == "H1";
 
     // Row-specific font colors
-    Color rowNameColor = isH1 ? Colors.red.shade700 : (isExpired ? Colors.red.shade900 : Colors.black87);
-    Color rowExpiryColor = isExpired ? Colors.red.shade900 : Colors.black87;
-    Color rowDefaultColor = isH1 ? Colors.red.shade900 : Colors.black87;
+    Color rowNameColor = isH1 ? Colors.red.shade700 : (isExpired ? Colors.red.shade900 : Colors.black);
+    Color rowExpiryColor = isExpired ? Colors.red.shade900 : Colors.black;
+    Color rowDefaultColor = isH1 ? Colors.red.shade900 : Colors.black;
 
     int liveRemStock = _getLiveRemainingStock(row, billQuantities);
     Color remColor = liveRemStock > 0
@@ -6842,7 +8873,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     bool isDiscMod = false;
     bool isProdMod = false;
 
-    if (_isExistingEntry && _highlightEdits) {
+    if (_isExistingEntry && _originalLoadedInvoice != null) {
       if (!_originalItemSnapshots.containsKey(it)) {
         isNewRow = true;
       } else {
@@ -6859,9 +8890,12 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       builder: (context, focus, _) {
         bool isRowActive = focus?.row == row;
 
-        Color rowBg = isRowActive
-            ? const Color(0xFFF0F7FF)
-            : (isH1 ? Colors.red.shade50 : (row % 2 == 0 ? Colors.white : const Color(0xFFF9FAFB)));
+        bool isHighlightedProduct = _highlightedRowIndices.contains(row);
+        Color rowBg = isHighlightedProduct
+            ? const Color(0xFFFFF9C4)
+            : (isRowActive
+                ? const Color(0xFFF0F7FF)
+                : (isH1 ? Colors.red.shade50 : (row % 2 == 0 ? Colors.white : const Color(0xFFF9FAFB))));
 
         return Container(
           key: ValueKey("s_row_${it.uuid}"),
@@ -6872,8 +8906,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           ),
           child: Row(
             children: [
-              _cell(row, 0, "${row + 1}", _colWidths[0]!, align: TextAlign.center, color: rowDefaultColor),
-              _cell(row, 1, "$liveRemStock", _colWidths[1]!, align: TextAlign.center, fontWeight: FontWeight.bold, color: remColor),
+              _cell(row, 0, _isDeleted ? "" : "${row + 1}", _colWidths[0]!, align: TextAlign.center, color: rowDefaultColor),
+              _cell(row, 1, _isDeleted ? "" : "$liveRemStock", _colWidths[1]!, align: TextAlign.center, fontWeight: FontWeight.bold, color: remColor),
               _cell(row, 2, _isDeleted ? "" : it.product.name.toUpperCase(), _colWidths[2]!, isInput: true, fontWeight: FontWeight.bold, color: rowNameColor, cellBg: (isNewRow || isProdMod) ? _editHighlightBg : null, onChanged: (v) {
                 // Instantly allocate an independent Product object to prevent cross-row mutation
                 it.product = Product(
@@ -6897,21 +8931,21 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                 _getGridCtrl(row, 5).clear();
                 _startProductSearch(v);
               }),
-              _cell(row, 3, it.product.rack.toUpperCase(), _colWidths[3]!, align: TextAlign.center, color: rowDefaultColor),
-              _cell(row, 4, _cleanBatch(it.product.batch).toUpperCase(), _colWidths[4]!, isInput: true, color: rowExpiryColor, cellBg: (isNewRow || isBatchMod) ? _editHighlightBg : null, onChanged: (v) {
+              _cell(row, 3, _isDeleted ? "" : it.product.rack.toUpperCase(), _colWidths[3]!, align: TextAlign.center, color: rowDefaultColor),
+              _cell(row, 4, _isDeleted ? "" : _cleanBatch(it.product.batch).toUpperCase(), _colWidths[4]!, isInput: true, color: rowExpiryColor, cellBg: (isNewRow || isBatchMod) ? _editHighlightBg : null, onChanged: (v) {
                 it.product.batch = v;
                 _startBatchSearch(row, v);
               }),
-              _cell(row, 5, it.product.expiry, _colWidths[5]!, isInput: true, align: TextAlign.center, color: rowExpiryColor, hint: "MM/YY", onChanged: (v) {
+              _cell(row, 5, _isDeleted ? "" : it.product.expiry, _colWidths[5]!, isInput: true, align: TextAlign.center, color: rowExpiryColor, hint: "MM/YY", onChanged: (v) {
                 it.product.expiry = v;
               }),
-              _cell(row, 6, it.packin.toString(), _colWidths[6]!, align: TextAlign.right, color: Colors.blueGrey, isLocked: true),
-              _cell(row, 7, it.qty.toString(), _colWidths[7]!, isInput: true, align: TextAlign.right, color: rowDefaultColor, cellBg: (isNewRow || isQtyMod) ? _editHighlightBg : null, onChanged: (v) {
+              _cell(row, 6, _isDeleted ? "" : it.packin.toString(), _colWidths[6]!, align: TextAlign.right, color: Colors.blueGrey, isLocked: true),
+              _cell(row, 7, _isDeleted ? "" : it.qty.toString(), _colWidths[7]!, isInput: true, align: TextAlign.right, color: rowDefaultColor, cellBg: (isNewRow || isQtyMod) ? _editHighlightBg : null, onChanged: (v) {
                 it.qty = int.tryParse(v) ?? 0;
                 _calculateItem(row);
               }),
               _cell(row, 8, "", _colWidths[8]!, align: TextAlign.center, isLocked: true,
-                customLabel: RichText(
+                customLabel: _isDeleted ? const SizedBox.shrink() : RichText(
                   text: TextSpan(
                     style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, fontFamily: 'Roboto'),
                     children: [
@@ -6928,16 +8962,16 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                   ),
                 ),
               ),
-              _cell(row, 9, it.product.mrp.toStringAsFixed(2), _colWidths[9]!, align: TextAlign.right, color: rowDefaultColor),
-              _cell(row, 10, it.mrp.toStringAsFixed(2), _colWidths[10]!, align: TextAlign.right, color: rowDefaultColor),
-              _cell(row, 11, it.discPercent.toStringAsFixed(2), _colWidths[11]!, isInput: true, align: TextAlign.right, color: rowDefaultColor, cellBg: (isNewRow || isDiscMod) ? _editHighlightBg : null, onChanged: (v) {
+              _cell(row, 9, _isDeleted ? "" : ((it.product.mrp >= it.mrp && it.product.mrp > it.mrp * 1.5) ? it.product.mrp : (it.mrp * (it.packin > 0 ? it.packin : 1))).toStringAsFixed(2), _colWidths[9]!, align: TextAlign.right, color: rowDefaultColor),
+              _cell(row, 10, _isDeleted ? "" : it.mrp.toStringAsFixed(2), _colWidths[10]!, align: TextAlign.right, color: rowDefaultColor),
+              _cell(row, 11, _isDeleted ? "" : it.discPercent.toStringAsFixed(2), _colWidths[11]!, isInput: true, align: TextAlign.right, color: rowDefaultColor, cellBg: (isNewRow || isDiscMod) ? _editHighlightBg : null, onChanged: (v) {
                 it.discPercent = double.tryParse(v) ?? 0;
                 _calculateItem(row);
               }),
-              _cell(row, 12, it.discAmt.toStringAsFixed(2), _colWidths[12]!, align: TextAlign.right, color: rowDefaultColor),
-              _cell(row, 13, (TaxCalculator.roundGstPercent(it.gstPercent) % 1 == 0 ? TaxCalculator.roundGstPercent(it.gstPercent).toInt().toString() : TaxCalculator.roundGstPercent(it.gstPercent).toStringAsFixed(1)), _colWidths[13]!, align: TextAlign.right, color: rowDefaultColor),
-              _cell(row, 14, it.total.toStringAsFixed(2), _colWidths[14]!, align: TextAlign.right, fontWeight: FontWeight.bold, color: Colors.blue.shade900),
-              _cell(row, 15, _showProfitColumn ? profit.toStringAsFixed(2) : "", _colWidths[15]!, align: TextAlign.right, color: profit >= 0 ? Colors.green.shade700 : Colors.red),
+              _cell(row, 12, _isDeleted ? "" : it.discAmt.toStringAsFixed(2), _colWidths[12]!, align: TextAlign.right, color: rowDefaultColor),
+              _cell(row, 13, _isDeleted ? "" : ((_gstType == 1 ? TaxCalculator.roundGstPercent(it.gstPercent) : 0.0) % 1 == 0 ? (_gstType == 1 ? TaxCalculator.roundGstPercent(it.gstPercent) : 0.0).toInt().toString() : (_gstType == 1 ? TaxCalculator.roundGstPercent(it.gstPercent) : 0.0).toStringAsFixed(1)), _colWidths[13]!, align: TextAlign.right, color: rowDefaultColor),
+              _cell(row, 14, _isDeleted ? "" : it.total.toStringAsFixed(2), _colWidths[14]!, align: TextAlign.right, fontWeight: FontWeight.bold, color: Colors.blue.shade900),
+              _cell(row, 15, (_showProfitColumn && !_isDeleted) ? profit.toStringAsFixed(2) : "", _colWidths[15]!, align: TextAlign.right, color: profit >= 0 ? Colors.green.shade700 : Colors.red),
               _isDeleted ? SizedBox(width: _colWidths[16]!) : Container(
                 width: _colWidths[16]!,
                 alignment: Alignment.center,
@@ -6999,6 +9033,101 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     );
   }
 
+  double _getExpiryMonths(String expStr) {
+    if (expStr.isEmpty) return 999.0;
+    final parts = expStr.split('/');
+    if (parts.length != 2) return 999.0;
+    final m = int.tryParse(parts[0]);
+    final y = int.tryParse(parts[1]);
+    if (m == null || y == null) return 999.0;
+    final fullYear = y < 100 ? 2000 + y : y;
+    final now = DateTime.now();
+    final expDate = DateTime(fullYear, m, 1);
+    final diffMonths = (expDate.year - now.year) * 12 + (expDate.month - now.month);
+    return diffMonths.toDouble();
+  }
+
+  ({Color bg, Color text})? _evalSalesRuleStyle(PharmacyProvider provider, SaleItem item, int col, String text) {
+    final rules = provider.getValidationRules("SALES");
+    if (rules.isEmpty) return null;
+
+    for (var rule in rules) {
+      if (!rule.enabled) continue;
+
+      bool appliesToCol = false;
+      if (rule.fieldA == "Disc %" && col == 11) appliesToCol = true;
+      if (rule.fieldA == "Expiry (Months)" && col == 5) appliesToCol = true;
+      if (rule.fieldA == "Pack Size" && col == 6) appliesToCol = true;
+      if (rule.fieldA == "Qty" && col == 7) appliesToCol = true;
+      if (rule.fieldA == "MRP" && (col == 9 || col == 10)) appliesToCol = true;
+      if (rule.fieldA == "GST %" && col == 13) appliesToCol = true;
+      if (rule.fieldA == "Total" && col == 14) appliesToCol = true;
+
+      if (!appliesToCol) continue;
+
+      double valA = 0.0;
+      switch (rule.fieldA) {
+        case "Disc %":
+          valA = double.tryParse(text) ?? item.discPercent;
+          break;
+        case "Expiry (Months)":
+          valA = _getExpiryMonths(text.isNotEmpty ? text : item.product.expiry);
+          break;
+        case "Pack Size":
+          valA = item.packin.toDouble();
+          break;
+        case "Qty":
+          valA = double.tryParse(text) ?? item.qty.toDouble();
+          break;
+        case "MRP":
+          valA = item.mrp;
+          break;
+        case "GST %":
+          valA = item.gstPercent;
+          break;
+        case "Total":
+          valA = item.total;
+          break;
+        default:
+          valA = 0.0;
+      }
+
+      if (valA <= 0 && rule.fieldA != "Expiry (Months)") {
+        continue;
+      }
+
+      double valB = double.tryParse(rule.fieldB) ?? 0.0;
+
+      bool isMatch = false;
+      switch (rule.operator) {
+        case ">=":
+          isMatch = valA >= valB;
+          break;
+        case ">":
+          isMatch = valA > valB;
+          break;
+        case "<=":
+          isMatch = valA <= valB && valA > 0;
+          break;
+        case "<":
+          isMatch = valA < valB && valA > 0;
+          break;
+        case "=":
+          isMatch = (valA - valB).abs() < 0.001;
+          break;
+        case "!=":
+          isMatch = (valA - valB).abs() >= 0.001;
+          break;
+      }
+
+      if (isMatch) {
+        return (bg: Color(rule.bgColorHex), text: Color(rule.textColorHex));
+      }
+    }
+
+    return null;
+  }
+
   Widget _cell(int row, int col, String val, double w, {bool isInput = false, bool isLocked = false, TextAlign align = TextAlign.left, Color? color, FontWeight? fontWeight, String hint = "", String? subValue, Function(String)? onChanged, Widget? customLabel, Color? cellBg}) {
     final actualFocusNode = _getGridFocusNode(row, col);
     String rowId = row < _items.length ? _items[row].uuid : "new_row";
@@ -7028,18 +9157,28 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         EdgeInsetsGeometry? customMargin;
 
         bool isModifiedCell = (cellBg != null);
-        bool isQtyZero = (col == 7 && row < _items.length && (_items[row].qty <= 0 || ctrl.text.trim() == "0" || (double.tryParse(ctrl.text.trim()) ?? 0) <= 0));
+        bool hasProduct = row < _items.length && _items[row].product.name.trim().isNotEmpty;
+        bool isQtyZero = (!_isDeleted && hasProduct && col == 7 && (_items[row].qty <= 0 || ctrl.text.trim() == "0" || (double.tryParse(ctrl.text.trim()) ?? 0) <= 0));
+
+        bool isHighlightedProduct = _highlightedRowIndices.contains(row);
+
+        final provider = Provider.of<PharmacyProvider>(context, listen: false);
+        final ruleStyle = (row < _items.length && !_isDeleted) ? _evalSalesRuleStyle(provider, _items[row], col, val) : null;
 
         if (_errorCells[row]?.contains(col) == true || isQtyZero) {
           bg = Colors.red.shade100;
           customBorder = Border.all(color: Colors.red.shade700, width: 1.5);
           customRadius = BorderRadius.circular(2);
+        } else if (ruleStyle != null) {
+          bg = ruleStyle.bg;
         } else if (isModifiedCell) {
           // ---> 3D RED BOX (MATCHING PHOTO 2 DATE BOX) <---
           bg = _editHighlightBg;
           customBorder = Border.all(color: _editHighlightBorder, width: 1.2);
           customRadius = BorderRadius.circular(4);
           customMargin = const EdgeInsets.symmetric(horizontal: 2, vertical: 2);
+        } else if (isHighlightedProduct) {
+          bg = const Color(0xFFFFF9C4);
         } else if (isLocked) {
           bg = const Color(0xFFF1F5F9);
         } else {
@@ -7049,18 +9188,93 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           }
         }
 
-        Color textColor = (color == Colors.blueGrey || color == Colors.grey || color == null)
-            ? const Color(0xFF0F172A)
-            : color;
+        Color textColor = (ruleStyle != null)
+            ? ruleStyle.text
+            : ((color == Colors.blueGrey || color == Colors.grey || color == null)
+                ? Colors.black
+                : color);
 
         Widget cellContent = renderAsTextField
-            ? TextField(
+            ? ErpGridTextField(
                 key: ValueKey("s_tf_${rowId}_$col"), 
                 controller: ctrl, 
                 focusNode: actualFocusNode, 
                 textAlign: align,
                 keyboardType: (col == 7 || col == 11 || col == 12) ? const TextInputType.numberWithOptions(decimal: true) : TextInputType.text,
                 inputFormatters: (col == 7 || col == 11 || col == 12) ? [FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))] : (col == 5 ? [ExpiryFormatter()] : [UpperCaseTextFormatter()]),
+                onNavigatePrevious: () {
+                  int curIdx = _navCols.indexOf(col);
+                  if (curIdx > 0) {
+                    _moveFocus(row, _navCols[curIdx - 1], autoOpen: _navCols[curIdx - 1] == 4);
+                  } else if (curIdx == 0 && row > 0) {
+                    _moveFocus(row - 1, _navCols.last);
+                  }
+                },
+                onNavigateNext: () {
+                  if (row == _items.length && _getGridCtrl(row, 2).text.trim().isEmpty) {
+                    _closeAllDropdowns();
+                    _focusNotifier.value = null;
+                    _rcvdAmtFocus.requestFocus();
+                    _rcvdAmtCtrl.selection = TextSelection(baseOffset: 0, extentOffset: _rcvdAmtCtrl.text.length);
+                  } else {
+                    int curIdx = _navCols.indexOf(col);
+                    if (curIdx != -1 && curIdx < _navCols.length - 1) {
+                      _moveFocus(row, _navCols[curIdx + 1], autoOpen: _navCols[curIdx + 1] == 4);
+                    } else if (curIdx == _navCols.length - 1 && row < _items.length) {
+                      _moveFocus(_items.length, _navCols.first, autoOpen: true);
+                    }
+                  }
+                },
+                onNavigateUp: () {
+                  final bool isOverlayOpen = _searchList.value.isNotEmpty ||
+                      _batchList.value.isNotEmpty ||
+                      _specialSearchList.value.isNotEmpty ||
+                      _patientSearchList.value.isNotEmpty ||
+                      _doctorSearchList.value.isNotEmpty;
+                  if (isOverlayOpen) {
+                    final list = _patientSearchList.value.isNotEmpty ? _patientSearchList.value
+                        : _doctorSearchList.value.isNotEmpty ? _doctorSearchList.value
+                        : _specialSearchList.value.isNotEmpty ? _specialSearchList.value
+                        : ((_isSelectingBatch || col == 4) && _batchList.value.isNotEmpty ? _batchList.value
+                        : (_searchList.value.isNotEmpty ? _searchList.value : _batchList.value));
+                    if (list.isNotEmpty) {
+                      _searchIdx.value = (_searchIdx.value - 1).clamp(0, list.length - 1);
+                      _scrollToIdx(_searchIdx.value);
+                    }
+                    return;
+                  }
+                  if (row > 0) {
+                    int nextCol = _navCols.contains(col) ? col : 1;
+                    _moveFocus(row - 1, nextCol);
+                  } else {
+                    _moveFocus(-1, 0);
+                  }
+                },
+                onNavigateDown: () {
+                  final bool isOverlayOpen = _searchList.value.isNotEmpty ||
+                      _batchList.value.isNotEmpty ||
+                      _specialSearchList.value.isNotEmpty ||
+                      _patientSearchList.value.isNotEmpty ||
+                      _doctorSearchList.value.isNotEmpty;
+                  if (isOverlayOpen) {
+                    final list = _patientSearchList.value.isNotEmpty ? _patientSearchList.value
+                        : _doctorSearchList.value.isNotEmpty ? _doctorSearchList.value
+                        : _specialSearchList.value.isNotEmpty ? _specialSearchList.value
+                        : ((_isSelectingBatch || col == 4) && _batchList.value.isNotEmpty ? _batchList.value
+                        : (_searchList.value.isNotEmpty ? _searchList.value : _batchList.value));
+                    if (list.isNotEmpty) {
+                      _searchIdx.value = (_searchIdx.value + 1).clamp(0, list.length - 1);
+                      _scrollToIdx(_searchIdx.value);
+                    }
+                    return;
+                  }
+                  if (row < _items.length - 1) {
+                    int nextCol = _navCols.contains(col) ? col : 1;
+                    _moveFocus(row + 1, nextCol);
+                  } else {
+                    _rcvdAmtFocus.requestFocus();
+                  }
+                },
                 onChanged: (v) {
                   if (_errorCells[row]?.contains(col) == true) {
                      setState(() {
@@ -7088,7 +9302,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                   final bool isAlreadyFocused = (_focusNotifier.value?.row == row && _focusNotifier.value?.col == col);
 
                   if (!isAlreadyFocused) {
-                    _moveFocus(row, col, autoOpen: (col == 2 || col == 4) && ctrl.text.trim().isEmpty);
+                    _moveFocus(row, col, autoOpen: (col == 2 && ctrl.text.trim().isEmpty) || col == 4);
                     if (ctrl.text.trim().isNotEmpty) {
                       ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
                     }
@@ -7098,17 +9312,13 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                         _startProductSearch(ctrl.text);
                       }
                     } else if (col == 4) {
-                      if (ctrl.text.trim().isEmpty) {
-                        _startBatchSearch(row, ctrl.text);
-                      }
+                      _startBatchSearch(row, "");
                     }
                   }
                 },
                 textCapitalization: (col == 5 || col == 11) ? TextCapitalization.none : TextCapitalization.characters,
-                textAlignVertical: TextAlignVertical.center,
                 style: TextStyle(fontSize: 14, fontWeight: fontWeight ?? FontWeight.bold, color: textColor),
                 decoration: InputDecoration(isDense: true, border: InputBorder.none, contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4), hintText: hint, hintStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.normal, color: Colors.grey)),
-                cursorColor: Colors.blue.shade900, cursorWidth: 2.0,
               )
             : Container(
                 padding: const EdgeInsets.symmetric(horizontal: 2),
@@ -7170,7 +9380,6 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   }
 
   Widget _buildTotalsRow(double width) {
-    double sumMrp = _items.fold(0, (sum, it) => sum + (it.mrp * (it.packin > 0 ? it.packin : 1)));
     int sumQty = _items.fold(0, (sum, it) => sum + it.qty);
     double sumDisc = _items.fold(0, (sum, it) => sum + it.discAmt);
     double sumTotal = _items.fold(0, (sum, it) => sum + it.total);
@@ -7179,28 +9388,35 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     return Container(
       height: 28, width: width, color: const Color(0xFF37474F),
       child: Row(children: [
-        SizedBox(width: _colWidths[0]! + _colWidths[1]! + _colWidths[2]! + _colWidths[3]! + _colWidths[4]! + _colWidths[5]!),
-        _Hdr(sumQty.toString(), width: _colWidths[6], align: TextAlign.right),
-        SizedBox(width: _colWidths[7]!),
-        _Hdr(sumMrp.toStringAsFixed(2), width: _colWidths[8], align: TextAlign.right),
-        SizedBox(width: _colWidths[9]! + _colWidths[10]!),
-        _Hdr(sumDisc.toStringAsFixed(2), width: _colWidths[11], align: TextAlign.right),
-        SizedBox(width: _colWidths[12]!),
-        _Hdr(sumTotal.toStringAsFixed(2), width: _colWidths[13], align: TextAlign.right),
-        _Hdr(_showProfitColumn ? sumProfit.toStringAsFixed(2) : "", width: _colWidths[14], align: TextAlign.right),
-        SizedBox(width: _colWidths[15]!),
+        SizedBox(width: _colWidths[0]! + _colWidths[1]! + _colWidths[2]! + _colWidths[3]! + _colWidths[4]! + _colWidths[5]! + _colWidths[6]!),
+        _Hdr(sumQty.toString(), width: _colWidths[7], align: TextAlign.right),
+        SizedBox(width: _colWidths[8]! + _colWidths[9]! + _colWidths[10]! + _colWidths[11]!),
+        _Hdr(sumDisc.toStringAsFixed(2), width: _colWidths[12], align: TextAlign.right),
+        SizedBox(width: _colWidths[13]!),
+        _Hdr(sumTotal.toStringAsFixed(2), width: _colWidths[14], align: TextAlign.right),
+        _Hdr(_showProfitColumn ? sumProfit.toStringAsFixed(2) : "", width: _colWidths[15], align: TextAlign.right),
+        SizedBox(width: _colWidths[16]!),
       ]),
     );
   }
 
   Widget _buildOverlay() {
-    return Stack(
-      clipBehavior: Clip.none,
-      children: [
-        _buildNameOverlay(_patientLayer, _patientSearchList, _patientCtrl, _mobileFocus),
-        _buildNameOverlay(_doctorLayer, _doctorSearchList, _doctorCtrl, null),
-        _buildNameOverlay(_specialCustomerLayer, _patientSearchList, _specialCustomerNameCtrl, _specialCustomerPhoneFocus),
-        // Obsolete global special order overlay removed.
+    return ListenableBuilder(
+      listenable: Listenable.merge([_patientSearchList, _searchList, _batchList, _focusNotifier]),
+      builder: (ctx, _) {
+        final bool hasActiveOverlay = _patientSearchList.value.isNotEmpty ||
+            _searchList.value.isNotEmpty ||
+            _batchList.value.isNotEmpty;
+
+        return IgnorePointer(
+          ignoring: !hasActiveOverlay,
+          child: Stack(
+            clipBehavior: Clip.none,
+            children: [
+              _buildNameOverlay(_patientLayer, _patientSearchList, _patientCtrl, _mobileFocus),
+              _buildNameOverlay(_doctorLayer, _doctorSearchList, _doctorCtrl, null),
+              _buildNameOverlay(_specialCustomerLayer, _patientSearchList, _specialCustomerNameCtrl, _specialCustomerPhoneFocus),
+              // Obsolete global special order overlay removed.
 
         ListenableBuilder(
           listenable: Listenable.merge([_searchList, _batchList, _focusNotifier]),
@@ -7209,18 +9425,20 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
             final bool isBatch = (focusedCol == 4 || _isSelectingBatch) && _batchList.value.isNotEmpty;
             final bool isProduct = (focusedCol == 2 || focusedCol == -1) && _searchList.value.isNotEmpty;
 
-            if (!isBatch && !isProduct) return const SizedBox();
+            if (!isBatch && !isProduct) return const SizedBox(key: ValueKey('empty_overlay'));
 
             final list = isBatch ? _batchList.value : _searchList.value;
-            if (list.isEmpty) return const SizedBox();
+            if (list.isEmpty) return const SizedBox(key: ValueKey('empty_overlay'));
             
             final link = isBatch ? _batchLayer : _searchLayer;
-            const double dropWidth = 1350.0;
+            final double dropWidth = isBatch ? 780.0 : 1250.0;
+            final Offset dropOffset = isBatch ? const Offset(-80, 30) : const Offset(0, 30);
 
             return CompositedTransformFollower(
+              key: ValueKey(isBatch ? 'batch_overlay' : 'product_overlay'),
               link: link,
               showWhenUnlinked: false,
-              offset: const Offset(0, 30),
+              offset: dropOffset,
               child: Listener(
                 behavior: HitTestBehavior.opaque,
                 onPointerDown: (_) {
@@ -7251,30 +9469,30 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                             child: Row(
                               children: isBatch
                                   ? const [
-                                _Hdr("Batch", width: 150),
-                                _Hdr("Stock", width: 80, align: TextAlign.right),
-                                _Hdr("Packing", width: 80, align: TextAlign.right),
-                                _Hdr("Strips/L", width: 80, align: TextAlign.center),
-                                _Hdr("Expiry", width: 90, align: TextAlign.center),
-                                _Hdr("MRP", width: 90, align: TextAlign.right),
-                                _Hdr("S.PRICE", width: 100, align: TextAlign.right),
-                                _Hdr("Disc%", width: 70, align: TextAlign.right),
-                                _Hdr("1 /MRP", width: 80, align: TextAlign.right),
-                                _Hdr("1 /S.PRICE", width: 90, align: TextAlign.right),
-                                _Hdr("LCWT", width: 90, align: TextAlign.right),
+                                _Hdr("Batch", width: 100),
+                                _Hdr("Stock", width: 55, align: TextAlign.right),
+                                _Hdr("Packing", width: 55, align: TextAlign.right),
+                                _Hdr("Strips/L", width: 65, align: TextAlign.center),
+                                _Hdr("Expiry", width: 60, align: TextAlign.center),
+                                _Hdr("MRP", width: 65, align: TextAlign.right),
+                                _Hdr("S.PRICE", width: 65, align: TextAlign.right),
+                                _Hdr("Disc%", width: 50, align: TextAlign.right),
+                                _Hdr("1 /MRP", width: 60, align: TextAlign.right),
+                                _Hdr("1 /S.PRICE", width: 65, align: TextAlign.right),
+                                _Hdr("LCWT", width: 60, align: TextAlign.right),
                                 _Hdr("Profit%", flex: 1, align: TextAlign.right)
                               ]
                                   : const [
-                                _Hdr("Name", width: 300),
-                                _Hdr("Stock", width: 70, align: TextAlign.right),
-                                _Hdr("Packin", width: 60, align: TextAlign.right),
-                                _Hdr("Strips/L", width: 80, align: TextAlign.center),
-                                _Hdr("MRP", width: 80, align: TextAlign.right),
-                                _Hdr("PRate", width: 80, align: TextAlign.right),
-                                _Hdr("Rack", width: 60),
-                                _Hdr("Cat", width: 50),
-                                _Hdr("Patent", width: 120),
-                                _Hdr("Generic Name", width: 150),
+                                _Hdr("Name", width: 380),
+                                _Hdr("Stock", width: 60, align: TextAlign.right),
+                                _Hdr("Packin", width: 50, align: TextAlign.right),
+                                _Hdr("Strips/L", width: 65, align: TextAlign.center),
+                                _Hdr("MRP", width: 65, align: TextAlign.right),
+                                _Hdr("PRate", width: 65, align: TextAlign.right),
+                                _Hdr("Rack", width: 45),
+                                _Hdr("Cat", width: 40),
+                                _Hdr("Patent", width: 80),
+                                _Hdr("Generic Name", width: 110),
                                 _Hdr("Use", flex: 1)
                               ],
                             ),
@@ -7282,96 +9500,120 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                         ),
                         ConstrainedBox(
                           constraints: const BoxConstraints(maxHeight: 168.0),
-                          child: ValueListenableBuilder<int>(
-                            valueListenable: _searchIdx,
-                            builder: (ctx, idx, _) => Scrollbar(
+                          child: _safeScrollbar(
+                            controller: _dropdownScrollCtrl,
+                            thumbVisibility: true,
+                            child: ListView.builder(
                               controller: _dropdownScrollCtrl,
-                              thumbVisibility: true,
-                              child: ListView.builder(
-                                controller: _dropdownScrollCtrl,
-                                padding: EdgeInsets.zero,
-                                shrinkWrap: true,
-                                itemExtent: 24.0,
-                                physics: const AlwaysScrollableScrollPhysics(),
-                                itemCount: list.length,
-                                itemBuilder: (ctx, i) {
-                                  final p = list[i];
-                                  bool sel = i == idx;
+                              padding: EdgeInsets.zero,
+                              shrinkWrap: true,
+                              itemExtent: 24.0,
+                              physics: const AlwaysScrollableScrollPhysics(),
+                              itemCount: list.length,
+                              itemBuilder: (ctx, i) {
+                                return ValueListenableBuilder<int>(
+                                  valueListenable: _searchIdx,
+                                  builder: (ctx, idx, _) {
+                                    final p = list[i];
+                                    bool sel = i == idx;
 
-                                  int displayStock = p.stock < 0 ? 0 : p.stock;
-                                  double ps = p.packSize == 0 ? 1 : p.packSize.toDouble();
-                                  double pcsMrp = p.mrp / ps;
-                                  double pcsPrice = p.mrp / ps;
-                                  double profit = p.purchaseRate > 0
-                                      ? ((p.mrp - p.purchaseRate) / p.purchaseRate) * 100
-                                      : 0.0;
+                                    int displayStock = p.stock < 0 ? 0 : p.stock;
+                                    double ps = p.packSize == 0 ? 1 : p.packSize.toDouble();
+                                    double pcsMrp = p.mrp / ps;
+                                    double pcsPrice = (p.salePrice > 0 ? p.salePrice : p.mrp) / ps;
+                                    double profit = p.purchaseRate > 0
+                                        ? ((p.mrp - p.purchaseRate) / p.purchaseRate) * 100
+                                        : 0.0;
 
-                                  Color bgColor = Colors.white;
-                                  Color fontColor = Colors.black;
+                                    Color bgColor = Colors.white;
+                                    Color fontColor = Colors.black;
 
-                                  if (isBatch) {
-                                    bgColor = _getBatchBgColor(p.expiry);
-                                    fontColor = _getBatchTextColor(p.expiry);
-                                  } else {
-                                    if (sel) bgColor = Colors.blue.shade50;
-                                  }
-
-                                  final bool isH1 = p.schedule.toUpperCase() == "H1";
-                                  return GestureDetector(
-                                    behavior: HitTestBehavior.opaque,
-                                    onTapDown: (_) {
-                                      _isSelectingFromDropdown = true;
-                                    },
-                                    onTap: () {
-                                      if (isBatch) {
-                                        _finalizeBatchSelection(p);
+                                    if (isBatch) {
+                                      if (sel) {
+                                        bgColor = Colors.blue.shade200;
+                                        fontColor = Colors.blue.shade900;
                                       } else {
-                                        _onProductSelected(p);
+                                        bgColor = _getBatchBgColor(p.expiry);
+                                        fontColor = _getBatchTextColor(p.expiry);
                                       }
-                                    },
-                                    child: Container(
-                                      height: 24,
-                                      decoration: BoxDecoration(
-                                          color: sel ? Colors.blue.shade100 : (isH1 ? Colors.red.shade50 : Colors.white),
-                                          border: Border(bottom: BorderSide(color: Colors.grey.shade300, width: 0.5))),
-                                      child: Row(
-                                        children: isBatch
-                                            ? [
-                                          _GridCell(_cleanBatch(p.batch), width: 150, fontWeight: FontWeight.bold, color: isH1 ? Colors.red.shade900 : Colors.black),
-                                          _GridCell(displayStock.toString(), width: 80, align: TextAlign.right, fontWeight: FontWeight.bold, color: isH1 ? Colors.red.shade900 : Colors.black),
-                                          _GridCell(p.packSize.toString(), width: 80, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.black),
-                                          _GridCell("${displayStock ~/ (p.packSize > 0 ? p.packSize : 1)} / ${displayStock % (p.packSize > 0 ? p.packSize : 1)}", width: 80, align: TextAlign.center, color: isH1 ? Colors.red.shade700 : Colors.blue.shade700, fontWeight: FontWeight.bold),
-                                          _GridCell(p.expiry, width: 90, align: TextAlign.center, fontWeight: FontWeight.bold, color: fontColor, bgColor: bgColor),
-                                          _GridCell(p.mrp.toStringAsFixed(2), width: 90, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.black),
-                                          _GridCell(p.mrp.toStringAsFixed(2), width: 100, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.black),
-                                          _GridCell(p.sDiscPercent.toStringAsFixed(2), width: 70, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.black),
-                                          _GridCell(pcsMrp.toStringAsFixed(2), width: 80, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.black),
-                                          _GridCell(pcsPrice.toStringAsFixed(2), width: 90, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.black),
-                                          _GridCell(p.purchaseRate.toStringAsFixed(2), width: 90, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.black),
-                                          _GridCell(profit.toStringAsFixed(2), flex: 1, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.black)
-                                        ]
-                                            : (p.id == "NEW"
+                                    } else {
+                                      if (sel) bgColor = Colors.blue.shade50;
+                                    }
+
+                                    final bool isH1 = p.schedule.toUpperCase() == "H1";
+                                    return MouseRegion(
+                                      onHover: (PointerHoverEvent event) {
+                                        if (event.kind == PointerDeviceKind.mouse && event.delta != Offset.zero) {
+                                          if (_searchIdx.value != i) {
+                                            _searchIdx.value = i;
+                                            if (!isBatch && p.id != "NEW") {
+                                              _updateFooter(p);
+                                            }
+                                          }
+                                        }
+                                      },
+                                      child: GestureDetector(
+                                        behavior: HitTestBehavior.opaque,
+                                        onTapDown: (_) {
+                                          _isSelectingFromDropdown = true;
+                                          _searchIdx.value = i;
+                                          if (!isBatch && p.id != "NEW") {
+                                            _updateFooter(p);
+                                          }
+                                        },
+                                        onTap: () {
+                                          if (isBatch) {
+                                            _finalizeBatchSelection(p);
+                                          } else {
+                                            _onProductSelected(p);
+                                          }
+                                        },
+                                        child: Container(
+                                          height: 24,
+                                          decoration: BoxDecoration(
+                                            color: sel ? Colors.blue.shade100 : (isH1 ? Colors.red.shade50 : Colors.white),
+                                            border: Border(bottom: BorderSide(color: Colors.grey.shade300, width: 0.5)),
+                                          ),
+                                          child: Row(
+                                            children: isBatch
                                                 ? [
-                                                    _GridCell("+ CREATE NEW MEDICINE: '${p.name}'", flex: 1, fontWeight: FontWeight.bold, color: Colors.green.shade800),
+                                                    _GridCell(_cleanBatch(p.batch), width: 100, fontWeight: FontWeight.bold, color: isH1 ? Colors.red.shade900 : Colors.black),
+                                                    _GridCell(displayStock.toString(), width: 55, align: TextAlign.right, fontWeight: FontWeight.bold, color: isH1 ? Colors.red.shade900 : Colors.black),
+                                                    _GridCell(p.packSize.toString(), width: 55, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.black),
+                                                    _GridCell("${displayStock ~/ (p.packSize > 0 ? p.packSize : 1)} / ${displayStock % (p.packSize > 0 ? p.packSize : 1)}", width: 65, align: TextAlign.center, color: isH1 ? Colors.red.shade700 : Colors.blue.shade700, fontWeight: FontWeight.bold),
+                                                    _GridCell(p.expiry, width: 60, align: TextAlign.center, fontWeight: FontWeight.bold, color: fontColor, bgColor: bgColor),
+                                                    _GridCell(p.mrp.toStringAsFixed(2), width: 65, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.black),
+                                                    _GridCell((p.salePrice > 0 ? p.salePrice : p.mrp).toStringAsFixed(2), width: 65, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.black),
+                                                    _GridCell(p.sDiscPercent.toStringAsFixed(2), width: 50, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.black),
+                                                    _GridCell(pcsMrp.toStringAsFixed(2), width: 60, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.black),
+                                                    _GridCell(pcsPrice.toStringAsFixed(2), width: 65, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.black),
+                                                    _GridCell(p.purchaseRate.toStringAsFixed(2), width: 60, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.black),
+                                                    _GridCell(profit.toStringAsFixed(2), flex: 1, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.black),
                                                   ]
-                                                : [
-                                          _GridCell(p.name, width: 300, fontWeight: FontWeight.bold, color: isH1 ? Colors.red.shade900 : null),
-                                          _GridCell(displayStock.toString(), width: 70, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.blue.shade700, fontWeight: FontWeight.bold),
-                                          _GridCell(p.packSize.toString(), width: 60, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : null),
-                                          _GridCell("${displayStock ~/ (p.packSize > 0 ? p.packSize : 1)} / ${displayStock % (p.packSize > 0 ? p.packSize : 1)}", width: 80, align: TextAlign.center, color: isH1 ? Colors.red.shade900 : Colors.blue.shade700, fontWeight: FontWeight.bold),
-                                          _GridCell(p.mrp.toStringAsFixed(2), width: 80, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : null),
-                                          _GridCell(p.purchaseRate.toStringAsFixed(2), width: 80, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : null),
-                                          _GridCell(p.rack, width: 60, color: isH1 ? Colors.red.shade900 : null),
-                                          _GridCell(p.category.length > 3 ? p.category.substring(0, 3).toUpperCase() : p.category, width: 50, color: isH1 ? Colors.red.shade900 : null),
-                                          _GridCell(p.patent, width: 120, color: isH1 ? Colors.red.shade900 : null),
-                                          _GridCell(p.genericName.isNotEmpty ? p.genericName : (Provider.of<PharmacyProvider>(context, listen: false).getProductById(p.id)?.genericName ?? Provider.of<PharmacyProvider>(context, listen: false).getProductMasterByName(p.name)?.genericName ?? ""), width: 150, color: isH1 ? Colors.red.shade900 : null),
-                                          _GridCell(p.use.isNotEmpty ? p.use : (Provider.of<PharmacyProvider>(context, listen: false).getProductById(p.id)?.use ?? Provider.of<PharmacyProvider>(context, listen: false).getProductMasterByName(p.name)?.use ?? ""), flex: 1, color: isH1 ? Colors.red.shade900 : null)
-                                        ]),
+                                                : (p.id == "NEW"
+                                                    ? [
+                                                        _GridCell("+ CREATE NEW MEDICINE: '${p.name}'", flex: 1, fontWeight: FontWeight.bold, color: Colors.green.shade800),
+                                                      ]
+                                                    : [
+                                                        _GridCell(p.name, width: 380, fontWeight: FontWeight.bold, color: isH1 ? Colors.red.shade900 : null),
+                                                        _GridCell(displayStock.toString(), width: 60, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : Colors.blue.shade700, fontWeight: FontWeight.bold),
+                                                        _GridCell(p.packSize.toString(), width: 50, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : null),
+                                                        _GridCell("${displayStock ~/ (p.packSize > 0 ? p.packSize : 1)} / ${displayStock % (p.packSize > 0 ? p.packSize : 1)}", width: 65, align: TextAlign.center, color: isH1 ? Colors.red.shade900 : Colors.blue.shade700, fontWeight: FontWeight.bold),
+                                                        _GridCell(p.mrp.toStringAsFixed(2), width: 65, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : null),
+                                                        _GridCell(p.purchaseRate.toStringAsFixed(2), width: 65, align: TextAlign.right, color: isH1 ? Colors.red.shade900 : null),
+                                                        _GridCell(p.rack, width: 45, color: isH1 ? Colors.red.shade900 : null),
+                                                        _GridCell(p.category.length > 3 ? p.category.substring(0, 3).toUpperCase() : p.category, width: 40, color: isH1 ? Colors.red.shade900 : null),
+                                                        _GridCell(p.patent, width: 80, color: isH1 ? Colors.red.shade900 : null),
+                                                        _GridCell(p.genericName.isNotEmpty ? p.genericName : (Provider.of<PharmacyProvider>(context, listen: false).getProductById(p.id)?.genericName ?? Provider.of<PharmacyProvider>(context, listen: false).getProductMasterByName(p.name)?.genericName ?? ""), width: 110, color: isH1 ? Colors.red.shade900 : null),
+                                                        _GridCell(p.use.isNotEmpty ? p.use : (Provider.of<PharmacyProvider>(context, listen: false).getProductById(p.id)?.use ?? Provider.of<PharmacyProvider>(context, listen: false).getProductMasterByName(p.name)?.use ?? ""), flex: 1, color: isH1 ? Colors.red.shade900 : null),
+                                                      ]),
+                                          ),
+                                        ),
                                       ),
-                                    ),
-                                  );
-                                },
-                              ),
+                                    );
+                                  },
+                                );
+                              },
                             ),
                           ),
                         ),
@@ -7395,6 +9637,9 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           },
         ),
       ],
+    ),
+  );
+      },
     );
   }
 
@@ -7402,8 +9647,9 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     return ValueListenableBuilder<List<dynamic>>(
       valueListenable: listNotifier,
       builder: (ctx, list, _) {
-        if (list.isEmpty) return const SizedBox();
+        if (list.isEmpty) return const SizedBox(key: ValueKey('empty_name_overlay'));
         return CompositedTransformFollower(
+          key: ValueKey(link.hashCode),
           link: link, showWhenUnlinked: false, offset: const Offset(0, 26),
           child: Listener(
             behavior: HitTestBehavior.opaque,
@@ -7451,7 +9697,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                                 child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    Text(title, style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: isNew ? Colors.blue.shade900 : Colors.black87)),
+                                    Text(title, style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: isNew ? Colors.blue.shade900 : Colors.black)),
                                     if (subtitle.isNotEmpty)
                                       Text(subtitle, style: TextStyle(fontSize: 10, color: isNew ? Colors.red.shade900 : Colors.grey.shade600, fontWeight: FontWeight.bold)),
                                   ],
@@ -7519,7 +9765,10 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       int discAmtPaise = TaxCalculator.toPaise(double.tryParse(_footerDiscAmtCtrl.text) ?? 0);
 
       int finalValPaise = subPaise - discAmtPaise + otherAmtPaise - lessCrPaise;
-      int roundedGrandTotalPaise = ((finalValPaise / 100.0).round()) * 100;
+      if (finalValPaise < 0) finalValPaise = 0;
+      int roundedGrandTotalPaise = _enableAutoRoundOff
+          ? (((finalValPaise / 100.0).round()) * 100)
+          : finalValPaise;
       int roundOffPaise = roundedGrandTotalPaise - finalValPaise;
 
       double finalVal = finalValPaise / 100.0;
@@ -7540,8 +9789,9 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       
       double rcvd = double.tryParse(_rcvdAmtCtrl.text) ?? 0.0;
       if (rcvd > 0) {
-        _balanceCtrl.text = _fmt(rcvd - rounded);
-        _balanceNotifier.value = rcvd - rounded;
+        double diff = rcvd - rounded;
+        _balanceCtrl.text = _fmt(diff.abs());
+        _balanceNotifier.value = diff;
       } else {
         _balanceCtrl.text = "0.00";
         _balanceNotifier.value = 0.0;
@@ -7549,6 +9799,26 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
       _summaryNotifier.value++;
       _syncToGlobalSession(notify: false);
+
+      // --- Reactive Continuous Validation (Eager 0ms Save Overhead) ---
+      final validItems = _items.where((it) => it.product.name.trim().isNotEmpty).toList();
+      if (validItems.isEmpty) {
+        _cachedValidationError = "Please add at least one valid item before saving.";
+      } else {
+        String? err;
+        for (int i = 0; i < validItems.length; i++) {
+          final it = validItems[i];
+          if (it.qty <= 0 && it.fQty <= 0) {
+            err = "Row ${i + 1}: '${it.product.name}' quantity must be greater than 0.";
+            break;
+          }
+          if (it.product.batch.trim().isEmpty) {
+            err = "Row ${i + 1}: '${it.product.name}' is missing Batch selection.";
+            break;
+          }
+        }
+        _cachedValidationError = err;
+      }
     });
   }
 
@@ -7556,7 +9826,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     Expanded(flex: 2, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [_footerTitle("Recent Entries:", color: Colors.blue.shade800), _footerTableHdr([{'title': 'Entry No', 'flex': 2}, {'title': 'Total', 'flex': 2, 'align': Alignment.centerRight}]), Expanded(child: _buildRecentInvoicesList())] )),
     const SizedBox(width: 8),
 
-    Expanded(flex: 5, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [_footerTitle(_activeGenericName.isNotEmpty ? "Generic Availability Helper (${_activeGenericName.toUpperCase()}):" : "Generic Availability Helper:", color: Colors.blue.shade800), _footerTableHdr([{'title': 'Medicine Name', 'flex': 4}, {'title': 'Generic Name', 'flex': 4}, {'title': 'Stock', 'flex': 1, 'align': Alignment.centerRight}]), Expanded(child: _buildAlternativesList())])),
+    Expanded(flex: 5, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [_footerTitle(_activeGenericName.isNotEmpty ? "Generic Availability Helper (${_activeGenericName.toUpperCase()}):" : "Generic Availability Helper:", color: Colors.blue.shade800), _footerTableHdr([{'title': 'Medicine Name', 'flex': 4}, {'title': 'Pack', 'flex': 1, 'align': Alignment.center}, {'title': 'Generic Name', 'flex': 4}, {'title': 'Strips/Loose', 'flex': 2, 'align': Alignment.center}, {'title': 'Stock', 'flex': 1, 'align': Alignment.centerRight}]), Expanded(child: _buildAlternativesList())])),
     const SizedBox(width: 8),
 
     Expanded(flex: 4, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [_footerTitle("Previous History", color: Colors.blue.shade800), _footerTableHdr([{'title': 'Date', 'flex': 2}, {'title': 'Inv', 'flex': 1}, {'title': 'Qty', 'flex': 1, 'align': Alignment.centerRight}, {'title': 'MRP', 'flex': 2, 'align': Alignment.centerRight}, {'title': 'Rate', 'flex': 2, 'align': Alignment.centerRight}, {'title': 'D%', 'flex': 1, 'align': Alignment.centerRight}]), Expanded(child: _buildProductHistoryList())])),
@@ -7607,10 +9877,12 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
            _activeGenericName.isNotEmpty
                ? "No Alternatives Found for '${_activeGenericName.toUpperCase()}'"
                : "No Alternatives Found",
-           style: const TextStyle(color: Colors.grey, fontSize: 12),
+           style: const TextStyle(color: Color(0xFF1E293B), fontSize: 12, fontWeight: FontWeight.bold),
          )
        );
     }
+
+    final provider = Provider.of<PharmacyProvider>(context, listen: false);
 
     return Container(
       decoration: BoxDecoration(border: Border.all(color: Colors.grey.shade300), color: Colors.white),
@@ -7621,6 +9893,28 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           bool isEven = i % 2 == 0;
           final genDisplay = p.genericName.isNotEmpty ? p.genericName : _activeGenericName;
 
+          final bool isGenCat = provider.isGenericProduct(p);
+          final double margin = p.purchaseRate > 0
+              ? (((p.mrp > 0 ? p.mrp : p.salePrice) - p.purchaseRate) / p.purchaseRate) * 100
+              : 0.0;
+          final bool isHighProfit = !isGenCat && (margin > 40.0);
+
+          final Color rowTextColor = isGenCat
+              ? const Color(0xFF15803D) // Green
+              : (isHighProfit ? const Color(0xFF1D4ED8) : Colors.blue.shade900); // Blue or Default
+
+          final Color genColor = isGenCat
+              ? const Color(0xFF15803D)
+              : (isHighProfit ? const Color(0xFF1D4ED8) : Colors.blue.shade700);
+
+          final Color stockColor = isGenCat
+              ? const Color(0xFF15803D)
+              : (isHighProfit ? const Color(0xFF1D4ED8) : Colors.blue);
+
+          final int packSize = p.packSize > 0 ? p.packSize : 1;
+          final int strips = p.stock > 0 ? (p.stock ~/ packSize) : 0;
+          final int loose = p.stock > 0 ? (p.stock % packSize) : 0;
+
           return InkWell(
             onTap: () => _onGenericAltSelected(p),
             child: Container(
@@ -7630,9 +9924,30 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                 border: Border(bottom: BorderSide(color: Colors.grey.shade200))
               ),
               child: Row(children: [
-                Expanded(flex: 4, child: Padding(padding: const EdgeInsets.only(left: 8), child: Text(p.name.toUpperCase(), style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.blue.shade900), overflow: TextOverflow.ellipsis))),
-                Expanded(flex: 4, child: Text(genDisplay.toUpperCase(), style: TextStyle(fontSize: 10, color: Colors.blue.shade700), overflow: TextOverflow.ellipsis)),
-                Expanded(flex: 1, child: Container(padding: const EdgeInsets.only(right: 8), alignment: Alignment.centerRight, child: Text(p.stock.toString(), style: const TextStyle(fontSize: 11, color: Colors.blue, fontWeight: FontWeight.bold))))
+                Expanded(flex: 4, child: Padding(padding: const EdgeInsets.only(left: 8), child: Text(p.name.toUpperCase(), style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold, color: rowTextColor), overflow: TextOverflow.ellipsis))),
+                Expanded(flex: 1, child: Container(alignment: Alignment.center, child: Text(packSize.toString(), style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.blueGrey.shade800), overflow: TextOverflow.ellipsis))),
+                Expanded(flex: 4, child: Text(genDisplay.toUpperCase(), style: TextStyle(fontSize: 11, fontWeight: (isGenCat || isHighProfit) ? FontWeight.bold : FontWeight.w600, color: genColor), overflow: TextOverflow.ellipsis)),
+                Expanded(flex: 2, child: Container(alignment: Alignment.center, child: RichText(
+                  textAlign: TextAlign.center,
+                  text: TextSpan(
+                    style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+                    children: [
+                      TextSpan(
+                        text: "$strips",
+                        style: const TextStyle(color: Color(0xFF15803D)),
+                      ),
+                      TextSpan(
+                        text: " / ",
+                        style: TextStyle(color: Colors.grey.shade600, fontWeight: FontWeight.normal),
+                      ),
+                      TextSpan(
+                        text: "$loose",
+                        style: const TextStyle(color: Color(0xFFDC2626)),
+                      ),
+                    ],
+                  ),
+                ))),
+                Expanded(flex: 1, child: Container(padding: const EdgeInsets.only(right: 8), alignment: Alignment.centerRight, child: Text(p.stock.toString(), style: TextStyle(fontSize: 11.5, color: stockColor, fontWeight: FontWeight.bold))))
               ]),
             ),
           );
@@ -7646,7 +9961,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       return Container(
         decoration: BoxDecoration(border: Border.all(color: Colors.grey.shade300), color: Colors.white),
         alignment: Alignment.center,
-        child: const Text("No History Found", style: TextStyle(color: Colors.grey, fontSize: 12))
+        child: const Text("No History Found", style: TextStyle(color: Color(0xFF1E293B), fontSize: 12, fontWeight: FontWeight.bold))
       );
     }
 
@@ -7663,15 +9978,15 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           } catch (_) {}
 
           return Container(
-            height: 20,
+            height: 22,
             decoration: BoxDecoration(border: Border(bottom: BorderSide(color: Colors.grey.shade100))),
             child: Row(children: [
-              Expanded(flex: 2, child: Padding(padding: const EdgeInsets.only(left: 4), child: Text(dateStr, style: const TextStyle(fontSize: 9)))),
-              Expanded(flex: 1, child: Text(h['entry_no'].toString(), style: const TextStyle(fontSize: 9))),
-              Expanded(flex: 1, child: Container(alignment: Alignment.centerRight, child: Text(h['qty'].toString(), style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold)))),
-              Expanded(flex: 2, child: Container(alignment: Alignment.centerRight, child: Text(double.tryParse(h['mrp'].toString())?.toStringAsFixed(2) ?? "0.00", style: const TextStyle(fontSize: 10)))),
-              Expanded(flex: 2, child: Container(alignment: Alignment.centerRight, child: Text(double.tryParse(h['s_rate'].toString())?.toStringAsFixed(2) ?? "0.00", style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.blue)))),
-              Expanded(flex: 1, child: Container(padding: const EdgeInsets.only(right: 4), alignment: Alignment.centerRight, child: Text(double.tryParse(h['disc_percent'].toString())?.toStringAsFixed(1) ?? "0.0", style: const TextStyle(fontSize: 9, color: Colors.red)))),
+              Expanded(flex: 2, child: Padding(padding: const EdgeInsets.only(left: 4), child: Text(dateStr, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600)))),
+              Expanded(flex: 1, child: Text(h['entry_no'].toString(), style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600))),
+              Expanded(flex: 1, child: Container(alignment: Alignment.centerRight, child: Text(h['qty'].toString(), style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold)))),
+              Expanded(flex: 2, child: Container(alignment: Alignment.centerRight, child: Text(double.tryParse(h['mrp'].toString())?.toStringAsFixed(2) ?? "0.00", style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600)))),
+              Expanded(flex: 2, child: Container(alignment: Alignment.centerRight, child: Text(double.tryParse(h['s_rate'].toString())?.toStringAsFixed(2) ?? "0.00", style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold, color: Colors.blue)))),
+              Expanded(flex: 1, child: Container(padding: const EdgeInsets.only(right: 4), alignment: Alignment.centerRight, child: Text(double.tryParse(h['disc_percent'].toString())?.toStringAsFixed(1) ?? "0.0", style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.red)))),
             ]),
           );
         },
@@ -7679,18 +9994,19 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     );
   }
 
-  Widget _footerTitle(String title, {Color color = Colors.blue}) => Padding(padding: const EdgeInsets.only(bottom: 4), child: Text(title, style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.bold)));
-  Widget _footerTableHdr(List<Map<String, dynamic>> cols) => Container(height: 18, color: const Color(0xFF424242), child: Row(children: cols.map((c) => Expanded(flex: c['flex'] ?? 1, child: Container(padding: const EdgeInsets.symmetric(horizontal: 4), alignment: c['align'] ?? Alignment.centerLeft, child: Text(c['title'], style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold))))).toList()));
+  Widget _footerTitle(String title, {Color color = Colors.blue}) => Padding(padding: const EdgeInsets.only(bottom: 4), child: Text(title, style: TextStyle(color: color, fontSize: 11.5, fontWeight: FontWeight.bold)));
+  Widget _footerTableHdr(List<Map<String, dynamic>> cols) => Container(height: 20, color: const Color(0xFF424242), child: Row(children: cols.map((c) => Expanded(flex: c['flex'] ?? 1, child: Container(padding: const EdgeInsets.symmetric(horizontal: 4), alignment: c['align'] ?? Alignment.centerLeft, child: Text(c['title'], style: const TextStyle(color: Colors.white, fontSize: 10.5, fontWeight: FontWeight.bold))))).toList()));
 
   Widget _buildRecentInvoicesList() {
-    final provider = Provider.of<PharmacyProvider>(context);
-    final sales = provider.sales.take(15).toList();
+    final p = Provider.of<PharmacyProvider>(context);
+    final Set<String> seenNos = {};
+    final sales = p.sales.where((s) => !s.isDeleted && seenNos.add(cleanEntryNo(s.entryNo))).take(15).toList();
 
     if (sales.isEmpty) {
       return Container(
         decoration: BoxDecoration(border: Border.all(color: Colors.grey.shade300), color: Colors.white),
         alignment: Alignment.center,
-        child: const Text("No Recent Entries", style: TextStyle(color: Colors.grey, fontSize: 12))
+        child: const Text("No Recent Entries", style: TextStyle(color: Color(0xFF1E293B), fontSize: 12, fontWeight: FontWeight.bold))
       );
     }
 
@@ -7700,14 +10016,21 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         itemCount: sales.length,
         itemBuilder: (ctx, i) {
           final inv = sales[i];
+          final displayNo = formatSaleDisplayNo(inv.entryNo);
           return InkWell(
-            onTap: () => _openSalesAsWindow(inv.entryNo),
+            onTap: () async {
+              if (_isExistingEntry && _isDirty) {
+                bool? discard = await _promptDiscardChanges();
+                if (discard != true) return;
+              }
+              _loadSaleData(inv.entryNo);
+            },
             child: Container(
-              height: 20,
+              height: 22,
               decoration: BoxDecoration(border: Border(bottom: BorderSide(color: Colors.grey.shade100))),
               child: Row(children: [
-                Expanded(flex: 2, child: Padding(padding: const EdgeInsets.only(left: 4), child: Text(inv.entryNo, style: const TextStyle(fontSize: 10)))),
-                Expanded(flex: 2, child: Container(padding: const EdgeInsets.only(right: 4), alignment: Alignment.centerRight, child: Text(inv.grandTotal.toStringAsFixed(2), style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.blue.shade800)))),
+                Expanded(flex: 2, child: Padding(padding: const EdgeInsets.only(left: 4), child: Text(displayNo, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600)))),
+                Expanded(flex: 2, child: Container(padding: const EdgeInsets.only(right: 4), alignment: Alignment.centerRight, child: Text(inv.grandTotal.toStringAsFixed(2), style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold, color: Colors.blue.shade800)))),
               ]),
             ),
           );
@@ -7753,35 +10076,72 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                       keyboardType: const TextInputType.numberWithOptions(decimal: true),
                       inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))],
                       onChanged: (_) {
+                        _isRcvdAmtConfirmed = false;
                         _markDirty();
                         _calculateFooter();
                       },
-                      onSubmitted: readOnly ? null : (_) => _promptSave(),
+                      onSubmitted: readOnly ? null : (_) {
+                        _calculateFooter();
+                        if (!_isRcvdAmtConfirmed) {
+                          setState(() {
+                            _isRcvdAmtConfirmed = true;
+                          });
+                        } else {
+                          _promptSave();
+                        }
+                      },
                       textAlign: TextAlign.right,
                       style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.black),
                       decoration: const InputDecoration(border: InputBorder.none, isDense: true, contentPadding: EdgeInsets.symmetric(horizontal: 4, vertical: 2)),
                     ),
                   ),
                 ),
-                const SizedBox(width: 4),
-                const Text("Balance", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
-                const SizedBox(width: 4),
-                Expanded(
-                  child: Container(
-                    height: 22,
-                    decoration: BoxDecoration(
-                      color: Colors.grey.shade200,
-                      border: Border.all(color: Colors.grey.shade400),
-                      borderRadius: BorderRadius.circular(4)
-                    ),
-                    child: TextField(
-                      controller: _balanceCtrl,
-                      readOnly: true,
-                      textAlign: TextAlign.right,
-                      style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.redAccent),
-                      decoration: const InputDecoration(border: InputBorder.none, isDense: true, contentPadding: EdgeInsets.symmetric(horizontal: 4, vertical: 2)),
-                    ),
-                  ),
+                ValueListenableBuilder<double>(
+                  valueListenable: _balanceNotifier,
+                  builder: (context, diff, _) {
+                    bool isReturn = diff > 0.005;
+                    bool isDue = diff < -0.005;
+
+                    String label = isReturn
+                        ? "Change Return"
+                        : (isDue ? "Balance Due" : "Balance");
+                    Color labelColor = isReturn
+                        ? Colors.green.shade800
+                        : (isDue ? Colors.red.shade800 : Colors.black);
+                    Color valueColor = isReturn
+                        ? Colors.green.shade800
+                        : (isDue ? Colors.redAccent : Colors.black);
+                    Color bgColor = isReturn
+                        ? Colors.green.shade50
+                        : (isDue ? Colors.red.shade50 : Colors.grey.shade200);
+                    Color borderColor = isReturn
+                        ? Colors.green.shade400
+                        : (isDue ? Colors.red.shade300 : Colors.grey.shade400);
+
+                    return Row(
+                      children: [
+                        const SizedBox(width: 4),
+                        Text(label, style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: labelColor)),
+                        const SizedBox(width: 4),
+                        Container(
+                          width: 65,
+                          height: 22,
+                          decoration: BoxDecoration(
+                            color: bgColor,
+                            border: Border.all(color: borderColor),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: TextField(
+                            controller: _balanceCtrl,
+                            readOnly: true,
+                            textAlign: TextAlign.right,
+                            style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: valueColor),
+                            decoration: const InputDecoration(border: InputBorder.none, isDense: true, contentPadding: EdgeInsets.symmetric(horizontal: 4, vertical: 2)),
+                          ),
+                        ),
+                      ],
+                    );
+                  },
                 ),
               ],
             ),
@@ -7918,132 +10278,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     );
   }
 
-  void _openSalesAsWindow(String invNo) {
-    setState(() => _isDialogOpen = true);
-    showDialog(
-      context: context,
-      barrierColor: Colors.black26,
-      builder: (ctx) {
-        final ValueNotifier<Offset> offsetNotifier = ValueNotifier<Offset>(Offset.zero);
-        bool isMinimized = false;
-        bool isMaximized = false; // <-- NEW STATE
 
-        return StatefulBuilder(
-          builder: (context, setWindowState) {
-            // MINIMIZED FLOATING TAB VIEW
-            if (isMinimized) {
-              return ValueListenableBuilder<Offset>(
-                  valueListenable: offsetNotifier,
-                  builder: (context, offset, child) {
-                    return Transform.translate(
-                      offset: offset,
-                      child: Align(
-                        alignment: Alignment.bottomLeft,
-                        child: Padding(
-                          padding: const EdgeInsets.all(20),
-                          child: GestureDetector(
-                            onPanUpdate: (d) => offsetNotifier.value += d.delta,
-                            child: Material(
-                              elevation: 10,
-                              borderRadius: BorderRadius.circular(6),
-                              color: Colors.blueGrey.shade900,
-                              child: Container(
-                                width: 250, height: 40,
-                                padding: const EdgeInsets.symmetric(horizontal: 10),
-                                child: Row(
-                                  children: [
-                                    const Icon(Icons.receipt_long, color: Colors.white, size: 16),
-                                    const SizedBox(width: 8),
-                                    Expanded(child: Text("Sales: $invNo", style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold))),
-                                    WindowControlsBar(
-                                      onMinimize: () => setWindowState(() => isMinimized = false),
-                                      onClose: () => Navigator.pop(ctx),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    );
-                  }
-              );
-            }
-
-            // FULL DRAGGABLE WINDOW VIEW
-            return ValueListenableBuilder<Offset>(
-              valueListenable: offsetNotifier,
-              builder: (context, offset, child) {
-                return Transform.translate(
-                  offset: offset,
-                  child: child,
-                );
-              },
-              child: Dialog(
-                // Remove padding entirely when maximized
-                insetPadding: isMaximized ? EdgeInsets.zero : const EdgeInsets.all(30),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(isMaximized ? 0 : 8)),
-                clipBehavior: Clip.antiAlias,
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 200),
-                  // Force full screen dimensions when maximized
-                  width: isMaximized ? MediaQuery.of(context).size.width : 1200,
-                  height: isMaximized ? MediaQuery.of(context).size.height : 800,
-                  child: Column(
-                    children: [
-                      // === DRAGGABLE OS-STYLE HEADER ===
-                      GestureDetector(
-                        onPanUpdate: (details) {
-                          if (isMaximized) return; // Block dragging if maximized
-                          offsetNotifier.value += details.delta;
-                        },
-                        onDoubleTap: () {
-                          // Double tap header to maximize/restore
-                          setWindowState(() {
-                            isMaximized = !isMaximized;
-                            offsetNotifier.value = Offset.zero;
-                          });
-                        },
-                        child: Container(
-                          height: 32,
-                          color: Colors.blueGrey.shade900,
-                          padding: const EdgeInsets.only(left: 12),
-                          child: Row(
-                            children: [
-                              const Icon(Icons.receipt_long, size: 14, color: Colors.white70),
-                              const SizedBox(width: 8),
-                              Text("Viewing Sales Entry: $invNo", style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1.0)),
-                              const Spacer(),
-                              WindowControlsBar(
-                                backgroundColor: Colors.transparent,
-                                onMinimize: () => setWindowState(() => isMinimized = true),
-                                onMaximize: () => setWindowState(() {
-                                  isMaximized = !isMaximized;
-                                  offsetNotifier.value = Offset.zero;
-                                }),
-                                onClose: () => Navigator.pop(ctx),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                      // === ACTUAL SALES SCREEN ===
-                      Expanded(
-                        child: SalesScreen(initialInvoiceNo: invNo, isDialog: true),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            );
-          },
-        );
-      },
-    ).then((_) {
-      if (mounted) setState(() => _isDialogOpen = false);
-    });
-  }
 
 
   // =========================================================================
@@ -8062,21 +10297,41 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
     final ValueNotifier<List<Map<String, dynamic>>> searchResults = ValueNotifier([]);
     final ValueNotifier<bool> isSearching = ValueNotifier(false);
+    final SearchDebouncer findDebouncer = SearchDebouncer(milliseconds: 180);
+    int querySeq = 0;
 
     final provider = Provider.of<PharmacyProvider>(context, listen: false);
 
-    void runQuery() async {
-      isSearching.value = true;
-      final results = await provider.searchSalesInvoices(
-        patient: patientCtrl.text,
-        doctor: doctorCtrl.text,
-        mobile: mobileCtrl.text,
-        billValue: billValueCtrl.text,
-      );
-      if (!mounted) return;
-      searchResults.value = results;
-      isSearching.value = false;
+    void runQuery({bool immediate = false}) {
+      Future<void> execute() async {
+        final seq = ++querySeq;
+        isSearching.value = true;
+        try {
+          final results = await provider.searchSalesInvoices(
+            patient: patientCtrl.text,
+            doctor: doctorCtrl.text,
+            mobile: mobileCtrl.text,
+            billValue: billValueCtrl.text,
+          );
+          if (!mounted || seq != querySeq) return;
+          searchResults.value = results;
+        } finally {
+          if (mounted && seq == querySeq) {
+            isSearching.value = false;
+          }
+        }
+      }
+
+      if (immediate) {
+        findDebouncer.cancel();
+        execute();
+      } else {
+        findDebouncer.run(execute);
+      }
     }
+
+    // Instantly preload 25 recent sales entries on open
+    runQuery(immediate: true);
 
     setState(() => _isDialogOpen = true);
     showDialog(
@@ -8085,19 +10340,20 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       builder: (ctx) {
         return StatefulBuilder(
           builder: (dialogContext, setDialogState) {
-            return CallbackShortcuts(
-              bindings: <ShortcutActivator, VoidCallback>{
-                const SingleActivator(LogicalKeyboardKey.escape): () {
+            return Focus(
+              autofocus: true,
+              onKeyEvent: (node, event) {
+                if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.escape) {
                   WidgetsBinding.instance.addPostFrameCallback((_) {
                     if (dialogContext.mounted && Navigator.of(dialogContext).canPop()) {
                       Navigator.pop(dialogContext);
                     }
                   });
-                },
+                  return KeyEventResult.handled;
+                }
+                return KeyEventResult.ignored;
               },
-              child: Focus(
-                autofocus: true,
-                child: AlertDialog(
+              child: AlertDialog(
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                   title: const Row(
                     children: [
@@ -8181,17 +10437,17 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                         child: Column(
                           children: [
                             Container(
-                              height: 28,
+                              height: 30,
                               color: Colors.blue.shade900,
                               padding: const EdgeInsets.symmetric(horizontal: 8),
                               child: const Row(
                                 children: [
-                                  SizedBox(width: 70, child: Text("Entry No", style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold))),
-                                  SizedBox(width: 80, child: Text("Date", style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold))),
-                                  Expanded(flex: 2, child: Text("Patient", style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold))),
-                                  Expanded(flex: 2, child: Text("Doctor", style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold))),
-                                  SizedBox(width: 90, child: Text("Mobile", style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold))),
-                                  SizedBox(width: 80, child: Text("Total", textAlign: TextAlign.right, style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold))),
+                                  SizedBox(width: 75, child: Text("Entry No", style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold))),
+                                  SizedBox(width: 85, child: Text("Date", style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold))),
+                                  Expanded(flex: 2, child: Text("Patient", style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold))),
+                                  Expanded(flex: 2, child: Text("Doctor", style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold))),
+                                  SizedBox(width: 95, child: Text("Mobile", style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold))),
+                                  SizedBox(width: 85, child: Text("Total", textAlign: TextAlign.right, style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold))),
                                 ],
                               ),
                             ),
@@ -8242,12 +10498,12 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                                               ),
                                               child: Row(
                                                 children: [
-                                                  SizedBox(width: 70, child: Text(entryNo, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.blue))),
-                                                  SizedBox(width: 80, child: Text(dtStr, style: const TextStyle(fontSize: 11))),
-                                                  Expanded(flex: 2, child: Text(patStr, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600), overflow: TextOverflow.ellipsis)),
-                                                  Expanded(flex: 2, child: Text(docStr, style: const TextStyle(fontSize: 11), overflow: TextOverflow.ellipsis)),
-                                                  SizedBox(width: 90, child: Text(mobStr, style: const TextStyle(fontSize: 11))),
-                                                  SizedBox(width: 80, child: Text("₹${totalVal.toStringAsFixed(2)}", textAlign: TextAlign.right, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold))),
+                                                  SizedBox(width: 75, child: Text(entryNo, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.blue))),
+                                                  SizedBox(width: 85, child: Text(dtStr, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600))),
+                                                  Expanded(flex: 2, child: Text(patStr, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold), overflow: TextOverflow.ellipsis)),
+                                                  Expanded(flex: 2, child: Text(docStr, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600), overflow: TextOverflow.ellipsis)),
+                                                  SizedBox(width: 95, child: Text(mobStr, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600))),
+                                                  SizedBox(width: 85, child: Text("₹${totalVal.toStringAsFixed(2)}", textAlign: TextAlign.right, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold))),
                                                 ],
                                               ),
                                             ),
@@ -8279,11 +10535,11 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                 ),
               ],
             ),
-          ),
-        );
-      },
-    );
-  }).then((val) async {
+          );
+        },
+      );
+    }).then((val) async {
+      findDebouncer.dispose();
       if (mounted) setState(() => _isDialogOpen = false);
       if (val != null && val is String) {
         if (_isExistingEntry && _isDirty) {
@@ -8291,9 +10547,9 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           if (!mounted) return;
           if (discard != true) return;
         }
-        Future.delayed(const Duration(milliseconds: 100), () {
-          if (mounted) _loadSaleData(val);
-        });
+        if (mounted) {
+          _loadSaleData(val);
+        }
       }
       patientCtrl.dispose();
       doctorCtrl.dispose();
@@ -8525,7 +10781,119 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     ).then((_) => setState(() => _isDialogOpen = false));
   }
 
+  // =========================================================================
+  // F1 SHORTCUTS CHEAT-SHEET OVERLAY DIALOG
+  // =========================================================================
+  void _showShortcutsDialog() {
+    _isDialogOpen = true;
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        final isDark = Theme.of(ctx).brightness == Brightness.dark;
+        return Dialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          child: Container(
+            width: 560,
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: isDark ? const Color(0xFF1E2638) : Colors.white,
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.keyboard_outlined, size: 28, color: Colors.blueAccent),
+                    const SizedBox(width: 10),
+                    const Text("POS Hotkeys & Shortcuts Cheat-Sheet", style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                    const Spacer(),
+                    IconButton(icon: const Icon(Icons.close), onPressed: () => Navigator.of(ctx).pop()),
+                  ],
+                ),
+                const Divider(height: 16),
+                SizedBox(
+                  height: 380,
+                  child: ListView(
+                    children: const [
+                      _ShortcutRowWidget("F1", "Show Hotkeys Cheat-Sheet"),
+                      _ShortcutRowWidget("Shift + F1 / Ctrl + N", "New Invoice / Reset Form"),
+                      _ShortcutRowWidget("F2", "Focus Patient / Customer Name"),
+                      _ShortcutRowWidget("F3", "Wholesale Stock Directory"),
+                      _ShortcutRowWidget("F4", "Jump to Product Item Grid"),
+                      _ShortcutRowWidget("F5", "Substitute Generic Salt Finder"),
+                      _ShortcutRowWidget("F6", "Dynamic UPI Payment QR Checkout"),
+                      _ShortcutRowWidget("F7", "Fast Save & Thermal Invoice Print"),
+                      _ShortcutRowWidget("F8", "Focus Cash Received Amount"),
+                      _ShortcutRowWidget("F9", "Invoice PDF Preview & Export"),
+                      _ShortcutRowWidget("F10", "Save Invoice / Edit Record"),
+                      _ShortcutRowWidget("F11", "Hold Billing Session & Switch Workspace"),
+                      _ShortcutRowWidget("F12", "Express Save & Print Bill"),
+                      _ShortcutRowWidget("Ctrl + 1", "Product Purchase History"),
+                      _ShortcutRowWidget("Ctrl + 2", "Product Sales History"),
+                      _ShortcutRowWidget("Ctrl + L", "Product Stock Movement Ledger"),
+                      _ShortcutRowWidget("Ctrl + Z", "Undo Last Grid Action"),
+                      _ShortcutRowWidget("Ctrl + Del", "Delete Selected Grid Row"),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: ElevatedButton(
+                    onPressed: () => Navigator.of(ctx).pop(),
+                    child: const Text("Close (Esc)"),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    ).then((_) {
+      _isDialogOpen = false;
+    });
+  }
 
+  // =========================================================================
+  // F6 DYNAMIC UPI PAYMENT QR CHECKOUT
+  // =========================================================================
+  Future<void> _triggerDynamicUpiQrPayment() async {
+    final double amt = _netTotalNotifier.value > 0 
+        ? _netTotalNotifier.value 
+        : (double.tryParse(_netTotalCtrl.text) ?? 0.0);
+
+    if (amt <= 0) {
+      _showFastDialog(
+        title: "Invalid Amount",
+        content: "Cannot generate UPI QR code for a bill with zero total.",
+      );
+      return;
+    }
+
+    final company = CompanyProfile();
+    final upiVpa = company.upiVpaId.isNotEmpty ? company.upiVpaId : "sahakarmedicals@upi";
+    final payeeName = company.upiPayeeName.isNotEmpty ? company.upiPayeeName : company.name;
+    final invNo = _entryNo.isNotEmpty ? _entryNo : "NEW";
+
+    final bool? paid = await DynamicUpiQrDialog.show(
+      context,
+      billAmount: amt,
+      invoiceNo: invNo,
+      upiVpa: upiVpa,
+      payeeName: payeeName,
+    );
+
+    if (paid == true) {
+      setState(() {
+        _customerAcc = "UPI";
+        _customerAccCtrl.text = "UPI";
+        _rcvdAmtCtrl.text = amt.toStringAsFixed(2);
+      });
+      _saveAndPrintBill();
+    }
+  }
 
   // =========================================================================
   // F3 GENERIC / CONTENT-WISE SEARCH DIALOG (AUTO-FILL BILLING)
@@ -8894,7 +11262,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
             Widget buildCutStripCell(Product p) {
               if (p.packSize <= 1) {
                 return const Center(
-                  child: Text("-", textAlign: TextAlign.center, style: TextStyle(fontSize: 10, color: Colors.black87)),
+                  child: Text("-", textAlign: TextAlign.center, style: TextStyle(fontSize: 10, color: Colors.black)),
                 );
               }
               final int fullStrips = p.stock > 0 ? (p.stock ~/ p.packSize) : 0;
@@ -8908,16 +11276,16 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                     children: [
                       TextSpan(
                         text: "$fullStrips ",
-                        style: const TextStyle(color: Colors.black87),
+                        style: const TextStyle(color: Colors.black),
                       ),
                       const TextSpan(
                         text: "/ ",
-                        style: TextStyle(color: Colors.black87),
+                        style: TextStyle(color: Colors.black),
                       ),
                       TextSpan(
                         text: "$looseUnits",
                         style: TextStyle(
-                          color: looseUnits > 0 ? Colors.red.shade700 : Colors.black87,
+                          color: looseUnits > 0 ? Colors.red.shade700 : Colors.black,
                         ),
                       ),
                     ],
@@ -9084,7 +11452,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                           color: const Color(0xFFEBF3FA),
                           child: Row(
                             children: [
-                              const Text("Category: ", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black87)),
+                              const Text("Category: ", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black)),
                               const SizedBox(width: 6),
                               ...["ALL", "GENERIC", "BRAND", "COUNTER", "TABLETS", "SYRUPS"].map((cat) {
                                 final bool isSel = selectedCategory == cat;
@@ -9109,7 +11477,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                                         style: TextStyle(
                                           fontSize: 10,
                                           fontWeight: FontWeight.bold,
-                                          color: isSel ? Colors.white : Colors.black87,
+                                          color: isSel ? Colors.white : Colors.black,
                                         ),
                                       ),
                                     ),
@@ -9198,7 +11566,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                                                 style: TextStyle(
                                                   fontWeight: isSelected ? FontWeight.bold : FontWeight.w600,
                                                   fontSize: 11,
-                                                  color: Colors.black87,
+                                                  color: Colors.black,
                                                 ),
                                                 overflow: TextOverflow.ellipsis,
                                               ),
@@ -9210,7 +11578,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                                                 style: const TextStyle(
                                                   fontWeight: FontWeight.bold,
                                                   fontSize: 11,
-                                                  color: Colors.black87,
+                                                  color: Colors.black,
                                                 ),
                                                 overflow: TextOverflow.ellipsis,
                                               ),
@@ -9222,7 +11590,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                                                 style: TextStyle(
                                                   fontSize: 10,
                                                   fontWeight: FontWeight.w600,
-                                                  color: isGenCategory ? Colors.green.shade700 : Colors.black87,
+                                                  color: isGenCategory ? Colors.green.shade700 : Colors.black,
                                                 ),
                                                 overflow: TextOverflow.ellipsis,
                                               ),
@@ -9235,14 +11603,14 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                                               flex: 1,
                                               child: Text(
                                                 p.rack.isNotEmpty ? p.rack : "-",
-                                                style: const TextStyle(fontSize: 10, color: Colors.black87),
+                                                style: const TextStyle(fontSize: 10, color: Colors.black),
                                               ),
                                             ),
                                             Expanded(
                                               flex: 2,
                                               child: Text(
                                                 p.batch.isNotEmpty ? _cleanBatch(p.batch) : "-",
-                                                style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.black87),
+                                                style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.black),
                                               ),
                                             ),
                                             Expanded(
@@ -9252,7 +11620,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                                                 style: TextStyle(
                                                   fontSize: 10,
                                                   fontWeight: nearExp ? FontWeight.bold : FontWeight.normal,
-                                                  color: nearExp ? Colors.red.shade700 : Colors.black87,
+                                                  color: nearExp ? Colors.red.shade700 : Colors.black,
                                                 ),
                                               ),
                                             ),
@@ -9264,7 +11632,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                                                 style: const TextStyle(
                                                   fontWeight: FontWeight.bold,
                                                   fontSize: 11,
-                                                  color: Colors.black87,
+                                                  color: Colors.black,
                                                 ),
                                               ),
                                             ),
@@ -9273,7 +11641,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                                               child: Text(
                                                 p.mrp > 0 ? p.mrp.toStringAsFixed(2) : "-",
                                                 textAlign: TextAlign.right,
-                                                style: const TextStyle(fontSize: 10, color: Colors.black87),
+                                                style: const TextStyle(fontSize: 10, color: Colors.black),
                                               ),
                                             ),
                                             Expanded(
@@ -9281,7 +11649,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                                               child: Text(
                                                 p.salePrice > 0 ? p.salePrice.toStringAsFixed(2) : (p.mrp > 0 ? p.mrp.toStringAsFixed(2) : "-"),
                                                 textAlign: TextAlign.right,
-                                                style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black87),
+                                                style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black),
                                               ),
                                             ),
                                           ],
@@ -9301,7 +11669,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                             children: [
                               Text(
                                 "Total Matching: ${results.length} items",
-                                style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black87),
+                                style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black),
                               ),
                               const Spacer(),
                               TextButton.icon(
@@ -9345,124 +11713,11 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   }
 
   // =========================================================================
-  // F2 SALES HISTORY DIALOG
+  // F2 SALES HISTORY DIALOG - Spawns as true floating Windows OS window (Matching YesPlus ERP)
   // =========================================================================
   void _openHistoryWindow(String productName, bool isSales) {
     if (productName.trim().isEmpty) return;
-
-    _isDialogOpen = true;
-    Offset dialogOffset = Offset.zero;
-
-    showGeneralDialog(
-      context: context,
-      barrierDismissible: true,
-      barrierLabel: isSales ? "Sales History" : "Purchase History",
-      barrierColor: Colors.black26,
-      transitionDuration: Duration.zero,
-      pageBuilder: (ctx, anim1, anim2) {
-        return StatefulBuilder(
-          builder: (context, setStateDialog) {
-            return Transform.translate(
-              offset: dialogOffset,
-              child: Focus(
-                autofocus: true,
-                onKeyEvent: (node, event) {
-                  if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.escape) {
-                    Navigator.of(ctx).pop();
-                    return KeyEventResult.handled;
-                  }
-                  return KeyEventResult.ignored;
-                },
-                child: Dialog(
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                  clipBehavior: Clip.antiAlias,
-                  elevation: 12,
-                  child: SizedBox(
-                    width: 1080,
-                    height: 540,
-                    child: Column(
-                      children: [
-                        GestureDetector(
-                          onPanUpdate: (details) {
-                            setStateDialog(() {
-                              dialogOffset += details.delta;
-                            });
-                          },
-                          child: Container(
-                            height: 38,
-                            color: AppColors.primary,
-                            padding: const EdgeInsets.symmetric(horizontal: 12),
-                            child: Row(
-                              children: [
-                                Icon(
-                                  isSales ? Icons.shopping_cart_rounded : Icons.local_shipping_rounded,
-                                  color: Colors.amber,
-                                  size: 18,
-                                ),
-                                const SizedBox(width: 8),
-                                Text(
-                                  isSales ? "Sales History: ${productName.toUpperCase()}" : "Purchase History: ${productName.toUpperCase()}",
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 13,
-                                  ),
-                                ),
-                                const SizedBox(width: 12),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                                  decoration: BoxDecoration(
-                                    color: Colors.white.withValues(alpha: 0.15),
-                                    borderRadius: BorderRadius.circular(4),
-                                  ),
-                                  child: const Text(
-                                    "Press ESC to Close | Drag header to move",
-                                    style: TextStyle(color: Colors.white70, fontSize: 10, fontStyle: FontStyle.italic),
-                                  ),
-                                ),
-                                const Spacer(),
-                                Tooltip(
-                                  message: "Pop out to separate OS Window",
-                                  child: InkWell(
-                                    onTap: () {
-                                      Navigator.of(ctx).pop();
-                                      spawnOSWindow(isSales ? "sales_history" : "purchase_history", productName.trim());
-                                    },
-                                    child: const Padding(
-                                      padding: EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                                      child: Icon(Icons.open_in_new_rounded, color: Colors.white70, size: 16),
-                                    ),
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                InkWell(
-                                  onTap: () => Navigator.of(ctx).pop(),
-                                  child: const Padding(
-                                    padding: EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                                    child: Icon(Icons.close, color: Colors.white, size: 18),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        Expanded(
-                          child: isSales
-                              ? SalesHistoryScreen(productName: productName)
-                              : PurchaseHistoryScreen(productName: productName),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            );
-          },
-        );
-      },
-    ).then((_) {
-      if (mounted) setState(() => _isDialogOpen = false);
-    });
+    spawnOSWindow(isSales ? "sales_history" : "purchase_history", productName.trim());
   }
 
   Future<void> _showH1DrugWarningDialog(String productName, String schedule) async {
@@ -9471,62 +11726,81 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     await showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        backgroundColor: Colors.red.shade50,
-        title: Row(
-          children: [
-            Icon(Icons.warning_amber_rounded, color: Colors.red.shade900, size: 28),
-            const SizedBox(width: 10),
-            Text("SCHEDULE $schedule DRUG ALERT", style: TextStyle(color: Colors.red.shade900, fontWeight: FontWeight.bold, fontSize: 16)),
-          ],
-        ),
-        content: SizedBox(
-          width: 420,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(color: Colors.red.shade100, borderRadius: BorderRadius.circular(6)),
-                child: Text(
-                  productName.toUpperCase(),
-                  style: TextStyle(fontWeight: FontWeight.w900, fontSize: 13, color: Colors.red.shade900),
+      builder: (ctx) {
+        void acknowledgeAndContinue() {
+          Navigator.pop(ctx);
+          // Automatically focus the Doctor field to capture prescription info if needed
+          if (_doctorCtrl.text == "D1" || _doctorCtrl.text.isEmpty) {
+            _doctorFocus.requestFocus();
+          }
+        }
+
+        return Focus(
+          autofocus: true,
+          onKeyEvent: (node, event) {
+            if (event is KeyDownEvent) {
+              if (event.logicalKey == LogicalKeyboardKey.enter ||
+                  event.logicalKey == LogicalKeyboardKey.numpadEnter ||
+                  event.logicalKey == LogicalKeyboardKey.space) {
+                acknowledgeAndContinue();
+                return KeyEventResult.handled;
+              }
+            }
+            return KeyEventResult.ignored;
+          },
+          child: AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            backgroundColor: Colors.red.shade50,
+            title: Row(
+              children: [
+                Icon(Icons.warning_amber_rounded, color: Colors.red.shade900, size: 28),
+                const SizedBox(width: 10),
+                Text("SCHEDULE $schedule DRUG ALERT", style: TextStyle(color: Colors.red.shade900, fontWeight: FontWeight.bold, fontSize: 16)),
+              ],
+            ),
+            content: SizedBox(
+              width: 420,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(color: Colors.red.shade100, borderRadius: BorderRadius.circular(6)),
+                    child: Text(
+                      productName.toUpperCase(),
+                      style: TextStyle(fontWeight: FontWeight.w900, fontSize: 13, color: Colors.red.shade900),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  const Text(
+                    "This medicine falls under Schedule H1 regulations.\n\n• Mandatory prescription required.\n• Ensure Patient Name, Doctor Name, and Prescribed Quantity are correctly logged.",
+                    style: TextStyle(fontSize: 13, color: Colors.black, height: 1.4),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    "Press ENTER to acknowledge and continue billing.",
+                    style: TextStyle(fontSize: 11, fontStyle: FontStyle.italic, color: Colors.grey),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              ElevatedButton(
+                autofocus: true,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.red.shade800,
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
                 ),
-              ),
-              const SizedBox(height: 16),
-              const Text(
-                "This medicine falls under Schedule H1/H regulations.\n\n• Mandatory prescription required.\n• Ensure Patient Name, Doctor Name, and Prescribed Quantity are correctly logged.",
-                style: TextStyle(fontSize: 13, color: Colors.black87, height: 1.4),
-              ),
-              const SizedBox(height: 12),
-              const Text(
-                "Press ENTER to acknowledge and continue billing.",
-                style: TextStyle(fontSize: 11, fontStyle: FontStyle.italic, color: Colors.grey),
+                onPressed: acknowledgeAndContinue,
+                child: const Text("ACKNOWLEDGE & CONTINUE (ENTER)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
               ),
             ],
           ),
-        ),
-        actions: [
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.red.shade800,
-              foregroundColor: Colors.white,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-            ),
-            onPressed: () {
-              Navigator.pop(ctx);
-              // Automatically focus the Doctor field to capture prescription info if needed
-              if (_doctorCtrl.text == "D1" || _doctorCtrl.text.isEmpty) {
-                _doctorFocus.requestFocus();
-              }
-            },
-            child: const Text("ACKNOWLEDGE & CONTINUE (ENTER)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-          ),
-        ],
-      ),
+        );
+      },
     );
     if (!mounted) return;
   }
@@ -9586,12 +11860,23 @@ class _ResizableHdr extends StatelessWidget {
 }
 
 class _Hdr extends StatelessWidget {
-  final String title; final String? tooltip; final double? width; final int? flex; final TextAlign align;
-  const _Hdr(this.title, {this.tooltip, this.width, this.flex, this.align = TextAlign.left});
+  final String title; final double? width; final int? flex; final TextAlign align;
+  const _Hdr(this.title, {this.width, this.flex, this.align = TextAlign.left});
   @override Widget build(BuildContext context) { 
-    final String msg = tooltip ?? title;
-    Widget child = Container(width: width, alignment: align == TextAlign.left ? Alignment.centerLeft : (align == TextAlign.center ? Alignment.center : Alignment.centerRight), padding: const EdgeInsets.symmetric(horizontal: 8), decoration: const BoxDecoration(border: Border(right: BorderSide(color: Colors.white24, width: 0.5))), child: Text(title, style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold))); 
-    if (msg.isNotEmpty) child = ERPTooltip(message: msg, child: child);
+    Widget child = Container(
+      width: width,
+      alignment: align == TextAlign.left ? Alignment.centerLeft : (align == TextAlign.center ? Alignment.center : Alignment.centerRight),
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      decoration: const BoxDecoration(border: Border(right: BorderSide(color: Colors.white24, width: 0.5))),
+      child: Text(
+        title,
+        style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold),
+        maxLines: 1,
+        softWrap: false,
+        overflow: TextOverflow.ellipsis,
+      ),
+    ); 
+    if (title.isNotEmpty) child = ERPTooltip(message: title, child: child);
     return flex != null ? Expanded(flex: flex!, child: child) : child; 
   }
 }
@@ -9707,6 +11992,284 @@ class _AnimatedMobileOrdersBtnState extends State<AnimatedMobileOrdersBtn> with 
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _NotificationItemRow extends StatefulWidget {
+  final Map<String, dynamic> item;
+  final int index;
+  final VoidCallback onChanged;
+
+  const _NotificationItemRow({
+    super.key,
+    required this.item,
+    required this.index,
+    required this.onChanged,
+  });
+
+  @override
+  State<_NotificationItemRow> createState() => _NotificationItemRowState();
+}
+
+class _NotificationItemRowState extends State<_NotificationItemRow> {
+  late TextEditingController _orderedQtyController;
+  late FocusNode _focusNode;
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode = FocusNode();
+
+    int? ordQty = widget.item['ordered_qty'] != null ? (widget.item['ordered_qty'] as num).toInt() : null;
+    if (ordQty == null && widget.item['ordered'] == true) {
+      ordQty = (widget.item['qty'] as num?)?.toInt() ?? 1;
+      widget.item['ordered_qty'] = ordQty;
+    }
+    String initialText = (ordQty != null && ordQty > 0) ? "$ordQty" : "";
+    _orderedQtyController = TextEditingController(text: initialText);
+  }
+
+  @override
+  void didUpdateWidget(covariant _NotificationItemRow oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!_focusNode.hasFocus) {
+      int? currentOrdQty = (widget.item['ordered_qty'] as num?)?.toInt();
+      bool isOrdered = widget.item['ordered'] == true;
+      if (isOrdered && (currentOrdQty == null || currentOrdQty <= 0)) {
+        currentOrdQty = (widget.item['qty'] as num?)?.toInt() ?? 1;
+        widget.item['ordered_qty'] = currentOrdQty;
+      }
+      String expectedText = (isOrdered && currentOrdQty != null && currentOrdQty > 0) ? "$currentOrdQty" : "";
+      if (_orderedQtyController.text != expectedText) {
+        _orderedQtyController.text = expectedText;
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _orderedQtyController.dispose();
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  void _toggleOrderStatus() {
+    bool currentlyOrdered = widget.item['ordered'] == true;
+    bool newOrdered = !currentlyOrdered;
+
+    widget.item['ordered'] = newOrdered;
+    widget.item['pending'] = !newOrdered;
+
+    if (newOrdered) {
+      int genQty = (widget.item['qty'] as num?)?.toInt() ?? 1;
+      int existingOrd = (widget.item['ordered_qty'] as num?)?.toInt() ?? 0;
+      int fillQty = existingOrd > 0 ? existingOrd : genQty;
+      widget.item['ordered_qty'] = fillQty;
+      _orderedQtyController.text = "$fillQty";
+    } else {
+      widget.item['ordered_qty'] = 0;
+      _orderedQtyController.text = "";
+    }
+
+    widget.onChanged();
+  }
+
+  void _onOrderedTextChanged(String val) {
+    String trimmed = val.trim();
+    int? parsed = int.tryParse(trimmed);
+
+    if (parsed != null && parsed > 0) {
+      widget.item['ordered_qty'] = parsed;
+      if (widget.item['ordered'] != true) {
+        widget.item['ordered'] = true;
+        widget.item['pending'] = false;
+      }
+    } else {
+      widget.item['ordered_qty'] = 0;
+      if (widget.item['ordered'] == true) {
+        widget.item['ordered'] = false;
+        widget.item['pending'] = true;
+      }
+    }
+
+    widget.onChanged();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final item = widget.item;
+    final int i = widget.index;
+    final int stockQty = (item['stock'] as num?)?.toInt() ?? 0;
+    final double pRate = (item['p_rate'] as num?)?.toDouble() ?? 0.0;
+    final bool isOrdered = item['ordered'] == true;
+
+    return InkWell(
+      onTap: _toggleOrderStatus,
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        decoration: BoxDecoration(
+          color: isOrdered ? Colors.blue.shade50.withValues(alpha: 0.4) : Colors.white,
+          border: Border(bottom: BorderSide(color: Colors.grey.shade200)),
+        ),
+        child: Row(
+          children: [
+            // 1. SL NO
+            Container(
+              width: 40,
+              alignment: Alignment.center,
+              child: Text(
+                "${i + 1}",
+                style: const TextStyle(fontSize: 10, color: Colors.grey, fontWeight: FontWeight.bold),
+              ),
+            ),
+            // 2. ITEM NAME
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text(
+                      item['name'] ?? '',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                        color: isOrdered ? Colors.grey.shade700 : Colors.black,
+                        decoration: isOrdered ? TextDecoration.lineThrough : TextDecoration.none,
+                      ),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      "Stock Qty: $stockQty",
+                      style: TextStyle(
+                        fontSize: 9,
+                        fontWeight: FontWeight.w600,
+                        color: stockQty <= 0 ? Colors.red.shade700 : Colors.blueGrey.shade700,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            // 3. GENERATED ORDER QTY
+            Container(
+              width: 80,
+              alignment: Alignment.center,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.blue.shade50,
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: Colors.blue.shade200),
+                ),
+                child: Text(
+                  "${item['qty']}",
+                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.blue.shade900),
+                ),
+              ),
+            ),
+            // 4. ORDERED QTY (EDITABLE BOX)
+            Container(
+              width: 70,
+              alignment: Alignment.center,
+              child: GestureDetector(
+                onTap: () {}, // Prevent row onTap from firing when tapping inside input box
+                child: Container(
+                  height: 26,
+                  width: 48,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: isOrdered ? Colors.blue.shade50 : Colors.grey.shade50,
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(
+                      color: isOrdered ? Colors.blue.shade400 : Colors.grey.shade300,
+                      width: isOrdered ? 1.2 : 1.0,
+                    ),
+                  ),
+                  child: TextField(
+                    controller: _orderedQtyController,
+                    focusNode: _focusNode,
+                    keyboardType: TextInputType.number,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                      color: isOrdered ? Colors.blue.shade900 : Colors.black,
+                    ),
+                    decoration: InputDecoration(
+                      isDense: true,
+                      contentPadding: const EdgeInsets.symmetric(vertical: 4, horizontal: 2),
+                      border: InputBorder.none,
+                      hintText: "0",
+                      hintStyle: TextStyle(fontSize: 10, color: Colors.grey.shade400, fontWeight: FontWeight.normal),
+                    ),
+                    onChanged: _onOrderedTextChanged,
+                  ),
+                ),
+              ),
+            ),
+            // 5. ORDER STATUS (Tick / No Tick Checkbox)
+            SizedBox(
+              width: 70,
+              child: Center(
+                child: Checkbox(
+                  value: isOrdered,
+                  onChanged: (_) => _toggleOrderStatus(),
+                  activeColor: Colors.blue.shade700,
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
+            ),
+            // 6. P.RATE (Old Purchase Rate)
+            Container(
+              width: 70,
+              alignment: Alignment.centerRight,
+              padding: const EdgeInsets.only(right: 8),
+              child: Text(
+                "₹${pRate.toStringAsFixed(2)}",
+                style: const TextStyle(fontSize: 10.5, fontWeight: FontWeight.bold, color: Color(0xFF0F172A)),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ShortcutRowWidget extends StatelessWidget {
+  final String keyName;
+  final String description;
+  const _ShortcutRowWidget(this.keyName, this.description);
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+            decoration: BoxDecoration(
+              color: Colors.blueAccent.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(color: Colors.blueAccent.withValues(alpha: 0.3)),
+            ),
+            child: Text(
+              keyName,
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.blueAccent),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(description, style: const TextStyle(fontSize: 12)),
+          ),
+        ],
       ),
     );
   }

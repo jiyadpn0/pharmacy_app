@@ -43,7 +43,7 @@ class InvoicePdfGenerator {
                   crossAxisAlignment: pw.CrossAxisAlignment.end,
                   children: [
                     pw.Text("TAX INVOICE", style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold, color: PdfColors.blue900)),
-                    pw.Text("Invoice No: ${invoice.entryNo}", style: const pw.TextStyle(fontSize: 9)),
+                    pw.Text("Invoice No: ${formatSaleDisplayNo(invoice.entryNo)}", style: const pw.TextStyle(fontSize: 9)),
                     pw.Text("Date: ${DateFormat('dd/MM/yyyy').format(invoice.date)}", style: const pw.TextStyle(fontSize: 9)),
                   ],
                 ),

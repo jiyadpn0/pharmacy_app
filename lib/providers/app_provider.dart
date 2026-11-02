@@ -4,9 +4,13 @@ import '../models/erp_models.dart';
 import '../screens/product_merge_screen.dart';
 import '../screens/stock_adjustment_batch_screen.dart';
 import '../screens/stock_adjustment_batch_report_screen.dart';
+import '../screens/realtime_stock_screen.dart';
 
 
 import '../screens/dashboard_screen.dart';
+import '../screens/gmail_inbox_screen.dart';
+import '../screens/reports/gmail_purchase_import_screen.dart';
+import '../models/pharmacy_email_account.dart';
 import '../screens/sales_screen.dart';
 import '../screens/purchase_screen.dart';
 import '../screens/stock_list_screen.dart';
@@ -82,6 +86,33 @@ class AppProvider extends ChangeNotifier {
   String get statusMessage => _statusMessage;
   bool get isDarkMode => _isDarkMode;
 
+  // Shared Report Synchronization State (Defaults to Current Date for Complete Movement Logs)
+  DateTime _reportFromDate = DateTime.now();
+  DateTime _reportToDate = DateTime.now();
+  bool _reportDetailedView = false;
+  String _reportSearchQuery = "";
+
+  DateTime get reportFromDate => _reportFromDate;
+  DateTime get reportToDate => _reportToDate;
+  bool get reportDetailedView => _reportDetailedView;
+  String get reportSearchQuery => _reportSearchQuery;
+
+  void setReportDateRange(DateTime from, DateTime to) {
+    _reportFromDate = from;
+    _reportToDate = to;
+    notifyListeners();
+  }
+
+  void setReportDetailedView(bool val) {
+    _reportDetailedView = val;
+    notifyListeners();
+  }
+
+  void setReportSearchQuery(String query) {
+    _reportSearchQuery = query;
+    notifyListeners();
+  }
+
   void toggleDarkMode() {
     _isDarkMode = !_isDarkMode;
     notifyListeners();
@@ -111,24 +142,42 @@ class AppProvider extends ChangeNotifier {
   }
 
   // Window openers
-  void openSales({String? invoiceNo}) => addTab("SALES ENTRY", SalesScreen(initialInvoiceNo: invoiceNo));
-  void openPurchase({String? entryNo}) => addTab("PURCHASE ENTRY", LocalPurchaseScreen(initialInvoiceNo: entryNo));
+  void openSales({String? invoiceNo, String? highlightProduct}) => addTab("SALES ENTRY", SalesScreen(initialInvoiceNo: invoiceNo, highlightProduct: highlightProduct));
+  void openPurchase({String? entryNo, String? highlightProduct}) => addTab("PURCHASE ENTRY", LocalPurchaseScreen(initialInvoiceNo: entryNo, highlightProduct: highlightProduct));
+  void openPurchaseWithImportFile({
+    required String filePath,
+    String? supplierName,
+    String? invoiceNo,
+    String? invDate,
+  }) =>
+      addTab(
+        "PURCHASE ENTRY",
+        LocalPurchaseScreen(
+          initialImportFilePath: filePath,
+          initialSupplierName: supplierName,
+          initialSupplierInvNo: invoiceNo,
+          initialInvDate: invDate,
+        ),
+      );
   void openEditedInvoices() => openSettings(tab: "Edited Invoices");
   void openSales3() => addTab("SALES ENGINE PRO", const SalesScreen());
   void openPurchaseHistory() => addTab("PURCHASE HISTORY", const PurchaseReportScreen());
   void openAllStockDetails() => addTab("INVENTORY", const StockListScreen());
   void openInventory() => addTab("INVENTORY", const StockListReportScreen());
+  void openRealtimeStock() => addTab("REALTIME STOCK QTY", const RealtimeStockScreen());
   void openProductMasterList() => openAllStockDetails();
   void openOrderBook() => addTab("Order Book", const SpecialOrdersScreen(initialView: 1));
   void openOrderConfirmation() => addTab("Order Confirmation", const OrderConfirmationScreen());
   void openSpecialOrders() => addTab("Special Orders", const SpecialOrdersScreen(initialView: 0));
-  void openStockEnquiries() => addTab("Stock Enquiries", const StockEnquiriesScreen());
+  void openStockEnquiries({String? initialQuery}) => addTab("Stock Enquiries", StockEnquiriesScreen(initialQuery: initialQuery));
   void openProductRanking() => addTab("Product Ranking", const ProductRankingScreen());
   void openSalesReport() => addTab("SALES ANALYSIS", const SalesReportScreen());
   void openScheduleH1Register() => addTab("SCHEDULE H1 REGISTER", const ScheduleH1RegisterScreen());
   void openReorderAssistant() => addTab("REORDER ASSISTANT", const ReorderAssistantScreen());
   void openSalesReturnReport() => addTab("SALES RETURN ANALYSIS", const SalesReturnReportScreen());
   void openGstReport() => addTab("GST FILING REPORT", const GstReportScreen());
+  void openGmailInbox() => addTab("GMAIL INBOX", const GmailInboxScreen());
+  void openGmailPurchaseImport({List<PharmacyProfile>? profiles}) => addTab("GMAIL PURCHASE IMPORT", GmailPurchaseImportScreen(profiles: profiles ?? [PharmacyProfile(id: 'main', name: 'Main Pharmacy')]));
   void openPurchaseReport() => addTab("PURCHASE ANALYSIS", const PurchaseReportScreen());
   void openPurchaseReturnReport() => addTab("PURCHASE RETURN ANALYSIS", const PurchaseReturnReportScreen());
   void openProductRegistration({String? initialName}) {
@@ -173,7 +222,7 @@ class AppProvider extends ChangeNotifier {
   void openPatientList() => addTab("Patient List", const PatientListScreen());
   void openCustomerLedger({String? patientName}) => addTab("Customer Ledger", CustomerLedgerScreen(initialPatient: patientName));
   void openDoctorList() => addTab("Doctor Registration", const DoctorRegistrationScreen());
-  void openExpiryList() => addTab("Expiry List", const ExpiryCheckScreen());
+  void openExpiryList() => addTab("Expiry / Non Moving", const ExpiryCheckScreen());
   void openDailyReport() => addTab("Daily Report", const DailyReportScreen());
   void openConsolidateStock() => addTab("Consolidate Stock Position", const ConsolidateStockScreen());
   void openWholesaleStockDirectory() => addTab("Wholesale Stock Directory", const WholesaleStockDirectoryScreen());
@@ -294,10 +343,13 @@ class AppProvider extends ChangeNotifier {
   void reorderTabs(int oldIndex, int newIndex) {
     if (oldIndex == 0) return;
     if (newIndex == 0) newIndex = 1;
+    if (oldIndex < 0 || oldIndex >= _openTabs.length) return;
+    if (newIndex < 0 || newIndex > _openTabs.length) return;
 
     if (oldIndex < newIndex) {
       newIndex -= 1;
     }
+    if (oldIndex == newIndex) return;
 
     final TabItem item = _openTabs.removeAt(oldIndex);
     _openTabs.insert(newIndex, item);
@@ -311,5 +363,39 @@ class AppProvider extends ChangeNotifier {
     }
 
     notifyListeners();
+  }
+
+  void moveTabLeft(int index) {
+    if (index <= 1 || index >= _openTabs.length) return;
+    reorderTabs(index, index - 1);
+  }
+
+  void moveTabRight(int index) {
+    if (index <= 0 || index >= _openTabs.length - 1) return;
+    reorderTabs(index, index + 2);
+  }
+
+  void closeOtherTabs(int index) {
+    if (index < 0 || index >= _openTabs.length) return;
+    final target = _openTabs[index];
+    final home = _openTabs[0];
+    _openTabs.clear();
+    _openTabs.add(home);
+    if (target != home) {
+      _openTabs.add(target);
+      _activeTabIndex = 1;
+    } else {
+      _activeTabIndex = 0;
+    }
+    notifyListeners();
+  }
+
+  void closeTabsToRight(int index) {
+    if (index < 0 || index >= _openTabs.length - 1) return;
+    for (int i = _openTabs.length - 1; i > index; i--) {
+      if (_openTabs[i].closable) {
+        closeTab(i);
+      }
+    }
   }
 }

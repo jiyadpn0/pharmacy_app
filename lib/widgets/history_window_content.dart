@@ -1,16 +1,81 @@
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
+import 'package:sqflite/sqflite.dart';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
-import '../providers/pharmacy_provider.dart';
 import '../utils/app_formatters.dart';
 import '../utils/theme_constants.dart';
+import '../database/db_helper.dart';
 
 class HistoryWindowContent extends StatefulWidget {
   final String productName;
+  final String? productId;
   final bool isSales;
 
-  const HistoryWindowContent({super.key, required this.productName, this.isSales = true});
+  const HistoryWindowContent({
+    super.key,
+    required this.productName,
+    this.productId,
+    this.isSales = true,
+  });
+
+  static Future<List<Map<String, dynamic>>> querySalesHistoryDirect(
+      Database db, String productName, String? productId) async {
+    final cleanName = productName.trim();
+    final cleanId = productId?.trim() ?? '';
+    final List<dynamic> whereArgs = [cleanName, cleanName];
+    String whereClause =
+        "WHERE (p.name = ? COLLATE NOCASE OR TRIM(i.product_name) = ? COLLATE NOCASE)";
+
+    if (cleanId.isNotEmpty) {
+      whereClause += " OR (p.id = ? OR i.product_id = ?)";
+      whereArgs.add(cleanId);
+      whereArgs.add(cleanId);
+    }
+
+    return await db.rawQuery('''
+      SELECT i.invoice_no as entry_no, e.date, i.batch_number as batch, i.expiry_date as expiry, 
+             i.qty, 0 as f_qty, i.mrp, i.s_rate, i.supplier_name, e.doctor, e.patient, i.disc_percent
+      FROM sales_items i
+      JOIN sales_invoices e ON i.invoice_no = e.entry_no
+      LEFT JOIN product_master p ON i.product_id = p.id
+      $whereClause
+        AND IFNULL(e.is_deleted, 0) = 0
+      ORDER BY e.date DESC, CAST(SUBSTR(SUBSTR(e.entry_no, INSTR(e.entry_no, '_') + 1), INSTR(SUBSTR(e.entry_no, INSTR(e.entry_no, '_') + 1), '-') + 1) AS INTEGER) DESC
+      LIMIT 50
+    ''', whereArgs);
+  }
+
+  static Future<List<Map<String, dynamic>>> queryPurchaseHistoryDirect(
+      Database db, String productName, String? productId) async {
+    final cleanName = productName.trim();
+    final cleanId = productId?.trim() ?? '';
+    final List<dynamic> whereArgs = [cleanName, cleanName];
+    String whereClause =
+        "WHERE (p.name = ? COLLATE NOCASE OR TRIM(i.product_name) = ? COLLATE NOCASE)";
+
+    if (cleanId.isNotEmpty) {
+      whereClause += " OR (p.id = ? OR i.product_id = ?)";
+      whereArgs.add(cleanId);
+      whereArgs.add(cleanId);
+    }
+
+    return await db.rawQuery('''
+      SELECT e.entry_no, 
+             e.date,
+             e.supplier_name, 
+             i.qty, 
+             i.f_qty,
+             i.p_rate, i.mrp, i.s_rate, i.batch, i.expiry, 
+             i.l_cost, i.disc_percent, i.packin
+      FROM purchase_items i
+      JOIN purchase_entries e ON i.entry_no = e.entry_no
+      LEFT JOIN product_master p ON i.product_id = p.id
+      $whereClause
+        AND IFNULL(e.is_deleted, 0) = 0
+      ORDER BY e.date DESC, CAST(SUBSTR(SUBSTR(e.entry_no, INSTR(e.entry_no, '_') + 1), INSTR(SUBSTR(e.entry_no, INSTR(e.entry_no, '_') + 1), '-') + 1) AS INTEGER) DESC
+      LIMIT 50
+    ''', whereArgs);
+  }
 
   @override
   State<HistoryWindowContent> createState() => _HistoryWindowContentState();
@@ -26,26 +91,36 @@ class _HistoryWindowContentState extends State<HistoryWindowContent> {
   }
 
   Future<List<Map<String, dynamic>>> _fetchHistory() async {
+    final method = widget.isSales ? 'query_sales_history' : 'query_purchase_history';
+    final payload = {
+      'productName': widget.productName,
+      if (widget.productId != null && widget.productId!.isNotEmpty)
+        'productId': widget.productId,
+    };
+
+    // 1. Try IPC call to main window with a 2-second timeout
     try {
-      final method = widget.isSales ? 'query_sales_history' : 'query_purchase_history';
-      final res = await DesktopMultiWindow.invokeMethod(
-        0,
-        method,
-        {'productName': widget.productName},
-      );
-      if (res is List) {
+      final res = await DesktopMultiWindow.invokeMethod(0, method, payload)
+          .timeout(const Duration(seconds: 2));
+      if (res is List && res.isNotEmpty) {
         return res.map((e) => Map<String, dynamic>.from(e as Map)).toList();
       }
-    } catch (_) {
-      if (mounted) {
-        final provider = Provider.of<PharmacyProvider>(context, listen: false);
-        if (widget.isSales) {
-          return await provider.getProductSaleHistory(widget.productName);
-        } else {
-          return await provider.getProductPurchaseHistory(widget.productName);
-        }
-      }
+    } catch (e) {
+      debugPrint("IPC fetchHistory failed or timed out: $e");
     }
+
+    // 2. Direct Database Query Fallback (Safe in sub-window)
+    try {
+      final db = await DbHelper.instance.database;
+      if (widget.isSales) {
+        return await HistoryWindowContent.querySalesHistoryDirect(db, widget.productName, widget.productId);
+      } else {
+        return await HistoryWindowContent.queryPurchaseHistoryDirect(db, widget.productName, widget.productId);
+      }
+    } catch (e) {
+      debugPrint("Direct database fetch failed: $e");
+    }
+
     return [];
   }
 
@@ -85,7 +160,18 @@ class _HistoryWindowContentState extends State<HistoryWindowContent> {
               
               final item = history[i - 1];
               String dateStr = "";
-              try { dateStr = DateFormat('dd/MM/yyyy').format(DateTime.parse(item['date'].toString())); } catch (_) {}
+              if (item['date'] != null) {
+                final String rawDate = item['date'].toString().trim();
+                try {
+                  dateStr = DateFormat('dd/MM/yyyy').format(DateTime.parse(rawDate));
+                } catch (_) {
+                  try {
+                    dateStr = DateFormat('dd/MM/yyyy').format(DateTime.parse(rawDate.replaceAll('/', '-')));
+                  } catch (_) {
+                    dateStr = rawDate;
+                  }
+                }
+              }
               
               double mrp = double.tryParse(item['mrp']?.toString() ?? "0") ?? 0.0;
               double rate = double.tryParse(item['s_rate']?.toString() ?? item['p_rate']?.toString() ?? "0") ?? 0.0;
@@ -122,7 +208,7 @@ class _HistoryWindowContentState extends State<HistoryWindowContent> {
 
   Widget _buildRow(BuildContext context, String c1, String c2, String c3, String c4, String c5, String c6, String c7, String c8, String c9, String c10, {bool isHeader = false}) {
     final c = AppColors.of(context);
-    final style = TextStyle(fontSize: 12, fontWeight: isHeader ? FontWeight.bold : FontWeight.normal, color: isHeader ? c.primaryText : c.primaryText.withValues(alpha: 0.9));
+    final style = TextStyle(fontSize: 12.5, fontWeight: isHeader ? FontWeight.bold : FontWeight.w600, color: isHeader ? c.primaryText : c.primaryText.withValues(alpha: 0.95));
     return Row(
       children: [
         Expanded(flex: 2, child: Padding(padding: const EdgeInsets.only(left: 12), child: Text(c1, style: style))),
@@ -135,7 +221,7 @@ class _HistoryWindowContentState extends State<HistoryWindowContent> {
         Expanded(flex: 4, child: Padding(padding: const EdgeInsets.only(left: 16), child: Text(c8, style: style, overflow: TextOverflow.ellipsis))),
         Expanded(flex: 3, child: Text(c9, style: style, overflow: TextOverflow.ellipsis)),
         if (c10.isNotEmpty)
-          Expanded(flex: 2, child: Text(c10, style: TextStyle(fontSize: 12, fontWeight: isHeader ? FontWeight.bold : FontWeight.bold, color: isHeader ? c.primaryText : Colors.teal.shade700), textAlign: TextAlign.right)),
+          Expanded(flex: 2, child: Text(c10, style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold, color: isHeader ? c.primaryText : Colors.teal.shade700), textAlign: TextAlign.right)),
       ],
     );
   }

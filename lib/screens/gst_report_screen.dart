@@ -1,12 +1,16 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:excel/excel.dart' as ex;
 import '../providers/pharmacy_provider.dart';
+import '../providers/app_provider.dart';
+import '../utils/tax_calculator.dart';
 import '../widgets/pin_unlock_dialog.dart';
 import '../widgets/app_date_picker.dart';
+import '../widgets/erp_tooltip.dart';
 import '../utils/app_formatters.dart';
 import '../utils/app_dialogs.dart';
 import '../services/gst_export_service.dart';
@@ -20,13 +24,20 @@ class GstReportScreen extends StatefulWidget {
 }
 
 class _GstReportScreenState extends State<GstReportScreen> {
-  DateTime _fromDate = DateTime(DateTime.now().year, DateTime.now().month, 1);
+  DateTime _fromDate = DateTime.now();
   DateTime _toDate = DateTime.now();
   String _reportType = 'B2C_SALES'; // B2C_SALES, B2B_SALES, PURCHASES, HSN_SUMMARY, GSTR_3B
   bool _isLoading = false;
   bool _isAuthorized = false;
 
   List<Map<String, dynamic>> _reportData = [];
+  int? _selectedIndex;
+  int? _lastTapIndex;
+  DateTime? _lastTapTime;
+
+  // Sorting state
+  String? _sortKey;
+  bool _isAscending = true;
 
   int _offset = 0;
   final int _pageSize = 100;
@@ -95,54 +106,57 @@ class _GstReportScreenState extends State<GstReportScreen> {
       for (var s in sales) {
         bool isB2B = (s.customerAcc.toUpperCase() == "CREDIT" && s.mobile.length >= 10);
         if ((_reportType == 'B2C_SALES' && !isB2B) || (_reportType == 'B2B_SALES' && isB2B) || _reportType == 'HSN_SUMMARY' || _reportType == 'GSTR_3B') {
-          int totalTaxablePaise = 0;
-          int totalCgstPaise = 0;
-          int totalSgstPaise = 0;
-          int totalIgstPaise = 0;
+          int totalTaxable = 0;
+          int totalCgst = 0;
+          int totalSgst = 0;
+          int totalIgst = 0;
 
           for (var item in s.items) {
-            // Integer Paise fixed-point calculations to eliminate floating point accumulation drift
-            int totalPaise = item.totalPaise;
-            int gstAmtPaise = item.gstAmtPaise;
-            int itemTaxablePaise = totalPaise - gstAmtPaise;
-            if (itemTaxablePaise < 0) itemTaxablePaise = 0;
+            int totalP = item.totalPaise;
+            int gstP = item.gstAmtPaise;
+            int itemTaxable = totalP - gstP;
+            if (itemTaxable < 0) itemTaxable = 0;
 
-            totalTaxablePaise += itemTaxablePaise;
-            totalCgstPaise += item.cgstAmtPaise;
-            totalSgstPaise += item.sgstAmtPaise;
-            totalIgstPaise += item.igstAmtPaise;
+            totalTaxable += itemTaxable.toInt();
+            totalCgst += item.cgstAmtPaise.toInt();
+            totalSgst += item.sgstAmtPaise.toInt();
+            totalIgst += item.igstAmtPaise.toInt();
           }
 
-          // Proportional adjustment for footer discounts/returns in paise
-          int totalTaxAmtPaise = totalCgstPaise + totalSgstPaise + totalIgstPaise;
-          int preAdjustTotalPaise = totalTaxablePaise + totalTaxAmtPaise;
-          if (preAdjustTotalPaise > 0 && (s.discountPaise > 0 || s.salesReturnPaise > 0)) {
-            int netGrandTotalPaise = s.grandTotalPaise - s.roundOffPaise;
-            double ratio = netGrandTotalPaise / preAdjustTotalPaise.toDouble();
-            totalTaxablePaise = (totalTaxablePaise * ratio).round();
-            totalCgstPaise = (totalCgstPaise * ratio).round();
-            totalSgstPaise = (totalSgstPaise * ratio).round();
-            totalIgstPaise = (totalIgstPaise * ratio).round();
+          int totalTaxAmt = (totalCgst + totalSgst + totalIgst).toInt();
+          int preAdjustTotal = totalTaxable + totalTaxAmt;
+          if (preAdjustTotal > 0 && (s.discount > 0 || s.salesReturn > 0)) {
+            double netGrandTotal = (s.grandTotalPaise - s.roundOffPaise).toDouble();
+            double ratio = netGrandTotal / preAdjustTotal.toDouble();
+            totalTaxable = (totalTaxable * ratio).round().toInt();
+            totalCgst = (totalCgst * ratio).round().toInt();
+            totalSgst = (totalSgst * ratio).round().toInt();
+            totalIgst = (totalIgst * ratio).round().toInt();
           }
+
+          int taxablePaiseInt = totalTaxable;
+          int cgstPaiseInt = totalCgst;
+          int sgstPaiseInt = totalSgst;
+          int igstPaiseInt = totalIgst;
 
           int grandTotalPaise = s.grandTotalPaise;
-          int totalTaxPaise = totalCgstPaise + totalSgstPaise + totalIgstPaise;
+          int totalTaxPaise = cgstPaiseInt + sgstPaiseInt + igstPaiseInt;
 
           data.add({
             'date': DateFormat('dd/MM/yyyy').format(s.date),
             'invoice_no': s.entryNo,
             'party_name': s.patient.toUpperCase() == "GENERAL" ? s.customerAcc : s.patient,
             'gstin': isB2B ? "URD-B2B" : "URD",
-            'taxable_paise': totalTaxablePaise,
-            'cgst_paise': totalCgstPaise,
-            'sgst_paise': totalSgstPaise,
-            'igst_paise': totalIgstPaise,
+            'taxable_paise': taxablePaiseInt,
+            'cgst_paise': cgstPaiseInt,
+            'sgst_paise': sgstPaiseInt,
+            'igst_paise': igstPaiseInt,
             'total_tax_paise': totalTaxPaise,
             'invoice_total_paise': grandTotalPaise,
-            'taxable_value': totalTaxablePaise.toRupees(),
-            'cgst': totalCgstPaise.toRupees(),
-            'sgst': totalSgstPaise.toRupees(),
-            'igst': totalIgstPaise.toRupees(),
+            'taxable_value': taxablePaiseInt.toRupees(),
+            'cgst': cgstPaiseInt.toRupees(),
+            'sgst': sgstPaiseInt.toRupees(),
+            'igst': igstPaiseInt.toRupees(),
             'total_tax': totalTaxPaise.toRupees(),
             'invoice_total': grandTotalPaise.toRupees(),
           });
@@ -155,13 +169,7 @@ class _GstReportScreenState extends State<GstReportScreen> {
         int totalTaxablePaise = 0;
         int totalCgstPaise = 0;
         int totalSgstPaise = 0;
-
-        for (var item in pur.items) {
-          totalTaxablePaise += item.netPaise;
-          int halfGstPaise = item.gstAmtPaise ~/ 2;
-          totalCgstPaise += halfGstPaise;
-          totalSgstPaise += (item.gstAmtPaise - halfGstPaise);
-        }
+        int totalIgstPaise = 0;
 
         String gstin = "URD";
         try {
@@ -169,8 +177,21 @@ class _GstReportScreenState extends State<GstReportScreen> {
           if (sup.gstIn.isNotEmpty) gstin = sup.gstIn;
         } catch (_) {}
 
+        bool isInterstate = pur.taxType == 'Interstate' || (gstin != "URD" && TaxCalculator.isInterstate(p.companyProfile.gstIn, gstin));
+
+        for (var item in pur.items) {
+          totalTaxablePaise += item.netPaise.toInt();
+          if (isInterstate) {
+            totalIgstPaise += item.gstAmtPaise.toInt();
+          } else {
+            int halfGstPaise = (item.gstAmtPaise / 2.0).round();
+            totalCgstPaise += halfGstPaise;
+            totalSgstPaise += (item.gstAmtPaise - halfGstPaise);
+          }
+        }
+
         int grandTotalPaise = pur.grandTotalPaise;
-        int totalTaxPaise = totalCgstPaise + totalSgstPaise;
+        int totalTaxPaise = totalCgstPaise + totalSgstPaise + totalIgstPaise;
 
         data.add({
           'date': DateFormat('dd/MM/yyyy').format(pur.date),
@@ -180,13 +201,13 @@ class _GstReportScreenState extends State<GstReportScreen> {
           'taxable_paise': totalTaxablePaise,
           'cgst_paise': totalCgstPaise,
           'sgst_paise': totalSgstPaise,
-          'igst_paise': 0,
+          'igst_paise': totalIgstPaise,
           'total_tax_paise': totalTaxPaise,
           'invoice_total_paise': grandTotalPaise,
           'taxable_value': totalTaxablePaise.toRupees(),
           'cgst': totalCgstPaise.toRupees(),
           'sgst': totalSgstPaise.toRupees(),
-          'igst': 0.0,
+          'igst': totalIgstPaise.toRupees(),
           'total_tax': totalTaxPaise.toRupees(),
           'invoice_total': grandTotalPaise.toRupees(),
         });
@@ -509,51 +530,92 @@ class _GstReportScreenState extends State<GstReportScreen> {
     int totalTaxP = _reportData.fold(0, (int s, r) => s + (r['total_tax_paise'] as int? ?? 0));
     int totalInvP = _reportData.fold(0, (int s, r) => s + (r['invoice_total_paise'] as int? ?? 0));
 
+    List<Map<String, dynamic>> displayData = List.from(_reportData);
+    if (_sortKey != null) {
+      displayData.sort((a, b) {
+        dynamic valA = a[_sortKey];
+        dynamic valB = b[_sortKey];
+
+        int comp = 0;
+        if (valA is num && valB is num) {
+          comp = valA.compareTo(valB);
+        } else {
+          String strA = valA?.toString().toLowerCase() ?? '';
+          String strB = valB?.toString().toLowerCase() ?? '';
+          comp = strA.compareTo(strB);
+        }
+        return _isAscending ? comp : -comp;
+      });
+    }
+
     return Column(
       children: [
         Container(
           height: 35,
           color: const Color(0xFF334155),
-          child: const Row(
+          child: Row(
             children: [
-              _Hdr("DATE", flex: 2),
-              _Hdr("INVOICE NO", flex: 3),
-              _Hdr("PARTY NAME", flex: 4),
-              _Hdr("GSTIN", flex: 3),
-              _Hdr("TAXABLE (₹)", flex: 3, align: TextAlign.right),
-              _Hdr("TAX (₹)", flex: 3, align: TextAlign.right),
-              _Hdr("TOTAL (₹)", flex: 3, align: TextAlign.right),
+              _Hdr("DATE", 'date', flex: 2, isSorted: _sortKey == 'date', isAscending: _isAscending, onSortTap: () => _onColumnHeaderTap('date')),
+              _Hdr("INVOICE NO", 'invoice_no', flex: 3, isSorted: _sortKey == 'invoice_no', isAscending: _isAscending, onSortTap: () => _onColumnHeaderTap('invoice_no')),
+              _Hdr("PARTY NAME", 'party_name', flex: 4, isSorted: _sortKey == 'party_name', isAscending: _isAscending, onSortTap: () => _onColumnHeaderTap('party_name')),
+              _Hdr("GSTIN", 'gstin', flex: 3, isSorted: _sortKey == 'gstin', isAscending: _isAscending, onSortTap: () => _onColumnHeaderTap('gstin')),
+              _Hdr("TAXABLE (₹)", 'taxable_paise', flex: 3, align: TextAlign.right, isSorted: _sortKey == 'taxable_paise', isAscending: _isAscending, onSortTap: () => _onColumnHeaderTap('taxable_paise')),
+              _Hdr("TAX (₹)", 'total_tax_paise', flex: 3, align: TextAlign.right, isSorted: _sortKey == 'total_tax_paise', isAscending: _isAscending, onSortTap: () => _onColumnHeaderTap('total_tax_paise')),
+              _Hdr("TOTAL (₹)", 'invoice_total_paise', flex: 3, align: TextAlign.right, isSorted: _sortKey == 'invoice_total_paise', isAscending: _isAscending, onSortTap: () => _onColumnHeaderTap('invoice_total_paise')),
             ],
           ),
         ),
         Expanded(
-          child: _reportData.isEmpty
+          child: displayData.isEmpty
               ? const Center(child: Text("No transactions recorded for this period.", style: TextStyle(color: Colors.grey)))
               : ListView.builder(
                   controller: _scrollController,
-                  itemCount: _reportData.length,
+                  itemCount: displayData.length,
                   itemBuilder: (ctx, i) {
-                    final row = _reportData[i];
+                    final row = displayData[i];
                     int taxableP = row['taxable_paise'] as int? ?? 0;
                     int taxP = row['total_tax_paise'] as int? ?? 0;
                     int invP = row['invoice_total_paise'] as int? ?? 0;
+                    final bool isSelected = (i == _selectedIndex);
 
-                    return Container(
-                      height: 32,
-                      decoration: BoxDecoration(
-                        color: i % 2 == 0 ? Colors.white : const Color(0xFFF8FAFC),
-                        border: Border(bottom: BorderSide(color: Colors.grey.shade200)),
-                      ),
-                      child: Row(
-                        children: [
-                          _Cell(row['date'], flex: 2),
-                          _Cell(row['invoice_no'], flex: 3, isBold: true),
-                          _Cell(row['party_name'], flex: 4),
-                          _Cell(row['gstin'], flex: 3, color: Colors.blueGrey),
-                          _Cell(taxableP.toRupeesString(), flex: 3, align: TextAlign.right),
-                          _Cell(taxP.toRupeesString(), flex: 3, align: TextAlign.right, color: Colors.red.shade700),
-                          _Cell(invP.toRupeesString(), flex: 3, align: TextAlign.right, isBold: true, color: Colors.green.shade800),
-                        ],
+                    return InkWell(
+                      onTap: () {
+                        final now = DateTime.now();
+                        setState(() => _selectedIndex = i);
+                        if (_lastTapIndex == i && _lastTapTime != null && now.difference(_lastTapTime!) < const Duration(milliseconds: 350)) {
+                          _lastTapTime = null;
+                          _lastTapIndex = null;
+                          final invNo = row['invoice_no']?.toString();
+                          if (invNo != null && invNo.isNotEmpty) {
+                            final app = Provider.of<AppProvider>(context, listen: false);
+                            if (_reportType == 'PURCHASES') {
+                              app.openPurchase(entryNo: invNo);
+                            } else {
+                              app.openSales(invoiceNo: invNo);
+                            }
+                          }
+                        } else {
+                          _lastTapIndex = i;
+                          _lastTapTime = now;
+                        }
+                      },
+                      child: Container(
+                        height: 32,
+                        decoration: BoxDecoration(
+                          color: isSelected ? const Color(0xFFBAE6FD) : (i % 2 == 0 ? Colors.white : const Color(0xFFF8FAFC)),
+                          border: Border(bottom: BorderSide(color: isSelected ? Colors.blue.shade300 : Colors.grey.shade200)),
+                        ),
+                        child: Row(
+                          children: [
+                            _Cell(row['date'], flex: 2),
+                            _Cell(row['invoice_no'], flex: 3, isBold: true),
+                            _Cell(row['party_name'], flex: 4),
+                            _Cell(row['gstin'], flex: 3, color: Colors.blueGrey),
+                            _Cell(taxableP.toRupeesString(), flex: 3, align: TextAlign.right),
+                            _Cell(taxP.toRupeesString(), flex: 3, align: TextAlign.right, color: Colors.red.shade700),
+                            _Cell(invP.toRupeesString(), flex: 3, align: TextAlign.right, isBold: true, color: Colors.green.shade800),
+                          ],
+                        ),
                       ),
                     );
                   },
@@ -565,27 +627,134 @@ class _GstReportScreenState extends State<GstReportScreen> {
           child: Row(
             children: [
               const Expanded(flex: 12, child: Padding(padding: EdgeInsets.only(left: 12), child: Text("PERIOD TOTALS (FIXED-POINT PRECISION)", style: TextStyle(fontWeight: FontWeight.w900, fontSize: 11)))),
-              _Cell(totalTaxableP.toRupeesString(), flex: 3, align: TextAlign.right, isBold: true),
-              _Cell(totalTaxP.toRupeesString(), flex: 3, align: TextAlign.right, isBold: true, color: Colors.red.shade900),
-              _Cell(totalInvP.toRupeesString(), flex: 3, align: TextAlign.right, isBold: true, color: Colors.green.shade900),
+              _footerInteractiveCell(totalTaxableP.toRupeesString(), flex: 3, isBold: true),
+              _footerInteractiveCell(totalTaxP.toRupeesString(), flex: 3, isBold: true, color: Colors.red.shade900),
+              _footerInteractiveCell(totalInvP.toRupeesString(), flex: 3, isBold: true, color: Colors.green.shade900),
             ],
           ),
         ),
       ],
     );
   }
+
+  Widget _footerInteractiveCell(String text, {int flex = 1, bool isBold = false, Color? color}) {
+    return Expanded(
+      flex: flex,
+      child: GestureDetector(
+        onTapDown: (details) => _showCopyMenu(details.globalPosition, text),
+        onSecondaryTapDown: (details) => _showCopyMenu(details.globalPosition, text),
+        child: ERPTooltip(
+          message: text,
+          child: _Cell(text, flex: flex, align: TextAlign.right, isBold: isBold, color: color),
+        ),
+      ),
+    );
+  }
+
+  void _showCopyMenu(Offset position, String text) {
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
+    showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(position.dx, position.dy, 0, 0),
+        Offset.zero & overlay.size,
+      ),
+      items: [
+        PopupMenuItem<String>(
+          value: "COPY",
+          height: 32,
+          child: Row(
+            children: [
+              const Icon(Icons.copy, size: 14, color: Colors.blue),
+              const SizedBox(width: 8),
+              Text("Copy ($text)", style: const TextStyle(fontSize: 11)),
+            ],
+          ),
+        ),
+      ],
+    ).then((val) {
+      if (val == "COPY") {
+        Clipboard.setData(ClipboardData(text: text));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Copied $text to clipboard"), duration: const Duration(seconds: 1)),
+          );
+        }
+      }
+    });
+  }
+
+  void _onColumnHeaderTap(String key) {
+    setState(() {
+      if (_sortKey == key) {
+        if (_isAscending) {
+          _isAscending = false;
+        } else {
+          _sortKey = null;
+          _isAscending = true;
+        }
+      } else {
+        _sortKey = key;
+        _isAscending = true;
+      }
+    });
+  }
 }
 
 class _Hdr extends StatelessWidget {
-  final String title; final int flex; final TextAlign align;
-  const _Hdr(this.title, {required this.flex, this.align = TextAlign.left});
-  @override Widget build(BuildContext context) {
+  final String title;
+  final String colKey;
+  final int flex;
+  final TextAlign align;
+  final bool isSorted;
+  final bool isAscending;
+  final VoidCallback? onSortTap;
+
+  const _Hdr(
+    this.title,
+    this.colKey, {
+    required this.flex,
+    this.align = TextAlign.left,
+    this.isSorted = false,
+    this.isAscending = true,
+    this.onSortTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
     return Expanded(
       flex: flex,
-      child: Container(
-        alignment: align == TextAlign.left ? Alignment.centerLeft : Alignment.centerRight,
-        padding: const EdgeInsets.symmetric(horizontal: 10),
-        child: Text(title, style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold)),
+      child: InkWell(
+        onTap: onSortTap,
+        child: Container(
+          alignment: align == TextAlign.left ? Alignment.centerLeft : Alignment.centerRight,
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Flexible(
+                child: Text(
+                  title,
+                  style: TextStyle(
+                    color: isSorted ? Colors.amberAccent : Colors.white,
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              if (isSorted) ...[
+                const SizedBox(width: 2),
+                Icon(
+                  isAscending ? Icons.arrow_upward : Icons.arrow_downward,
+                  size: 11,
+                  color: Colors.amberAccent,
+                ),
+              ],
+            ],
+          ),
+        ),
       ),
     );
   }

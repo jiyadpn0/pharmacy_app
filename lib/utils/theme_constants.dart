@@ -35,9 +35,9 @@ class AppThemeColors {
     isDark: false,
     background: Color(0xFFF8FAFC),
     surface: Colors.white,
-    primaryText: Color(0xFF0F172A),
-    secondaryText: Color(0xFF64748B),
-    border: Color(0xFFE2E8F0),
+    primaryText: Colors.black, // Solid pure black
+    secondaryText: Color(0xFF0F172A), // High-contrast Navy/Slate 900
+    border: Color(0xFF94A3B8), // Crisp Slate 400 border
     cardBg: Colors.white,
     headerBg: Color(0xFFF8FAFC),
     sidebarBg: Color(0xFFF1F5F9),
@@ -51,9 +51,9 @@ class AppThemeColors {
     isDark: true,
     background: Color(0xFF0F172A),
     surface: Color(0xFF1E293B),
-    primaryText: Color(0xFFF8FAFC),
-    secondaryText: Color(0xFF94A3B8),
-    border: Color(0xFF334155),
+    primaryText: Color(0xFFFFFFFF), // Pure crisp white
+    secondaryText: Color(0xFFCBD5E1), // High-contrast Slate 300
+    border: Color(0xFF475569), // Crisp Slate 600
     cardBg: Color(0xFF1E293B),
     headerBg: Color(0xFF0F172A),
     sidebarBg: Color(0xFF0F172A),
@@ -140,11 +140,25 @@ class AppStyles {
     color: AppColors.of(context).primaryText,
   );
 
+  static TextStyle bodyOf(BuildContext context, {double fontSize = 13.0, FontWeight fontWeight = FontWeight.w600}) => TextStyle(
+    fontSize: fontSize,
+    fontWeight: fontWeight,
+    letterSpacing: 0.2,
+    color: AppColors.of(context).primaryText,
+  );
+
+  static TextStyle subtextOf(BuildContext context, {double fontSize = 11.0, FontWeight fontWeight = FontWeight.w600}) => TextStyle(
+    fontSize: fontSize,
+    fontWeight: fontWeight,
+    letterSpacing: 0.3,
+    color: AppColors.of(context).secondaryText,
+  );
+
   static TextStyle labelOf(BuildContext context) => TextStyle(
     fontSize: 11,
     fontWeight: FontWeight.w900,
     color: AppColors.of(context).secondaryText,
-    letterSpacing: 1,
+    letterSpacing: 0.8,
   );
 
   static BoxDecoration cardDecoration = BoxDecoration(
@@ -182,21 +196,22 @@ class AppStyles {
   static TextStyle label = const TextStyle(
     fontSize: 11,
     fontWeight: FontWeight.w900,
-    color: Color(0xFF64748B),
+    color: Colors.black,
     letterSpacing: 1,
   );
 }
 
 class AppGridTheme {
   static Color cellTextColor(bool isDark) =>
-      isDark ? const Color(0xFFF8FAFC) : const Color(0xFF0F172A);
+      isDark ? const Color(0xFFFFFFFF) : Colors.black;
 
   static Color cellSecondaryTextColor(bool isDark) =>
-      isDark ? const Color(0xFF94A3B8) : const Color(0xFF475569);
+      isDark ? const Color(0xFFCBD5E1) : const Color(0xFF0F172A);
 
   static TextStyle cellStyle(bool isDark, {double fontSize = 12.0, FontWeight fontWeight = FontWeight.w600}) => TextStyle(
         fontSize: fontSize,
         fontWeight: fontWeight,
+        letterSpacing: 0.2,
         color: cellTextColor(isDark),
       );
 

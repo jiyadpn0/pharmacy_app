@@ -53,6 +53,7 @@ class _PaymentReceivedDialogState extends State<PaymentReceivedDialog> {
 
     final provider = p ?? Provider.of<PharmacyProvider>(context, listen: false);
     final db = await DbHelper.instance.database;
+    if (!mounted) return;
 
     try {
       if (_selectedTarget == AccountTarget.customer) {

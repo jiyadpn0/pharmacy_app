@@ -1,10 +1,16 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../controllers/paginated_inventory_notifier.dart';
 import '../providers/pharmacy_provider.dart';
+import '../services/app_notification_service.dart';
+import '../services/sync_event_bus.dart';
 import '../widgets/pin_unlock_dialog.dart';
+import '../widgets/erp_tooltip.dart';
 import '../utils/search_debouncer.dart';
 import '../utils/theme_constants.dart';
+import '../widgets/server_discrepancy_dialog.dart';
 
 class CurrentStockScreen extends StatefulWidget {
   const CurrentStockScreen({super.key});
@@ -20,6 +26,8 @@ class _CurrentStockScreenState extends State<CurrentStockScreen> {
 
   String _filterMode = "Available"; // "All", "Available", "Out of Stock", "Low Stock", "Expired"
   late final PaginatedInventoryNotifier _notifier;
+  StreamSubscription<AppNotification>? _watchdogSub;
+  StreamSubscription? _syncBusSub;
 
   @override
   void initState() {
@@ -31,6 +39,34 @@ class _CurrentStockScreenState extends State<CurrentStockScreen> {
       final p = Provider.of<PharmacyProvider>(context, listen: false);
       _notifier.updateProvider(p);
       _notifier.loadInitial(_searchCtrl.text, filterMode: _filterMode);
+    });
+
+    _watchdogSub = AppNotificationService.instance.watchdogStream.listen((notif) {
+      if (!mounted) return;
+      final cat = notif.detectedCategory;
+      final op = notif.detectedOperationType;
+      if (cat == 'STOCK' || cat == 'CATALOG' || cat == 'SALES' || cat == 'PURCHASE' || op == 'STOCK_CHANGE' || op == 'IMPORT') {
+        _reloadScreenData();
+      }
+    });
+
+    _syncBusSub = SyncEventBus.instance.stream.listen((event) {
+      if (!mounted) return;
+      final table = (event is TableChangedEvent) ? event.tableName : event.toString();
+      if (table == 'stock_batches' || table == 'product_master' || table == 'purchase_items' || table == 'sales_items') {
+        _reloadScreenData();
+      }
+    });
+  }
+
+  void _reloadScreenData() {
+    if (!mounted) return;
+    final p = Provider.of<PharmacyProvider>(context, listen: false);
+    p.loadFromDatabase().then((_) {
+      if (mounted) {
+        _notifier.updateProvider(p);
+        _notifier.loadInitial(_searchCtrl.text, filterMode: _filterMode);
+      }
     });
   }
 
@@ -51,6 +87,8 @@ class _CurrentStockScreenState extends State<CurrentStockScreen> {
 
   @override
   void dispose() {
+    _watchdogSub?.cancel();
+    _syncBusSub?.cancel();
     _searchDebouncer.dispose();
     _searchCtrl.removeListener(_onSearchChanged);
     _searchCtrl.dispose();
@@ -174,6 +212,20 @@ class _CurrentStockScreenState extends State<CurrentStockScreen> {
     }
   }
 
+  Future<void> _reconcileStockFromLedger(BuildContext context) async {
+    final provider = Provider.of<PharmacyProvider>(context, listen: false);
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text("Recalculating live stock from ground truth transaction ledger..."), duration: Duration(seconds: 2)),
+    );
+    final msg = await provider.recalculateAllStockFromLedger();
+    if (context.mounted) {
+      _notifier.loadInitial(_searchCtrl.text, filterMode: _filterMode);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(msg), backgroundColor: Colors.teal.shade800),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final pharmacyProvider = context.watch<PharmacyProvider>();
@@ -243,6 +295,28 @@ class _CurrentStockScreenState extends State<CurrentStockScreen> {
             ),
           ),
           const SizedBox(width: 12),
+          ElevatedButton.icon(
+            onPressed: () => _reconcileStockFromLedger(context),
+            icon: const Icon(Icons.sync_rounded, size: 16, color: Colors.white),
+            label: const Text("RECONCILE STOCK", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.white)),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.teal.shade700,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+          ),
+          const SizedBox(width: 8),
+          ElevatedButton.icon(
+            onPressed: () => ServerDiscrepancyDialog.show(context, initialCategoryKey: 'stock_batches'),
+            icon: const Icon(Icons.youtube_searched_for_rounded, size: 16, color: Colors.white),
+            label: const Text("CLOUD AUDIT", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.white)),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.indigo.shade800,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+          ),
+          const SizedBox(width: 8),
           ElevatedButton.icon(
             onPressed: () => _deleteAllStock(context),
             icon: const Icon(Icons.delete_forever_rounded, size: 16, color: Colors.white),
@@ -536,13 +610,54 @@ class _CurrentStockScreenState extends State<CurrentStockScreen> {
   }
 
   Widget _footerStat(String label, String value, {bool isHighlight = false}) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.end,
-      children: [
-        Text(label, style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.blueGrey)),
-        Text(value, style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900, color: isHighlight ? Colors.blue.shade900 : Colors.black87)),
-      ],
+    return GestureDetector(
+      onSecondaryTapDown: (details) => _showCopyMenu(details.globalPosition, value),
+      onTapDown: (details) => _showCopyMenu(details.globalPosition, value),
+      child: ERPTooltip(
+        message: "$label: $value",
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            Text(label, style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.blueGrey)),
+            Text(value, style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900, color: isHighlight ? Colors.blue.shade900 : Colors.black87)),
+          ],
+        ),
+      ),
     );
+  }
+
+  void _showCopyMenu(Offset position, String text) {
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
+    showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(position.dx, position.dy, 0, 0),
+        Offset.zero & overlay.size,
+      ),
+      items: [
+        PopupMenuItem<String>(
+          value: "COPY",
+          height: 32,
+          child: Row(
+            children: [
+              const Icon(Icons.copy, size: 14, color: Colors.blue),
+              const SizedBox(width: 8),
+              Text("Copy ($text)", style: const TextStyle(fontSize: 11)),
+            ],
+          ),
+        ),
+      ],
+    ).then((val) {
+      if (val == "COPY") {
+        Clipboard.setData(ClipboardData(text: text));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Copied $text to clipboard"), duration: const Duration(seconds: 1)),
+          );
+        }
+      }
+    });
   }
 }
 

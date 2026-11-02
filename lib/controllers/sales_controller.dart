@@ -114,6 +114,9 @@ class SalesController extends ChangeNotifier {
     if (rowIndex < 0 || rowIndex >= items.length) return;
     
     final item = items[rowIndex];
+    if (item.packin <= 0 || (item.packin == 1 && item.product.packSize > 1)) {
+      item.packin = item.product.packSize > 0 ? item.product.packSize : 1;
+    }
     double pack = (item.packin > 0) ? item.packin.toDouble() : 1.0;
 
     // Unit Selling Rate in paise
@@ -161,16 +164,22 @@ class SalesController extends ChangeNotifier {
       item.taxableSP = item.qty > 0 ? (netTaxablePaise / (item.qty * 100.0)) : (netTaxablePaise / 100.0);
     }
 
-    // Profit Calculation in Paise
+    // Profit Calculation in Paise (Profit is calculated on Net Taxable Sales Amount excluding GST)
     double effectivePackLCost = item.product.landingCost > 0 
         ? item.product.landingCost 
-        : (item.product.purchaseRate > 0 ? item.product.purchaseRate : item.purchaseRate);
+        : (item.landingCost > 0
+            ? (item.landingCost * pack)
+            : (item.product.purchaseRate > 0 ? item.product.purchaseRate : (item.purchaseRate * pack)));
 
     int landingCostPaise = effectivePackLCost > 0 ? ((effectivePackLCost / pack) * 100).round() : 0;
     item.landingCost = landingCostPaise / 100.0;
     int totalCostPaise = landingCostPaise * (item.qty + item.fQty);
-    int totalPaise = (item.total * 100).round();
-    int profitPaise = totalPaise - totalCostPaise;
+
+    int netSalesTaxablePaise = (gstType == 1 && item.gstPercent > 0)
+        ? TaxCalculator.calculateInclusivePaise(netTaxablePaise, item.gstPercent).taxablePaise
+        : netTaxablePaise;
+
+    int profitPaise = netSalesTaxablePaise - totalCostPaise;
     item.profit = profitPaise / 100.0;
 
     markDirty();

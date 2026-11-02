@@ -163,7 +163,7 @@ class DotMatrixFormatter {
 
     for (var item in invoice.items) {
       if (item.gstPercent > 0) {
-        double base = item.total;
+        double base = item.total - item.gstAmt;
         taxableBase[item.gstPercent] = (taxableBase[item.gstPercent] ?? 0) + base;
         cgstMap[item.gstPercent] = (cgstMap[item.gstPercent] ?? 0) + item.cgstAmt;
         sgstMap[item.gstPercent] = (sgstMap[item.gstPercent] ?? 0) + item.sgstAmt;

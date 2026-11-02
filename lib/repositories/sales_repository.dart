@@ -1,49 +1,28 @@
-import 'package:flutter/foundation.dart';
+import 'package:sqflite/sqflite.dart';
 import '../database/db_helper.dart';
-import '../providers/pharmacy_provider.dart';
 
 class SalesRepository {
-  /// Fetches a paginated slice of sales invoices with server-side sorting
-  static Future<List<SaleInvoice>> getPagedSalesInvoices({
-    int limit = 50,
-    int offset = 0,
-    PharmacyProvider? pharmacyProvider,
-  }) async {
-    if (kIsWeb) {
-      if (pharmacyProvider == null) return [];
-      var list = pharmacyProvider.sales.where((s) => !s.isDeleted).toList();
-      if (offset >= list.length) return [];
-      return list.skip(offset).take(limit).toList();
-    }
+  static final SalesRepository instance = SalesRepository._internal();
+  SalesRepository._internal();
 
-    try {
-      final db = await DbHelper.instance.database;
-      final List<Map<String, dynamic>> maps = await db.query(
-        'sales_invoices',
-        where: 'IFNULL(is_deleted, 0) = 0',
-        orderBy: 'date DESC',
-        limit: limit,
-        offset: offset,
-      );
+  Future<Database> get _db async => await DbHelper.instance.database;
 
-      return maps.map((map) => SaleInvoice(
-        entryNo: map['entry_no']?.toString() ?? '',
-        date: DateTime.tryParse(map['date']?.toString() ?? '') ?? DateTime.now(),
-        customerAcc: map['customer_acc']?.toString() ?? 'Cash',
-        patient: map['patient']?.toString() ?? 'General',
-        mobile: map['mobile']?.toString() ?? '',
-        doctor: map['doctor']?.toString() ?? 'Unknown',
-        grandTotal: (map['grand_total'] as num?)?.toDouble() ?? 0.0,
-        items: [], // Loaded lazily on demand
-      )).toList();
-    } catch (e) {
-      debugPrint("Error fetching paged sales invoices: $e");
-      if (pharmacyProvider != null) {
-        var list = pharmacyProvider.sales.where((s) => !s.isDeleted).toList();
-        if (offset >= list.length) return [];
-        return list.skip(offset).take(limit).toList();
-      }
-      return [];
+  /// Fetches total sales count for a given date range
+  Future<double> getTotalSalesAmount(DateTime fromDate, DateTime toDate) async {
+    final db = await _db;
+    final fromStr = fromDate.toIso8601String().split('T')[0];
+    final toStr = toDate.toIso8601String().split('T')[0];
+
+    const query = '''
+      SELECT SUM(IFNULL(grand_total, IFNULL(total_amount, 0.0))) as total
+      FROM sales_invoices
+      WHERE date >= ? AND date <= ? AND (is_deleted = 0 OR is_deleted IS NULL)
+    ''';
+
+    final result = await db.rawQuery(query, [fromStr, toStr]);
+    if (result.isNotEmpty && result.first['total'] != null) {
+      return (result.first['total'] as num).toDouble();
     }
+    return 0.0;
   }
 }

@@ -228,6 +228,9 @@ class _PathLinkDialogState extends State<PathLinkDialog> {
 }
 
 class AppDialogs {
+  static Future<void>? _fastDialogLock;
+  static Future<bool?>? _confirmDialogLock;
+
   // ---> THE FIX: The Global Exception Cleaner <---
   static String _cleanErrorMessage(String msg) {
     String clean = msg;
@@ -343,71 +346,96 @@ class AppDialogs {
     );
   }
 
-  static void showFastDialog({
+  static Future<void> showFastDialog({
     required BuildContext context,
     required String title,
     required String content,
     bool isSuccess = false,
-  }) {
-    if (!isSuccess) AppSounds.playError();
-    
-    final cleanContent = _cleanErrorMessage(content);
-    final pathData = _extractPathAndMessage(cleanContent);
+  }) async {
+    if (_fastDialogLock != null) {
+      await _fastDialogLock;
+    }
+    if (!context.mounted) return;
 
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => Focus(
-        autofocus: true,
-        onKeyEvent: (node, event) {
-          if (event is KeyDownEvent) {
-            if (event.logicalKey == LogicalKeyboardKey.enter ||
-                event.logicalKey == LogicalKeyboardKey.numpadEnter ||
-                event.logicalKey == LogicalKeyboardKey.escape) {
-              Navigator.pop(ctx);
-              return KeyEventResult.handled;
+    final future = _doShowFastDialog(context: context, title: title, content: content, isSuccess: isSuccess);
+    _fastDialogLock = future;
+    await future;
+    _fastDialogLock = null;
+  }
+
+  static Future<void> _doShowFastDialog({
+    required BuildContext context,
+    required String title,
+    required String content,
+    bool isSuccess = false,
+  }) async {
+    try {
+      if (!isSuccess) AppSounds.playError();
+      
+      final cleanContent = _cleanErrorMessage(content);
+      final pathData = _extractPathAndMessage(cleanContent);
+
+      await showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => Focus(
+          autofocus: true,
+          onKeyEvent: (node, event) {
+            if (event is KeyDownEvent) {
+              if (event.logicalKey == LogicalKeyboardKey.enter ||
+                  event.logicalKey == LogicalKeyboardKey.numpadEnter ||
+                  event.logicalKey == LogicalKeyboardKey.escape) {
+                if (Navigator.canPop(ctx)) {
+                  Navigator.pop(ctx);
+                }
+                return KeyEventResult.handled;
+              }
             }
-          }
-          return KeyEventResult.ignored;
-        },
-        child: AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          title: Row(
-            children: [
-              Text(isSuccess ? "✅" : "⚠️"),
-              const SizedBox(width: 10),
-              Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+            return KeyEventResult.handled; // Absorb ALL key events so background handlers aren't re-triggered!
+          },
+          child: AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            title: Row(
+              children: [
+                Text(isSuccess ? "✅" : "⚠️"),
+                const SizedBox(width: 10),
+                Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+              ],
+            ),
+            content: pathData != null
+                ? SizedBox(
+                    width: 500,
+                    child: PathLinkWidget(
+                      message: pathData['message'],
+                      path: pathData['path']!,
+                    ),
+                  )
+                : Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(isSuccess ? "✨" : "❌", style: const TextStyle(fontSize: 20)),
+                      const SizedBox(width: 12),
+                      Expanded(child: Text(cleanContent, style: const TextStyle(fontSize: 14))),
+                    ],
+                  ),
+            actions: [
+              ElevatedButton(
+                onPressed: () {
+                  if (Navigator.canPop(ctx)) {
+                    Navigator.pop(ctx);
+                  }
+                },
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: isSuccess ? Colors.green : Colors.blueGrey.shade700,
+                  foregroundColor: Colors.white,
+                ),
+                child: const Text("OK (ENTER/ESC)", style: TextStyle(fontWeight: FontWeight.bold)),
+              ),
             ],
           ),
-          content: pathData != null
-              ? SizedBox(
-                  width: 500,
-                  child: PathLinkWidget(
-                    message: pathData['message'],
-                    path: pathData['path']!,
-                  ),
-                )
-              : Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(isSuccess ? "✨" : "❌", style: const TextStyle(fontSize: 20)),
-                    const SizedBox(width: 12),
-                    Expanded(child: Text(cleanContent, style: const TextStyle(fontSize: 14))),
-                  ],
-                ),
-          actions: [
-            ElevatedButton(
-              onPressed: () => Navigator.pop(ctx),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: isSuccess ? Colors.green : Colors.blueGrey.shade700,
-                foregroundColor: Colors.white,
-              ),
-              child: const Text("OK (ENTER/ESC)", style: TextStyle(fontWeight: FontWeight.bold)),
-            ),
-          ],
         ),
-      ),
-    );
+      );
+    } catch (_) {}
   }
 
   static Future<bool?> showConfirmDialog({
@@ -417,58 +445,93 @@ class AppDialogs {
     String yesLabel = "YES",
     String noLabel = "NO",
     bool isDangerous = false,
-  }) {
-    AppSounds.playError();
-    return showDialog<bool>(
+  }) async {
+    if (_confirmDialogLock != null) {
+      await _confirmDialogLock;
+    }
+    if (!context.mounted) return false;
+
+    final future = _doShowConfirmDialog(
       context: context,
-      barrierDismissible: false,
-      builder: (ctx) => Focus(
-        autofocus: true,
-        onKeyEvent: (node, event) {
-          if (event is KeyDownEvent) {
-            if (event.logicalKey == LogicalKeyboardKey.enter ||
-                event.logicalKey == LogicalKeyboardKey.numpadEnter) {
-              Navigator.pop(ctx, true);
-              return KeyEventResult.handled;
-            } else if (event.logicalKey == LogicalKeyboardKey.escape) {
-              Navigator.pop(ctx, false);
-              return KeyEventResult.handled;
-            }
-          }
-          return KeyEventResult.ignored;
-        },
-        child: AlertDialog(
-          title: Row(
-            children: [
-              const Text("⚠️"),
-              const SizedBox(width: 10),
-              Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
-            ],
-          ),
-          content: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text("❓", style: TextStyle(fontSize: 20)),
-              const SizedBox(width: 12),
-              Expanded(child: Text(content)),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: Text("$noLabel (ESC)", style: const TextStyle(color: Colors.grey)),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: isDangerous ? Colors.red : Colors.blue,
-                foregroundColor: Colors.white,
-              ),
-              child: Text("$yesLabel (ENTER)", style: const TextStyle(fontWeight: FontWeight.bold)),
-            ),
-          ],
-        ),
-      ),
+      title: title,
+      content: content,
+      yesLabel: yesLabel,
+      noLabel: noLabel,
+      isDangerous: isDangerous,
     );
+    _confirmDialogLock = future;
+    final res = await future;
+    _confirmDialogLock = null;
+    return res;
+  }
+
+  static Future<bool?> _doShowConfirmDialog({
+    required BuildContext context,
+    required String title,
+    required String content,
+    String yesLabel = "YES",
+    String noLabel = "NO",
+    bool isDangerous = false,
+  }) async {
+    try {
+      AppSounds.playError();
+      return await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => Focus(
+          autofocus: true,
+          onKeyEvent: (node, event) {
+            if (event is KeyDownEvent) {
+              if (event.logicalKey == LogicalKeyboardKey.enter ||
+                  event.logicalKey == LogicalKeyboardKey.numpadEnter) {
+                if (Navigator.canPop(ctx)) Navigator.pop(ctx, true);
+                return KeyEventResult.handled;
+              } else if (event.logicalKey == LogicalKeyboardKey.escape) {
+                if (Navigator.canPop(ctx)) Navigator.pop(ctx, false);
+                return KeyEventResult.handled;
+              }
+            }
+            return KeyEventResult.handled; // Absorb ALL key events while confirm dialog is active
+          },
+          child: AlertDialog(
+            title: Row(
+              children: [
+                const Text("⚠️"),
+                const SizedBox(width: 10),
+                Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+              ],
+            ),
+            content: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text("❓", style: TextStyle(fontSize: 20)),
+                const SizedBox(width: 12),
+                Expanded(child: Text(content)),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  if (Navigator.canPop(ctx)) Navigator.pop(ctx, false);
+                },
+                child: Text("$noLabel (ESC)", style: const TextStyle(color: Colors.grey)),
+              ),
+              ElevatedButton(
+                onPressed: () {
+                  if (Navigator.canPop(ctx)) Navigator.pop(ctx, true);
+                },
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: isDangerous ? Colors.red : Colors.blue,
+                  foregroundColor: Colors.white,
+                ),
+                child: Text("$yesLabel (ENTER)", style: const TextStyle(fontWeight: FontWeight.bold)),
+              ),
+            ],
+          ),
+        ),
+      );
+    } catch (_) {
+      return false;
+    }
   }
 }

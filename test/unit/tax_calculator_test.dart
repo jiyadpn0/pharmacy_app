@@ -16,10 +16,13 @@ void main() {
       expect(TaxCalculator.toRupeesString(5), equals('0.05'));
     });
 
-    test('roundGstPercent normalizes near-integer GST rates', () {
+    test('roundGstPercent normalizes near-integer GST rates while preserving fractional rates', () {
       expect(TaxCalculator.roundGstPercent(17.99), equals(18.0));
       expect(TaxCalculator.roundGstPercent(4.99), equals(5.0));
       expect(TaxCalculator.roundGstPercent(12.0), equals(12.0));
+      expect(TaxCalculator.roundGstPercent(12.1), equals(12.1));
+      expect(TaxCalculator.roundGstPercent(5.05), equals(5.05));
+      expect(TaxCalculator.roundGstPercent(18.5), equals(18.5));
       expect(TaxCalculator.roundGstPercent(0.0), equals(0.0));
     });
 
@@ -48,6 +51,17 @@ void main() {
       expect(res.taxableAmount, equals(100.0));
       expect(res.gstAmount, equals(0.0));
       expect(res.totalAmount, equals(100.0));
+    });
+
+    test('calculateLandedCostPerPack calculates diluted cost per pack correctly with free quantity, discount, and tax', () {
+      final cost = TaxCalculator.calculateLandedCostPerPack(
+        purchaseRate: 100.0,
+        qty: 10,
+        fQty: 2,
+        discPercent: 10.0,
+        gstPercent: 12.0,
+      );
+      expect(cost, equals(84.0));
     });
   });
 }

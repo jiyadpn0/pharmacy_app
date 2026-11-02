@@ -42,9 +42,9 @@ class WindowControlsBar extends StatelessWidget {
       ),
       child: Row(
         children: [
-          // 1. LEFT SIDE: Logo (Fixed)
-          const SizedBox(width: 16),
-          if (titleWidget != null) titleWidget!,
+          // 1. LEFT SIDE: Logo & Staff Chips
+          const SizedBox(width: 12),
+          if (titleWidget != null) Flexible(child: titleWidget!),
           if (title != null && titleWidget == null)
             Text(
               title!,

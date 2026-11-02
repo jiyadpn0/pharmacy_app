@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../../providers/pharmacy_provider.dart';
+import '../../providers/app_provider.dart';
 import '../../widgets/advanced_filter.dart';
 import '../../widgets/erp_tooltip.dart';
 import '../../utils/app_formatters.dart';
 import '../../utils/theme_constants.dart';
+import '../../utils/pack_unit_converter.dart';
 
 class StockListReportScreen extends StatefulWidget {
   const StockListReportScreen({super.key});
@@ -21,6 +23,12 @@ class _StockListReportScreenState extends State<StockListReportScreen> {
   double _headerHeight = 52.0;
   int _selectedRowIndex = -1;
   int _selectedColIndex = -1;
+  int? _lastTapIndex;
+  DateTime? _lastTapTime;
+
+  // Sorting state
+  int? _sortColIdx;
+  bool _isAscending = true;
 
   @override
   void initState() {
@@ -83,11 +91,50 @@ class _StockListReportScreenState extends State<StockListReportScreen> {
 
   String _fmt(double v) => v.toStringAsFixed(2).replaceFirst(RegExp(r'\.?0*$'), '');
 
+  void _onColumnHeaderTap(int idx) {
+    setState(() {
+      if (_sortColIdx == idx) {
+        if (_isAscending) {
+          _isAscending = false;
+        } else {
+          _sortColIdx = null;
+          _isAscending = true;
+        }
+      } else {
+        _sortColIdx = idx;
+        _isAscending = true;
+      }
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final provider = context.watch<PharmacyProvider>();
     final List<Product> inventoryItems = provider.products.where((p) => p.stock > 0).toList();
     final List<Product> filteredItems = inventoryItems.where((p) => _matchesFilter(p)).toList();
+
+    if (_sortColIdx != null) {
+      filteredItems.sort((a, b) {
+        dynamic valA = _getColValue(a, _sortColIdx!);
+        dynamic valB = _getColValue(b, _sortColIdx!);
+
+        int comp = 0;
+        if (valA is num && valB is num) {
+          comp = valA.compareTo(valB);
+        } else {
+          double? numA = double.tryParse(valA?.toString() ?? '');
+          double? numB = double.tryParse(valB?.toString() ?? '');
+          if (numA != null && numB != null) {
+            comp = numA.compareTo(numB);
+          } else {
+            String strA = valA?.toString().toLowerCase() ?? '';
+            String strB = valB?.toString().toLowerCase() ?? '';
+            comp = strA.compareTo(strB);
+          }
+        }
+        return _isAscending ? comp : -comp;
+      });
+    }
 
     return Container(
       color: Colors.white,
@@ -111,16 +158,29 @@ class _StockListReportScreenState extends State<StockListReportScreen> {
                           final p = filteredItems[index];
                           final isRowSelected = _selectedRowIndex == index;
                           return InkWell(
-                            onTap: () => setState(() { _selectedRowIndex = index; _selectedColIndex = -1; }),
+                            onTap: () {
+                              final now = DateTime.now();
+                              setState(() { _selectedRowIndex = index; _selectedColIndex = -1; });
+                              if (_lastTapIndex == index && _lastTapTime != null && now.difference(_lastTapTime!) < const Duration(milliseconds: 350)) {
+                                _lastTapTime = null;
+                                _lastTapIndex = null;
+                                if (p.name.isNotEmpty) {
+                                  Provider.of<AppProvider>(context, listen: false).openStockEnquiries(initialQuery: p.name);
+                                }
+                              } else {
+                                _lastTapIndex = index;
+                                _lastTapTime = now;
+                              }
+                            },
                             child: Container(
                               height: 35,
-                              decoration: BoxDecoration(color: isRowSelected ? Colors.blue.shade50 : Colors.white, border: Border(bottom: BorderSide(color: Colors.grey.shade300, width: 0.5))),
+                              decoration: BoxDecoration(color: isRowSelected ? const Color(0xFFBAE6FD) : Colors.white, border: Border(bottom: BorderSide(color: isRowSelected ? Colors.blue.shade300 : Colors.grey.shade300, width: 0.5))),
                               child: Row(
                                 children: [
                                   _Cell("${index + 1}", width: 40, textAlign: TextAlign.right),
                                   _Cell(p.name, width: _colW[0], fontWeight: FontWeight.bold, isSelected: _selectedColIndex == 0),
                                   _Cell(p.manufacturer, width: _colW[1], isSelected: _selectedColIndex == 1),
-                                  _StockCell(p.stock, width: _colW[2], isSelected: _selectedColIndex == 2),
+                                  _StockCell(p.stock, packSize: p.packSize, width: _colW[2], isSelected: _selectedColIndex == 2),
                                   _Cell(cleanBatch(p.batch), width: _colW[3], color: Colors.green.shade900, isSelected: _selectedColIndex == 3),
                                   _Cell(p.expiry, width: _colW[4], textAlign: TextAlign.left, isSelected: _selectedColIndex == 4),
                                   _Cell(_fmt(p.mrp), width: _colW[5], textAlign: TextAlign.right, isSelected: _selectedColIndex == 5),
@@ -173,6 +233,8 @@ class _StockListReportScreenState extends State<StockListReportScreen> {
           return double.tryParse(val.toString()) ?? 0.0;
         }).toList();
 
+        if (values.isEmpty) return;
+
         switch (type) {
           case _SummaryType.sum:
             summaryValues[colIndex] = _fmt(values.fold(0.0, (a, b) => a + b));
@@ -187,7 +249,7 @@ class _StockListReportScreenState extends State<StockListReportScreen> {
             summaryValues[colIndex] = products.length.toString();
             break;
           case _SummaryType.average:
-            summaryValues[colIndex] = _fmt(values.fold(0.0, (a, b) => a + b) / products.length);
+            summaryValues[colIndex] = products.isNotEmpty ? _fmt(values.fold(0.0, (a, b) => a + b) / products.length) : "0";
             break;
           case _SummaryType.none:
             break;
@@ -283,6 +345,9 @@ class _StockListReportScreenState extends State<StockListReportScreen> {
       width: width ?? _colW[idx],
       flex: flex?.toDouble(),
       columnType: columnType,
+      isSorted: _sortColIdx == idx,
+      isAscending: _isAscending,
+      onSortTap: () => _onColumnHeaderTap(idx),
       onQuickFilter: (c, v) => _applyQuickFilter(idx, c, v),
       onAdvancedTap: (pos) => _openAdvancedFilterDialog(idx, pos),
       onResize: (v) => setState(() => _colW[idx] = v.clamp(40, 500)),
@@ -312,19 +377,49 @@ class _Cell extends StatelessWidget {
 }
 
 class _StockCell extends StatelessWidget {
-  final int stock; final double width; final bool isSelected;
-  const _StockCell(this.stock, {required this.width, this.isSelected = false});
-  @override Widget build(BuildContext context) => ERPTooltip(
-    message: "$stock units",
-    child: Container(width: width, padding: const EdgeInsets.symmetric(horizontal: 8), alignment: Alignment.centerRight, decoration: BoxDecoration(color: isSelected ? Colors.blue.withValues(alpha: 0.1) : null, border: const Border(right: BorderSide(color: Colors.grey, width: 0.5))), child: Text("$stock", style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.blue))),
-  );
+  final int stock; final int packSize; final double width; final bool isSelected;
+  const _StockCell(this.stock, {this.packSize = 1, required this.width, this.isSelected = false});
+  @override Widget build(BuildContext context) {
+    final String formatted = PackUnitConverter.formatStockDisplay(
+      totalLooseUnits: stock,
+      packing: packSize,
+    );
+    return ERPTooltip(
+      message: formatted,
+      child: Container(width: width, padding: const EdgeInsets.symmetric(horizontal: 8), alignment: Alignment.centerRight, decoration: BoxDecoration(color: isSelected ? Colors.blue.withValues(alpha: 0.1) : null, border: const Border(right: BorderSide(color: Colors.grey, width: 0.5))), child: Text("$stock", style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.blue))),
+    );
+  }
 }
 
 enum _SummaryType { none, sum, min, max, count, average }
 
 class _Hdr extends StatefulWidget {
-  final String title; final double width; final double? flex; final String columnType; final Function(String condition, String value) onQuickFilter; final Function(Offset position)? onAdvancedTap; final Function(double) onResize; final Function(double) onHeightResize;
-  const _Hdr({required this.title, required this.width, this.flex, this.columnType = 'text', required this.onQuickFilter, this.onAdvancedTap, required this.onResize, required this.onHeightResize});
+  final String title;
+  final double width;
+  final double? flex;
+  final String columnType;
+  final bool isSorted;
+  final bool isAscending;
+  final VoidCallback? onSortTap;
+  final Function(String condition, String value) onQuickFilter;
+  final Function(Offset position)? onAdvancedTap;
+  final Function(double) onResize;
+  final Function(double) onHeightResize;
+
+  const _Hdr({
+    required this.title,
+    required this.width,
+    this.flex,
+    this.columnType = 'text',
+    this.isSorted = false,
+    this.isAscending = true,
+    this.onSortTap,
+    required this.onQuickFilter,
+    this.onAdvancedTap,
+    required this.onResize,
+    required this.onHeightResize,
+  });
+
   @override State<_Hdr> createState() => _HdrState();
 }
 
@@ -345,7 +440,41 @@ class _HdrState extends State<_Hdr> {
             Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Row(children: [Expanded(child: Padding(padding: const EdgeInsets.only(left: 8, top: 4, bottom: 2), child: Text(widget.title, style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey.shade800), overflow: TextOverflow.ellipsis))), Opacity(opacity: showFilter ? 1.0 : 0.0, child: GestureDetector(onTapDown: (details) => widget.onAdvancedTap?.call(details.globalPosition), child: Padding(padding: const EdgeInsets.only(right: 4), child: Icon(Icons.filter_alt_outlined, size: 14, color: Colors.blueGrey.shade600))))]),
+                Row(children: [
+                  Expanded(
+                    child: InkWell(
+                      onTap: widget.onSortTap,
+                      child: Padding(
+                        padding: const EdgeInsets.only(left: 8, top: 4, bottom: 2),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Flexible(
+                              child: Text(
+                                widget.title,
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.bold,
+                                  color: widget.isSorted ? Colors.blue.shade900 : Colors.grey.shade800,
+                                ),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            if (widget.isSorted) ...[
+                              const SizedBox(width: 2),
+                              Icon(
+                                widget.isAscending ? Icons.arrow_upward : Icons.arrow_downward,
+                                size: 11,
+                                color: Colors.blue.shade900,
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  Opacity(opacity: showFilter ? 1.0 : 0.0, child: GestureDetector(onTapDown: (details) => widget.onAdvancedTap?.call(details.globalPosition), child: Padding(padding: const EdgeInsets.only(right: 4), child: Icon(Icons.filter_alt_outlined, size: 14, color: Colors.blueGrey.shade600)))),
+                ]),
                 Container(height: 20, margin: const EdgeInsets.fromLTRB(4, 0, 4, 4), decoration: BoxDecoration(color: Colors.white, border: Border.all(color: Colors.grey.shade300), borderRadius: BorderRadius.circular(2)), child: Row(children: [GestureDetector(onTapDown: _showQuickConditionMenu, child: Container(padding: const EdgeInsets.symmetric(horizontal: 4), color: Colors.grey.shade100, alignment: Alignment.center, child: Text(_getConditionSymbol(), style: const TextStyle(fontSize: 10, color: Colors.green, fontWeight: FontWeight.bold)))), Expanded(child: TextField(controller: _quickCtrl, style: const TextStyle(fontSize: 10), decoration: const InputDecoration(isDense: true, contentPadding: EdgeInsets.symmetric(horizontal: 4, vertical: 6), border: InputBorder.none), onChanged: (val) { widget.onQuickFilter(_quickCondition, val); setState(() {}); }))]))
               ],
             ),

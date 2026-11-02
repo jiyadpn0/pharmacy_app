@@ -25,7 +25,7 @@ class _OrderConfirmationScreenState extends State<OrderConfirmationScreen> {
   String _selectedStatusFilter = "ALL"; // 'ALL', 'PENDING', 'PARTIAL', 'RECEIVED'
   String _selectedDatePreset = "2_MONTHS"; // '2_MONTHS', '30_DAYS', 'THIS_MONTH', 'ALL', 'CUSTOM'
 
-  DateTime _fromDate = DateTime.now().subtract(const Duration(days: 60)); // Default 2 Months
+  DateTime _fromDate = DateTime.now();
   DateTime _toDate = DateTime.now();
 
   final TextEditingController _searchCtrl = TextEditingController();
@@ -970,12 +970,28 @@ class _CreateOrderConfirmationDialogState extends State<_CreateOrderConfirmation
     }
   }
 
+  bool _isItemModified(int idx) {
+    if (widget.existingOrder == null) return false;
+    if (idx >= widget.existingOrder!.items.length) return false;
+    final orig = widget.existingOrder!.items[idx];
+    final curr = _items[idx];
+    return curr.productName.trim().toLowerCase() != orig.productName.trim().toLowerCase() ||
+           curr.orderQty != orig.orderQty ||
+           (curr.unitPrice - orig.unitPrice).abs() > 0.01;
+  }
+
+  bool _isNewItem(int idx) {
+    if (widget.existingOrder == null) return false;
+    return idx >= widget.existingOrder!.items.length;
+  }
+
   double get _calculatedTotal {
     return _items.fold(0.0, (sum, i) => sum + i.totalPrice);
   }
 
   void _saveOrder() async {
     if (_formKey.currentState?.validate() != true) return;
+    final provider = Provider.of<PharmacyProvider>(context, listen: false);
 
     final supplier = _supplierCtrl.text.trim();
     if (supplier.isEmpty) {
@@ -993,6 +1009,41 @@ class _CreateOrderConfirmationDialogState extends State<_CreateOrderConfirmation
       return;
     }
 
+    if (widget.existingOrder != null) {
+      final bool? confirmSave = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+          title: const Row(
+            children: [
+              Icon(Icons.save_rounded, color: Colors.blue, size: 28),
+              SizedBox(width: 10),
+              Text("Update Order Confirmation", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+            ],
+          ),
+          content: Text(
+            "Are you sure you want to update Order Confirmation $_orderId?\nAll modifications will be saved to your records.",
+            style: const TextStyle(fontSize: 14, height: 1.4),
+          ),
+          actions: [
+            OutlinedButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text("Cancel"),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.blue.shade800,
+                foregroundColor: Colors.white,
+              ),
+              child: const Text("Update Order", style: TextStyle(fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+      );
+      if (confirmSave != true) return;
+    }
+
     final order = OrderConfirmation(
       orderId: _orderId,
       orderDate: DateTime.now(),
@@ -1006,16 +1057,14 @@ class _CreateOrderConfirmationDialogState extends State<_CreateOrderConfirmation
       items: validItems,
     );
 
-    final provider = Provider.of<PharmacyProvider>(context, listen: false);
     await provider.saveOrderConfirmation(order);
 
-    if (mounted) {
-      Navigator.pop(context);
-      widget.onSaved();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("Order confirmation $_orderId saved successfully! Data stored up to 2 months."), backgroundColor: Colors.green),
-      );
-    }
+    if (!mounted) return;
+    Navigator.pop(context);
+    widget.onSaved();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text("Order confirmation $_orderId saved successfully! Data stored up to 2 months."), backgroundColor: Colors.green),
+    );
   }
 
   @override
@@ -1172,10 +1221,19 @@ class _CreateOrderConfirmationDialogState extends State<_CreateOrderConfirmation
                     itemCount: _items.length,
                     itemBuilder: (context, idx) {
                       final item = _items[idx];
+                      Color rowBg = idx % 2 == 0 ? Colors.white : const Color(0xFFF8FAFC);
+                      if (widget.existingOrder != null) {
+                        if (_isNewItem(idx)) {
+                          rowBg = const Color(0xFFDCFCE7);
+                        } else if (_isItemModified(idx)) {
+                          rowBg = const Color(0xFFFEF3C7);
+                        }
+                      }
+
                       return Container(
                         padding: const EdgeInsets.all(8),
                         decoration: BoxDecoration(
-                          color: idx % 2 == 0 ? Colors.white : const Color(0xFFF8FAFC),
+                          color: rowBg,
                           border: const Border(bottom: BorderSide(color: Color(0xFFE2E8F0))),
                         ),
                         child: Row(

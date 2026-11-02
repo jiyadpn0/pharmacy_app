@@ -1,6 +1,8 @@
 import 'dart:io';
 import 'dart:convert';
 import 'dart:ui';
+import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -19,14 +21,29 @@ import 'providers/pharmacy_provider.dart';
 import 'providers/master_data_provider.dart';
 import 'providers/inventory_provider.dart';
 import 'providers/mdi_controller.dart';
+import 'providers/gmail_account_provider.dart';
+import 'providers/gst_provider.dart';
+import 'providers/sales_provider.dart';
+import 'providers/purchase_provider.dart';
 import 'controllers/sales_controller.dart';
 import 'utils/theme_constants.dart';
+import 'utils/window_utils.dart';
+import 'utils/app_logger.dart';
 import 'database/db_helper.dart';
 import 'services/remote_logger_service.dart';
 import 'services/update_checker_service.dart';
+import 'services/server_config_service.dart';
+import 'services/supabase_sync_service.dart';
+import 'services/supabase_realtime_service.dart';
+import 'services/delta_sync_service.dart';
+import 'services/lan_sync_service.dart';
+
+bool _isIpcServerSet = false;
 
 void setupMainIpcServer() {
-  DesktopMultiWindow.setMethodHandler((call, fromWindowId) async {
+  if (_isIpcServerSet) return;
+  try {
+    DesktopMultiWindow.setMethodHandler((call, fromWindowId) async {
     try {
       final db = await DbHelper.instance.database;
 
@@ -36,58 +53,20 @@ void setupMainIpcServer() {
           final Map argsMap = call.arguments is Map ? call.arguments : {};
           final String productName = argsMap['productName']?.toString() ?? '';
           final String? productId = argsMap['productId']?.toString();
-
-          String whereClause = "WHERE (p.name = ? COLLATE NOCASE OR TRIM(i.product_name) = ? COLLATE NOCASE)";
-          List<dynamic> whereArgs = [productName, productName];
-
-          if (productId != null && productId.isNotEmpty) {
-            whereClause += " AND (p.id = ? OR i.product_id = ?)";
-            whereArgs.add(productId);
-            whereArgs.add(productId);
-          }
-
-          final List<Map<String, dynamic>> result = await db.rawQuery('''
-            SELECT i.invoice_no as entry_no, e.date, i.batch_number as batch, i.expiry_date as expiry, 
-                   i.qty, 0 as f_qty, i.mrp, i.s_rate, i.supplier_name, e.doctor, e.patient, i.disc_percent
-            FROM sales_items i
-            JOIN sales_invoices e ON i.invoice_no = e.entry_no
-            LEFT JOIN product_master p ON i.product_id = p.id
-            $whereClause
-            ORDER BY e.date DESC, CAST(e.entry_no AS INTEGER) DESC
-            LIMIT 30
-          ''', whereArgs);
-          return result;
+          return await HistoryWindowContent.querySalesHistoryDirect(db, productName, productId);
         }
 
         case 'query_purchase_history': {
           final Map argsMap = call.arguments is Map ? call.arguments : {};
           final String productName = argsMap['productName']?.toString() ?? '';
           final String? productId = argsMap['productId']?.toString();
-          final cleanName = productName.trim();
-
-          final List<Map<String, dynamic>> result = await db.rawQuery('''
-            SELECT e.entry_no, 
-                   e.date,
-                   e.supplier_name, 
-                   i.qty, 
-                   i.f_qty,
-                   i.p_rate, i.mrp, i.s_rate, i.batch, i.expiry, 
-                   i.l_cost, i.disc_percent, i.packin
-            FROM purchase_items i
-            JOIN purchase_entries e ON i.entry_no = e.entry_no
-            WHERE (TRIM(i.product_name) = ? COLLATE NOCASE 
-                   OR (i.product_id IS NOT NULL AND i.product_id != '' AND i.product_id = ?))
-              AND IFNULL(e.is_deleted, 0) = 0
-            ORDER BY e.date DESC, CAST(e.entry_no AS INTEGER) DESC
-            LIMIT 30
-          ''', [cleanName, productId ?? '']);
-          return result;
+          return await HistoryWindowContent.queryPurchaseHistoryDirect(db, productName, productId);
         }
 
         case 'fetch_invoice': {
           final Map argsMap = call.arguments is Map ? call.arguments : {};
           final String entryNo = argsMap['entryNo']?.toString() ?? '';
-          final res = await db.query('sales_invoices', where: 'entry_no = ?', whereArgs: [entryNo]);
+          final res = await db.query('sales_invoices', where: 'entry_no = ? OR entry_no LIKE ?', whereArgs: [entryNo, '%_$entryNo']);
           return res.isNotEmpty ? res.first : null;
         }
 
@@ -104,19 +83,49 @@ void setupMainIpcServer() {
       rethrow;
     }
   });
+  _isIpcServerSet = true;
+  } catch (e) {
+    debugPrint("IPC Method Handler re-registration safely skipped: $e");
+  }
 }
 
 void main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  AppLogger.instance.info("SYSTEM", "Main application launch initiated.");
+
+  if (kReleaseMode) {
+    debugPrint = (String? message, {int? wrapWidth}) {};
+  }
+
+  // Teardown any background timers and subscriptions from previous hot restart sessions
+  DeltaSyncService.instance.stopPeriodicSync();
+  SupabaseRealtimeService.instance.disposeAll();
+  LanSyncService.instance.dispose();
+
+  if (!Platform.isAndroid && !Platform.isIOS) {
+    sqfliteFfiInit();
+    databaseFactory = databaseFactoryFfi;
+  }
+  unawaited(RemoteLoggerService.instance.init().catchError((e, s) => debugPrint("RemoteLogger init error: $e")));
+  unawaited(UpdateCheckerService.init().catchError((e, s) => debugPrint("UpdateChecker init error: $e")));
+  unawaited(ServerConfigService.instance.init().catchError((e, s) => debugPrint("ServerConfig init error: $e")));
+  unawaited(SupabaseSyncService.instance.init().catchError((e, s) => debugPrint("SupabaseSync init error: $e")));
+  unawaited(DbHelper.instance.autoBackupDatabase().catchError((e, s) => debugPrint("AutoBackup init error: $e")));
   try {
-    await RemoteLoggerService.instance.init();
-    await UpdateCheckerService.init();
+    DeltaSyncService.instance.startPeriodicSync();
   } catch (e) {
-    debugPrint("Init failed safely: $e");
+    AppLogger.instance.error("SYSTEM", "Periodic sync start error: $e");
   }
 
   // Handle all unhandled asynchronous / Future platform errors
   PlatformDispatcher.instance.onError = (error, stack) {
+    AppLogger.instance.error(
+      "ASYNC_ERROR",
+      "Unhandled async platform exception",
+      error: error,
+      stackTrace: stack,
+    );
     RemoteLoggerService.instance.logError(
       error,
       stackTrace: stack,
@@ -133,27 +142,26 @@ void main(List<String> args) async {
   final originalOnError = FlutterError.onError;
 
   FlutterError.onError = (FlutterErrorDetails details) {
-    // Log all uncaught errors to remote/offline logger
-    RemoteLoggerService.instance.logError(
-      details.exception,
-      stackTrace: details.stack,
-      library: details.library,
-      context: details.context?.toString(),
-    );
-
     final bool isRenderFlexOverflow =
         details.exceptionAsString().contains('RenderFlex overflowed');
 
     if (isRenderFlexOverflow) {
       renderFlexOverflowCount++;
-      debugPrint('\n==================================================');
-      debugPrint('🚨 [RENDERFLEX OVERFLOW #$renderFlexOverflowCount DETECTED]');
-      debugPrint('Summary: ${details.summary}');
-      debugPrint('Library: ${details.library ?? "Flutter UI"}');
-      if (details.context != null) {
-        debugPrint('Context: ${details.context}');
-      }
-      debugPrint('==================================================\n');
+      AppLogger.instance.warn("UI_LAYOUT", "RenderFlex overflow #$renderFlexOverflowCount", details: details.summary.toString());
+    } else {
+      AppLogger.instance.error(
+        "UI_ERROR",
+        details.exceptionAsString(),
+        error: details.exception,
+        stackTrace: details.stack,
+        details: details.context?.toString(),
+      );
+      RemoteLoggerService.instance.logError(
+        details.exception,
+        stackTrace: details.stack,
+        library: details.library,
+        context: details.context?.toString(),
+      );
     }
 
     if (originalOnError != null) {
@@ -319,31 +327,32 @@ void main(List<String> args) async {
     );
   };
 
-  if (!Platform.isAndroid && !Platform.isIOS) {
-    sqfliteFfiInit();
-    databaseFactory = databaseFactoryFfi;
-  }
-
   // =========================================================
   // TRUE OS MULTI-WINDOW ROUTER (ANDROID STUDIO STYLE)
   // =========================================================
   if (args.isNotEmpty && args.first == 'multi_window') {
-    final argument = args[2].isEmpty ? '{}' : args[2];
+    final argument = args.length > 2 && args[2].isNotEmpty ? args[2] : '{}';
     final Map<String, dynamic> data = jsonDecode(argument);
     final String productName = data['productName']?.toString() ?? '';
+    final String? productId = data['productId']?.toString();
     final bool isSales = data['isSales'] ?? true;
 
     runApp(
       MaterialApp(
         debugShowCheckedModeBanner: false,
-        theme: ThemeData.dark(),
+        theme: ThemeData.dark().copyWith(
+          textTheme: GoogleFonts.interTextTheme(ThemeData.dark().textTheme).apply(
+            bodyColor: const Color(0xFFFFFFFF),
+            displayColor: const Color(0xFFFFFFFF),
+          ),
+        ),
         home: Scaffold(
           appBar: AppBar(
-            title: Text("$productName - History", style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+            title: Text("$productName - ${isSales ? 'Sales' : 'Purchase'} History", style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
             elevation: 0,
             backgroundColor: const Color(0xFF1E293B),
           ),
-          body: HistoryWindowContent(productName: productName, isSales: isSales),
+          body: HistoryWindowContent(productName: productName, productId: productId, isSales: isSales),
         ),
       ),
     );
@@ -416,6 +425,7 @@ void main(List<String> args) async {
 
     windowManager.waitUntilReadyToShow(windowOptions, () async {
       try {
+        await windowManager.setPreventClose(true);
         if (useSavedPosition) {
           await windowManager.setPosition(initialPosition);
         } else {
@@ -439,10 +449,14 @@ void main(List<String> args) async {
       providers: [
         ChangeNotifierProvider(create: (_) => AppProvider()),
         ChangeNotifierProvider(create: (_) => PharmacyProvider()),
-        ChangeNotifierProvider(create: (_) => MasterDataProvider()..loadAllMasterData()),
-        ChangeNotifierProvider(create: (_) => InventoryProvider()..refreshInventoryValuation()),
+        ChangeNotifierProvider(create: (_) => MasterDataProvider()),
+        ChangeNotifierProvider(create: (_) => InventoryProvider()),
         ChangeNotifierProvider(create: (_) => MdiController()),
         ChangeNotifierProvider(create: (_) => SalesController()),
+        ChangeNotifierProvider(create: (_) => GmailAccountProvider()),
+        ChangeNotifierProvider(create: (_) => GstProvider()),
+        ChangeNotifierProvider(create: (_) => SalesProvider()),
+        ChangeNotifierProvider(create: (_) => PurchaseProvider()),
       ],
       child: const PharmacyApp(),
     ),
@@ -462,20 +476,58 @@ class ERPWindowListener extends WindowListener {
   @override
   void onWindowUnmaximize() => _saveMaximized(false);
 
-  static Future<void> _saveBounds() async {
+  @override
+  void onWindowClose() async {
+    if (AppCloseHandler.isClosing) return;
+    AppCloseHandler.isClosing = true;
+
     try {
-      if (await windowManager.isMaximized() || await windowManager.isMinimized()) return;
-      final bounds = await windowManager.getBounds();
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setDouble('win_width', bounds.width);
-      await prefs.setDouble('win_height', bounds.height);
-      await prefs.setDouble('win_x', bounds.topLeft.dx);
-      await prefs.setDouble('win_y', bounds.topLeft.dy);
-      await prefs.setBool('win_is_maximized', false);
-    } catch (_) {}
+      // Stop periodic sync and realtime subscriptions before backing up & closing
+      DeltaSyncService.instance.stopPeriodicSync();
+      SupabaseRealtimeService.instance.disposeAll();
+      LanSyncService.instance.dispose();
+
+      bool isPreventClose = await windowManager.isPreventClose();
+      if (isPreventClose) {
+        try {
+          await windowManager.hide();
+        } catch (e) {
+          debugPrint("Error hiding window on close: $e");
+        }
+
+        try {
+          await DbHelper.instance.autoBackupOnClose();
+        } catch (e) {
+          debugPrint("Auto backup on close error: $e");
+        }
+
+        await windowManager.destroy();
+      }
+    } catch (e) {
+      debugPrint("Window close error: $e");
+      await windowManager.destroy();
+    }
   }
 
-  static Future<void> _saveMaximized(bool isMaximized) async {
+  static Timer? _boundsSaveTimer;
+
+  static void _saveBounds() {
+    _boundsSaveTimer?.cancel();
+    _boundsSaveTimer = Timer(const Duration(milliseconds: 500), () async {
+      try {
+        if (await windowManager.isMaximized() || await windowManager.isMinimized()) return;
+        final bounds = await windowManager.getBounds();
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setDouble('win_width', bounds.width);
+        await prefs.setDouble('win_height', bounds.height);
+        await prefs.setDouble('win_x', bounds.topLeft.dx);
+        await prefs.setDouble('win_y', bounds.topLeft.dy);
+        await prefs.setBool('win_is_maximized', false);
+      } catch (_) {}
+    });
+  }
+
+  static void _saveMaximized(bool isMaximized) async {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool('win_is_maximized', isMaximized);
@@ -499,6 +551,30 @@ class PharmacyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final app = Provider.of<AppProvider>(context);
+
+    // High-Contrast Crisp Typography for Windows ClearType Rendering
+    final baseLight = GoogleFonts.interTextTheme(ThemeData.light().textTheme);
+    final lightTextTheme = baseLight.copyWith(
+      bodySmall: baseLight.bodySmall?.copyWith(fontSize: 11.5, fontWeight: FontWeight.w600, color: Colors.black),
+      labelSmall: baseLight.labelSmall?.copyWith(fontSize: 11.0, fontWeight: FontWeight.bold, color: Colors.black),
+      labelMedium: baseLight.labelMedium?.copyWith(fontSize: 12.0, fontWeight: FontWeight.w600, color: Colors.black),
+      bodyMedium: baseLight.bodyMedium?.copyWith(fontSize: 13.0, fontWeight: FontWeight.w500, color: Colors.black),
+    ).apply(
+      bodyColor: Colors.black,
+      displayColor: Colors.black,
+    );
+
+    final baseDark = GoogleFonts.interTextTheme(ThemeData.dark().textTheme);
+    final darkTextTheme = baseDark.copyWith(
+      bodySmall: baseDark.bodySmall?.copyWith(fontSize: 11.5, fontWeight: FontWeight.w600, color: const Color(0xFFFFFFFF)),
+      labelSmall: baseDark.labelSmall?.copyWith(fontSize: 11.0, fontWeight: FontWeight.bold, color: const Color(0xFFFFFFFF)),
+      labelMedium: baseDark.labelMedium?.copyWith(fontSize: 12.0, fontWeight: FontWeight.w600, color: const Color(0xFFFFFFFF)),
+      bodyMedium: baseDark.bodyMedium?.copyWith(fontSize: 13.0, fontWeight: FontWeight.w500, color: const Color(0xFFFFFFFF)),
+    ).apply(
+      bodyColor: const Color(0xFFFFFFFF),
+      displayColor: const Color(0xFFFFFFFF),
+    );
+
     return MaterialApp(
       title: 'PharmaPro ERP',
       scrollBehavior: AppScrollBehavior(),
@@ -507,12 +583,13 @@ class PharmacyApp extends StatelessWidget {
       theme: ThemeData(
         useMaterial3: true,
         brightness: Brightness.light,
+        fontFamilyFallback: const ['Segoe UI', 'Roboto', 'Arial', 'sans-serif'],
         colorScheme: ColorScheme.fromSeed(
           seedColor: AppColors.secondary,
           primary: AppColors.primary,
           brightness: Brightness.light,
         ),
-        textTheme: GoogleFonts.interTextTheme(ThemeData.light().textTheme),
+        textTheme: lightTextTheme,
         visualDensity: VisualDensity.compact,
         inputDecorationTheme: const InputDecorationTheme(
           border: InputBorder.none,
@@ -523,6 +600,7 @@ class PharmacyApp extends StatelessWidget {
       darkTheme: ThemeData(
         useMaterial3: true,
         brightness: Brightness.dark,
+        fontFamilyFallback: const ['Segoe UI', 'Roboto', 'Arial', 'sans-serif'],
         scaffoldBackgroundColor: const Color(0xFF0F172A),
         cardColor: const Color(0xFF1E293B),
         dialogTheme: const DialogThemeData(backgroundColor: Color(0xFF1E293B)),
@@ -534,7 +612,7 @@ class PharmacyApp extends StatelessWidget {
           surface: const Color(0xFF1E293B),
           onSurface: const Color(0xFFF8FAFC),
         ),
-        textTheme: GoogleFonts.interTextTheme(ThemeData.dark().textTheme),
+        textTheme: darkTextTheme,
         visualDensity: VisualDensity.compact,
         inputDecorationTheme: const InputDecorationTheme(
           border: InputBorder.none,
@@ -543,16 +621,23 @@ class PharmacyApp extends StatelessWidget {
         ),
       ),
       builder: (context, child) {
-        return Builder(
-          builder: (innerContext) {
-            return CallbackShortcuts(
-              bindings: <ShortcutActivator, VoidCallback>{
-                const SingleActivator(LogicalKeyboardKey.escape): () {
+        final mediaQueryData = MediaQuery.of(context);
+        final clampedData = mediaQueryData.copyWith(
+          textScaler: mediaQueryData.textScaler.clamp(minScaleFactor: 1.0, maxScaleFactor: 1.3),
+        );
+        return MediaQuery(
+          data: clampedData,
+          child: Builder(
+            builder: (innerContext) {
+            return Focus(
+              autofocus: true,
+              onKeyEvent: (node, event) {
+                if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.escape) {
                   try {
                     final pharma = Provider.of<PharmacyProvider>(innerContext, listen: false);
                     if (pharma.isImportInProgress) {
                       pharma.cancelImport();
-                      return;
+                      return KeyEventResult.handled;
                     }
                   } catch (_) {}
 
@@ -561,7 +646,7 @@ class PharmacyApp extends StatelessWidget {
                     final isEditable = primaryFocus.context!.findAncestorWidgetOfExactType<EditableText>() != null;
                     if (isEditable) {
                       primaryFocus.unfocus();
-                      return;
+                      return KeyEventResult.handled;
                     }
                   }
 
@@ -569,17 +654,20 @@ class PharmacyApp extends StatelessWidget {
                     final navigatorState = Navigator.maybeOf(innerContext);
                     if (navigatorState != null && navigatorState.canPop()) {
                       navigatorState.maybePop();
+                      return KeyEventResult.handled;
                     }
                   } catch (e) {
                     debugPrint('Safely caught ESC key navigation exception: $e');
                   }
-                },
+                }
+                return KeyEventResult.ignored;
               },
               child: child ?? const SizedBox.shrink(),
             );
           },
-        );
-      },
+        ),
+      );
+    },
       home: const MainShell(),
     );
   }

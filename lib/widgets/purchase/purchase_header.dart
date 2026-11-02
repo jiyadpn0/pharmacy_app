@@ -33,6 +33,7 @@ class PurchaseHeader extends StatelessWidget {
   final ValueChanged<String>? onSupInvNoChanged;
   final TextEditingController invTotalCtrl;
   final FocusNode invTotalFocus;
+  final Function(int row, int col)? onHeaderSubmitted;
   
   final Widget formatSelector;
   final Widget smartPasteZone;
@@ -66,6 +67,7 @@ class PurchaseHeader extends StatelessWidget {
     this.onSupInvNoChanged,
     required this.invTotalCtrl,
     required this.invTotalFocus,
+    this.onHeaderSubmitted,
     required this.formatSelector,
     required this.smartPasteZone,
   });
@@ -92,7 +94,7 @@ class PurchaseHeader extends StatelessWidget {
                   _radio(c, "Cash", 2, paymentMode, onPaymentModeChanged),
                   const SizedBox(width: 10),
                   _label(c, "Supplier:"),
-                  _headerField(c, supplierCtrl, supplierFocus, width: 250, link: supplierLayer, onChanged: onSupplierChanged),
+                  _headerField(c, supplierCtrl, supplierFocus, width: 250, link: supplierLayer, onChanged: onSupplierChanged, onSubmitted: (_) => onHeaderSubmitted?.call(-1, 0)),
                   _smallIconBtn(Icons.add, () {
                     Provider.of<AppProvider>(context, listen: false).openSupplierRegistration();
                   }),
@@ -101,7 +103,7 @@ class PurchaseHeader extends StatelessWidget {
                   _dateBox(context, c, dueDate, onDueDateChanged),
                   const SizedBox(width: 10),
                   _label(c, "Done By:"),
-                  _headerField(c, doneByCtrl, doneByFocus, width: 100, link: doneByLayer, onChanged: onDoneByChanged),
+                  _headerField(c, doneByCtrl, doneByFocus, width: 100, link: doneByLayer, onChanged: onDoneByChanged, onSubmitted: (_) => onHeaderSubmitted?.call(-1, 1)),
                   const SizedBox(width: 10),
                   _radio(c, "Gst", 1, gstMode, onGstModeChanged),
                   _radio(c, "Non Gst", 2, gstMode, onGstModeChanged),
@@ -137,6 +139,7 @@ class PurchaseHeader extends StatelessWidget {
                         onChanged: (val) {
                           if (onSupInvNoChanged != null) onSupInvNoChanged!(val);
                         },
+                        onSubmitted: (_) => onHeaderSubmitted?.call(-1, 2),
                       ),
                       if (isDuplicateSupInv) ...[
                         const SizedBox(width: 4),
@@ -179,7 +182,7 @@ class PurchaseHeader extends StatelessWidget {
                   ),
                   const SizedBox(width: 20),
                   _label(c, "Inv Total:"),
-                  _headerField(c, invTotalCtrl, invTotalFocus, width: 100, bgColor: c.isDark ? Colors.amber.shade900.withValues(alpha: 0.2) : const Color(0xFFFFFDE7), isNumeric: true),
+                  _headerField(c, invTotalCtrl, invTotalFocus, width: 100, bgColor: c.isDark ? Colors.amber.shade900.withValues(alpha: 0.2) : const Color(0xFFFFFDE7), isNumeric: true, onSubmitted: (_) => onHeaderSubmitted?.call(-1, 3)),
                 ]),
               ]),
             ),
@@ -207,7 +210,9 @@ class PurchaseHeader extends StatelessWidget {
       height: 22,
       child: Radio<int>(
         value: val,
+        // ignore: deprecated_member_use
         groupValue: group,
+        // ignore: deprecated_member_use
         onChanged: (v) => onChange(v!),
         visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
         materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
@@ -217,11 +222,12 @@ class PurchaseHeader extends StatelessWidget {
     Text(label, style: TextStyle(fontSize: 11, color: c.primaryText)),
   ]);
 
-  Widget _headerField(AppThemeColors c, TextEditingController ctrl, FocusNode fn, {double width = 150, LayerLink? link, Color? bgColor, Color? borderColor, Color? textColor, bool isNumeric = false, ValueChanged<String>? onChanged}) {
+  Widget _headerField(AppThemeColors c, TextEditingController ctrl, FocusNode fn, {double width = 150, LayerLink? link, Color? bgColor, Color? borderColor, Color? textColor, bool isNumeric = false, ValueChanged<String>? onChanged, ValueChanged<String>? onSubmitted}) {
     Widget field = TextField(
       controller: ctrl,
       focusNode: fn,
       onChanged: onChanged,
+      onSubmitted: onSubmitted,
       keyboardType: isNumeric ? const TextInputType.numberWithOptions(decimal: true) : null,
       style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: textColor ?? c.primaryText),
       decoration: InputDecoration(

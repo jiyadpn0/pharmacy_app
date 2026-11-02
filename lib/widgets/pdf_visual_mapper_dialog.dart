@@ -30,11 +30,18 @@ class PdfVisualMapperDialog extends StatefulWidget {
   State<PdfVisualMapperDialog> createState() => _PdfVisualMapperDialogState();
 }
 
+class _PdfWord {
+  final String text;
+  final Rect bounds;
+
+  _PdfWord(this.text, this.bounds);
+}
+
 class _PdfPageData {
   final int pageNumber;
   final double width;
   final double height;
-  final List<TextWord> words;
+  final List<_PdfWord> words;
 
   _PdfPageData({
     required this.pageNumber,
@@ -177,7 +184,16 @@ class _PdfVisualMapperDialogState extends State<PdfVisualMapperDialog> {
     });
 
     try {
-      final bytes = File(_selectedFilePath!).readAsBytesSync();
+      final file = File(_selectedFilePath!);
+      if (!file.existsSync()) {
+        throw "File does not exist: $_selectedFilePath";
+      }
+
+      final bytes = file.readAsBytesSync();
+      if (bytes.isEmpty) {
+        throw "Downloaded PDF file is empty (0 bytes).";
+      }
+
       PdfDocument document = PdfDocument(inputBytes: bytes);
       PdfTextExtractor extractor = PdfTextExtractor(document);
 
@@ -186,10 +202,25 @@ class _PdfVisualMapperDialogState extends State<PdfVisualMapperDialog> {
       for (int p = 0; p < document.pages.count; p++) {
         final page = document.pages[p];
         List<TextLine> textLines = extractor.extractTextLines(startPageIndex: p, endPageIndex: p);
-        List<TextWord> words = [];
+        List<_PdfWord> words = [];
         for (var line in textLines) {
-          for (var word in line.wordCollection) {
-            if (word.text.trim().isNotEmpty) words.add(word);
+          if (line.wordCollection.isNotEmpty) {
+            for (var word in line.wordCollection) {
+              if (word.text.trim().isNotEmpty) words.add(_PdfWord(word.text, word.bounds));
+            }
+          } else if (line.text.trim().isNotEmpty) {
+            final rawWords = line.text.split(RegExp(r'\s+'));
+            double currentLeft = line.bounds.left;
+            final charWidth = line.text.isNotEmpty ? (line.bounds.width / line.text.length) : 7.0;
+            for (var w in rawWords) {
+              if (w.trim().isEmpty) continue;
+              final wWidth = w.length * charWidth;
+              words.add(_PdfWord(
+                w,
+                Rect.fromLTWH(currentLeft, line.bounds.top, wWidth, line.bounds.height),
+              ));
+              currentLeft += (w.length + 1) * charWidth;
+            }
           }
         }
 
@@ -203,7 +234,7 @@ class _PdfVisualMapperDialogState extends State<PdfVisualMapperDialog> {
 
       document.dispose();
 
-      if (parsedPages.isEmpty || parsedPages.first.words.isEmpty) {
+      if (parsedPages.isEmpty || parsedPages.every((p) => p.words.isEmpty)) {
         throw "No selectable text found in this PDF.";
       }
 
@@ -211,12 +242,124 @@ class _PdfVisualMapperDialogState extends State<PdfVisualMapperDialog> {
         _pages = parsedPages;
         _restoreSavedOrAutoLayout();
       });
+
+      if (widget.initialFilePath != null && !widget.isEditMode) {
+        final rows = _extractStructuredRows();
+        if (rows.isNotEmpty) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            _confirmAndSaveTemplate();
+          });
+        }
+      }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Error: $e"), backgroundColor: Colors.red));
       }
     } finally {
       if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  void _autoDetectPdfHeaderBoundaries(_PdfPageData page) {
+    if (page.words.isEmpty) return;
+
+    final candidateWords = page.words.where((w) {
+      return w.bounds.top >= (page.height * 0.08) && w.bounds.top <= (page.height * 0.45);
+    }).toList();
+
+    if (candidateWords.isEmpty) return;
+
+    final Map<String, List<String>> keywordMap = {
+      'Product': ['product', 'item', 'description', 'particulars', 'desc', 'medicine', 'name'],
+      'Batch': ['batch', 'b.no', 'bno', 'b.n', 'batchno'],
+      'Exp': ['exp', 'expiry', 'exp.date', 'expdate'],
+      'Qty': ['qty', 'quantity', 'billed', 'qnty'],
+      'Fqty': ['fqty', 'free', 'scheme'],
+      'Packing': ['pack', 'packing', 'pk', 'pkg'],
+      'Prate': ['rate', 'p.rate', 'prate', 'cost', 'unit rate'],
+      'Mrp': ['mrp'],
+      'Disc %': ['disc', 'disc%', 'discount', 'dis%'],
+      'GST %': ['gst', 'gst%', 'tax', 'cgst', 'sgst'],
+      'HSN': ['hsn', 'hsncode'],
+      'Product Code': ['code', 'pcode', 'item code'],
+    };
+
+    Map<int, List<_PdfWord>> yBuckets = {};
+    for (var w in candidateWords) {
+      int yBucket = (w.bounds.top / 12.0).round() * 12;
+      yBuckets.putIfAbsent(yBucket, () => []).add(w);
+    }
+
+    int bestYBucket = -1;
+    int bestScore = 0;
+
+    yBuckets.forEach((yBucket, words) {
+      int score = 0;
+      for (var w in words) {
+        String clean = w.text.toLowerCase().replaceAll(RegExp(r'[^a-z0-9%]'), '');
+        for (var entry in keywordMap.entries) {
+          if (entry.value.contains(clean)) {
+            score++;
+            break;
+          }
+        }
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestYBucket = yBucket;
+      }
+    });
+
+    if (bestYBucket != -1 && bestScore >= 2) {
+      var headerWords = yBuckets[bestYBucket]!..sort((a, b) => a.bounds.left.compareTo(b.bounds.left));
+      double headerLineY = headerWords.first.bounds.top;
+
+      _topBound = (headerLineY + 16.0).clamp(page.height * 0.10, page.height * 0.60);
+      _bottomBound = page.height * 0.82;
+
+      Map<String, _PdfWord> detectedFields = {};
+
+      for (var w in headerWords) {
+        String clean = w.text.toLowerCase().replaceAll(RegExp(r'[^a-z0-9%]'), '');
+        for (var entry in keywordMap.entries) {
+          String fieldName = entry.key;
+          if (entry.value.contains(clean) && !detectedFields.containsKey(fieldName)) {
+            detectedFields[fieldName] = w;
+            break;
+          }
+        }
+      }
+
+      var sortedDetected = detectedFields.entries.toList()
+        ..sort((a, b) => a.value.bounds.left.compareTo(b.value.bounds.left));
+
+      for (int i = 0; i < sortedDetected.length; i++) {
+        String field = sortedDetected[i].key;
+        _PdfWord word = sortedDetected[i].value;
+
+        double left = max(10.0, word.bounds.left - 4.0);
+        double right = word.bounds.right + 25.0;
+
+        if (i < sortedDetected.length - 1) {
+          double nextLeft = sortedDetected[i + 1].value.bounds.left;
+          right = min(word.bounds.right + 30.0, nextLeft - 2.0);
+        } else {
+          right = min(page.width - 10.0, left + (field == 'Product' ? 140.0 : 60.0));
+        }
+
+        if (right > left + 10.0) {
+          _fieldBoundaries[field] = _FieldColumnBoundary(
+            field: field,
+            left: left,
+            right: right,
+            color: _getFieldColor(field),
+          );
+        }
+      }
+
+      if (_fieldBoundaries.isNotEmpty) {
+        _activeEditingField = _fieldBoundaries.keys.first;
+      }
     }
   }
 
@@ -269,6 +412,10 @@ class _PdfVisualMapperDialogState extends State<PdfVisualMapperDialog> {
 
     _topBound = page.height * 0.22;
     _bottomBound = page.height * 0.75;
+
+    if (_fieldBoundaries.isEmpty) {
+      _autoDetectPdfHeaderBoundaries(page);
+    }
   }
 
   void _onHeadingClicked(String field) {
@@ -340,7 +487,7 @@ class _PdfVisualMapperDialogState extends State<PdfVisualMapperDialog> {
 
       if (validWords.isEmpty) continue;
 
-      Map<int, List<TextWord>> rowsMap = {};
+      Map<int, List<_PdfWord>> rowsMap = {};
       for (var w in validWords) {
         int ySnap = (w.bounds.top / 7.0).round() * 7;
         rowsMap.putIfAbsent(ySnap, () => []).add(w);
@@ -725,7 +872,14 @@ class _PdfVisualMapperDialogState extends State<PdfVisualMapperDialog> {
                   ),
                 ],
                 const SizedBox(width: 8),
-                IconButton(icon: const Icon(Icons.close), onPressed: () => Navigator.pop(context)),
+                IconButton(
+                  icon: const Icon(Icons.close),
+                  onPressed: () {
+                    if (Navigator.canPop(context)) {
+                      Navigator.of(context).pop();
+                    }
+                  },
+                ),
               ],
             ),
             const Divider(height: 12),
@@ -955,7 +1109,11 @@ class _PdfVisualMapperDialogState extends State<PdfVisualMapperDialog> {
                 ),
                 const Spacer(),
                 TextButton(
-                  onPressed: () => Navigator.pop(context),
+                  onPressed: () {
+                    if (Navigator.canPop(context)) {
+                      Navigator.of(context).pop();
+                    }
+                  },
                   child: const Text("CANCEL", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.grey)),
                 ),
                 const SizedBox(width: 12),

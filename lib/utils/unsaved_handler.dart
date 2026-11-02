@@ -15,21 +15,31 @@ abstract class UnsavedHandler {
 class UnsavedChangesRegistry {
   static final Map<String, UnsavedHandler> _handlers = {};
 
+  static String normalizeTitle(String title) {
+    String clean = title.trim().toUpperCase();
+    // Remove (#2), (#3) multi-tab suffixes
+    clean = clean.replaceAll(RegExp(r'\s*\(\#\d+\)$'), '');
+    if (clean.startsWith("STOCK ADJUSTMENT")) {
+      return "STOCK ADJUSTMENT";
+    }
+    return clean;
+  }
+
   static void register(String tabTitle, UnsavedHandler handler) {
-    _handlers[tabTitle] = handler;
+    _handlers[normalizeTitle(tabTitle)] = handler;
   }
 
   static void unregister(String tabTitle) {
-    _handlers.remove(tabTitle);
+    _handlers.remove(normalizeTitle(tabTitle));
   }
 
   static UnsavedHandler? getHandler(String tabTitle) {
-    return _handlers[tabTitle];
+    return _handlers[normalizeTitle(tabTitle)];
   }
 
   /// Checks if a tab title belongs to one of the 6 entry screens
   static bool isEntryTab(String title) {
-    final upper = title.trim().toUpperCase();
+    final upper = normalizeTitle(title);
     return upper.startsWith("SALES ENTRY") ||
         upper.startsWith("PURCHASE ENTRY") ||
         upper.startsWith("PURCHASE RETURN") ||
@@ -46,38 +56,38 @@ enum UnsavedDialogResult {
   cancel,
 }
 
-/// Shows the 3-Option Unsaved Changes confirmation dialog:
-/// [ SHOW THE DIFFERENCE ] | [ Discard ] | [ Cancel ]
+/// Shows the Unsaved Changes confirmation dialog:
+/// [ Discard Changes ] | [ Keep Editing ]
 Future<UnsavedDialogResult?> showUnsavedChangesDialog(BuildContext context) {
-  final FocusNode diffFocusNode = FocusNode();
-
   return showDialog<UnsavedDialogResult>(
     context: context,
     builder: (ctx) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        diffFocusNode.requestFocus();
-      });
-
       return AlertDialog(
-        title: const Text("Unsaved Changes", style: TextStyle(fontWeight: FontWeight.bold)),
-        content: const Text("Some data are not saved, are you sure to delete?"),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        title: const Row(
+          children: [
+            Icon(Icons.warning_amber_rounded, color: Colors.amber, size: 28),
+            SizedBox(width: 8),
+            Text("Unsaved Changes Detected", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+          ],
+        ),
+        content: const Text(
+          "You have unsaved modifications in this entry. Leaving or closing now will discard your changes.\n\nDo you want to discard your changes?",
+          style: TextStyle(fontSize: 14, height: 1.4),
+        ),
+        actionsPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         actions: [
-          ElevatedButton(
-            focusNode: diffFocusNode,
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.orange.shade800,
-              foregroundColor: Colors.white,
-            ),
+          OutlinedButton(
             onPressed: () {
               if (ctx.mounted && Navigator.of(ctx).canPop()) {
-                Navigator.of(ctx).pop(UnsavedDialogResult.showDifference);
+                Navigator.of(ctx).pop(UnsavedDialogResult.cancel);
               }
             },
-            child: const Text("SHOW THE DIFFERENCE", style: TextStyle(fontWeight: FontWeight.bold)),
+            child: const Text("Keep Editing", style: TextStyle(fontWeight: FontWeight.bold)),
           ),
           ElevatedButton(
             style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.red,
+              backgroundColor: Colors.red.shade700,
               foregroundColor: Colors.white,
             ),
             onPressed: () {
@@ -85,15 +95,7 @@ Future<UnsavedDialogResult?> showUnsavedChangesDialog(BuildContext context) {
                 Navigator.of(ctx).pop(UnsavedDialogResult.discard);
               }
             },
-            child: const Text("Discard"),
-          ),
-          TextButton(
-            onPressed: () {
-              if (ctx.mounted && Navigator.of(ctx).canPop()) {
-                Navigator.of(ctx).pop(UnsavedDialogResult.cancel);
-              }
-            },
-            child: const Text("Cancel", style: TextStyle(color: Colors.grey)),
+            child: const Text("Discard Changes", style: TextStyle(fontWeight: FontWeight.bold)),
           ),
         ],
       );

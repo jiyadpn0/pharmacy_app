@@ -1,5 +1,4 @@
 import 'dart:convert';
-import 'dart:math';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -9,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:file_picker/file_picker.dart';
 import 'dart:async';
 import '../../providers/pharmacy_provider.dart';
+import '../../providers/app_provider.dart';
 import '../../models/product_ranking.dart';
 import '../../utils/search_debouncer.dart';
 import '../../utils/theme_constants.dart';
@@ -38,6 +38,24 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
 
   // Filtering state
   final Map<String, Map<String, dynamic>> _activeFilters = {};
+  int? _selectedIndex;
+  int? _lastTapIndex;
+  DateTime? _lastTapTime;
+
+  void _onRowTap(int i, String productName) {
+    final now = DateTime.now();
+    setState(() => _selectedIndex = i);
+    if (_lastTapIndex == i && _lastTapTime != null && now.difference(_lastTapTime!) < const Duration(milliseconds: 350)) {
+      _lastTapTime = null;
+      _lastTapIndex = null;
+      if (productName.isNotEmpty) {
+        Provider.of<AppProvider>(context, listen: false).openStockEnquiries(initialQuery: productName);
+      }
+    } else {
+      _lastTapIndex = i;
+      _lastTapTime = now;
+    }
+  }
 
   String _rankFormula = "=MAX(C,D,A)+B";
   final TextEditingController _formulaCtrl = TextEditingController();
@@ -182,7 +200,7 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
       _mavgInterval = prefs.getInt('pr_mavg_int') ?? 0;
       _specialInterval = prefs.getInt('pr_spec_int') ?? 0;
 
-      String? rankRulesJson = prefs.getString('pr_rank_rules_v1');
+      String? rankRulesJson = prefs.getString('pr_rank_rules_v1') ?? prefs.getString('pr_rank_rules');
       if (rankRulesJson != null) {
         try {
           _rankRules = List<Map<String, dynamic>>.from(jsonDecode(rankRulesJson));
@@ -193,7 +211,7 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
         _rankRules = [];
       }
 
-      String? warningRulesJson = prefs.getString('pr_warning_rules_v1');
+      String? warningRulesJson = prefs.getString('pr_warning_rules_v1') ?? prefs.getString('pr_warning_rules');
       if (warningRulesJson != null) {
         try {
           _warningRules = List<Map<String, dynamic>>.from(jsonDecode(warningRulesJson));
@@ -204,7 +222,7 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
         _warningRules = [];
       }
 
-      String? rulesJson = prefs.getString('pr_reorder_rules_v1');
+      String? rulesJson = prefs.getString('pr_reorder_rules_v1') ?? prefs.getString('pr_reorder_rules');
       if (rulesJson != null) {
         try {
           _reOrderRules = List<Map<String, dynamic>>.from(jsonDecode(rulesJson));
@@ -215,7 +233,7 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
         _reOrderRules = [];
       }
 
-      String? maxRulesJson = prefs.getString('pr_maxorder_rules_v1');
+      String? maxRulesJson = prefs.getString('pr_maxorder_rules_v1') ?? prefs.getString('pr_maxorder_rules');
       if (maxRulesJson != null) {
         try {
           _maxOrderRules = List<Map<String, dynamic>>.from(jsonDecode(maxRulesJson));
@@ -226,7 +244,7 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
         _maxOrderRules = [];
       }
 
-      List<String>? savedColsJson = prefs.getStringList('pr_cols_dual_v8');
+      List<String>? savedColsJson = prefs.getStringList('pr_cols_dual_v8') ?? prefs.getStringList('pr_cols_dual_v7') ?? prefs.getStringList('pr_cols_dual');
       if (savedColsJson != null) {
         _customMetricColumns.clear();
         for (var item in savedColsJson) {
@@ -615,34 +633,6 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
     }
   }
 
-  double _evaluateRules(List<Map<String, dynamic>> rules, Map<String, double> vars) {
-    const double eps = 0.0001;
-    for (var rule in rules) {
-      try {
-        String varName = rule['var'] ?? 'Y';
-        String op = rule['op'] ?? '>=';
-        
-        // Evaluate Value and Result as full formulas to allow variables like 'A' or 'Y*0.5'
-        double target = _evaluateFormula(rule['val']?.toString() ?? '0', vars) ?? 0.0;
-        double result = _evaluateFormula(rule['res']?.toString() ?? '0', vars) ?? 0.0;
-
-        double leftValue = vars[varName] ?? 0.0;
-        
-        bool trigger = false;
-        switch (op) {
-          case '>': trigger = leftValue > (target + eps); break;
-          case '<': trigger = leftValue < (target - eps); break;
-          case '>=': trigger = leftValue >= (target - eps); break;
-          case '<=': trigger = leftValue <= (target + eps); break;
-          case '=': trigger = (leftValue - target).abs() < eps; break;
-        }
-        
-        if (trigger) return result;
-      } catch (_) {}
-    }
-    return 0.0;
-  }
-
   void _validateFormulaSubmission(String formula, String title) {
     if (_allRankings.isEmpty) return;
     
@@ -691,186 +681,7 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
     }
   }
 
-  // Clean parameter splitter preventing comma clashes inside nested formulas
-  List<String> _splitParams(String s) {
-    List<String> res = [];
-    int depth = 0;
-    StringBuffer sb = StringBuffer();
-    for (int i = 0; i < s.length; i++) {
-      String char = s[i];
-      if (char == '(') {
-        depth++;
-      } else if (char == ')') depth--;
-      if (char == ',' && depth == 0) {
-        res.add(sb.toString().trim());
-        sb.clear();
-      } else {
-        sb.write(char);
-      }
-    }
-    res.add(sb.toString().trim());
-    return res;
-  }
 
-  static final RegExp _funcRegex = RegExp(r"(AVERAGE|MAX|MIN|IF)\(([^()]+)\)");
-  static final RegExp _parenRegex = RegExp(r"\(([^()]+)\)");
-  static final Map<String, RegExp> _varRegexCache = {};
-
-  static RegExp _getVarRegex(String k) {
-    return _varRegexCache.putIfAbsent(k, () => RegExp('(?<![A-Z0-9\\.])$k(?![A-Z0-9\\.])'));
-  }
-
-  double? _evaluateFormula(String formula, Map<String, double> vars) {
-    try {
-      // 1. Pre-process: Remove spaces and ONLY the leading '=' if it exists
-      String s = formula.toUpperCase().replaceAll(' ', '');
-      if (s.startsWith('=')) s = s.substring(1);
-      if (s.isEmpty) return 0.0;
-
-      // 2. Resolve Variables with strict boundary checking
-      List<String> sortedKeys = vars.keys.toList()..sort((a, b) => b.length.compareTo(a.length));
-      for (var k in sortedKeys) {
-        s = s.replaceAll(_getVarRegex(k), vars[k].toString());
-      }
-
-      return _recursiveEval(s);
-    } catch (e) {
-      debugPrint("Formula Error: $e");
-      return null;
-    }
-  }
-
-  double? _recursiveEval(String s) {
-    int safety = 0;
-
-    while (safety < 50) {
-      safety++;
-      
-      // A. Innermost Functions
-      var fMatch = _funcRegex.firstMatch(s);
-      if (fMatch != null) {
-        String name = fMatch.group(1)!;
-        List<String> parts = _splitParams(fMatch.group(2)!);
-        double result = 0.0;
-
-        if (name == "IF") {
-          if (parts.length >= 3) {
-            double cond = _recursiveEval(parts[0]) ?? 0.0;
-            result = (cond > 0.5) ? (_recursiveEval(parts[1]) ?? 0.0) : (_recursiveEval(parts[2]) ?? 0.0);
-          }
-        } else {
-          List<double> vals = parts.map((p) => _recursiveEval(p) ?? 0.0).toList();
-          if (vals.isNotEmpty) {
-            if (name == "MAX") {
-              result = vals.reduce(max);
-            } else if (name == "MIN") result = vals.reduce(min);
-            else if (name == "AVERAGE") result = vals.reduce((a, b) => a + b) / vals.length;
-          }
-        }
-        s = s.replaceRange(fMatch.start, fMatch.end, result.toString());
-        continue;
-      }
-
-      // B. Innermost Parentheses
-      var pMatch = _parenRegex.firstMatch(s);
-      if (pMatch != null) {
-        double res = _recursiveEval(pMatch.group(1)!) ?? 0.0;
-        s = s.replaceRange(pMatch.start, pMatch.end, res.toString());
-        continue;
-      }
-
-      break;
-    }
-
-    return _evaluateFinalMath(s);
-  }
-
-  double? _evaluateFinalMath(String expr) {
-    const double eps = 0.0001;
-    
-    // 1. Resolve logical comparison (IF condition or standalone comparison)
-    // We search for operators in a specific order to avoid partial matching (e.g., <= before <)
-    final List<String> ops = [">=", "<=", "!=", ">", "<", "="];
-    for (var op in ops) {
-      if (expr.contains(op)) {
-        int idx = expr.indexOf(op);
-        // Trim to handle cases like " 3.0 <= 3.0 "
-        String leftPart = expr.substring(0, idx).trim();
-        String rightPart = expr.substring(idx + op.length).trim();
-        
-        // Evaluate both sides as pure math before comparing
-        double left = _evaluateBasicMath(leftPart) ?? 0.0;
-        double right = _evaluateBasicMath(rightPart) ?? 0.0;
-        
-        bool res = false;
-        if (op == ">") {
-          res = left > (right + eps);
-        } else if (op == "<") res = left < (right - eps);
-        else if (op == ">=") res = left >= (right - eps);
-        else if (op == "<=") res = left <= (right + eps);
-        else if (op == "=") res = (left - right).abs() < eps;
-        else if (op == "!=") res = (left - right).abs() >= eps;
-        
-        return res ? 1.0 : 0.0;
-      }
-    }
-
-    // 2. If no comparison, evaluate as standard math (+ - * /)
-    return _evaluateBasicMath(expr);
-  }
-
-  double? _evaluateBasicMath(String expr) {
-    try {
-      // Multiplication / Division
-      // Regex updated to support scientific notation (e.g. 1.2e-5)
-      RegExp mdRegex = RegExp(r"(-?[0-9.]+(?:[eE]-?[0-9]+)?)([*]" r"[/])(-?[0-9.]+(?:[eE]-?[0-9]+)?)");
-      int s1 = 0;
-      while (mdRegex.hasMatch(expr) && s1 < 20) {
-        s1++;
-        expr = expr.replaceAllMapped(mdRegex, (m) {
-          double a = double.tryParse(m.group(1)!) ?? 0;
-          double b = double.tryParse(m.group(3)!) ?? 0;
-          return m.group(2) == "*" ? (a * b).toString() : (b.abs() < 1e-12 ? "0" : (a / b).toString());
-        });
-      }
-
-      // Addition / Subtraction
-      List<String> tokens = [];
-      String cur = "";
-      for (int i = 0; i < expr.length; i++) {
-        String c = expr[i];
-        // Check if '-' is a sign or an operator (allowing for scientific notation like 1e-5)
-        bool isSign = (c == "-" && (i == 0 || "+-*/".contains(expr[i - 1]) || (i > 0 && expr[i - 1].toUpperCase() == "E")));
-        
-        if (isSign) { 
-          cur += c; 
-          continue; 
-        }
-        
-        if ("+-".contains(c)) { 
-          if (cur.isNotEmpty) tokens.add(cur); 
-          tokens.add(c); 
-          cur = ""; 
-        }
-        else { 
-          cur += c; 
-        }
-      }
-      if (cur.isNotEmpty) tokens.add(cur);
-
-      double res = 0.0;
-      String op = "+";
-      for (var t in tokens) {
-        if (t == "+" || t == "-") {
-          op = t;
-        } else {
-          double v = double.tryParse(t) ?? 0.0;
-          res = (op == "+") ? res + v : res - v;
-        }
-      }
-      return res;
-    } catch (_) { return null; }
-  }
 
 
 
@@ -891,92 +702,6 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
     }
     
     return counts.entries.where((e) => e.value > 1).map((e) => e.key).toSet();
-  }
-
-  String _getMovingAverage(ProductRanking r, {int interval = 0}) {
-    if (r.monthlyStats.isEmpty) return "0.0";
-    
-    List<MonthlyStat> stats = r.monthlyStats;
-    if (interval > 0) {
-      stats = stats.take(interval).toList();
-    }
-    
-    List<double> chronoSales = stats.map((e) => e.monthSale).toList().reversed.toList();
-
-    int firstSaleIndex = 0;
-    bool hasSales = false;
-    for (int i = 0; i < chronoSales.length; i++) {
-      if (chronoSales[i] != 0) { // Changed from > 0 to != 0 to account for net sales being negative or positive
-        firstSaleIndex = i;
-        hasSales = true;
-        break;
-      }
-    }
-
-    if (!hasSales) return "0";
-
-    List<double> activeSales = chronoSales.sublist(firstSaleIndex);
-    double totalSum = activeSales.fold(0.0, (a, b) => a + b);
-    int divisor = activeSales.length < 3 ? 3 : activeSales.length;
-
-    return _cleanFormat(totalSum / divisor);
-  }
-
-  String _calculateCustomMetric({
-    required ProductRanking product,
-    required String rankPart,
-    required String metricPart,
-    int interval = 0,
-    double minRank = 0.0,
-  }) {
-    if (product.monthlyStats.isEmpty) {
-      if (minRank > 0) return _cleanFormat(minRank);
-      return "0";
-    }
-
-    List<MonthlyStat> stats = product.monthlyStats;
-    if (interval > 0) {
-      stats = stats.take(interval).toList();
-    }
-
-    double resVal = 0.0;
-
-    if (metricPart == "MOVING AVERAGE" || metricPart == "TOTAL SALE AVERAGE") {
-      resVal = double.tryParse(_getMovingAverage(product, interval: interval)) ?? 0.0;
-    } else {
-      List<double> monthSales = stats.map((e) => e.monthSale).toList();
-      List<double> higherSales = stats.map((e) => e.higherSale).toList();
-      List<int> saleCounts = stats.map((e) => e.saleCount).toList();
-
-      monthSales.sort();
-      higherSales.sort();
-      saleCounts.sort();
-
-      int rankIndex = 1;
-      if (rankPart.startsWith("2")) rankIndex = 2;
-      if (rankPart.startsWith("3")) rankIndex = 3;
-
-      bool isAscending = rankPart.contains("LOWER");
-
-      double getDesc(List<double> l, int rnk) => l.length >= rnk ? l[l.length - rnk] : 0.0;
-      double getAsc(List<double> l, int rnk) => l.length >= rnk ? l[rnk - 1] : 0.0;
-      int getDescInt(List<int> l, int rnk) => l.length >= rnk ? l[l.length - rnk] : 0;
-      int getAscInt(List<int> l, int rnk) => l.length >= rnk ? l[rnk - 1] : 0;
-
-      if (metricPart == "TOTAL MONTH SALE COUNTS") {
-        resVal = (isAscending ? getAscInt(saleCounts, rankIndex) : getDescInt(saleCounts, rankIndex)).toDouble();
-      } else if (metricPart == "SINGLE HIGHER SALE TOTAL") {
-        resVal = isAscending ? getAsc(higherSales, rankIndex) : getDesc(higherSales, rankIndex);
-      } else if (metricPart == "TOTAL MONTH SALE") {
-        resVal = isAscending ? getAsc(monthSales, rankIndex) : getDesc(monthSales, rankIndex);
-      }
-    }
-
-    if (minRank > 0 && resVal < minRank) {
-      resVal = minRank;
-    }
-
-    return _cleanFormat(resVal);
   }
 
   String _getColKey(Map<String, dynamic> col) {
@@ -1227,18 +952,22 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
                     itemCount: _displayRankings.length,
                     itemBuilder: (ctx, i) {
                       final r = _displayRankings[i];
-                      final Color rowColor = i % 2 == 0 ? const Color(0xFFD9E1F2) : const Color(0xFFB4C6E7);
-                      return Container(
-                        height: 38,
-                        decoration: BoxDecoration(
-                          color: rowColor,
-                          border: Border(bottom: BorderSide(color: Colors.white.withValues(alpha: 0.5))),
-                        ),
-                        child: Row(
-                          children: [
-                            _cellText(r.name, _getW('NAME', 200), bold: true, isPrimary: true),
-                            _cellText(r.pack.toString(), _getW('PACK', 45), center: true, isPrimary: true, bold: true),
-                          ],
+                      final bool isSelected = i == _selectedIndex;
+                      final Color rowColor = isSelected ? const Color(0xFFBAE6FD) : (i % 2 == 0 ? const Color(0xFFD9E1F2) : const Color(0xFFB4C6E7));
+                      return InkWell(
+                        onTap: () => _onRowTap(i, r.name),
+                        child: Container(
+                          height: 38,
+                          decoration: BoxDecoration(
+                            color: rowColor,
+                            border: Border(bottom: BorderSide(color: isSelected ? Colors.blue.shade300 : Colors.white.withValues(alpha: 0.5))),
+                          ),
+                          child: Row(
+                            children: [
+                              _cellText(r.name, _getW('NAME', 200), bold: true, isPrimary: true),
+                              _cellText(r.pack.toString(), _getW('PACK', 45), center: true, isPrimary: true, bold: true),
+                            ],
+                          ),
                         ),
                       );
                     },
@@ -1353,139 +1082,138 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
                           itemCount: _displayRankings.length,
                             itemBuilder: (ctx, i) {
                               final r = _displayRankings[i];
-                              final Color rowColor = i % 2 == 0 ? const Color(0xFFD9E1F2) : const Color(0xFFB4C6E7);
+                              final bool isSelected = i == _selectedIndex;
+                              final Color rowColor = isSelected ? const Color(0xFFBAE6FD) : (i % 2 == 0 ? const Color(0xFFD9E1F2) : const Color(0xFFB4C6E7));
 
                               // Pre-calculate Sky Blue Ranking colors (Alternating Multicolor)
                               final bool isDupA = _duplicateCriteriaKeys.contains("MOVING AVERAGE_NONE_$_mavgInterval");
-                              final Color rowColorA = i % 2 == 0 
+                              final Color rowColorA = isSelected ? const Color(0xFFBAE6FD) : (i % 2 == 0 
                                   ? (isDupA ? const Color(0xFFFDEDEC) : const Color(0xFFE0F2FE)) 
-                                  : (isDupA ? const Color(0xFFFADBD8) : const Color(0xFFBAE6FD));
+                                  : (isDupA ? const Color(0xFFFADBD8) : const Color(0xFFBAE6FD)));
                               
                               final bool isDupB = _duplicateCriteriaKeys.contains("SPECIAL ORDERS_NONE_$_specialInterval");
-                              final Color rowColorB = i % 2 == 0 
+                              final Color rowColorB = isSelected ? const Color(0xFFBAE6FD) : (i % 2 == 0 
                                   ? (isDupB ? const Color(0xFFFDEDEC) : const Color(0xFFE0F2FE)) 
-                                  : (isDupB ? const Color(0xFFFADBD8) : const Color(0xFFBAE6FD));
+                                  : (isDupB ? const Color(0xFFFADBD8) : const Color(0xFFBAE6FD)));
 
-                              return Row(
-                                children: [
-                                  Container(
-                                    height: 38,
-                                    decoration: BoxDecoration(
-                                      color: rowColor,
-                                      border: Border(bottom: BorderSide(color: Colors.white.withValues(alpha: 0.5))),
-                                    ),
-                                    child: Row(
-                                      children: [
-                                        _statusCell(r.isActive, _getW('STATUS', 75), i),
-                                        if (_showFeatures) ...[
-                                          _cellText(r.patent, _getW('PATENT', 85), bgColor: i % 2 == 0 ? const Color(0xFFE8F5E9) : const Color(0xFFC8E6C9)),
-                                          _cellText(r.category, _getW('BRAND', 85), bgColor: i % 2 == 0 ? const Color(0xFFE8F5E9) : const Color(0xFFC8E6C9)),
-                                          _cellText(r.rack, _getW('RACK', 45), center: true, bgColor: i % 2 == 0 ? const Color(0xFFE8F5E9) : const Color(0xFFC8E6C9)),
-                                          _cellText(r.mrp.toStringAsFixed(2), _getW('MRP', 65), right: true, bgColor: i % 2 == 0 ? const Color(0xFFE8F5E9) : const Color(0xFFC8E6C9)),
-                                          _cellText(r.pRate.toStringAsFixed(2), _getW('PRATE', 65), right: true, bgColor: i % 2 == 0 ? const Color(0xFFE8F5E9) : const Color(0xFFC8E6C9)),
-                                          _cellText(r.genericName, _getW('CONTENT', 110), isSecondary: true, bgColor: i % 2 == 0 ? const Color(0xFFE8F5E9) : const Color(0xFFC8E6C9)),
-                                        ],
-                                        if (_showOffer) ...[
-                                          _cellText(r.preferredWholesale, _getW('SUPP', 110)),
-                                          _cellText(r.offer, _getW('OFFER', 45)),
-                                        ],
+                              return InkWell(
+                                onTap: () => _onRowTap(i, r.name),
+                                child: Container(
+                                  height: 38,
+                                  decoration: BoxDecoration(
+                                    color: rowColor,
+                                    border: Border(bottom: BorderSide(color: isSelected ? Colors.blue.shade300 : Colors.white.withValues(alpha: 0.5))),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      _statusCell(r.isActive, _getW('STATUS', 75), i),
+                                      if (_showFeatures) ...[
+                                        _cellText(r.patent, _getW('PATENT', 85), bgColor: i % 2 == 0 ? const Color(0xFFE8F5E9) : const Color(0xFFC8E6C9)),
+                                        _cellText(r.category, _getW('BRAND', 85), bgColor: i % 2 == 0 ? const Color(0xFFE8F5E9) : const Color(0xFFC8E6C9)),
+                                        _cellText(r.rack, _getW('RACK', 45), center: true, bgColor: i % 2 == 0 ? const Color(0xFFE8F5E9) : const Color(0xFFC8E6C9)),
+                                        _cellText(r.mrp.toStringAsFixed(2), _getW('MRP', 65), right: true, bgColor: i % 2 == 0 ? const Color(0xFFE8F5E9) : const Color(0xFFC8E6C9)),
+                                        _cellText(r.pRate.toStringAsFixed(2), _getW('PRATE', 65), right: true, bgColor: i % 2 == 0 ? const Color(0xFFE8F5E9) : const Color(0xFFC8E6C9)),
+                                        _cellText(r.genericName, _getW('CONTENT', 110), isSecondary: true, bgColor: i % 2 == 0 ? const Color(0xFFE8F5E9) : const Color(0xFFC8E6C9)),
+                                      ],
+                                      if (_showOffer) ...[
+                                        _cellText(r.preferredWholesale, _getW('SUPP', 110)),
+                                        _cellText(r.offer, _getW('OFFER', 45)),
+                                      ],
 
-                                        if (_showMonths) ...[
-                                          for (int mIndex = 0; mIndex < _allRankings.first.monthlyStats.length; mIndex++) ...[
-                                            _cellText(r.monthlyStats[mIndex].saleCount.toString(), _getW('M${mIndex}_C', 45), center: true),
-                                            _cellText(_cleanFormat(r.monthlyStats[mIndex].higherSale), _getW('M${mIndex}_H', 45), center: true),
-                                            _cellText(_cleanFormat(r.monthlyStats[mIndex].monthSale), _getW('M${mIndex}_M', 50), center: true, bold: true),
-                                            Container(width: 1, height: 38, color: Colors.white.withValues(alpha: 0.3)),
-                                          ]
-                                        ],
+                                      if (_showMonths) ...[
+                                        for (int mIndex = 0; mIndex < _allRankings.first.monthlyStats.length; mIndex++) ...[
+                                          _cellText(r.monthlyStats[mIndex].saleCount.toString(), _getW('M${mIndex}_C', 45), center: true),
+                                          _cellText(_cleanFormat(r.monthlyStats[mIndex].higherSale), _getW('M${mIndex}_H', 45), center: true),
+                                          _cellText(_cleanFormat(r.monthlyStats[mIndex].monthSale), _getW('M${mIndex}_M', 50), center: true, bold: true),
+                                          Container(width: 1, height: 38, color: Colors.white.withValues(alpha: 0.3)),
+                                        ]
+                                      ],
 
-                                        if (_showRanking) ...[
-                                          // CRITERIA A: MOVING AVERAGE
-                                          _cellText(_cleanFormat(r.mavg), _getW('MAVG', 130), center: true, bold: true, bgColor: rowColorA, textColor: const Color(0xFF0369A1), isAccent: true),
-                                          
-                                          // CRITERIA B: SPECIAL ORDERS
-                                          _cellText(_cleanFormat(r.specialOrders), _getW('SPECIAL', 130), center: true, bold: true, bgColor: rowColorB, textColor: const Color(0xFF0369A1), isAccent: true),
+                                      if (_showRanking) ...[
+                                        // CRITERIA A: MOVING AVERAGE
+                                        _cellText(_cleanFormat(r.mavg), _getW('MAVG', 130), center: true, bold: true, bgColor: rowColorA, textColor: const Color(0xFF0369A1), isAccent: true),
+                                        
+                                        // CRITERIA B: SPECIAL ORDERS
+                                        _cellText(_cleanFormat(r.specialOrders), _getW('SPECIAL', 130), center: true, bold: true, bgColor: rowColorB, textColor: const Color(0xFF0369A1), isAccent: true),
 
-                                          // CRITERIA C: LAST SALE QTY
-                                          _cellText(
-                                              _cleanFormat(r.lastSaleQty), 
-                                              _getW('LASTSALE', 130), 
-                                              center: true, 
-                                              bold: true,
-                                              bgColor: i % 2 == 0 ? const Color(0xFFE0F2FE) : const Color(0xFFBAE6FD),
-                                              textColor: const Color(0xFF0369A1),
-                                              isAccent: true
-                                          ),
-
-                                          // CRITERIA D, E, F...
-                                          ...List.generate(_customMetricColumns.length, (colIdx) {
-                                            final col = _customMetricColumns[colIdx];
-                                            String letter = String.fromCharCode(68 + colIdx);
-                                            final bool isDupC = _duplicateCriteriaKeys.contains("${col['metric']}_${col['rank']}_${col['interval']}");
-                                            final Color critColor = i % 2 == 0 
-                                                ? (isDupC ? const Color(0xFFFDEDEC) : const Color(0xFFE0F2FE)) 
-                                                : (isDupC ? const Color(0xFFFADBD8) : const Color(0xFFBAE6FD));
-                                            double val = r.customCriteria[letter] ?? 0.0;
-                                            return _cellText(_cleanFormat(val), _getW(_getColKey(col), 130.0), center: true, bold: true, bgColor: critColor, textColor: const Color(0xFF0369A1), isAccent: true);
-                                          }),
-
-                                          // Spacer under (+) button
-                                          Container(
-                                              width: 40, 
-                                              decoration: BoxDecoration(
-                                                  color: i % 2 == 0 ? const Color(0xFFE0F2FE) : const Color(0xFFBAE6FD), 
-                                              )
-                                          ),
-
-                                          // ORANGE THEME FOR WARNING LEVEL DATA [X]
-                                          _cellText(
-                                              _cleanFormat(r.warningScore), 
-                                              _getW('WARNING', 110), 
-                                              center: true, 
-                                              bold: true, 
-                                              bgColor: i % 2 == 0 ? const Color(0xFFFEF5E7) : const Color(0xFFFDEBD0), 
-                                              textColor: const Color(0xFFD35400), 
-                                              boldText: true
-                                          ),
-                                          
-                                          // RED THEME FOR RE-ORDER LEVEL DATA [Y]
-                                          _cellText(
-                                              _cleanFormat(r.reOrderScore), 
-                                              _getW('REORDER', 110), 
-                                              center: true, 
-                                              bold: true, 
-                                              bgColor: i % 2 == 0 ? const Color(0xFFFDEDEC) : const Color(0xFFFADBD8), 
-                                              textColor: const Color(0xFFC0392B), 
-                                              boldText: true
-                                          ),
-                                          
-                                          // GREEN THEME FOR MAX ORDER LEVEL DATA [Z]
-                                          _cellText(
-                                              _cleanFormat(r.maxOrderLevel), 
-                                              _getW('MAXORDER', 130), 
-                                              center: true, 
-                                              bold: true, 
-                                              bgColor: i % 2 == 0 ? const Color(0xFFE8F5E9) : const Color(0xFFC8E6C9), 
-                                              textColor: const Color(0xFF2E7D32), 
-                                              boldText: true
-                                          ),
-                                        ],
-
-                                        // GOLDEN THEME FOR OVERALL RANK DATA [W]
+                                        // CRITERIA C: LAST SALE QTY
                                         _cellText(
-                                            _cleanFormat(r.weightedScore), 
-                                            _getW('OVERALL', 110), 
+                                            _cleanFormat(r.lastSaleQty), 
+                                            _getW('LASTSALE', 130), 
+                                            center: true, 
+                                            bold: true,
+                                            bgColor: i % 2 == 0 ? const Color(0xFFE0F2FE) : const Color(0xFFBAE6FD),
+                                            textColor: const Color(0xFF0369A1),
+                                            isAccent: true
+                                        ),
+
+                                        // CRITERIA D, E, F...
+                                        ...List.generate(_customMetricColumns.length, (colIdx) {
+                                          final col = _customMetricColumns[colIdx];
+                                          String letter = String.fromCharCode(68 + colIdx);
+                                          final bool isDupC = _duplicateCriteriaKeys.contains("${col['metric']}_${col['rank']}_${col['interval']}");
+                                          final Color critColor = i % 2 == 0 
+                                              ? (isDupC ? const Color(0xFFFDEDEC) : const Color(0xFFE0F2FE)) 
+                                              : (isDupC ? const Color(0xFFFADBD8) : const Color(0xFFBAE6FD));
+                                          double val = r.customCriteria[letter] ?? 0.0;
+                                          return _cellText(_cleanFormat(val), _getW(_getColKey(col), 130.0), center: true, bold: true, bgColor: critColor, textColor: const Color(0xFF0369A1), isAccent: true);
+                                        }),
+
+                                        // Spacer under (+) button
+                                        Container(
+                                            width: 40, 
+                                            decoration: BoxDecoration(
+                                                color: i % 2 == 0 ? const Color(0xFFE0F2FE) : const Color(0xFFBAE6FD), 
+                                            )
+                                        ),
+
+                                        // ORANGE THEME FOR WARNING LEVEL DATA [X]
+                                        _cellText(
+                                            _cleanFormat(r.warningScore), 
+                                            _getW('WARNING', 110), 
                                             center: true, 
                                             bold: true, 
-                                            bgColor: i % 2 == 0 ? const Color(0xFFFEF9E7) : const Color(0xFFF9E79F), 
-                                            textColor: const Color(0xFF9A7D0A), 
+                                            bgColor: i % 2 == 0 ? const Color(0xFFFEF5E7) : const Color(0xFFFDEBD0), 
+                                            textColor: const Color(0xFFD35400), 
+                                            boldText: true
+                                        ),
+                                        
+                                        // RED THEME FOR RE-ORDER LEVEL DATA [Y]
+                                        _cellText(
+                                            _cleanFormat(r.reOrderScore), 
+                                            _getW('REORDER', 110), 
+                                            center: true, 
+                                            bold: true, 
+                                            bgColor: i % 2 == 0 ? const Color(0xFFFDEDEC) : const Color(0xFFFADBD8), 
+                                            textColor: const Color(0xFFC0392B), 
+                                            boldText: true
+                                        ),
+                                        
+                                        // GREEN THEME FOR MAX ORDER LEVEL DATA [Z]
+                                        _cellText(
+                                            _cleanFormat(r.maxOrderLevel), 
+                                            _getW('MAXORDER', 130), 
+                                            center: true, 
+                                            bold: true, 
+                                            bgColor: i % 2 == 0 ? const Color(0xFFE8F5E9) : const Color(0xFFC8E6C9), 
+                                            textColor: const Color(0xFF2E7D32), 
                                             boldText: true
                                         ),
                                       ],
-                                    ),
+
+                                      // GOLDEN THEME FOR OVERALL RANK DATA [W]
+                                      _cellText(
+                                          _cleanFormat(r.weightedScore), 
+                                          _getW('OVERALL', 110), 
+                                          center: true, 
+                                          bold: true, 
+                                          bgColor: i % 2 == 0 ? const Color(0xFFFEF9E7) : const Color(0xFFF9E79F), 
+                                          textColor: const Color(0xFF9A7D0A), 
+                                          boldText: true
+                                      ),
+                                    ],
                                   ),
-                                  const SizedBox(width: rightBuffer),
-                                ],
+                                ),
                               );
                             },
                         ),
@@ -1546,7 +1274,7 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
   }
 
   Widget _staticHdr(String colKey, String label, double defaultWidth, {Color? bgColor, Color? textColor, String? tooltip, ColumnType type = ColumnType.text}) {
-    return _FilterableHdr(
+    return _filterableHdr(
       title: label,
       colKey: colKey,
       type: type,
@@ -1583,7 +1311,7 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
     final Color bgColor = isDup ? const Color(0xFFC0392B) : const Color(0xFF0288D1); // Sky Blue Header
     final Color darkColor = isDup ? const Color(0xFF922B21) : const Color(0xFF0277BD); // Darker Sky Blue Interval Bar
 
-    return _FilterableHdr(
+    return _filterableHdr(
       title: "CRITERIA $letter",
       colKey: key,
       type: ColumnType.numeric,
@@ -1632,7 +1360,7 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
     final Color bgColor = isDup ? const Color(0xFFC0392B) : const Color(0xFF0288D1); // Sky Blue Header
     final Color darkColor = isDup ? const Color(0xFF922B21) : const Color(0xFF0277BD); // Darker Sky Blue Interval Bar
 
-    return _FilterableHdr(
+    return _filterableHdr(
       title: "CRITERIA $letter",
       colKey: colKey,
       type: ColumnType.numeric,
@@ -1749,8 +1477,7 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
   }
 
   Widget _intervalField(int val, Function(int) onChanged) {
-    return Container(
-      child: Row(
+    return Row(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           const Flexible(
@@ -1782,8 +1509,7 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
             ),
           ),
         ],
-      ),
-    );
+      );
   }
 
   Widget _overallRankHdr() {
@@ -1940,7 +1666,7 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
     required VoidCallback onOpenRules,
     required double colWidth,
   }) {
-    return _FilterableHdr(
+    return _filterableHdr(
       title: title,
       colKey: colKey,
       type: ColumnType.numeric,
@@ -2020,68 +1746,6 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
               ),
             ),
           ],
-        ],
-      ),
-      resizeHandle: Positioned(right: 0, top: 0, bottom: 0, child: _resizeHandle(colKey, colWidth)),
-    );
-  }
-
-  Widget _formulaResultHdr({
-    required String title,
-    required TextEditingController formulaCtrl,
-    required String formulaVal,
-    required bool isValid,
-    required Function(String) onChanged,
-    required VoidCallback onSaved,
-    required String colKey,
-    required double colWidth,
-    Color titleColor = Colors.white,
-    Color? bgColor,
-    Color? darkColor,
-  }) {
-    final Color mainColor = bgColor ?? (isValid ? const Color(0xFF27AE60) : const Color(0xFFC0392B));
-    final Color innerColor = darkColor ?? mainColor;
-
-    return _FilterableHdr(
-      title: title,
-      colKey: colKey,
-      type: ColumnType.numeric,
-      width: _getW(colKey, colWidth),
-      bgColor: mainColor,
-      textColor: titleColor,
-      activeFilter: _activeFilters[colKey],
-      onQuickFilter: (c, v) => _applyQuickFilter(colKey, c, v),
-      onAdvancedTap: (pos) => _openAdvancedFilterDialog(colKey, title, ColumnType.numeric, pos),
-      onHeaderTap: () => _handleHeaderSort(colKey),
-      isSorted: _sortCol == colKey,
-      isAscending: _sortAscending,
-      body: Column(
-        children: [
-          Container(
-            height: 32,
-            width: double.infinity,
-            color: innerColor,
-            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-            child: Container(
-              decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(4)),
-              child: TextField(
-                controller: formulaCtrl,
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 9, fontWeight: FontWeight.w900, color: innerColor),
-                decoration: const InputDecoration(border: InputBorder.none, isDense: true, hintText: "FORMULA", contentPadding: EdgeInsets.symmetric(vertical: 8)),
-                onChanged: onChanged,
-                onSubmitted: (_) => onSaved(),
-              ),
-            ),
-          ),
-          Expanded(
-            child: Stack(
-              alignment: Alignment.center,
-              children: [
-                Text(isValid ? "VALID" : "INVALID", textAlign: TextAlign.center, style: TextStyle(fontWeight: FontWeight.w900, fontSize: 10, color: titleColor, height: 1.1)),
-              ],
-            ),
-          ),
         ],
       ),
       resizeHandle: Positioned(right: 0, top: 0, bottom: 0, child: _resizeHandle(colKey, colWidth)),
@@ -2241,7 +1905,7 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
   }
 
   Widget _monthSubHdr(String colKey, String label, double defaultWidth, {String? tooltip, ColumnType type = ColumnType.numeric}) {
-    return _FilterableHdr(
+    return _filterableHdr(
       title: label,
       colKey: colKey,
       type: type,
@@ -2260,7 +1924,7 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
   }
 
   Widget _fixedSimpleCriteriaHdr(String key, String line1, String line2, String letter, {String? tooltip}) {
-    return _FilterableHdr(
+    return _filterableHdr(
       title: "CRITERIA $letter",
       colKey: key,
       type: ColumnType.numeric,
@@ -2379,7 +2043,7 @@ class _ProductRankingScreenState extends State<ProductRankingScreen> {
     );
   }
 
-  Widget _FilterableHdr({
+  Widget _filterableHdr({
     required String title,
     required String colKey,
     required ColumnType type,

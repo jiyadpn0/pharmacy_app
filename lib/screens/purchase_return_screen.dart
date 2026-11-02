@@ -7,11 +7,9 @@ import 'dart:async';
 import 'package:file_picker/file_picker.dart';
 import '../providers/pharmacy_provider.dart';
 import '../providers/app_provider.dart';
+import '../services/server_config_service.dart';
 
-import 'reports/sales_history_screen.dart';
-import 'reports/purchase_history_screen.dart';
 import '../windows/window_spawner.dart';
-import '../utils/theme_constants.dart';
 import '../utils/app_dialogs.dart';
 import '../utils/invoice_pdf_generator.dart';
 import '../utils/printer_service.dart';
@@ -19,10 +17,12 @@ import '../utils/app_formatters.dart';
 import '../utils/tax_calculator.dart';
 import '../widgets/app_date_picker.dart';
 import '../widgets/erp_tooltip.dart';
+import '../widgets/fluent_nav_button.dart';
 import '../utils/search_debouncer.dart';
 import '../widgets/purchase/purchase_footer.dart';
 import '../utils/unsaved_handler.dart';
 import '../widgets/pin_unlock_dialog.dart';
+import '../widgets/erp_grid_text_field.dart';
 
 class PurchaseReturnScreen extends StatefulWidget {
   final String? initialEntryNo;
@@ -34,8 +34,51 @@ class PurchaseReturnScreen extends StatefulWidget {
 }
 
 class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements UnsavedHandler {
+  bool _hasMeaningfulEdits() {
+    if (!_isExistingEntry) return false;
+    if (_originalLoadedReturn == null) return _isDirty;
+
+    if (_supplierCtrl.text.trim().toUpperCase() != _originalLoadedReturn!.supplierName.trim().toUpperCase()) return true;
+    if (_originalInvCtrl.text.trim().toUpperCase() != _originalLoadedReturn!.originalPurchaseNo.trim().toUpperCase()) return true;
+    if (_doneByCtrl.text.trim().toUpperCase() != _originalLoadedReturn!.doneBy.trim().toUpperCase()) return true;
+
+    final validItems = _items.where((it) => it.product.name.trim().isNotEmpty).toList();
+    final origItems = _originalLoadedReturn!.items;
+    if (validItems.length != origItems.length) return true;
+
+    for (int i = 0; i < validItems.length; i++) {
+      final it = validItems[i];
+      final orig = origItems[i];
+
+      if (it.product.name.trim().toUpperCase() != orig.productName.trim().toUpperCase()) return true;
+      if (it.product.batch.trim().toUpperCase() != orig.batch.trim().toUpperCase()) return true;
+      if (it.qty != orig.qty) return true;
+      if (it.looseQty != orig.looseQty) return true;
+      if ((it.discPercent - orig.discPercent).abs() > 0.01) return true;
+      if ((it.gstPercent - orig.gstPercent).abs() > 0.01) return true;
+      if (it.reason.trim().toUpperCase() != orig.reason.trim().toUpperCase()) return true;
+    }
+
+    return false;
+  }
+
   @override
-  bool hasUnsavedChanges() => _isDirty || (_items.isNotEmpty && !_isExistingEntry);
+  bool hasUnsavedChanges() {
+    double total = _grandTotalNotifier.value;
+    if (total <= 0) {
+      total = double.tryParse(_grandTotalCtrl.text) ?? 0.0;
+    }
+    if (total <= 0) {
+      total = _items.fold(0.0, (s, i) => s + i.total);
+    }
+    if (total <= 0) return false;
+
+    if (_isExistingEntry) {
+      return _hasMeaningfulEdits();
+    } else {
+      return _items.isNotEmpty;
+    }
+  }
 
   @override
   void showDifferences() {
@@ -101,6 +144,8 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
     16: 65,  17: 65,  18: 50,  19: 75,  20: 80,  21: 30,
   };
 
+  bool _hasCustomColWidths = false;
+
   List<int> get _navCols {
     final List<int> cols = [1, 3];
     if (_showSupplierCol) cols.add(5);
@@ -125,8 +170,8 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
   final ValueNotifier<int> _searchIdx = ValueNotifier(0);
 
   bool _isSelectingBatch = false;
-  bool _isSelectingFromDropdown = false;
   bool _isLoading = false;
+  bool _isNavigating = false;
   bool _isSaving = false;
 
   final List<List<PurchaseReturnItem>> _undoStack = [];
@@ -151,48 +196,10 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
     }
   }
 
-  bool _hasValidItems() {
-    if (_isExistingEntry) return _isDirty;
 
-    for (int i = 0; i < _items.length; i++) {
-      final it = _items[i];
-      final prodName = it.product.name.trim();
-      int qty = it.qty;
-      final ctrlText = _getGridCtrl(i, 9).text.trim();
-      if (ctrlText.isNotEmpty) {
-        final parsed = int.tryParse(ctrlText) ?? 0;
-        if (parsed > 0) qty = parsed;
-      }
-      int loose = it.looseQty;
-      final looseText = _getGridCtrl(i, 10).text.trim();
-      if (looseText.isNotEmpty) {
-        final parsedL = int.tryParse(looseText) ?? 0;
-        if (parsedL > 0) loose = parsedL;
-      }
-
-      if (prodName.isNotEmpty && (qty > 0 || loose > 0 || it.fQty > 0)) {
-        return true;
-      }
-    }
-
-    final activeProdName = _getGridCtrl(_items.length, 1).text.trim();
-    final activeQtyText = _getGridCtrl(_items.length, 9).text.trim();
-    final activeQty = int.tryParse(activeQtyText) ?? 0;
-    final activeLooseText = _getGridCtrl(_items.length, 10).text.trim();
-    final activeLoose = int.tryParse(activeLooseText) ?? 0;
-    if (activeProdName.isNotEmpty && (activeQty > 0 || activeLoose > 0)) {
-      return true;
-    }
-
-    return false;
-  }
 
   Future<bool?> _promptDiscardChanges() async {
-    if (!_isExistingEntry) {
-      if (!_hasValidItems()) return true;
-    } else if (!_isDirty) {
-      return true;
-    }
+    if (!hasUnsavedChanges()) return true;
 
     return await showDialog<bool>(
       context: context,
@@ -229,10 +236,15 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
   void initState() {
     super.initState();
     UnsavedChangesRegistry.register("PURCHASE RETURN", this);
+    _entryNo = widget.initialEntryNo ?? "...";
     final p = Provider.of<PharmacyProvider>(context, listen: false);
     Future.microtask(() async {
-      final next = await p.getNextPurchaseReturnEntryNo();
-      if (mounted) setState(() => _entryNo = next);
+      if (widget.initialEntryNo != null) {
+        _navigateEntry('find', searchNo: widget.initialEntryNo);
+      } else {
+        final next = await p.getNextPurchaseReturnEntryNo();
+        if (mounted) setState(() => _entryNo = next);
+      }
     });
     _resetPage();
 
@@ -373,13 +385,23 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
     });
   }
 
+  void _clearGridMaps() {
+    final oldCtrls = Map<int, Map<int, TextEditingController>>.from(_gridCtrls);
+    final oldNodes = Map<int, Map<int, FocusNode>>.from(_gridFocusNodes);
+    _gridCtrls.clear();
+    _gridFocusNodes.clear();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      for (var m in oldCtrls.values) { for (var c in m.values) { c.dispose(); } }
+      for (var m in oldNodes.values) { for (var f in m.values) { f.dispose(); } }
+    });
+  }
+
   void _deleteRow(int row) {
     if (row < 0 || row >= _items.length) return;
     _saveUndoState();
     setState(() {
       _items.removeAt(row);
-      _gridCtrls.clear();
-      _gridFocusNodes.clear();
+      _clearGridMaps();
       _errorCells.clear();
       _calculateFooter();
     });
@@ -425,6 +447,161 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
     return _gridFocusNodes[row]![col]!;
   }
 
+  int _getCrossRowStockUsedForBatch(dynamic target, int excludeRow) {
+    int usedLoose = 0;
+    String targetProdId = "";
+    String targetProdName = "";
+    String targetBatch = "";
+    if (target is PurchaseReturnItem) {
+      targetProdId = target.product.id;
+      targetProdName = Product.cleanProductName(target.product.name).toLowerCase();
+      targetBatch = target.product.batch.trim().toUpperCase();
+    } else if (target is Product) {
+      targetProdId = target.id;
+      targetProdName = Product.cleanProductName(target.name).toLowerCase();
+      targetBatch = target.batch.trim().toUpperCase();
+    }
+    if (targetProdName.isEmpty && targetProdId.isEmpty) return 0;
+
+    for (int i = 0; i < _items.length; i++) {
+      if (i != excludeRow) {
+        final it = _items[i];
+        bool idMatch = targetProdId.isNotEmpty && it.product.id.isNotEmpty && it.product.id == targetProdId;
+        bool nameMatch = targetProdName.isNotEmpty && Product.cleanProductName(it.product.name).toLowerCase() == targetProdName;
+        bool batchMatch = targetBatch.isEmpty || (it.product.batch.trim().toUpperCase() == targetBatch);
+        if ((idMatch || nameMatch) && batchMatch) {
+          int pack = it.packin > 0 ? it.packin : 1;
+          usedLoose += (it.qty * pack) + it.looseQty + (it.fQty * pack);
+        }
+      }
+    }
+    return usedLoose;
+  }
+
+  int _getCrossRowStockUsedForProduct(dynamic target, int excludeRow) {
+    int usedLoose = 0;
+    String targetProdId = "";
+    String targetProdName = "";
+    if (target is PurchaseReturnItem) {
+      targetProdId = target.product.id;
+      targetProdName = Product.cleanProductName(target.product.name).toLowerCase();
+    } else if (target is Product) {
+      targetProdId = target.id;
+      targetProdName = Product.cleanProductName(target.name).toLowerCase();
+    }
+    if (targetProdName.isEmpty && targetProdId.isEmpty) return 0;
+
+    for (int i = 0; i < _items.length; i++) {
+      if (i != excludeRow) {
+        final it = _items[i];
+        bool idMatch = targetProdId.isNotEmpty && it.product.id.isNotEmpty && it.product.id == targetProdId;
+        bool nameMatch = targetProdName.isNotEmpty && Product.cleanProductName(it.product.name).toLowerCase() == targetProdName;
+        if (idMatch || nameMatch) {
+          int pack = it.packin > 0 ? it.packin : 1;
+          usedLoose += (it.qty * pack) + it.looseQty + (it.fQty * pack);
+        }
+      }
+    }
+    return usedLoose;
+  }
+
+  int _getOriginalQtyForBatch(dynamic target) {
+    if (!_isExistingEntry || _originalLoadedReturn == null) return 0;
+    String targetProdId = "";
+    String targetProdName = "";
+    String targetBatch = "";
+    if (target is PurchaseReturnItem) {
+      targetProdId = target.product.id;
+      targetProdName = Product.cleanProductName(target.product.name).toLowerCase();
+      targetBatch = target.product.batch.trim().toUpperCase();
+    } else if (target is Product) {
+      targetProdId = target.id;
+      targetProdName = Product.cleanProductName(target.name).toLowerCase();
+      targetBatch = target.batch.trim().toUpperCase();
+    }
+
+    int origLoose = 0;
+    for (var item in _originalLoadedReturn!.items) {
+      bool idMatch = targetProdId.isNotEmpty && item.id.isNotEmpty && item.id == targetProdId;
+      bool nameMatch = targetProdName.isNotEmpty && Product.cleanProductName(item.productName).toLowerCase() == targetProdName;
+      bool batchMatch = targetBatch.isEmpty || (item.batch.trim().toUpperCase() == targetBatch);
+      if ((idMatch || nameMatch) && batchMatch) {
+        int pack = item.packin > 0 ? item.packin : 1;
+        origLoose += (item.qty * pack) + item.looseQty + (item.fQty * pack);
+      }
+    }
+    return origLoose;
+  }
+
+  int _getOriginalQtyForProduct(dynamic target) {
+    if (!_isExistingEntry || _originalLoadedReturn == null) return 0;
+    String targetProdId = "";
+    String targetProdName = "";
+    if (target is PurchaseReturnItem) {
+      targetProdId = target.product.id;
+      targetProdName = Product.cleanProductName(target.product.name).toLowerCase();
+    } else if (target is Product) {
+      targetProdId = target.id;
+      targetProdName = Product.cleanProductName(target.name).toLowerCase();
+    }
+
+    int origLoose = 0;
+    for (var item in _originalLoadedReturn!.items) {
+      bool idMatch = targetProdId.isNotEmpty && item.id.isNotEmpty && item.id == targetProdId;
+      bool nameMatch = targetProdName.isNotEmpty && Product.cleanProductName(item.productName).toLowerCase() == targetProdName;
+      if (idMatch || nameMatch) {
+        int pack = item.packin > 0 ? item.packin : 1;
+        origLoose += (item.qty * pack) + item.looseQty + (item.fQty * pack);
+      }
+    }
+    return origLoose;
+  }
+
+  bool _validateQuantity(int row, int col, String val) {
+    if (row < 0 || row >= _items.length) return true;
+    final it = _items[row];
+    if (it.product.name.isEmpty) return true;
+
+    int inputVal = double.tryParse(val.trim())?.toInt() ?? 0;
+    int pack = (col == 8 ? inputVal : it.packin);
+    if (pack <= 0) pack = 1;
+
+    int testQty = col == 9 ? inputVal : it.qty;
+    int testLooseQty = col == 10 ? inputVal : it.looseQty;
+    int testFQty = col == 11 ? inputVal : it.fQty;
+
+    int totalRequestedLoose = (testQty * pack) + testLooseQty + (testFQty * pack);
+    int usedInOtherRows = _getCrossRowStockUsedForBatch(it.product, row);
+    int origQty = _getOriginalQtyForBatch(it.product);
+    int availLoose = it.product.stock + origQty - usedInOtherRows;
+
+    if (totalRequestedLoose > availLoose) {
+      AppDialogs.showFastDialog(
+        context: context,
+        title: "Insufficient Stock",
+        content: "INSUFFICIENT STOCK: Cannot return $totalRequestedLoose loose units for '${it.product.name}' (Batch: ${cleanBatch(it.product.batch)}).\n\nAvailable stock: $availLoose loose units (${it.product.stock} total stock, $usedInOtherRows used in other rows).",
+      );
+
+      if (col == 9) {
+        it.qty = 0;
+        _getGridCtrl(row, 9, "0").text = "0";
+      } else if (col == 10) {
+        it.looseQty = 0;
+        _getGridCtrl(row, 10, "0").text = "0";
+      } else if (col == 11) {
+        it.fQty = 0;
+        _getGridCtrl(row, 11, "0").text = "0";
+      } else if (col == 8) {
+        it.packin = 1;
+        _getGridCtrl(row, 8, "1").text = "1";
+      }
+      _calculateItem(row);
+      _moveFocus(row, col);
+      return false;
+    }
+    return true;
+  }
+
   void _onBlur(int row, int col, String value) {
     if (row < _items.length) {
       final it = _items[row];
@@ -435,10 +612,31 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
           final matches = p.searchProducts(value.trim(), includeGenerics: false);
           if (matches.isNotEmpty) {
             final best = matches.first;
-            it.product = Product(id: best.id, name: best.name, batch: best.batch, expiry: best.expiry, packSize: best.packSize, mrp: best.mrp, purchaseRate: best.purchaseRate, salePrice: best.salePrice, gstPercent: best.gstPercent, rack: best.rack, category: best.category, manufacturer: best.manufacturer, supplier: best.supplier, genericName: best.genericName, hsnCode: best.hsnCode)..stock = best.stock;
-            it.hsncode = best.hsnCode;
-            _getGridCtrl(row, 1).text = best.name;
-            _getGridCtrl(row, 2).text = best.hsnCode;
+            int usedInOtherRows = _getCrossRowStockUsedForProduct(best, row);
+            int origQty = _getOriginalQtyForProduct(best);
+            int availStock = best.stock + origQty - usedInOtherRows;
+            if (availStock <= 0) {
+              _getGridCtrl(row, 1).clear();
+              it.product = Product(id: '', name: '');
+              AppDialogs.showFastDialog(
+                context: context,
+                title: "Zero Stock",
+                content: "ZERO STOCK: '${best.name}' has no available stock for return (${best.stock} total stock, $usedInOtherRows used in other rows).",
+              );
+            } else {
+              it.product = Product(id: best.id, name: best.name, batch: best.batch, expiry: best.expiry, packSize: best.packSize, mrp: best.mrp, purchaseRate: best.purchaseRate, salePrice: best.salePrice, gstPercent: best.gstPercent, rack: best.rack, category: best.category, manufacturer: best.manufacturer, supplier: best.supplier, genericName: best.genericName, hsnCode: best.hsnCode)..stock = best.stock;
+              it.hsncode = best.hsnCode;
+              _getGridCtrl(row, 1).text = best.name;
+              _getGridCtrl(row, 2).text = best.hsnCode;
+            }
+          } else {
+            _getGridCtrl(row, 1).clear();
+            it.product = Product(id: '', name: '');
+            AppDialogs.showFastDialog(
+              context: context,
+              title: "Zero Stock",
+              content: "ZERO STOCK: '$value' has no available stock for return.",
+            );
           }
         }
       }
@@ -454,6 +652,11 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
 
       if ([8, 9, 10, 11, 12, 13, 15, 18].contains(col)) {
         String val = value.trim().isEmpty ? "0" : value;
+        if (col == 8 || col == 9 || col == 10 || col == 11) {
+          if (!_validateQuantity(row, col, val)) {
+            return;
+          }
+        }
         if (col == 8) {
           it.packin = double.tryParse(val)?.toInt() ?? 1;
         } else if (col == 9) {
@@ -505,13 +708,17 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
 
     _focusNotifier.value = IntPair(safeRow, safeCol);
 
+    if (safeRow != -1) {
+      FocusScope.of(context).requestFocus(_getGridFocusNode(safeRow, safeCol));
+    }
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       if (safeRow == -1) {
         final fn = safeCol == 0 ? _supplierFocus : (safeCol == 1 ? _originalInvFocus : _doneByFocus);
         final ctrl = safeCol == 0 ? _supplierCtrl : (safeCol == 1 ? _originalInvCtrl : _doneByCtrl);
         if (!fn.hasFocus) {
-          fn.requestFocus();
+          FocusScope.of(context).requestFocus(fn);
           ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
         }
       } else {
@@ -519,15 +726,15 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
         final ctrl = _getGridCtrl(safeRow, safeCol);
         final initialText = ctrl.text;
 
-        fn.requestFocus();
+        FocusScope.of(context).requestFocus(fn);
         if (initialText.isNotEmpty) {
           ctrl.selection = TextSelection(baseOffset: 0, extentOffset: initialText.length);
         }
 
-        if (autoOpen || safeCol == 3) {
+        if (autoOpen) {
           if (safeCol == 1 && initialText.trim().isEmpty) {
             _startProductSearch("");
-          } else if (safeCol == 3) {
+          } else if (safeCol == 3 && initialText.trim().isEmpty) {
             _startBatchSearch(safeRow, "");
           }
         }
@@ -541,7 +748,20 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
     final isShift = HardwareKeyboard.instance.isShiftPressed;
     final isCtrl = HardwareKeyboard.instance.isControlPressed;
 
-    if (key == LogicalKeyboardKey.f6) {
+    if (key == LogicalKeyboardKey.f2 || (HardwareKeyboard.instance.isAltPressed && key == LogicalKeyboardKey.arrowDown)) {
+      if (_focusedColIndex == 1) {
+        _startProductSearch(_getGridCtrl(_focusedRowIndex, 1).text);
+        return true;
+      } else if (_focusedColIndex == 3) {
+        _startBatchSearch(_focusedRowIndex, "");
+        return true;
+      }
+    }
+    if (key == LogicalKeyboardKey.f4) {
+      _moveFocus(_items.length, 1);
+      return true;
+    }
+    if (key == LogicalKeyboardKey.f6 || key == LogicalKeyboardKey.f7 || key == LogicalKeyboardKey.f10 || key == LogicalKeyboardKey.f12) {
       if (!_isDeleted) _saveReturn(isEdit: _isExistingEntry);
       return true;
     }
@@ -579,10 +799,16 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
     if (isOverlayOpen) {
       final list = _supplierSearchList.value.isNotEmpty ? _supplierSearchList.value : (_isSelectingBatch ? _batchList.value : _searchList.value);
       if (key == LogicalKeyboardKey.arrowDown) {
-        _searchIdx.value = (_searchIdx.value + 1) % list.length;
+        if (list.isNotEmpty) {
+          _searchIdx.value = (_searchIdx.value + 1).clamp(0, list.length - 1);
+          _scrollToIdx(_searchIdx.value);
+        }
         return true;
       } else if (key == LogicalKeyboardKey.arrowUp) {
-        _searchIdx.value = (_searchIdx.value - 1 + list.length) % list.length;
+        if (list.isNotEmpty) {
+          _searchIdx.value = (_searchIdx.value - 1).clamp(0, list.length - 1);
+          _scrollToIdx(_searchIdx.value);
+        }
         return true;
       } else if (key == LogicalKeyboardKey.enter || key == LogicalKeyboardKey.numpadEnter) {
         if (list.isNotEmpty) {
@@ -625,16 +851,8 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
       return true;
     }
 
-    if (key == LogicalKeyboardKey.arrowLeft) {
-      int curIdx = _navCols.indexOf(col);
-      if (curIdx > 0) { _moveFocus(row, _navCols[curIdx - 1]); return true; }
-      else if (row > 0) { _moveFocus(row - 1, _navCols.last); return true; }
-    }
-
-    if (key == LogicalKeyboardKey.arrowRight && (!ctrl.selection.isValid || ctrl.selection.baseOffset >= ctrl.text.length)) {
-      int curIdx = _navCols.indexOf(col);
-      if (curIdx != -1 && curIdx < _navCols.length - 1) { _moveFocus(row, _navCols[curIdx + 1]); return true; }
-      else if (row < _items.length) { _moveFocus(_items.length, _navCols[0]); return true; }
+    if (key == LogicalKeyboardKey.arrowLeft || key == LogicalKeyboardKey.arrowRight) {
+      return false;
     }
 
     if (key == LogicalKeyboardKey.arrowDown && row < _items.length) { _moveFocus(row + 1, col); return true; }
@@ -650,6 +868,20 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
     return false;
   }
 
+  void _scrollToIdx(int index) {
+    if (!_dropdownScrollCtrl.hasClients) return;
+    const double itemHeight = 30.0;
+    const double viewportHeight = 200.0;
+    double targetOffset = index * itemHeight;
+    double currentOffset = _dropdownScrollCtrl.offset;
+
+    if (targetOffset < currentOffset) {
+      _dropdownScrollCtrl.jumpTo(targetOffset);
+    } else if (targetOffset + itemHeight > currentOffset + viewportHeight) {
+      _dropdownScrollCtrl.jumpTo(targetOffset - viewportHeight + itemHeight);
+    }
+  }
+
   void _onFieldSubmitted(int row, int col) {
     if (col == 1) {
       String typedText = _getGridCtrl(row, 1).text.trim();
@@ -661,7 +893,13 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
         if (matches.isNotEmpty) {
           _onProductSelected(matches.first);
         } else {
-          _moveFocus(row, 3, autoOpen: true);
+          _getGridCtrl(row, 1).clear();
+          AppDialogs.showFastDialog(
+            context: context,
+            title: "Zero Stock",
+            content: "ZERO STOCK: '$typedText' has no available stock for return.",
+          );
+          _moveFocus(row, 1);
         }
       }
     } else if (col == 3) {
@@ -669,8 +907,34 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
       if (_batchList.value.isNotEmpty) {
         final exactIdx = _batchList.value.indexWhere((b) => b.batch.toUpperCase() == typed);
         _finalizeBatchSelection(_batchList.value[exactIdx != -1 ? exactIdx : _searchIdx.value]);
+      } else if (typed.isNotEmpty) {
+        final p = Provider.of<PharmacyProvider>(context, listen: false);
+        String prodName = row < _items.length ? _items[row].product.name : "";
+        final all = p.products.where((it) => it.name.toLowerCase() == prodName.toLowerCase() && it.batch.toUpperCase() == typed).toList();
+        if (all.isNotEmpty) {
+          _finalizeBatchSelection(all.first);
+        } else {
+          _getGridCtrl(row, 3).clear();
+          AppDialogs.showFastDialog(
+            context: context,
+            title: "Zero Stock",
+            content: "ZERO STOCK: Batch '$typed' of '$prodName' has no available stock.",
+          );
+          _moveFocus(row, 3, autoOpen: true);
+        }
       } else {
         _moveFocus(row, 9);
+      }
+    } else if (col == 8 || col == 9 || col == 10 || col == 11) {
+      String val = _getGridCtrl(row, col).text.trim();
+      if (!_validateQuantity(row, col, val)) {
+        return;
+      }
+      int curIdx = _navCols.indexOf(col);
+      if (curIdx != -1 && curIdx < _navCols.length - 1) {
+        _moveFocus(row, _navCols[curIdx + 1]);
+      } else {
+        _moveFocus(_items.length, 1, autoOpen: true);
       }
     } else {
       int curIdx = _navCols.indexOf(col);
@@ -825,9 +1089,33 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
     });
   }
 
-  void _onProductSelected(Product p) {
-    _saveUndoState();
+  Future<void> _onProductSelected(Product p) async {
     final row = _focusedRowIndex;
+    int usedInOtherRows = _getCrossRowStockUsedForProduct(p, row);
+    int origQty = _getOriginalQtyForProduct(p);
+    int availStock = p.stock + origQty - usedInOtherRows;
+
+    if (availStock <= 0) {
+      _searchList.value = [];
+      if (row >= 0) {
+        if (row < _items.length && _items[row].product.name.isNotEmpty) {
+          _getGridCtrl(row, 1, _items[row].product.name).text = _items[row].product.name;
+        } else {
+          _getGridCtrl(row, 1).clear();
+        }
+      }
+      await AppDialogs.showFastDialog(
+        context: context,
+        title: "Zero Stock",
+        content: "ZERO STOCK: '${p.name}' has no available stock for return (${p.stock} total stock, $usedInOtherRows used in other rows).",
+      );
+      if (mounted && row >= 0) {
+        _moveFocus(row, 1);
+      }
+      return;
+    }
+
+    _saveUndoState();
     setState(() {
       _getGridCtrl(row, 1, p.name).text = p.name;
       _getGridCtrl(row, 2, p.hsnCode).text = p.hsnCode;
@@ -865,8 +1153,33 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
     _moveFocus(_focusedRowIndex, 3, autoOpen: true);
   }
 
-  void _finalizeBatchSelection(Product p) {
+  Future<void> _finalizeBatchSelection(Product p) async {
     final row = _focusedRowIndex;
+    int usedInOtherRows = _getCrossRowStockUsedForBatch(p, row);
+    int origQty = _getOriginalQtyForBatch(p);
+    int availStock = p.stock + origQty - usedInOtherRows;
+
+    if (availStock <= 0) {
+      _batchList.value = [];
+      if (row >= 0 && row < _items.length) {
+        if (_items[row].product.batch.isNotEmpty) {
+          _getGridCtrl(row, 3, cleanBatch(_items[row].product.batch)).text = cleanBatch(_items[row].product.batch);
+        } else {
+          _getGridCtrl(row, 3).clear();
+        }
+      }
+      String prodName = (row >= 0 && row < _items.length) ? _items[row].product.name : p.name;
+      await AppDialogs.showFastDialog(
+        context: context,
+        title: "Zero Stock",
+        content: "ZERO STOCK: Batch '${cleanBatch(p.batch)}' of '$prodName' has no available stock (${p.stock} total stock, $usedInOtherRows used in other rows).",
+      );
+      if (mounted && row >= 0) {
+        _moveFocus(row, 3, autoOpen: true);
+      }
+      return;
+    }
+
     setState(() {
       _getGridCtrl(row, 3, cleanBatch(p.batch)).text = cleanBatch(p.batch);
       _getGridCtrl(row, 4, p.expiry).text = p.expiry;
@@ -980,164 +1293,12 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
     _grandTotalCtrl.text = _fmt(rounded);
   }
 
-  // --- GENERATE DETAILED EDIT DIFF SPANS FOR RE-WRITE DIALOG ---
-  List<InlineSpan> _generateDiffSpans() {
-    final List<InlineSpan> diffSpans = [];
 
-    if (!_isExistingEntry || _originalLoadedReturn == null) {
-      return diffSpans;
-    }
-
-    const redStyle = TextStyle(color: Colors.red, fontWeight: FontWeight.bold, fontSize: 13);
-    const normalStyle = TextStyle(color: Colors.black87, fontSize: 13, height: 1.5);
-
-    void addDiffLine(List<InlineSpan> parts) {
-      diffSpans.add(const TextSpan(text: "• ", style: normalStyle));
-      diffSpans.addAll(parts);
-      diffSpans.add(const TextSpan(text: "\n", style: normalStyle));
-    }
-
-    // 1. HEADER COMPARISONS
-    // Supplier Name
-    final currentSupplier = _supplierCtrl.text.trim();
-    final origSupplier = _originalLoadedReturn!.supplierName.trim();
-    if (currentSupplier.toUpperCase() != origSupplier.toUpperCase()) {
-      addDiffLine([
-        const TextSpan(text: "supplier name ", style: normalStyle),
-        TextSpan(text: origSupplier.isEmpty ? "(blank)" : origSupplier, style: redStyle),
-        const TextSpan(text: " to ", style: normalStyle),
-        TextSpan(text: currentSupplier.isEmpty ? "(blank)" : currentSupplier, style: redStyle),
-        const TextSpan(text: ".", style: normalStyle),
-      ]);
-    }
-
-    // Ref Purchase Inv No
-    final currentRefNo = _originalInvCtrl.text.trim();
-    final origRefNo = _originalLoadedReturn!.originalPurchaseNo.trim();
-    if (currentRefNo.toUpperCase() != origRefNo.toUpperCase()) {
-      addDiffLine([
-        const TextSpan(text: "ref purchase no ", style: normalStyle),
-        TextSpan(text: origRefNo.isEmpty ? "(blank)" : origRefNo, style: redStyle),
-        const TextSpan(text: " to ", style: normalStyle),
-        TextSpan(text: currentRefNo.isEmpty ? "(blank)" : currentRefNo, style: redStyle),
-        const TextSpan(text: ".", style: normalStyle),
-      ]);
-    }
-
-    // Done By
-    final currentDoneBy = _doneByCtrl.text.trim();
-    final origDoneBy = _originalLoadedReturn!.doneBy.trim();
-    if (currentDoneBy.toUpperCase() != origDoneBy.toUpperCase()) {
-      addDiffLine([
-        const TextSpan(text: "done by ", style: normalStyle),
-        TextSpan(text: origDoneBy.isEmpty ? "(blank)" : origDoneBy, style: redStyle),
-        const TextSpan(text: " to ", style: normalStyle),
-        TextSpan(text: currentDoneBy.isEmpty ? "(blank)" : currentDoneBy, style: redStyle),
-        const TextSpan(text: ".", style: normalStyle),
-      ]);
-    }
-
-    // 2. ITEM COMPARISONS
-    final origItems = _originalLoadedReturn!.items;
-    final currentValidItems = _items.where((it) => it.product.name.trim().isNotEmpty && (it.qty > 0 || it.looseQty > 0)).toList();
-
-    int maxLen = origItems.length > currentValidItems.length ? origItems.length : currentValidItems.length;
-
-    for (int i = 0; i < maxLen; i++) {
-      if (i < origItems.length && i < currentValidItems.length) {
-        final orig = origItems[i];
-        final curr = currentValidItems[i];
-
-        // Product Name
-        final origName = orig.productName.trim();
-        final currName = curr.product.name.trim();
-        if (origName.toUpperCase() != currName.toUpperCase()) {
-          addDiffLine([
-            const TextSpan(text: "product name ", style: normalStyle),
-            TextSpan(text: origName, style: redStyle),
-            const TextSpan(text: " to ", style: normalStyle),
-            TextSpan(text: currName, style: redStyle),
-            const TextSpan(text: ".", style: normalStyle),
-          ]);
-        }
-
-        // Batch Number
-        final origBatch = orig.batch.trim();
-        final currBatch = curr.product.batch.trim();
-        if (origBatch.toUpperCase() != currBatch.toUpperCase()) {
-          addDiffLine([
-            TextSpan(text: "batch ($currName) changed from ", style: normalStyle),
-            TextSpan(text: '"$origBatch"', style: redStyle),
-            const TextSpan(text: " to ", style: normalStyle),
-            TextSpan(text: '"$currBatch"', style: redStyle),
-            const TextSpan(text: ".", style: normalStyle),
-          ]);
-        }
-
-        // Quantity
-        if (orig.qty != curr.qty) {
-          addDiffLine([
-            TextSpan(text: "qty ($currName) changed from ", style: normalStyle),
-            TextSpan(text: "${orig.qty}", style: redStyle),
-            const TextSpan(text: " to ", style: normalStyle),
-            TextSpan(text: "${curr.qty}", style: redStyle),
-            const TextSpan(text: ".", style: normalStyle),
-          ]);
-        }
-
-        // Purchase Rate
-        if ((orig.pRate - curr.pRate).abs() > 0.01) {
-          addDiffLine([
-            TextSpan(text: "purchase rate ($currName) changed from ", style: normalStyle),
-            TextSpan(text: "₹${orig.pRate.toStringAsFixed(2)}", style: redStyle),
-            const TextSpan(text: " to ", style: normalStyle),
-            TextSpan(text: "₹${curr.pRate.toStringAsFixed(2)}", style: redStyle),
-            const TextSpan(text: ".", style: normalStyle),
-          ]);
-        }
-
-        // Discount %
-        if ((orig.discPercent - curr.discPercent).abs() > 0.01) {
-          addDiffLine([
-            TextSpan(text: "discount ($currName) changed from ", style: normalStyle),
-            TextSpan(text: "${orig.discPercent.toStringAsFixed(1)}%", style: redStyle),
-            const TextSpan(text: " to ", style: normalStyle),
-            TextSpan(text: "${curr.discPercent.toStringAsFixed(1)}%", style: redStyle),
-            const TextSpan(text: ".", style: normalStyle),
-          ]);
-        }
-      } else if (i < currentValidItems.length) {
-        final curr = currentValidItems[i];
-        addDiffLine([
-          const TextSpan(text: "added product ", style: normalStyle),
-          TextSpan(text: curr.product.name.trim(), style: redStyle),
-          const TextSpan(text: " (qty: ", style: normalStyle),
-          TextSpan(text: "${curr.qty}", style: redStyle),
-          if (curr.product.batch.isNotEmpty) ...[
-            const TextSpan(text: ', batch: "', style: normalStyle),
-            TextSpan(text: curr.product.batch.trim(), style: redStyle),
-            const TextSpan(text: '"', style: normalStyle),
-          ],
-          const TextSpan(text: ").", style: normalStyle),
-        ]);
-      } else if (i < origItems.length) {
-        final orig = origItems[i];
-        addDiffLine([
-          const TextSpan(text: "removed product ", style: normalStyle),
-          TextSpan(text: orig.productName.trim(), style: redStyle),
-          const TextSpan(text: " (qty: ", style: normalStyle),
-          TextSpan(text: "${orig.qty}", style: redStyle),
-          const TextSpan(text: ").", style: normalStyle),
-        ]);
-      }
-    }
-
-    return diffSpans;
-  }
 
   void _saveReturn({bool isEdit = false}) async {
     if (_isSaving || _isLoading) return;
     _isSaving = true;
+    if (mounted) setState(() {});
 
     try {
       final p = Provider.of<PharmacyProvider>(context, listen: false);
@@ -1226,112 +1387,81 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
       }
 
       if (isEdit || _isExistingEntry) {
-        final diffSpans = _generateDiffSpans();
-
-        if (diffSpans.isEmpty) {
-          await showDialog(
+        if (mounted) {
+          _isSaving = false;
+          if (mounted) setState(() {});
+          final confirmed = await showDialog<bool>(
             context: context,
+            barrierDismissible: false,
             builder: (ctx) => AlertDialog(
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
               title: const Row(
                 children: [
-                  Icon(Icons.info_outline_rounded, color: Colors.blue, size: 26),
-                  SizedBox(width: 8),
-                  Text("No Changes Found", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                  Icon(Icons.save_rounded, color: Colors.blue, size: 28),
+                  SizedBox(width: 10),
+                  Text("Update Purchase Return", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
                 ],
               ),
               content: Text(
-                "No modifications were detected on Return PRET-$_entryNo.\nThere are no changes to save.",
-                style: const TextStyle(fontSize: 13, height: 1.4),
+                "Are you sure you want to update Return PRET-$_entryNo?\nAll modifications will be saved to your stock and supplier ledger.",
+                style: const TextStyle(fontSize: 14, height: 1.4),
               ),
               actions: [
+                OutlinedButton(
+                  onPressed: () => Navigator.pop(ctx, false),
+                  child: const Text("Cancel"),
+                ),
                 ElevatedButton(
-                  onPressed: () => Navigator.pop(ctx),
-                  style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
-                  child: const Text("OK", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                  onPressed: () => Navigator.pop(ctx, true),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.blue.shade800,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                  ),
+                  child: const Text("Update Return", style: TextStyle(fontWeight: FontWeight.bold)),
                 ),
               ],
             ),
           );
-          return;
+          if (confirmed != true) return;
+          _isSaving = true;
+          if (mounted) setState(() {});
         }
+      }
 
-        final confirmed = await showDialog<bool>(
+      if (ServerConfigService.instance.isPureCloud && !ServerConfigService.instance.isConnected) {
+        if (!mounted) return;
+        AppDialogs.showFastDialog(
           context: context,
-          barrierDismissible: false,
-          builder: (ctx) => AlertDialog(
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-            title: Row(
-              children: [
-                const Icon(Icons.edit_note_rounded, color: Colors.orange, size: 28),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    "Re-write Return PRET-$_entryNo?",
-                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-                  ),
-                ),
-              ],
-            ),
-            content: SizedBox(
-              width: 480,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    "The following changes will be applied to this purchase return:",
-                    style: TextStyle(fontSize: 13, color: Colors.grey, fontWeight: FontWeight.w600),
-                  ),
-                  const SizedBox(height: 12),
-                  ConstrainedBox(
-                    constraints: const BoxConstraints(maxHeight: 250),
-                    child: Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: Colors.grey.shade50,
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: Colors.grey.shade300),
-                      ),
-                      child: SingleChildScrollView(
-                        child: SelectableText.rich(
-                          TextSpan(children: diffSpans),
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  Text(
-                    "Are you sure you want to overwrite Return PRET-$_entryNo? Stock will be updated accordingly.",
-                    style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: Colors.black87),
-                  ),
-                ],
-              ),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx, false),
-                child: const Text("NO", style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold)),
-              ),
-              ElevatedButton(
-                onPressed: () => Navigator.pop(ctx, true),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.orange.shade800,
-                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-                ),
-                child: const Text("YES, RE-WRITE", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-              ),
-            ],
-          ),
+          title: "Pure Cloud Live Disconnected",
+          content: "Cannot save purchase return while disconnected from Supabase Cloud Server.\n\nPlease check your internet connection.",
         );
-        if (confirmed != true) return;
+        return;
+      }
+
+      String targetEntryNo = isEdit ? _entryNo : "";
+      if (!isEdit) {
+        final requested = cleanEntryNo(_entryNo);
+        final resolvedNo = await p.resolveGuaranteedNextEntryNo('purchase_return_entries', requested);
+        if (resolvedNo != requested && requested.isNotEmpty) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text("Return #$requested already taken. Automatically saved as Return #$resolvedNo"),
+                backgroundColor: Colors.blueAccent,
+                duration: const Duration(seconds: 4),
+              ),
+            );
+          }
+        }
+        targetEntryNo = resolvedNo;
+        _entryNo = resolvedNo;
       }
 
       setState(() => _isLoading = true);
 
       final entry = PurchaseReturnEntry(
-        entryNo: isEdit ? _entryNo : "",
+        entryNo: targetEntryNo,
         date: _date,
         supplierName: validSupplier,
         originalPurchaseNo: _originalInvCtrl.text.trim(),
@@ -1364,16 +1494,29 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
         AppDialogs.showFastDialog(context: context, title: "Save Blocked", content: e.toString());
       }
     } finally {
-      _isSaving = false;
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted) {
+        setState(() {
+          _isSaving = false;
+          _isLoading = false;
+        });
+      } else {
+        _isSaving = false;
+        _isLoading = false;
+      }
     }
   }
 
   void _navigateEntry(String dir, {String? searchNo}) async {
+    if (_isNavigating || _isLoading || _isSaving) return;
+    _isNavigating = true;
+
     // ---> THE FIX: Protect against losing unsaved edits <---
     if (_isExistingEntry && _isDirty) {
       bool? discard = await _promptDiscardChanges();
-      if (discard != true) return; // User chose to stay
+      if (discard != true) {
+        _isNavigating = false;
+        return; // User chose to stay
+      }
     }
 
     _closeAllDropdowns();
@@ -1386,87 +1529,96 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
       final data = await p.navigateInvoice(targetNo, dir, isPurchaseReturn: true);
       
       if (data != null && mounted) {
-        String actualNo = data['entry_no']?.toString() ?? targetNo;
-        bool isDel = (data['is_deleted'] == 1 || data['is_deleted'] == true || data['is_deleted'] == '1');
-        final items = await p.getInvoiceItems(actualNo, isPurchaseReturn: true);
-
-        setState(() {
-          _isExistingEntry = true;
-          _isDeleted = isDel;
-          _isDirty = false; // Freshly loaded, reset dirty flag
-          String cleanNo = actualNo.startsWith("PRET-") ? actualNo.substring(5) : actualNo;
-          if (cleanNo.contains('_')) {
-            cleanNo = cleanNo.substring(cleanNo.indexOf('_') + 1);
-          }
-          _entryNo = cleanNo;
-          _date = DateTime.tryParse(data['date'].toString()) ?? DateTime.now();
-          _supplierCtrl.text = data['supplier_name']?.toString() ?? '';
-          _originalInvCtrl.text = data['original_purchase_no']?.toString() ?? '';
-          _doneByCtrl.text = data['done_by']?.toString() ?? '';
-          _gstMode = (data['gst_mode'] as num?)?.toInt() ?? 1;
-
-          _items.clear();
-          _gridCtrls.clear();
-          _gridFocusNodes.clear();
-
-          for (var m in items) {
-            _items.add(PurchaseReturnItem(product: Product(id: '', name: m['product_name'] ?? '', batch: m['batch'] ?? ''))
-              ..hsncode = m['hsn_code'] ?? ''
-              ..qty = m['qty'] ?? 0
-              ..looseQty = m['loose_qty'] ?? 0
-              ..packin = m['packin'] ?? 1
-              ..pRate = (m['p_rate'] ?? 0).toDouble()
-              ..mrp = (m['mrp'] ?? 0).toDouble()
-              ..discPercent = (m['disc_percent'] ?? 0).toDouble()
-              ..gstPercent = (m['gst_percent'] ?? 0).toDouble()
-              ..reason = m['reason'] ?? ''
-              ..supplier = m['supplier'] ?? ''
-              ..supInvNo = cleanInvoiceNo(m['sup_inv_no'])
-              ..total = (m['total'] ?? 0).toDouble()
-            );
-          }
-          for (int i = 0; i < _items.length; i++) {
-            _calculateItem(i);
-          }
-
-          _calculateFooter();
-
-          _originalLoadedReturn = PurchaseReturnEntry(
-            entryNo: _entryNo,
-            date: _date,
-            supplierName: _supplierCtrl.text.trim(),
-            originalPurchaseNo: _originalInvCtrl.text.trim(),
-            doneBy: _doneByCtrl.text.trim().isEmpty ? "Admin" : _doneByCtrl.text.trim(),
-            gstMode: _gstMode,
-            items: _items.where((it) => it.product.name.trim().isNotEmpty).map((it) => PurchaseItem(
-              productName: it.product.name,
-              batch: it.product.batch,
-              expiry: it.product.expiry,
-              packin: it.packin,
-              qty: it.qty,
-              looseQty: it.looseQty,
-              pRate: it.pRate,
-              mrp: it.mrp,
-              discPercent: it.discPercent,
-              discAmt: it.discAmt,
-              total: it.total,
-            )).toList(),
-            grandTotal: _grandTotalNotifier.value,
-          );
-        });
-      } else if (dir == 'next') {
-        if (_isExistingEntry) {
+        if (data['is_blank'] == true) {
           _resetPage();
+          String cleanNo = data['entry_no'].toString();
+          if (cleanNo.startsWith("PRET-")) cleanNo = cleanNo.substring(5);
+          if (cleanNo.contains('_')) cleanNo = cleanNo.substring(cleanNo.indexOf('_') + 1);
+          _entryNo = cleanNo;
+          setState(() {});
         } else {
-          AppDialogs.showFastDialog(context: context, title: "Navigation", content: "NO MORE RECORDS TO SHOW");
+          String actualNo = data['entry_no']?.toString() ?? targetNo;
+          bool isDel = (data['is_deleted'] == 1 || data['is_deleted'] == true || data['is_deleted'] == '1');
+          final items = await p.getInvoiceItems(actualNo, isPurchaseReturn: true);
+
+          setState(() {
+            _isExistingEntry = true;
+            _isDeleted = isDel;
+            _isDirty = false; // Freshly loaded, reset dirty flag
+            String cleanNo = actualNo.startsWith("PRET-") ? actualNo.substring(5) : actualNo;
+            if (cleanNo.contains('_')) {
+              cleanNo = cleanNo.substring(cleanNo.indexOf('_') + 1);
+            }
+            _entryNo = cleanNo;
+            _date = DateTime.tryParse(data['date'].toString()) ?? DateTime.now();
+            _supplierCtrl.text = data['supplier_name']?.toString() ?? '';
+            _originalInvCtrl.text = data['original_purchase_no']?.toString() ?? '';
+            _doneByCtrl.text = data['done_by']?.toString() ?? '';
+            _gstMode = (data['gst_mode'] as num?)?.toInt() ?? 1;
+
+            _items.clear();
+            _clearGridMaps();
+
+            for (var m in items) {
+              _items.add(PurchaseReturnItem(product: Product(id: '', name: m['product_name'] ?? '', batch: m['batch'] ?? ''))
+                ..hsncode = m['hsn_code'] ?? ''
+                ..qty = m['qty'] ?? 0
+                ..looseQty = m['loose_qty'] ?? 0
+                ..packin = m['packin'] ?? 1
+                ..pRate = (m['p_rate'] ?? 0).toDouble()
+                ..mrp = (m['mrp'] ?? 0).toDouble()
+                ..discPercent = (m['disc_percent'] ?? 0).toDouble()
+                ..gstPercent = (m['gst_percent'] ?? 0).toDouble()
+                ..reason = m['reason'] ?? ''
+                ..supplier = m['supplier'] ?? ''
+                ..supInvNo = cleanInvoiceNo(m['sup_inv_no'])
+                ..total = (m['total'] ?? 0).toDouble()
+              );
+            }
+            for (int i = 0; i < _items.length; i++) {
+              _calculateItem(i);
+            }
+
+            _calculateFooter();
+
+            _originalLoadedReturn = PurchaseReturnEntry(
+              entryNo: _entryNo,
+              date: _date,
+              supplierName: _supplierCtrl.text.trim(),
+              originalPurchaseNo: _originalInvCtrl.text.trim(),
+              doneBy: _doneByCtrl.text.trim().isEmpty ? "Admin" : _doneByCtrl.text.trim(),
+              gstMode: _gstMode,
+              items: _items.where((it) => it.product.name.trim().isNotEmpty).map((it) => PurchaseItem(
+                productName: it.product.name,
+                batch: it.product.batch,
+                expiry: it.product.expiry,
+                packin: it.packin,
+                qty: it.qty,
+                looseQty: it.looseQty,
+                pRate: it.pRate,
+                mrp: it.mrp,
+                discPercent: it.discPercent,
+                discAmt: it.discAmt,
+                total: it.total,
+              )).toList(),
+              grandTotal: _grandTotalNotifier.value,
+            );
+          });
         }
+      } else if (dir == 'next') {
+        if (mounted) AppDialogs.showFastDialog(context: context, title: "Navigation Limit", content: "MAX ENTRY LIMIT REACHED");
       } else if (dir == 'prev') {
-        AppDialogs.showFastDialog(context: context, title: "Navigation", content: "FIRST RECORD REACHED");
+        if (mounted) AppDialogs.showFastDialog(context: context, title: "Navigation Limit", content: "FIRST RECORD REACHED (Entry #1)");
       }
     } catch (e) {
       debugPrint("Load Purchase Return Error: $e");
     } finally {
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _isNavigating = false;
+        });
+      }
     }
   }
 
@@ -1492,6 +1644,7 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
     _gridCtrls.clear();
     _gridFocusNodes.clear();
 
+    _entryNo = "...";
     final nextNo = await p.getNextPurchaseReturnEntryNo();
 
     if (mounted) {
@@ -1606,11 +1759,13 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
                       if (k == 7 && !_showEntryNoCol) return;
                       fixedTotal += v;
                     });
-                    double productWidth = 180;
-                    if (con.maxWidth > (fixedTotal + 180)) {
-                      productWidth = con.maxWidth - fixedTotal;
+                    if (!_hasCustomColWidths) {
+                      double productWidth = 180;
+                      if (con.maxWidth > (fixedTotal + 180)) {
+                        productWidth = con.maxWidth - fixedTotal;
+                      }
+                      _colWidths[1] = productWidth;
                     }
-                    _colWidths[1] = productWidth;
                     final double finalTw = fixedTotal + _colWidths[1]!;
 
                     return Scrollbar(
@@ -1793,20 +1948,23 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
     });
   }
 
-  Widget _topActionBtn(IconData icon, String label, Color color, {VoidCallback? onTap}) => Padding(
-    padding: const EdgeInsets.symmetric(horizontal: 12),
-    child: InkWell(
-      onTap: onTap,
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(icon, size: 28, color: color),
-          const SizedBox(height: 2),
-          Text(label, style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.black87)),
-        ],
+  Widget _topActionBtn(IconData icon, String label, Color color, {VoidCallback? onTap}) {
+    bool isBusy = _isSaving || _isLoading;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      child: InkWell(
+        onTap: isBusy ? null : onTap,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, size: 28, color: isBusy ? Colors.grey : color),
+            const SizedBox(height: 2),
+            Text(label, style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: isBusy ? Colors.grey : Colors.black)),
+          ],
+        ),
       ),
-    ),
-  );
+    );
+  }
 
   Widget _headerColumn(String label, Widget child, {CrossAxisAlignment align = CrossAxisAlignment.start}) => Column(
     crossAxisAlignment: align,
@@ -1835,22 +1993,47 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
               _headerColumn("Entry No:", Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  _entryNavBtn("<", onTap: () => _navigateEntry('prev')),
+                  FluentNavButton(
+                    icon: Icons.chevron_left_rounded,
+                    tooltip: "Previous Entry",
+                    isBusy: _isNavigating,
+                    onTap: _isNavigating ? null : () => _navigateEntry('prev'),
+                  ),
+                  const SizedBox(width: 3),
                   Container(
                     width: 70, height: 26,
                     padding: const EdgeInsets.symmetric(horizontal: 2),
                     alignment: Alignment.center,
-                    decoration: BoxDecoration(color: Colors.white, border: Border.all(color: Colors.grey.shade400)),
-                    child: FittedBox(
-                      fit: BoxFit.scaleDown,
-                      child: Text(
-                        _entryNo.contains('_') ? _entryNo.substring(_entryNo.indexOf('_') + 1) : _entryNo,
-                        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
-                        maxLines: 1,
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      border: Border.all(
+                        color: _isNavigating ? Colors.blue.shade600 : Colors.grey.shade400,
+                        width: _isNavigating ? 1.5 : 1.0,
                       ),
+                      borderRadius: BorderRadius.circular(3),
                     ),
+                    child: _isNavigating
+                        ? SizedBox(
+                            width: 14,
+                            height: 14,
+                            child: CircularProgressIndicator(strokeWidth: 1.8, valueColor: AlwaysStoppedAnimation<Color>(Colors.blue.shade700)),
+                          )
+                        : FittedBox(
+                            fit: BoxFit.scaleDown,
+                            child: Text(
+                              formatSaleDisplayNo(_entryNo),
+                              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                              maxLines: 1,
+                            ),
+                          ),
                   ),
-                  _entryNavBtn(">", onTap: () => _navigateEntry('next')),
+                  const SizedBox(width: 3),
+                  FluentNavButton(
+                    icon: Icons.chevron_right_rounded,
+                    tooltip: "Next Entry",
+                    isBusy: _isNavigating,
+                    onTap: _isNavigating ? null : () => _navigateEntry('next'),
+                  ),
                 ],
               )),
               const SizedBox(height: 4),
@@ -1876,7 +2059,7 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Text(DateFormat('d/M/yy').format(_date), style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black87)),
+                          Text(DateFormat('d/M/yy').format(_date), style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black)),
                           const SizedBox(width: 4),
                           Icon(Icons.calendar_month, size: 13, color: Colors.orange.shade800),
                         ],
@@ -1900,7 +2083,7 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
                         border: Border.all(color: Colors.green.shade300),
                       ),
                       child: Center(
-                        child: Text(DateFormat('hh:mm a').format(_date), style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black87)),
+                        child: Text(DateFormat('hh:mm a').format(_date), style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black)),
                       ),
                     ),
                   )),
@@ -1968,75 +2151,70 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
                   _headerColumn("TAX TYPE", Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      InkWell(
-                        onTap: () {
-                          if (_gstMode != 1) {
-                            setState(() {
-                              _gstMode = 1;
-                              for (int i = 0; i < _items.length; i++) {
-                                _calculateItem(i);
+                    RadioGroup<int>(
+                      groupValue: _gstMode,
+                      onChanged: (v) {
+                        if (v != null) {
+                          setState(() {
+                            _gstMode = v;
+                            for (int i = 0; i < _items.length; i++) {
+                              _calculateItem(i);
+                            }
+                          });
+                        }
+                      },
+                      child: Row(
+                        children: [
+                          InkWell(
+                            onTap: () {
+                              if (_gstMode != 1) {
+                                setState(() {
+                                  _gstMode = 1;
+                                  for (int i = 0; i < _items.length; i++) {
+                                    _calculateItem(i);
+                                  }
+                                });
                               }
-                            });
-                          }
-                        },
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Radio<int>(
-                              value: 1,
-                              groupValue: _gstMode,
-                              onChanged: (v) {
-                                if (v != null) {
-                                  setState(() {
-                                    _gstMode = v;
-                                    for (int i = 0; i < _items.length; i++) {
-                                      _calculateItem(i);
-                                    }
-                                  });
-                                }
-                              },
-                              visualDensity: VisualDensity.compact,
-                              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            },
+                            child: const Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Radio<int>(
+                                  value: 1,
+                                  visualDensity: VisualDensity.compact,
+                                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                ),
+                                Text("Gst", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                              ],
                             ),
-                            const Text("Gst", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(width: 4),
-                      InkWell(
-                        onTap: () {
-                          if (_gstMode != 2) {
-                            setState(() {
-                              _gstMode = 2;
-                              for (int i = 0; i < _items.length; i++) {
-                                _calculateItem(i);
+                          ),
+                          const SizedBox(width: 4),
+                          InkWell(
+                            onTap: () {
+                              if (_gstMode != 2) {
+                                setState(() {
+                                  _gstMode = 2;
+                                  for (int i = 0; i < _items.length; i++) {
+                                    _calculateItem(i);
+                                  }
+                                });
                               }
-                            });
-                          }
-                        },
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Radio<int>(
-                              value: 2,
-                              groupValue: _gstMode,
-                              onChanged: (v) {
-                                if (v != null) {
-                                  setState(() {
-                                    _gstMode = v;
-                                    for (int i = 0; i < _items.length; i++) {
-                                      _calculateItem(i);
-                                    }
-                                  });
-                                }
-                              },
-                              visualDensity: VisualDensity.compact,
-                              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            },
+                            child: const Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Radio<int>(
+                                  value: 2,
+                                  visualDensity: VisualDensity.compact,
+                                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                ),
+                                Text("Non Gst", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                              ],
                             ),
-                            const Text("Non Gst", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
-                          ],
-                        ),
+                          ),
+                        ],
                       ),
+                    ),
                     ],
                   )),
                 ],
@@ -2171,7 +2349,10 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
       if (i == 5 && !_showSupplierCol) return const SizedBox();
       if (i == 6 && !_showInvNoCol) return const SizedBox();
       if (i == 7 && !_showEntryNoCol) return const SizedBox();
-      return _ResizableHdr(i, _getColName(i), width: _colWidths[i]!, tooltip: _getColTooltip(i), onResize: (v) => setState(() => _colWidths[i] = v), align: _getColAlign(i));
+      return _ResizableHdr(i, _getColName(i), width: _colWidths[i]!, tooltip: _getColTooltip(i), onResize: (v) => setState(() {
+        _colWidths[i] = v;
+        _hasCustomColWidths = true;
+      }), align: _getColAlign(i));
     })),
   );
 
@@ -2203,6 +2384,39 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
       ][i];
   TextAlign _getColAlign(int i) => [TextAlign.center, TextAlign.left, TextAlign.left, TextAlign.left, TextAlign.center, TextAlign.left, TextAlign.left, TextAlign.center, TextAlign.right, TextAlign.right, TextAlign.right, TextAlign.right, TextAlign.right, TextAlign.right, TextAlign.right, TextAlign.right, TextAlign.right, TextAlign.right, TextAlign.right, TextAlign.right, TextAlign.left, TextAlign.center][i];
 
+  bool _isCellModified(int row, int col) {
+    if (!_isExistingEntry || _originalLoadedReturn == null) return false;
+    final origItems = _originalLoadedReturn!.items;
+    if (row >= origItems.length) return false;
+
+    final currentItem = _items[row];
+    final origItem = origItems[row];
+
+    switch (col) {
+      case 1:
+        return currentItem.product.name.trim().toLowerCase() != origItem.productName.trim().toLowerCase();
+      case 3:
+        return currentItem.product.batch.trim().toLowerCase() != origItem.batch.trim().toLowerCase();
+      case 9:
+        return currentItem.qty != origItem.qty;
+      case 10:
+        return currentItem.looseQty != origItem.looseQty;
+      case 15:
+        return (currentItem.discPercent - origItem.discPercent).abs() > 0.01;
+      case 18:
+        return (currentItem.gstPercent - origItem.gstPercent).abs() > 0.01;
+      case 20:
+        return currentItem.reason.trim().toLowerCase() != origItem.reason.trim().toLowerCase();
+      default:
+        return false;
+    }
+  }
+
+  bool _isNewRowOnExistingEntry(int row) {
+    if (!_isExistingEntry || _originalLoadedReturn == null) return false;
+    return row >= _originalLoadedReturn!.items.length;
+  }
+
   Widget _buildGrid() => ListView.builder(
     controller: _verticalGridScrollCtrl,
     itemExtent: 30.0,
@@ -2225,27 +2439,27 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
           decoration: BoxDecoration(color: rowBg, border: Border(bottom: BorderSide(color: Colors.grey.shade200, width: 0.5))),
           child: Row(
             children: [
-              _cell(row, 0, "${row + 1}", _colWidths[0]!, align: TextAlign.center),
+              _cell(row, 0, _isDeleted ? "" : "${row + 1}", _colWidths[0]!, align: TextAlign.center),
               _cell(row, 1, _isDeleted ? "" : it.product.name.toUpperCase(), _colWidths[1]!, isInput: true, fontWeight: FontWeight.bold, onChanged: (v) { _saveUndoState(); it.product.name = v; _startProductSearch(v); }),
-              _cell(row, 2, it.hsncode.toUpperCase(), _colWidths[2]!),
-              _cell(row, 3, cleanBatch(it.product.batch).toUpperCase(), _colWidths[3]!, isInput: true, onChanged: (v) { _saveUndoState(); it.product.batch = v; _startBatchSearch(row, v); }),
-              _cell(row, 4, it.product.expiry, _colWidths[4]!, align: TextAlign.center),
-              if (_showSupplierCol) _cell(row, 5, it.supplier.toUpperCase(), _colWidths[5]!, isInput: true, onChanged: (v) { _saveUndoState(); it.supplier = v; }),
-              if (_showInvNoCol) _cell(row, 6, it.supInvNo.toUpperCase(), _colWidths[6]!, isInput: true, onChanged: (v) { _saveUndoState(); it.supInvNo = v; }),
-              if (_showEntryNoCol) _cell(row, 7, _entryNo, _colWidths[7]!, align: TextAlign.center),
-              _cell(row, 8, it.packin.toString(), _colWidths[8]!, align: TextAlign.right),
-              _cell(row, 9, it.qty.toString(), _colWidths[9]!, isInput: true, align: TextAlign.right, onChanged: (v) { _saveUndoState(); it.qty = int.tryParse(v) ?? 0; _calculateItem(row); }),
-              _cell(row, 10, it.looseQty.toString(), _colWidths[10]!, isInput: true, align: TextAlign.right, onChanged: (v) { _saveUndoState(); it.looseQty = int.tryParse(v) ?? 0; _calculateItem(row); }),
-              _cell(row, 11, it.fQty.toString(), _colWidths[11]!, isInput: true, align: TextAlign.right),
-              _cell(row, 12, it.pRate.toStringAsFixed(2), _colWidths[12]!, align: TextAlign.right),
-              _cell(row, 13, it.mrp.toStringAsFixed(2), _colWidths[13]!, align: TextAlign.right),
-              _cell(row, 14, it.gross.toStringAsFixed(2), _colWidths[14]!, align: TextAlign.right),
-              _cell(row, 15, it.discPercent.toStringAsFixed(2), _colWidths[15]!, isInput: true, align: TextAlign.right, onChanged: (v) { _saveUndoState(); it.discPercent = double.tryParse(v) ?? 0.0; _calculateItem(row); }),
-              _cell(row, 16, it.net.toStringAsFixed(2), _colWidths[16]!, align: TextAlign.right),
-              _cell(row, 17, it.gstAmt.toStringAsFixed(2), _colWidths[17]!, align: TextAlign.right),
-              _cell(row, 18, (TaxCalculator.roundGstPercent(it.gstPercent) % 1 == 0 ? TaxCalculator.roundGstPercent(it.gstPercent).toInt().toString() : TaxCalculator.roundGstPercent(it.gstPercent).toStringAsFixed(1)), _colWidths[18]!, isInput: true, align: TextAlign.right, onChanged: (v) { _saveUndoState(); it.gstPercent = TaxCalculator.roundGstPercent(double.tryParse(v) ?? 0.0); _calculateItem(row); }),
-              _cell(row, 19, it.total.toStringAsFixed(2), _colWidths[19]!, align: TextAlign.right, fontWeight: FontWeight.bold, color: Colors.blue.shade900),
-              _cell(row, 20, it.reason, _colWidths[20]!, isInput: true, onChanged: (v) { _saveUndoState(); it.reason = v; }),
+              _cell(row, 2, _isDeleted ? "" : it.hsncode.toUpperCase(), _colWidths[2]!),
+              _cell(row, 3, _isDeleted ? "" : cleanBatch(it.product.batch).toUpperCase(), _colWidths[3]!, isInput: true, onChanged: (v) { _saveUndoState(); it.product.batch = v; _startBatchSearch(row, v); }),
+              _cell(row, 4, _isDeleted ? "" : it.product.expiry, _colWidths[4]!, align: TextAlign.center),
+              if (_showSupplierCol) _cell(row, 5, _isDeleted ? "" : it.supplier.toUpperCase(), _colWidths[5]!, isInput: true, onChanged: (v) { _saveUndoState(); it.supplier = v; }),
+              if (_showInvNoCol) _cell(row, 6, _isDeleted ? "" : it.supInvNo.toUpperCase(), _colWidths[6]!, isInput: true, onChanged: (v) { _saveUndoState(); it.supInvNo = v; }),
+              if (_showEntryNoCol) _cell(row, 7, _isDeleted ? "" : _entryNo, _colWidths[7]!, align: TextAlign.center),
+              _cell(row, 8, _isDeleted ? "" : it.packin.toString(), _colWidths[8]!, align: TextAlign.right),
+              _cell(row, 9, _isDeleted ? "" : it.qty.toString(), _colWidths[9]!, isInput: true, align: TextAlign.right, onChanged: (v) { _saveUndoState(); it.qty = int.tryParse(v) ?? 0; _calculateItem(row); }),
+              _cell(row, 10, _isDeleted ? "" : it.looseQty.toString(), _colWidths[10]!, isInput: true, align: TextAlign.right, onChanged: (v) { _saveUndoState(); it.looseQty = int.tryParse(v) ?? 0; _calculateItem(row); }),
+              _cell(row, 11, _isDeleted ? "" : it.fQty.toString(), _colWidths[11]!, isInput: true, align: TextAlign.right),
+              _cell(row, 12, _isDeleted ? "" : it.pRate.toStringAsFixed(2), _colWidths[12]!, align: TextAlign.right),
+              _cell(row, 13, _isDeleted ? "" : it.mrp.toStringAsFixed(2), _colWidths[13]!, align: TextAlign.right),
+              _cell(row, 14, _isDeleted ? "" : it.gross.toStringAsFixed(2), _colWidths[14]!, align: TextAlign.right),
+              _cell(row, 15, _isDeleted ? "" : it.discPercent.toStringAsFixed(2), _colWidths[15]!, isInput: true, align: TextAlign.right, onChanged: (v) { _saveUndoState(); it.discPercent = double.tryParse(v) ?? 0.0; _calculateItem(row); }),
+              _cell(row, 16, _isDeleted ? "" : it.net.toStringAsFixed(2), _colWidths[16]!, align: TextAlign.right),
+              _cell(row, 17, _isDeleted ? "" : it.gstAmt.toStringAsFixed(2), _colWidths[17]!, align: TextAlign.right),
+              _cell(row, 18, _isDeleted ? "" : (TaxCalculator.roundGstPercent(it.gstPercent) % 1 == 0 ? TaxCalculator.roundGstPercent(it.gstPercent).toInt().toString() : TaxCalculator.roundGstPercent(it.gstPercent).toStringAsFixed(1)), _colWidths[18]!, isInput: true, align: TextAlign.right, onChanged: (v) { _saveUndoState(); it.gstPercent = TaxCalculator.roundGstPercent(double.tryParse(v) ?? 0.0); _calculateItem(row); }),
+              _cell(row, 19, _isDeleted ? "" : it.total.toStringAsFixed(2), _colWidths[19]!, align: TextAlign.right, fontWeight: FontWeight.bold, color: Colors.blue.shade900),
+              _cell(row, 20, _isDeleted ? "" : it.reason, _colWidths[20]!, isInput: true, onChanged: (v) { _saveUndoState(); it.reason = v; }),
               Container(width: _colWidths[21]!, alignment: Alignment.center, child: IconButton(icon: const Icon(Icons.close, color: Colors.red, size: 16), padding: EdgeInsets.zero, onPressed: () => _deleteRow(row))),
             ],
           ),
@@ -2294,6 +2508,106 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
     );
   }
 
+  double _getExpiryMonths(String expStr) {
+    if (expStr.isEmpty) return 999.0;
+    final parts = expStr.split('/');
+    if (parts.length != 2) return 999.0;
+    final m = int.tryParse(parts[0]);
+    final y = int.tryParse(parts[1]);
+    if (m == null || y == null) return 999.0;
+    final fullYear = y < 100 ? 2000 + y : y;
+    final now = DateTime.now();
+    final expDate = DateTime(fullYear, m, 1);
+    final diffMonths = (expDate.year - now.year) * 12 + (expDate.month - now.month);
+    return diffMonths.toDouble();
+  }
+
+  ({Color bg, Color text})? _evalPurchaseReturnRuleStyle(PharmacyProvider provider, PurchaseReturnItem item, int col, String text) {
+    final rules = provider.getValidationRules("PURCHASE_RETURN");
+    if (rules.isEmpty) return null;
+
+    for (var rule in rules) {
+      if (!rule.enabled) continue;
+
+      bool appliesToCol = false;
+      if (rule.fieldA == "Expiry (Months)" && col == 4) appliesToCol = true;
+      if (rule.fieldA == "Pack Size" && col == 8) appliesToCol = true;
+      if (rule.fieldA == "Disc %" && col == 15) appliesToCol = true;
+      if (rule.fieldA == "Qty" && col == 9) appliesToCol = true;
+      if (rule.fieldA == "MRP" && col == 13) appliesToCol = true;
+      if (rule.fieldA == "P.Rate" && col == 12) appliesToCol = true;
+
+      if (!appliesToCol) continue;
+
+      double valA = 0.0;
+      switch (rule.fieldA) {
+        case "Expiry (Months)":
+          valA = _getExpiryMonths(text.isNotEmpty ? text : item.product.expiry);
+          break;
+        case "Pack Size":
+          valA = item.packin.toDouble();
+          break;
+        case "Disc %":
+          valA = item.discPercent;
+          break;
+        case "Qty":
+          valA = item.qty.toDouble();
+          break;
+        case "MRP":
+          valA = item.mrp;
+          break;
+        case "P.Rate":
+          valA = item.pRate;
+          break;
+        default:
+          valA = 0.0;
+      }
+
+      if (valA <= 0 && rule.fieldA != "Expiry (Months)") {
+        continue;
+      }
+
+      double valB = 0.0;
+      if (rule.isFieldBHeading) {
+        if (rule.fieldB == "Master Pack") {
+          valB = item.product.packSize > 0 ? item.product.packSize.toDouble() : item.packin.toDouble();
+        } else {
+          valB = double.tryParse(rule.fieldB) ?? 0.0;
+        }
+      } else {
+        valB = double.tryParse(rule.fieldB) ?? 0.0;
+      }
+
+      bool isMatch = false;
+      switch (rule.operator) {
+        case ">=":
+          isMatch = valA >= valB;
+          break;
+        case ">":
+          isMatch = valA > valB;
+          break;
+        case "<=":
+          isMatch = valA <= valB && valA > 0;
+          break;
+        case "<":
+          isMatch = valA < valB && valA > 0;
+          break;
+        case "=":
+          isMatch = (valA - valB).abs() < 0.001;
+          break;
+        case "!=":
+          isMatch = (valA - valB).abs() >= 0.001;
+          break;
+      }
+
+      if (isMatch) {
+        return (bg: Color(rule.bgColorHex), text: Color(rule.textColorHex));
+      }
+    }
+
+    return null;
+  }
+
   Widget _cell(int row, int col, String val, double w, {bool isInput = false, TextAlign align = TextAlign.left, Color? color, FontWeight? fontWeight, String hint = "", Function(String)? onChanged}) {
     final actualFocusNode = _getGridFocusNode(row, col);
     String rowId = row < _items.length ? _items[row].uuid : "new_row";
@@ -2312,11 +2626,26 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
 
         const bool isEntryLocked = false;
         bool isActuallyInput = isInput && !_isDeleted && !isEntryLocked;
-        bool renderAsTextField = isActuallyInput && isFocused;
+        bool renderAsTextField = isActuallyInput;
+
+        final provider = Provider.of<PharmacyProvider>(context, listen: false);
+        final ruleStyle = (row < _items.length && !_isDeleted) ? _evalPurchaseReturnRuleStyle(provider, _items[row], col, val) : null;
 
         Color? bg;
         if (_errorCells[row]?.contains(col) == true) {
           bg = Colors.red.shade100;
+        } else if (ruleStyle != null) {
+          bg = ruleStyle.bg;
+        } else if (_isExistingEntry && row < _items.length) {
+          if (_isNewRowOnExistingEntry(row)) {
+            bg = const Color(0xFFDCFCE7);
+          } else if (_isCellModified(row, col)) {
+            bg = const Color(0xFFFEF3C7);
+          } else {
+            bg = (isActuallyInput)
+              ? (isFocused ? null : const Color(0xFFFFFDE7).withValues(alpha: 0.5))
+              : const Color(0xFFCFD8DC).withValues(alpha: 0.5);
+          }
         } else {
           bg = (isActuallyInput)
             ? (isFocused ? null : const Color(0xFFFFFDE7).withValues(alpha: 0.5))
@@ -2324,13 +2653,65 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
         }
 
         Widget cellContent = renderAsTextField
-            ? TextField(
+            ? ErpGridTextField(
                 key: ValueKey("pret_tf_${rowId}_$col"),
                 controller: ctrl, 
                 focusNode: actualFocusNode, 
                 textAlign: align,
                 keyboardType: (col >= 8 && col <= 19) ? const TextInputType.numberWithOptions(decimal: true) : TextInputType.text,
                 inputFormatters: (col >= 8 && col <= 19) ? [FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))] : (col == 4 ? [ExpiryFormatter()] : [UpperCaseTextFormatter()]),
+                onNavigatePrevious: () {
+                  int curIdx = _navCols.indexOf(col);
+                  if (curIdx > 0) {
+                    _moveFocus(row, _navCols[curIdx - 1]);
+                  } else if (row > 0) {
+                    _moveFocus(row - 1, _navCols.last);
+                  }
+                },
+                onNavigateNext: () {
+                  int curIdx = _navCols.indexOf(col);
+                  if (curIdx != -1 && curIdx < _navCols.length - 1) {
+                    _moveFocus(row, _navCols[curIdx + 1]);
+                  } else if (row < _items.length) {
+                    _moveFocus(_items.length, _navCols[0]);
+                  }
+                },
+                onNavigateUp: () {
+                  final bool isOverlayOpen = _searchList.value.isNotEmpty ||
+                      _batchList.value.isNotEmpty ||
+                      _supplierSearchList.value.isNotEmpty;
+                  if (isOverlayOpen) {
+                    final list = _supplierSearchList.value.isNotEmpty ? _supplierSearchList.value
+                        : (_isSelectingBatch ? _batchList.value : _searchList.value);
+                    if (list.isNotEmpty) {
+                      _searchIdx.value = (_searchIdx.value - 1).clamp(0, list.length - 1);
+                      _scrollToIdx(_searchIdx.value);
+                    }
+                    return;
+                  }
+                  if (row > 0) {
+                    _moveFocus(row - 1, col);
+                  } else {
+                    _moveFocus(-1, 0);
+                  }
+                },
+                onNavigateDown: () {
+                  final bool isOverlayOpen = _searchList.value.isNotEmpty ||
+                      _batchList.value.isNotEmpty ||
+                      _supplierSearchList.value.isNotEmpty;
+                  if (isOverlayOpen) {
+                    final list = _supplierSearchList.value.isNotEmpty ? _supplierSearchList.value
+                        : (_isSelectingBatch ? _batchList.value : _searchList.value);
+                    if (list.isNotEmpty) {
+                      _searchIdx.value = (_searchIdx.value + 1).clamp(0, list.length - 1);
+                      _scrollToIdx(_searchIdx.value);
+                    }
+                    return;
+                  }
+                  if (row < _items.length) {
+                    _moveFocus(row + 1, col);
+                  }
+                },
                 onChanged: (v) {
                   if (_errorCells[row]?.contains(col) == true) {
                      setState(() {
@@ -2372,15 +2753,13 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
                   }
                 },
                 textCapitalization: (col == 4 || col == 5 || col == 10) ? TextCapitalization.none : TextCapitalization.characters,
-                textAlignVertical: TextAlignVertical.center,
-                style: TextStyle(fontSize: 12, fontWeight: fontWeight ?? FontWeight.bold, color: color ?? Colors.black),
+                style: TextStyle(fontSize: 12, fontWeight: fontWeight ?? FontWeight.bold, color: ruleStyle?.text ?? color ?? Colors.black),
                 decoration: InputDecoration(isDense: true, border: InputBorder.none, contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8), hintText: hint, hintStyle: const TextStyle(fontSize: 10, color: Colors.grey)),
-                cursorColor: Colors.blue.shade900, cursorWidth: 2.0,
               )
             : Container(
                 padding: const EdgeInsets.symmetric(horizontal: 4),
                 alignment: align == TextAlign.center ? Alignment.center : (align == TextAlign.right ? Alignment.centerRight : Alignment.centerLeft),
-                child: Text(val.toUpperCase(), style: TextStyle(fontSize: 12, color: color ?? Colors.black, fontWeight: fontWeight ?? FontWeight.normal), overflow: TextOverflow.ellipsis),
+                child: Text(val.toUpperCase(), style: TextStyle(fontSize: 12, color: ruleStyle?.text ?? color ?? Colors.black, fontWeight: fontWeight ?? FontWeight.normal), overflow: TextOverflow.ellipsis),
               );
 
         Widget content = Container(
@@ -2442,22 +2821,25 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
               link: _supplierLayer,
               showWhenUnlinked: false,
               offset: const Offset(0, 28),
-              child: Listener(
-                behavior: HitTestBehavior.opaque,
-                onPointerDown: (_) => _isSelectingFromDropdown = true,
-                child: Material(
-                  elevation: 8,
-                  child: Container(
-                    width: 250, constraints: const BoxConstraints(maxHeight: 200),
-                    decoration: BoxDecoration(color: Colors.white, border: Border.all(color: Colors.blue.shade900)),
-                    child: ListView.builder(
-                      padding: EdgeInsets.zero, shrinkWrap: true, itemCount: list.length,
-                      itemBuilder: (ctx, i) => InkWell(
-                        onTap: () => _onSupplierSelected(list[i]),
-                        child: Container(
-                          padding: const EdgeInsets.all(8),
-                          decoration: BoxDecoration(border: Border(bottom: BorderSide(color: Colors.grey.shade100))),
-                          child: Text(list[i], style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+              child: Align(
+                alignment: Alignment.topLeft,
+                child: Listener(
+                  behavior: HitTestBehavior.opaque,
+
+                  child: Material(
+                    elevation: 8,
+                    child: Container(
+                      width: 250, constraints: const BoxConstraints(maxHeight: 200),
+                      decoration: BoxDecoration(color: Colors.white, border: Border.all(color: Colors.blue.shade900)),
+                      child: ListView.builder(
+                        padding: EdgeInsets.zero, shrinkWrap: true, itemCount: list.length,
+                        itemBuilder: (ctx, i) => InkWell(
+                          onTap: () => _onSupplierSelected(list[i]),
+                          child: Container(
+                            padding: const EdgeInsets.all(8),
+                            decoration: BoxDecoration(border: Border(bottom: BorderSide(color: Colors.grey.shade100))),
+                            child: Text(list[i], style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                          ),
                         ),
                       ),
                     ),
@@ -2475,7 +2857,7 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
             if (list.isEmpty) return const SizedBox();
 
             final link = isBatch ? _batchLayer : _searchLayer;
-            const double dropWidth = 1350.0;
+            const double dropWidth = 1450.0;
             const headerColor = Color(0xFF334155);
 
             return CompositedTransformFollower(
@@ -2484,7 +2866,7 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
               offset: const Offset(0, 30),
               child: Listener(
                 behavior: HitTestBehavior.opaque,
-                onPointerDown: (_) => _isSelectingFromDropdown = true,
+
                 child: Material(
                   elevation: 16,
                   shadowColor: Colors.black54,
@@ -2517,16 +2899,16 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
                                     _Hdr("Profit%", flex: 1, align: TextAlign.right),
                                   ]
                                 : const [
-                                    _Hdr("Name", width: 300),
-                                    _Hdr("Stock", width: 70, align: TextAlign.right),
-                                    _Hdr("Packin", width: 60, align: TextAlign.right),
-                                    _Hdr("Strips/L", width: 80, align: TextAlign.center),
-                                    _Hdr("MRP", width: 80, align: TextAlign.right),
-                                    _Hdr("PRate", width: 80, align: TextAlign.right),
-                                    _Hdr("Rack", width: 60),
-                                    _Hdr("Cat", width: 50),
-                                    _Hdr("Patent", width: 120),
-                                    _Hdr("Generic Name", width: 150),
+                                    _Hdr("Name", width: 380),
+                                    _Hdr("Stock", width: 60, align: TextAlign.right),
+                                    _Hdr("Packin", width: 50, align: TextAlign.right),
+                                    _Hdr("Strips/L", width: 65, align: TextAlign.center),
+                                    _Hdr("MRP", width: 65, align: TextAlign.right),
+                                    _Hdr("PRate", width: 65, align: TextAlign.right),
+                                    _Hdr("Rack", width: 45),
+                                    _Hdr("Cat", width: 40),
+                                    _Hdr("Patent", width: 80),
+                                    _Hdr("Generic Name", width: 110),
                                     _Hdr("Use", flex: 1),
                                   ],
                           ),
@@ -2545,9 +2927,18 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
                               itemBuilder: (ctx, i) {
                                 final p = list[i];
                                 bool sel = i == idx;
+                                int usedInOtherRows = isBatch 
+                                    ? _getCrossRowStockUsedForBatch(p, _focusedRowIndex)
+                                    : _getCrossRowStockUsedForProduct(p, _focusedRowIndex);
+                                int origQty = isBatch
+                                    ? _getOriginalQtyForBatch(p)
+                                    : _getOriginalQtyForProduct(p);
+                                int availStock = p.stock + origQty - usedInOtherRows;
+                                if (availStock < 0) availStock = 0;
+
                                 double ps = p.packSize == 0 ? 1 : p.packSize.toDouble();
-                                int strips = p.stock ~/ ps;
-                                int loose = p.stock % ps.toInt();
+                                int strips = availStock ~/ ps;
+                                int loose = availStock % ps.toInt();
                                 String stripsStr = "$strips / $loose";
 
                                 return InkWell(
@@ -2562,7 +2953,7 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
                                       children: isBatch
                                           ? [
                                               _GridCell(cleanBatch(p.batch), width: 150, fontWeight: FontWeight.bold),
-                                              _GridCell("${p.stock}", width: 80, align: TextAlign.right),
+                                              _GridCell("$availStock", width: 80, align: TextAlign.right),
                                               _GridCell("${p.packSize}", width: 80, align: TextAlign.right),
                                               _GridCell(stripsStr, width: 80, align: TextAlign.center),
                                               _GridCell(p.expiry, width: 90, align: TextAlign.center),
@@ -2579,15 +2970,15 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
                                               ),
                                             ]
                                           : [
-                                              _GridCell(p.name, width: 300, fontWeight: FontWeight.bold),
-                                              _GridCell("${p.stock}", width: 70, align: TextAlign.right, color: Colors.blue.shade900, fontWeight: FontWeight.bold),
-                                              _GridCell("${p.packSize}", width: 60, align: TextAlign.right),
-                                              _GridCell(stripsStr, width: 80, align: TextAlign.center, color: Colors.blue.shade800),
-                                              _GridCell(p.mrp.toStringAsFixed(2), width: 80, align: TextAlign.right),
-                                              _GridCell(p.purchaseRate.toStringAsFixed(2), width: 80, align: TextAlign.right),
-                                              _GridCell(p.rack, width: 60),
-                                              _GridCell(p.category, width: 50),
-                                              _GridCell(p.manufacturer, width: 120),
+                                              _GridCell(p.name, width: 380, fontWeight: FontWeight.bold),
+                                              _GridCell("$availStock", width: 60, align: TextAlign.right, color: Colors.blue.shade900, fontWeight: FontWeight.bold),
+                                              _GridCell("${p.packSize}", width: 50, align: TextAlign.right),
+                                              _GridCell(stripsStr, width: 65, align: TextAlign.center, color: Colors.blue.shade800),
+                                              _GridCell(p.mrp.toStringAsFixed(2), width: 65, align: TextAlign.right),
+                                              _GridCell(p.purchaseRate.toStringAsFixed(2), width: 65, align: TextAlign.right),
+                                              _GridCell(p.rack, width: 45),
+                                              _GridCell(p.category, width: 40),
+                                              _GridCell(p.manufacturer, width: 80),
                                               _GridCell(p.genericName.isNotEmpty ? p.genericName : (Provider.of<PharmacyProvider>(context, listen: false).getProductById(p.id)?.genericName ?? Provider.of<PharmacyProvider>(context, listen: false).getProductMasterByName(p.name)?.genericName ?? ""), width: 150),
                                               _GridCell(p.use.isNotEmpty ? p.use : (Provider.of<PharmacyProvider>(context, listen: false).getProductById(p.id)?.use ?? Provider.of<PharmacyProvider>(context, listen: false).getProductMasterByName(p.name)?.use ?? ""), flex: 1),
                                             ],
@@ -2650,16 +3041,16 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
         String batch = h['batch']?.toString() ?? '';
 
         return Container(
-          height: 22,
+          height: 24,
           decoration: BoxDecoration(border: Border(bottom: BorderSide(color: Colors.grey.shade200))),
           child: Row(children: [
-            SizedBox(width: 65, child: Text(DateFormat('dd/MM/yy').format(DateTime.parse(h['date'])), style: const TextStyle(fontSize: 10))),
-            SizedBox(width: 60, child: Text(h['entry_no']?.toString() ?? '', style: const TextStyle(fontSize: 10))),
-            Expanded(flex: 2, child: Text(h['supplier_name']?.toString() ?? '', style: const TextStyle(fontSize: 10), overflow: TextOverflow.ellipsis)),
-            SizedBox(width: 65, child: Text(batch, style: const TextStyle(fontSize: 10), overflow: TextOverflow.ellipsis)),
-            SizedBox(width: 55, child: Text(_fmt(mrp), textAlign: TextAlign.right, style: const TextStyle(fontSize: 10))),
-            SizedBox(width: 55, child: Text(_fmt(pRate), textAlign: TextAlign.right, style: const TextStyle(fontSize: 10))),
-            SizedBox(width: 55, child: Text("${profitPct.toStringAsFixed(1)}%", textAlign: TextAlign.right, style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.green.shade800))),
+            SizedBox(width: 65, child: Text(DateFormat('dd/MM/yy').format(DateTime.parse(h['date'])), style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600))),
+            SizedBox(width: 60, child: Text(h['entry_no']?.toString() ?? '', style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600))),
+            Expanded(flex: 2, child: Text(h['supplier_name']?.toString() ?? '', style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600), overflow: TextOverflow.ellipsis)),
+            SizedBox(width: 65, child: Text(batch, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600), overflow: TextOverflow.ellipsis)),
+            SizedBox(width: 55, child: Text(_fmt(mrp), textAlign: TextAlign.right, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600))),
+            SizedBox(width: 55, child: Text(_fmt(pRate), textAlign: TextAlign.right, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600))),
+            SizedBox(width: 55, child: Text("${profitPct.toStringAsFixed(1)}%", textAlign: TextAlign.right, style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold, color: Colors.green.shade800))),
           ]),
         );
       },
@@ -2681,16 +3072,16 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
             : ((h['doctor'] as String?)?.isNotEmpty == true ? h['doctor']! : (h['supplier_name']?.toString() ?? ''));
 
         return Container(
-          height: 22,
+          height: 24,
           decoration: BoxDecoration(border: Border(bottom: BorderSide(color: Colors.grey.shade200))),
           child: Row(children: [
-            SizedBox(width: 65, child: Text(DateFormat('dd/MM/yy').format(DateTime.parse(h['date'])), style: const TextStyle(fontSize: 10))),
-            SizedBox(width: 60, child: Text(h['entry_no']?.toString() ?? '', style: const TextStyle(fontSize: 10))),
-            Expanded(flex: 2, child: Text(party, style: const TextStyle(fontSize: 10), overflow: TextOverflow.ellipsis)),
-            SizedBox(width: 55, child: Text(_fmt(mrp), textAlign: TextAlign.right, style: const TextStyle(fontSize: 10))),
-            SizedBox(width: 55, child: Text(_fmt(sRate), textAlign: TextAlign.right, style: const TextStyle(fontSize: 10))),
-            SizedBox(width: 40, child: Text("$qty", textAlign: TextAlign.right, style: const TextStyle(fontSize: 10))),
-            SizedBox(width: 45, child: Text("${_fmt(disc)}%", textAlign: TextAlign.right, style: const TextStyle(fontSize: 10))),
+            SizedBox(width: 65, child: Text(DateFormat('dd/MM/yy').format(DateTime.parse(h['date'])), style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600))),
+            SizedBox(width: 60, child: Text(h['entry_no']?.toString() ?? '', style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600))),
+            Expanded(flex: 2, child: Text(party, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600), overflow: TextOverflow.ellipsis)),
+            SizedBox(width: 55, child: Text(_fmt(mrp), textAlign: TextAlign.right, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600))),
+            SizedBox(width: 55, child: Text(_fmt(sRate), textAlign: TextAlign.right, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600))),
+            SizedBox(width: 40, child: Text("$qty", textAlign: TextAlign.right, style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold))),
+            SizedBox(width: 45, child: Text("${_fmt(disc)}%", textAlign: TextAlign.right, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold))),
           ]),
         );
       },
@@ -2785,117 +3176,7 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
 
   void _openHistoryWindow(String productName, bool isSales) {
     if (productName.trim().isEmpty) return;
-
-    Offset dialogOffset = Offset.zero;
-
-    showGeneralDialog(
-      context: context,
-      barrierDismissible: true,
-      barrierLabel: isSales ? "Sales History" : "Purchase History",
-      barrierColor: Colors.black26,
-      transitionDuration: Duration.zero,
-      pageBuilder: (ctx, anim1, anim2) {
-        return StatefulBuilder(
-          builder: (context, setStateDialog) {
-            return Transform.translate(
-              offset: dialogOffset,
-              child: Focus(
-                autofocus: true,
-                onKeyEvent: (node, event) {
-                  if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.escape) {
-                    Navigator.of(ctx).pop();
-                    return KeyEventResult.handled;
-                  }
-                  return KeyEventResult.ignored;
-                },
-                child: Dialog(
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                  clipBehavior: Clip.antiAlias,
-                  elevation: 12,
-                  child: SizedBox(
-                    width: 1080,
-                    height: 540,
-                    child: Column(
-                      children: [
-                        GestureDetector(
-                          onPanUpdate: (details) {
-                            setStateDialog(() {
-                              dialogOffset += details.delta;
-                            });
-                          },
-                          child: Container(
-                            height: 38,
-                            color: AppColors.primary,
-                            padding: const EdgeInsets.symmetric(horizontal: 12),
-                            child: Row(
-                              children: [
-                                Icon(
-                                  isSales ? Icons.shopping_cart_rounded : Icons.local_shipping_rounded,
-                                  color: Colors.amber,
-                                  size: 18,
-                                ),
-                                const SizedBox(width: 8),
-                                Text(
-                                  isSales ? "Sales History: ${productName.toUpperCase()}" : "Purchase History: ${productName.toUpperCase()}",
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 13,
-                                  ),
-                                ),
-                                const SizedBox(width: 12),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                                  decoration: BoxDecoration(
-                                    color: Colors.white.withValues(alpha: 0.15),
-                                    borderRadius: BorderRadius.circular(4),
-                                  ),
-                                  child: const Text(
-                                    "Press ESC to Close | Drag header to move",
-                                    style: TextStyle(color: Colors.white70, fontSize: 10, fontStyle: FontStyle.italic),
-                                  ),
-                                ),
-                                const Spacer(),
-                                Tooltip(
-                                  message: "Pop out to separate OS Window",
-                                  child: InkWell(
-                                    onTap: () {
-                                      Navigator.of(ctx).pop();
-                                      spawnOSWindow(isSales ? "sales_history" : "purchase_history", productName.trim());
-                                    },
-                                    child: const Padding(
-                                      padding: EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                                      child: Icon(Icons.open_in_new_rounded, color: Colors.white70, size: 16),
-                                    ),
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                InkWell(
-                                  onTap: () => Navigator.of(ctx).pop(),
-                                  child: const Padding(
-                                    padding: EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                                    child: Icon(Icons.close, color: Colors.white, size: 18),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        Expanded(
-                          child: isSales
-                              ? SalesHistoryScreen(productName: productName)
-                              : PurchaseHistoryScreen(productName: productName),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            );
-          },
-        );
-      },
-    );
+    spawnOSWindow(isSales ? "sales_history" : "purchase_history", productName.trim());
   }
 
   Widget _buildFooter() {
@@ -3007,16 +3288,15 @@ class _ResizableHdr extends StatelessWidget {
 
 class _Hdr extends StatelessWidget {
   final String title;
-  final String? tooltip;
   final double? width;
   final int? flex;
   final TextAlign align;
 
-  const _Hdr(this.title, {this.tooltip, this.width, this.flex, this.align = TextAlign.left});
+  const _Hdr(this.title, {this.width, this.flex, this.align = TextAlign.left});
 
   @override
   Widget build(BuildContext context) {
-    final String msg = tooltip ?? title;
+    final String msg = title;
     Widget child = Container(
       width: width,
       alignment: align == TextAlign.left

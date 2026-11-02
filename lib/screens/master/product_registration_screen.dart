@@ -5,6 +5,7 @@ import '../../providers/pharmacy_provider.dart';
 import '../../providers/app_provider.dart';
 import '../../widgets/pin_unlock_dialog.dart';
 import '../../widgets/app_strict_autocomplete.dart';
+import '../../widgets/erp_grid_text_field.dart';
 import '../../utils/theme_constants.dart';
 
 class ProductRegistrationScreen extends StatefulWidget {
@@ -70,6 +71,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
   bool _isNrx = false;
   bool _isActive = true;
   bool _isDiscLocked = false;
+  bool _userEditedAlias = false;
 
   Product? _editingProduct;
 
@@ -83,6 +85,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
       _nameCtrl.text = widget.initialName!;
     }
     _setupFocusListeners();
+    _setupShortcodeAutoSuggestion();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (widget.initialName != null && widget.initialName!.isNotEmpty) {
         _hsnFocus.requestFocus();
@@ -90,6 +93,39 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
         _nameFocus.requestFocus();
       }
     });
+  }
+
+  void _setupShortcodeAutoSuggestion() {
+    _aliasFocus.addListener(() {
+      if (_aliasFocus.hasFocus) {
+        _userEditedAlias = true;
+      }
+    });
+    _nameCtrl.addListener(() {
+      if (_editingProduct == null && !_userEditedAlias) {
+        final generated = _generateShortcode(_nameCtrl.text);
+        if (_aliasCtrl.text != generated) {
+          _aliasCtrl.text = generated;
+        }
+      }
+    });
+  }
+
+  String _generateShortcode(String name) {
+    final clean = name.trim();
+    if (clean.isEmpty) return "";
+    final words = clean.split(RegExp(r'\s+'));
+    if (words.length == 1) {
+      final w = words.first;
+      return w.length > 4 ? w.substring(0, 4).toUpperCase() : w.toUpperCase();
+    }
+    String code = "";
+    for (var w in words) {
+      if (w.isNotEmpty) {
+        code += w[0].toUpperCase();
+      }
+    }
+    return code;
   }
 
   String _generate10DigitId() {
@@ -268,6 +304,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
     final provider = Provider.of<PharmacyProvider>(context, listen: false);
     provider.trackProductModified(p);
     setState(() {
+      _userEditedAlias = true;
       _highlightedSearchIndex = 0;
       _editingProduct = p;
       _nameCtrl.text = p.name;
@@ -384,8 +421,8 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
         barrierDismissible: false,
         builder: (ctx) => AlertDialog(
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-          title: Row(
-            children: const [
+          title: const Row(
+            children: [
               Icon(Icons.warning_amber_rounded, color: Colors.red, size: 28),
               SizedBox(width: 10),
               Text(
@@ -478,12 +515,15 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
         : (_selectedWholesale == "Select Wholesale" ? "" : _selectedWholesale);
 
     final gstVal = double.tryParse(_gstCtrl.text.trim()) ?? (double.tryParse(_selectedGst) ?? 0.0);
+    final barcodeVal = _barcodeCtrl.text.trim().isNotEmpty
+        ? _barcodeCtrl.text.trim()
+        : (_editingProduct?.id ?? _generatedId);
 
     final p = Product(
       id: _editingProduct?.id ?? _generatedId,
       name: enteredName,
       hsnCode: _hsnCtrl.text.trim(),
-      batch: _barcodeCtrl.text.trim(),
+      batch: barcodeVal,
       rack: rackVal,
       category: categoryVal,
       patent: patentVal,
@@ -515,7 +555,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
     }
     provider.trackProductModified(p);
 
-    if (widget.initialName != null) {
+    if (widget.isCompact || widget.initialName != null) {
       if (!mounted) return;
       final appProvider = Provider.of<AppProvider>(context, listen: false);
       if (appProvider.openTabs.any((t) => t.title == "PRODUCT REGISTRATION")) {
@@ -535,6 +575,9 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
 
   void _clear() {
     setState(() {
+      _userEditedAlias = false;
+      _searchCtrl.clear();
+      _highlightedSearchIndex = 0;
       _editingProduct = null;
       _generatedId = _generate10DigitId();
       _nameCtrl.clear(); _hsnCtrl.clear(); _barcodeCtrl.clear(); _aliasCtrl.clear();
@@ -577,43 +620,26 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
       focusNode: _keyboardFocusNode,
       onKeyEvent: _handleGlobalKey,
       child: Scaffold(
-        backgroundColor: c.background,
+        backgroundColor: compact ? Colors.white : c.background,
         body: Column(
           children: [
             _buildToolbar(provider, isCompact: compact),
             Expanded(
               child: compact
-                  ? Center(
-                      child: SingleChildScrollView(
-                        padding: const EdgeInsets.all(16),
-                        child: Container(
-                          constraints: const BoxConstraints(maxWidth: 580),
-                          padding: const EdgeInsets.all(16),
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: Colors.grey.shade200),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withValues(alpha: 0.03),
-                                blurRadius: 10,
-                              ),
-                            ],
-                          ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              _buildHeaderSectionSimple(),
-                              const SizedBox(height: 16),
-                              _buildSimpleGrid(provider),
-                              const Divider(height: 32),
-                              _buildStatusToggles(),
-                              const SizedBox(height: 12),
-                              const Text("F6: Save • ESC: Clear • TAB: Navigate",
-                                  style: TextStyle(color: Colors.grey, fontSize: 10, fontStyle: FontStyle.italic)),
-                            ],
-                          ),
-                        ),
+                  ? SingleChildScrollView(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          _buildHeaderSectionSimple(),
+                          const SizedBox(height: 12),
+                          _buildSimpleGrid(provider),
+                          const Divider(height: 20),
+                          _buildStatusToggles(),
+                          const SizedBox(height: 8),
+                          const Text("F6: Save • ESC: Clear • TAB: Navigate",
+                              style: TextStyle(color: Colors.grey, fontSize: 10, fontStyle: FontStyle.italic)),
+                        ],
                       ),
                     )
                   : Row(
@@ -690,6 +716,29 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
       searchMatches = uniqueMap.values.toList();
     }
 
+    // Build master display list when search query is empty:
+    // Place recently modified/registered products at the top first, followed by all remaining products in productMaster
+    final List<Product> masterList;
+    if (query.isNotEmpty) {
+      masterList = searchMatches;
+    } else {
+      final Set<String> seenIds = {};
+      final List<Product> combined = [];
+      for (var p in recentList) {
+        if (!seenIds.contains(p.id)) {
+          seenIds.add(p.id);
+          combined.add(p);
+        }
+      }
+      for (var p in provider.productMaster) {
+        if (!seenIds.contains(p.id)) {
+          seenIds.add(p.id);
+          combined.add(p);
+        }
+      }
+      masterList = combined;
+    }
+
     return Stack(
       clipBehavior: Clip.none,
       children: [
@@ -737,13 +786,12 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
                 if (event is KeyDownEvent && searchMatches.isNotEmpty) {
                   if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
                     setState(() {
-                      _highlightedSearchIndex = (_highlightedSearchIndex + 1) % searchMatches.length;
+                      _highlightedSearchIndex = (_highlightedSearchIndex + 1).clamp(0, searchMatches.length - 1);
                     });
                     return KeyEventResult.handled;
                   } else if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
                     setState(() {
-                      _highlightedSearchIndex =
-                          (_highlightedSearchIndex - 1 + searchMatches.length) % searchMatches.length;
+                      _highlightedSearchIndex = (_highlightedSearchIndex - 1).clamp(0, searchMatches.length - 1);
                     });
                     return KeyEventResult.handled;
                   } else if (event.logicalKey == LogicalKeyboardKey.enter) {
@@ -856,7 +904,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
                 ),
               ),
 
-            // SECTION HEADER FOR LAST MODIFIED STOCKS (RECENT 20)
+            // SECTION HEADER FOR SAVED PRODUCT MASTER LIST
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
               margin: const EdgeInsets.only(bottom: 8),
@@ -867,10 +915,16 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
               ),
               child: Row(
                 children: [
-                  Icon(Icons.history_rounded, size: 16, color: Colors.indigo.shade800),
+                  Icon(
+                    query.isNotEmpty ? Icons.search_rounded : Icons.inventory_2_rounded,
+                    size: 16,
+                    color: Colors.indigo.shade800,
+                  ),
                   const SizedBox(width: 6),
                   Text(
-                    "LAST MODIFIED STOCKS (RECENT 20)",
+                    query.isNotEmpty
+                        ? "SEARCH MATCHES (${searchMatches.length})"
+                        : "SAVED PRODUCT MASTER LIST (RECENT & ALL)",
                     style: TextStyle(
                       fontSize: 11,
                       fontWeight: FontWeight.bold,
@@ -887,7 +941,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
                       border: Border.all(color: Colors.indigo.shade200),
                     ),
                     child: Text(
-                      "${recentList.length} recent",
+                      "${masterList.length} ${masterList.length == 1 ? 'medicine' : 'medicines'}",
                       style: TextStyle(
                         fontSize: 10,
                         fontWeight: FontWeight.bold,
@@ -899,9 +953,9 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
               ),
             ),
 
-            // MAIN LIST UNDER SEARCH BOX (LAST MODIFIED STOCKS - MAX 20)
+            // MAIN LIST UNDER SEARCH BOX (PRODUCT MASTER CATALOG)
             Expanded(
-              child: recentList.isEmpty
+              child: masterList.isEmpty
                   ? Center(
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
@@ -909,7 +963,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
                           Icon(Icons.inventory_2_outlined, size: 54, color: Colors.grey.shade300),
                           const SizedBox(height: 12),
                           Text(
-                            "No last modified stocks history",
+                            query.isNotEmpty ? "No medicines matching '$query'" : "No registered medicines found",
                             style: TextStyle(
                               color: Colors.grey.shade600,
                               fontSize: 13,
@@ -926,12 +980,11 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
                       ),
                     )
                   : ListView.separated(
-                      itemCount: recentList.length,
+                      itemCount: masterList.length,
                       separatorBuilder: (ctx, i) => const SizedBox(height: 6),
                       itemBuilder: (ctx, index) {
-                        final p = recentList[index];
+                        final p = masterList[index];
                         final isSelected = _editingProduct?.id == p.id;
-
                         return Container(
                           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                           decoration: BoxDecoration(
@@ -1068,6 +1121,10 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
                                       spacing: 6,
                                       runSpacing: 4,
                                       children: [
+                                        _badge(
+                                          p.stock > 0 ? "Stock: ${p.stock}" : "Out of Stock",
+                                          p.stock > 0 ? Colors.green : Colors.red,
+                                        ),
                                         if (p.rack.isNotEmpty)
                                           _badge("Rack: ${p.rack}", Colors.teal),
                                         _badge(p.category, Colors.indigo),
@@ -1292,17 +1349,31 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
     );
   }
 
-  Widget _badge(String text, MaterialColor color) {
+  Widget _badge(String text, Color color) {
+    if (color is MaterialColor) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        decoration: BoxDecoration(
+          color: color.shade50,
+          borderRadius: BorderRadius.circular(4),
+          border: Border.all(color: color.shade200),
+        ),
+        child: Text(
+          text,
+          style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: color.shade800),
+        ),
+      );
+    }
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
       decoration: BoxDecoration(
-        color: color.shade50,
+        color: color.withValues(alpha: 0.1),
         borderRadius: BorderRadius.circular(4),
-        border: Border.all(color: color.shade200),
+        border: Border.all(color: color.withValues(alpha: 0.3)),
       ),
       child: Text(
         text,
-        style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: color.shade800),
+        style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: color),
       ),
     );
   }
@@ -1495,7 +1566,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
                       borderRadius: BorderRadius.circular(8),
                       border: Border.all(color: Colors.grey.shade300),
                     ),
-                    child: Text(_editingProduct != null ? _editingProduct!.id : "",
+                    child: Text(_editingProduct != null ? _editingProduct!.id : _generatedId,
                       style: TextStyle(fontWeight: FontWeight.w900, fontSize: 13, color: Colors.blue.shade700),
                       overflow: TextOverflow.ellipsis,
                       maxLines: 1,
@@ -1556,7 +1627,18 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
               getItems: _getCategoryOptions,
               defaultOption: "",
               provider: provider,
-              onValueChanged: (v) => setState(() => _selectedCategory = v),
+              onValueChanged: (v) {
+                setState(() {
+                  _selectedCategory = v;
+                  if (_hsnCtrl.text.trim().isEmpty) {
+                    _hsnCtrl.text = "30049099";
+                  }
+                  if (_selectedGst.isEmpty || _gstCtrl.text.trim().isEmpty) {
+                    _selectedGst = "12";
+                    _gstCtrl.text = "12";
+                  }
+                });
+              },
             )),
           ],
         ),
@@ -1571,7 +1653,18 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
               getItems: _getGenericOptions,
               defaultOption: "Select Generic",
               provider: provider,
-              onValueChanged: (v) => setState(() => _selectedGeneric = v),
+              onValueChanged: (v) {
+                setState(() {
+                  _selectedGeneric = v;
+                  if (_hsnCtrl.text.trim().isEmpty) {
+                    _hsnCtrl.text = "30049099";
+                  }
+                  if (_selectedGst.isEmpty || _gstCtrl.text.trim().isEmpty) {
+                    _selectedGst = "12";
+                    _gstCtrl.text = "12";
+                  }
+                });
+              },
             )),
             const SizedBox(width: 8),
             Expanded(child: _searchableAutocompleteField(
@@ -1646,7 +1739,27 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
         const SizedBox(height: 8),
         Row(
           children: [
-            Expanded(child: _field("BARCODE / SKU", _barcodeCtrl, _barcodeFocus)),
+            Expanded(
+              child: _field(
+                "BARCODE / SKU",
+                _barcodeCtrl,
+                _barcodeFocus,
+                suffixIcon: Tooltip(
+                  message: "Auto-generate Barcode from Product ID",
+                  child: InkWell(
+                    onTap: () {
+                      setState(() {
+                        _barcodeCtrl.text = _editingProduct?.id ?? _generatedId;
+                      });
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 6),
+                      child: Icon(Icons.qr_code_2_rounded, size: 16, color: Colors.blue.shade700),
+                    ),
+                  ),
+                ),
+              ),
+            ),
             const SizedBox(width: 8),
             Expanded(child: _field("SHORTCODE / ALIAS", _aliasCtrl, _aliasFocus)),
           ],
@@ -1666,7 +1779,7 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
     );
   }
 
-  Widget _field(String label, TextEditingController ctrl, FocusNode node, {FocusNode? next, Function(String)? onChange, bool enabled = true}) {
+  Widget _field(String label, TextEditingController ctrl, FocusNode node, {FocusNode? prev, FocusNode? next, Function(String)? onChange, bool enabled = true, Widget? suffixIcon}) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
@@ -1683,17 +1796,20 @@ class _ProductRegistrationScreenState extends State<ProductRegistrationScreen> {
               width: node.hasFocus ? 1.5 : 1,
             ),
           ),
-          child: TextField(
+          child: ErpGridTextField(
             controller: ctrl,
             focusNode: node,
             enabled: enabled,
             onChanged: onChange,
+            onNavigatePrevious: () => prev?.requestFocus(),
+            onNavigateNext: () => next?.requestFocus(),
             onSubmitted: (_) => next?.requestFocus(),
             style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-            decoration: const InputDecoration(
+            decoration: InputDecoration(
               isDense: true,
               border: InputBorder.none,
-              contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              suffixIcon: suffixIcon,
             ),
           ),
         ),

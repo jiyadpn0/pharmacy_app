@@ -69,9 +69,10 @@ class _LedgerRegistrationScreenState extends State<LedgerRegistrationScreen> {
           );
           await provider.updateSupplier(updatedSupplier);
         } else {
-          // Create new
+          // Create new with collision-safe unique ID
+          final String uniqueId = "SUP_${DateTime.now().microsecondsSinceEpoch}";
           final newSupplier = Supplier(
-            id: "SUP_${DateTime.now().millisecondsSinceEpoch}",
+            id: uniqueId,
             name: _nameCtrl.text.trim(),
             phone: _phoneCtrl.text.trim(),
             address: _addressCtrl.text.trim(),
@@ -92,8 +93,9 @@ class _LedgerRegistrationScreenState extends State<LedgerRegistrationScreen> {
           );
           await provider.updatePatient(updated);
         } else {
+          final String uniqueId = "PAT_${DateTime.now().microsecondsSinceEpoch}";
           final newPatient = Patient(
-            id: "PAT_${DateTime.now().millisecondsSinceEpoch}",
+            id: uniqueId,
             name: _nameCtrl.text.trim(),
             mobile: _phoneCtrl.text.trim(),
             address: _addressCtrl.text.trim(),
@@ -110,8 +112,9 @@ class _LedgerRegistrationScreenState extends State<LedgerRegistrationScreen> {
           );
           await provider.updateDoctor(updated);
         } else {
+          final String uniqueId = "DOC_${DateTime.now().microsecondsSinceEpoch}";
           final newDoctor = Doctor(
-            id: "DOC_${DateTime.now().millisecondsSinceEpoch}",
+            id: uniqueId,
             name: _nameCtrl.text.trim(),
             mobile: _phoneCtrl.text.trim(),
           );
@@ -212,10 +215,19 @@ class _LedgerRegistrationScreenState extends State<LedgerRegistrationScreen> {
       currentList = provider.doctorMaster;
     }
 
-    return CallbackShortcuts(
-      bindings: {
-        const SingleActivator(LogicalKeyboardKey.f2): () => _save(isEdit: false),
-        const SingleActivator(LogicalKeyboardKey.f3): _resetPage,
+    return Focus(
+      autofocus: true,
+      onKeyEvent: (node, event) {
+        if (event is KeyDownEvent) {
+          if (event.logicalKey == LogicalKeyboardKey.f2) {
+            _save(isEdit: false);
+            return KeyEventResult.handled;
+          } else if (event.logicalKey == LogicalKeyboardKey.f3) {
+            _resetPage();
+            return KeyEventResult.handled;
+          }
+        }
+        return KeyEventResult.ignored;
       },
       child: Scaffold(
         backgroundColor: AppColors.of(context).background,

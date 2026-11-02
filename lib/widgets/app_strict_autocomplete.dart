@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 class AppStrictAutocomplete extends StatefulWidget {
   final String? label;
@@ -36,6 +37,9 @@ class AppStrictAutocomplete extends StatefulWidget {
 
 class _AppStrictAutocompleteState extends State<AppStrictAutocomplete> {
   String? _lastHighlightedOption;
+  int _highlightedIndex = 0;
+  bool _isUserTyping = false;
+  bool _isExplicitOpen = false;
 
   @override
   void initState() {
@@ -60,6 +64,8 @@ class _AppStrictAutocompleteState extends State<AppStrictAutocomplete> {
 
   void _onFocusChange() {
     if (widget.focusNode.hasFocus) {
+      _isUserTyping = false;
+      _isExplicitOpen = false;
       if (widget.controller.text.isNotEmpty) {
         widget.controller.selection = TextSelection(
           baseOffset: 0,
@@ -67,6 +73,8 @@ class _AppStrictAutocompleteState extends State<AppStrictAutocomplete> {
         );
       }
     } else {
+      _isUserTyping = false;
+      _isExplicitOpen = false;
       _commitSelectionOrClear();
     }
   }
@@ -156,13 +164,25 @@ class _AppStrictAutocompleteState extends State<AppStrictAutocomplete> {
           focusNode: widget.focusNode,
           optionsBuilder: (TextEditingValue textEditingValue) {
             final text = textEditingValue.text.trim().toLowerCase();
+            if (!_isUserTyping && !_isExplicitOpen && validItems.any((item) => item.toLowerCase() == text)) {
+              return const Iterable<String>.empty();
+            }
             if (text.isEmpty || _isPlaceholder(text)) {
               return validItems.take(50);
             }
-            final matches = validItems.where((g) => g.toLowerCase().contains(text)).toList();
-            return matches.take(50);
+            final matches = <String>[];
+            for (int i = 0; i < validItems.length; i++) {
+              final item = validItems[i];
+              if (item.toLowerCase().contains(text)) {
+                matches.add(item);
+                if (matches.length >= 50) break;
+              }
+            }
+            return matches;
           },
           onSelected: (String selection) {
+            _isUserTyping = false;
+            _isExplicitOpen = false;
             if (!_isPlaceholder(selection)) {
               widget.controller.text = selection;
               widget.onValueChanged(selection);
@@ -188,37 +208,100 @@ class _AppStrictAutocompleteState extends State<AppStrictAutocomplete> {
               child: Row(
                 children: [
                   Expanded(
-                    child: TextField(
-                      controller: textController,
-                      focusNode: fieldFocusNode,
-                      style: widget.style ?? const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-                      decoration: InputDecoration(
-                        isDense: true,
-                        hintText: displayHint,
-                        hintStyle: TextStyle(fontSize: 12, color: Colors.grey.shade500, fontWeight: FontWeight.w500),
-                        border: InputBorder.none,
-                        contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    child: Focus(
+                      onKeyEvent: (node, event) {
+                        if (event is KeyDownEvent || event is KeyRepeatEvent) {
+                          if (event.logicalKey == LogicalKeyboardKey.f2 ||
+                              (HardwareKeyboard.instance.isAltPressed && event.logicalKey == LogicalKeyboardKey.arrowDown)) {
+                            setState(() {
+                              _isExplicitOpen = true;
+                            });
+                            return KeyEventResult.handled;
+                          }
+
+                          // Opening dropdown on Arrow Down if closed
+                          if (event.logicalKey == LogicalKeyboardKey.arrowDown && !_isExplicitOpen) {
+                            setState(() {
+                              _isExplicitOpen = true;
+                            });
+                          }
+
+                          final text = textController.text.trim().toLowerCase();
+                          List<String> matches;
+                          if (text.isEmpty || _isPlaceholder(text) || _isExplicitOpen) {
+                            matches = validItems.take(50).toList();
+                          } else {
+                            matches = validItems.where((g) => g.toLowerCase().contains(text)).take(50).toList();
+                          }
+
+                          if (matches.isNotEmpty) {
+                            if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
+                              setState(() {
+                                _highlightedIndex = (_highlightedIndex + 1).clamp(0, matches.length - 1);
+                              });
+                              return KeyEventResult.handled;
+                            } else if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+                              setState(() {
+                                _highlightedIndex = (_highlightedIndex - 1).clamp(0, matches.length - 1);
+                              });
+                              return KeyEventResult.handled;
+                            } else if (event.logicalKey == LogicalKeyboardKey.enter || event.logicalKey == LogicalKeyboardKey.numpadEnter) {
+                              int idx = _highlightedIndex.clamp(0, matches.length - 1);
+                              final selection = matches[idx];
+                              _isUserTyping = false;
+                              _isExplicitOpen = false;
+                              if (!_isPlaceholder(selection)) {
+                                textController.text = selection;
+                                widget.onValueChanged(selection);
+                              } else {
+                                textController.clear();
+                                widget.onValueChanged(widget.defaultOption);
+                              }
+                              if (widget.nextFocus != null) {
+                                widget.nextFocus!.requestFocus();
+                              }
+                              return KeyEventResult.handled;
+                            }
+                          }
+                        }
+                        return KeyEventResult.ignored;
+                      },
+                      child: TextField(
+                        controller: textController,
+                        focusNode: fieldFocusNode,
+                        style: widget.style ?? const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                        decoration: InputDecoration(
+                          isDense: true,
+                          hintText: displayHint,
+                          hintStyle: TextStyle(fontSize: 12, color: Colors.grey.shade500, fontWeight: FontWeight.w500),
+                          border: InputBorder.none,
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                        ),
+                        onTap: () {
+                          if (textController.text.isNotEmpty) {
+                            textController.selection = TextSelection(
+                              baseOffset: 0,
+                              extentOffset: textController.text.length,
+                            );
+                          }
+                        },
+                        onChanged: (val) {
+                          setState(() {
+                            _isUserTyping = true;
+                            _highlightedIndex = 0;
+                          });
+                          if (val.trim().isEmpty) {
+                            _lastHighlightedOption = null;
+                            widget.onValueChanged(widget.defaultOption);
+                          }
+                        },
+                        onSubmitted: (_) {
+                          _commitSelectionOrClear();
+                          if (widget.nextFocus != null) {
+                            widget.nextFocus!.requestFocus();
+                          }
+                        },
                       ),
-                      onTap: () {
-                        if (textController.text.isNotEmpty) {
-                          textController.selection = TextSelection(
-                            baseOffset: 0,
-                            extentOffset: textController.text.length,
-                          );
-                        }
-                      },
-                      onChanged: (val) {
-                        if (val.trim().isEmpty) {
-                          _lastHighlightedOption = null;
-                          widget.onValueChanged(widget.defaultOption);
-                        }
-                      },
-                      onSubmitted: (_) {
-                        _commitSelectionOrClear();
-                        if (widget.nextFocus != null) {
-                          widget.nextFocus!.requestFocus();
-                        }
-                      },
                     ),
                   ),
                   if (textController.text.isNotEmpty && textController.text != widget.defaultOption)
@@ -240,13 +323,9 @@ class _AppStrictAutocompleteState extends State<AppStrictAutocomplete> {
             );
           },
           optionsViewBuilder: (context, onSelected, options) {
-            final highlightedIndex = AutocompleteHighlightedOption.of(context);
             if (options.isNotEmpty) {
-              if (highlightedIndex >= 0 && highlightedIndex < options.length) {
-                _lastHighlightedOption = options.elementAt(highlightedIndex);
-              } else {
-                _lastHighlightedOption = options.first;
-              }
+              int safeIdx = _highlightedIndex.clamp(0, options.length - 1);
+              _lastHighlightedOption = options.elementAt(safeIdx);
             } else {
               _lastHighlightedOption = null;
             }
@@ -272,9 +351,12 @@ class _AppStrictAutocompleteState extends State<AppStrictAutocomplete> {
                     separatorBuilder: (context, index) => Divider(height: 1, color: Colors.grey.shade100),
                     itemBuilder: (context, index) {
                       final option = options.elementAt(index);
-                      final isHighlighted = (highlightedIndex == index) || (highlightedIndex == -1 && index == 0);
+                      final isHighlighted = (index == _highlightedIndex.clamp(0, options.length - 1));
                       return InkWell(
-                        onTap: () => onSelected(option),
+                        onTap: () {
+                          _highlightedIndex = index;
+                          onSelected(option);
+                        },
                         child: Container(
                           color: isHighlighted ? Colors.blue.shade50 : Colors.white,
                           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),

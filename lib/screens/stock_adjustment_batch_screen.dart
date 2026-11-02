@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import '../providers/pharmacy_provider.dart';
+import '../services/server_config_service.dart';
 import '../utils/app_dialogs.dart';
 import '../widgets/pin_unlock_dialog.dart';
 import '../utils/app_formatters.dart';
@@ -11,6 +12,7 @@ import '../utils/report_pdf_generator.dart';
 import '../utils/printer_service.dart';
 import '../utils/unsaved_handler.dart';
 import '../widgets/app_strict_autocomplete.dart';
+import '../widgets/erp_grid_text_field.dart';
 
 class StockAdjustmentBatchScreen extends StatefulWidget {
   const StockAdjustmentBatchScreen({super.key});
@@ -20,8 +22,60 @@ class StockAdjustmentBatchScreen extends StatefulWidget {
 }
 
 class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen> with AutomaticKeepAliveClientMixin implements UnsavedHandler {
+  double _getGrandTotal() {
+    double total = 0.0;
+    for (var row in _rows) {
+      if (row.selectedBatch != null && row.physicalCtrl.text.isNotEmpty) {
+        int physicalQty = int.tryParse(row.physicalCtrl.text) ?? row.selectedBatch!.stock;
+        int systemStock = row.selectedBatch!.stock;
+        if (_isExistingEntry) systemStock -= row.savedVariance;
+        int variance = physicalQty - systemStock;
+        if (variance != 0) {
+          int pSize = row.selectedBatch!.packSize > 0 ? row.selectedBatch!.packSize : 1;
+          double unitCost = row.selectedBatch!.landingCost / pSize;
+          // Net valuation difference must reflect signed financial impact (+ for surplus, - for shrinkage)
+          total += (variance * unitCost);
+        }
+      }
+    }
+    return total;
+  }
+
+  bool _hasMeaningfulEdits() {
+    if (!_isExistingEntry) return false;
+    if (_originalLoadedAdj == null) return _isDirty;
+
+    if (_reasonCtrl.text.trim().toUpperCase() != _originalLoadedAdj!.reason.trim().toUpperCase()) return true;
+    if (_doneByCtrl.text.trim().toUpperCase() != _originalLoadedAdj!.doneBy.trim().toUpperCase()) return true;
+
+    final origItems = _originalLoadedAdj!.items;
+    final currentValidRows = _rows.where((r) => r.selectedBatch != null && r.physicalCtrl.text.trim().isNotEmpty).toList();
+
+    if (currentValidRows.length != origItems.length) return true;
+
+    for (int i = 0; i < origItems.length; i++) {
+      final orig = origItems[i];
+      final currRow = currentValidRows[i];
+      final currProduct = currRow.selectedBatch!;
+      final currPhysical = int.tryParse(currRow.physicalCtrl.text.trim()) ?? currProduct.stock;
+
+      if (currProduct.id != orig.product.id) return true;
+      if (currProduct.batch.trim().toUpperCase() != orig.product.batch.trim().toUpperCase()) return true;
+      if (currPhysical != orig.qty) return true;
+    }
+
+    return false;
+  }
+
   @override
-  bool hasUnsavedChanges() => _isDirty || (_hasValidItems() && !_isExistingEntry);
+  bool hasUnsavedChanges() {
+    if (_getGrandTotal() <= 0) return false;
+    if (_isExistingEntry) {
+      return _hasMeaningfulEdits();
+    } else {
+      return _hasValidItems();
+    }
+  }
 
   @override
   void showDifferences() {
@@ -34,7 +88,8 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
   final TextEditingController _dateCtrl = TextEditingController();
   final TextEditingController _doneByCtrl = TextEditingController(text: "ADMIN");
   final FocusNode _doneByFocus = FocusNode();
-  final TextEditingController _reasonCtrl = TextEditingController();
+  final TextEditingController _reasonCtrl = TextEditingController(text: "PHYSICAL STOCK VERIFICATION");
+  final FocusNode _reasonFocus = FocusNode();
 
   final FocusNode _globalFocus = FocusNode();
   final ScrollController _scrollController = ScrollController();
@@ -42,6 +97,7 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
   final List<_AdjustmentRow> _rows = [];
 
   bool _isExistingEntry = false;
+  bool _isDeleted = false;
   bool _isLoading = false;
   bool _isDirty = false;
   StockAdjustment? _originalLoadedAdj;
@@ -57,7 +113,7 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
   }
 
   bool _hasValidItems() {
-    if (_isExistingEntry) return _isDirty;
+    if (_isExistingEntry) return _hasMeaningfulEdits();
 
     for (var row in _rows) {
       if (row.selectedBatch != null) {
@@ -70,11 +126,7 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
   }
 
   Future<bool?> _promptDiscardChanges() async {
-    if (!_isExistingEntry) {
-      if (!_hasValidItems()) return true;
-    } else if (!_isDirty) {
-      return true;
-    }
+    if (!hasUnsavedChanges()) return true;
 
     return await showDialog<bool>(
       context: context,
@@ -126,6 +178,7 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
     _doneByCtrl.dispose();
     _doneByFocus.dispose();
     _reasonCtrl.dispose();
+    _reasonFocus.dispose();
     _globalFocus.dispose();
     for (var row in _rows) {
       row.dispose();
@@ -146,8 +199,9 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
     if (mounted) {
       setState(() {
         _isExistingEntry = false;
+        _isDeleted = false;
         _isDirty = false;
-        _entryNoCtrl.text = nextNo;
+        _entryNoCtrl.text = formatSaleDisplayNo(nextNo);
         _dateCtrl.text = DateFormat('dd/MM/yyyy').format(DateTime.now());
         for (var row in _rows) {
           row.dispose();
@@ -173,8 +227,11 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
     final row = _rows[rowIdx];
     if (colIdx == 0) {
       row.productFocus.requestFocus();
-    } else if (colIdx == 1) row.batchFocus.requestFocus();
-    else if (colIdx == 2) row.physicalFocus.requestFocus();
+    } else if (colIdx == 1) {
+      row.batchFocus.requestFocus();
+    } else if (colIdx == 2) {
+      row.physicalFocus.requestFocus();
+    }
   }
 
   void _navigateEntry(String dir, {String? searchNo}) async {
@@ -188,23 +245,25 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
 
     try {
       String targetNo = searchNo ?? _entryNoCtrl.text;
-      final nextNo = await p.getNextAdjustmentNo();
-      if (targetNo == nextNo && (dir == 'prev' || dir == 'last')) {
-        dir = 'last';
-      }
-
       final data = await p.navigateInvoice(targetNo, dir, isAdjustment: true);
 
       if (data != null) {
-        _loadAdjustmentData(data['entry_no'].toString());
+        if (data['is_blank'] == true) {
+          _resetPage();
+          String cleanNo = data['entry_no'].toString();
+          _entryNoCtrl.text = formatSaleDisplayNo(cleanNo);
+          setState(() {});
+        } else {
+          _loadAdjustmentData(data['entry_no'].toString(), data: data);
+        }
       } else {
         if (dir == 'next') {
-          _isExistingEntry ? _resetPage() : _showDialog("Navigation", "NO MORE RECORDS TO SHOW");
+          _showDialog("Navigation Limit", "MAX ENTRY LIMIT REACHED");
         } else if (dir == 'prev') {
-          _showDialog("Navigation", "FIRST RECORD REACHED");
+          _showDialog("Navigation Limit", "FIRST RECORD REACHED (Entry #1)");
         } else if (dir == 'find') {
           _showDialog("Not Found", "Entry $targetNo not found.");
-          _entryNoCtrl.text = _isExistingEntry ? _entryNoCtrl.text : await p.getNextAdjustmentNo();
+          _entryNoCtrl.text = _isExistingEntry ? _entryNoCtrl.text : formatSaleDisplayNo(await p.getNextAdjustmentNo());
         }
       }
     } catch (e) {
@@ -214,54 +273,75 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
     }
   }
 
-  void _loadAdjustmentData(String entryNo) {
+  void _loadAdjustmentData(String entryNo, {Map<String, dynamic>? data}) async {
     final provider = Provider.of<PharmacyProvider>(context, listen: false);
 
     try {
-      final adj = provider.adjustments.firstWhere((a) => a.entryNo == entryNo);
+      final dbData = data ?? await provider.navigateInvoice(entryNo, 'find', isAdjustment: true);
+      final adj = provider.adjustments.cast<StockAdjustment?>().firstWhere(
+        (a) => a?.entryNo == entryNo,
+        orElse: () => null,
+      );
+
+      bool isDel = false;
+      if (dbData != null) {
+        isDel = (dbData['is_deleted'] == 1 || dbData['is_deleted'] == true || dbData['is_deleted'] == '1');
+      } else if (adj != null) {
+        isDel = adj.isDeleted;
+      }
 
       setState(() {
         _isExistingEntry = true;
+        _isDeleted = isDel;
         _isDirty = false;
-        _entryNoCtrl.text = adj.entryNo;
-        _dateCtrl.text = DateFormat('dd/MM/yyyy').format(adj.date);
-        _doneByCtrl.text = adj.doneBy;
-        _reasonCtrl.text = adj.reason;
+        _entryNoCtrl.text = formatSaleDisplayNo(dbData != null ? (dbData['entry_no']?.toString() ?? entryNo) : (adj?.entryNo ?? entryNo));
+        if (dbData != null) {
+          _dateCtrl.text = DateFormat('dd/MM/yyyy').format(DateTime.tryParse(dbData['date']?.toString() ?? '') ?? DateTime.now());
+          _doneByCtrl.text = dbData['done_by']?.toString() ?? '';
+          _reasonCtrl.text = dbData['reason']?.toString() ?? '';
+        } else if (adj != null) {
+          _dateCtrl.text = DateFormat('dd/MM/yyyy').format(adj.date);
+          _doneByCtrl.text = adj.doneBy;
+          _reasonCtrl.text = adj.reason;
+        }
 
         for (var row in _rows) {
           row.dispose();
         }
         _rows.clear();
 
-        for (var item in adj.items) {
-          final row = _AdjustmentRow();
-          row.selectedBatch = item.product;
-          row.selectedProduct = item.product; 
-          row.productCtrl.text = item.product.name;
-          row.batchCtrl.text = cleanBatch(item.product.batch);
-          row.expiryCtrl.text = item.product.expiry;
-          // When loading an existing entry, physical count is (system stock at that time + variance)
-          // Since p.stock is the current stock (already includes variance if this was the last adjustment),
-          // we can just use p.stock as the physical count, and (p.stock - variance) as the old system stock.
-          row.physicalCtrl.text = item.product.stock.toString();
-          row.savedVariance = item.qty;
-          _rows.add(row);
+        if (adj != null && adj.items.isNotEmpty) {
+          for (var item in adj.items) {
+            final row = _AdjustmentRow();
+            row.selectedBatch = item.product;
+            row.selectedProduct = item.product; 
+            row.productCtrl.text = item.product.name;
+            row.batchCtrl.text = cleanBatch(item.product.batch);
+            row.expiryCtrl.text = item.product.expiry;
+            row.physicalCtrl.text = item.product.stock.toString();
+            row.savedVariance = item.qty;
+            _rows.add(row);
+          }
         }
-        _addNewRow();
+        if (!_isDeleted) {
+          _addNewRow();
+        }
 
-        _originalLoadedAdj = StockAdjustment(
-          entryNo: adj.entryNo,
-          date: adj.date,
-          doneBy: adj.doneBy,
-          reason: adj.reason,
-          items: adj.items.map((item) => StockAdjustmentItem(
-            product: item.product.clone(),
-            qty: item.qty,
-            purchaseRate: item.purchaseRate,
-            total: item.total,
-          )).toList(),
-          grandTotal: adj.grandTotal,
-        );
+        if (adj != null) {
+          _originalLoadedAdj = StockAdjustment(
+            entryNo: adj.entryNo,
+            date: adj.date,
+            doneBy: adj.doneBy,
+            reason: adj.reason,
+            items: adj.items.map((item) => StockAdjustmentItem(
+              product: item.product.clone(),
+              qty: item.qty,
+              purchaseRate: item.purchaseRate,
+              total: item.total,
+            )).toList(),
+            grandTotal: adj.grandTotal,
+          );
+        }
       });
     } catch (e) {
       _showDialog("Error", "Could not load data: $e");
@@ -391,213 +471,180 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
     return diffSpans;
   }
 
-  void _saveAdjustments({bool isEdit = false}) async {
-    FocusScope.of(context).unfocus();
-    final provider = Provider.of<PharmacyProvider>(context, listen: false);
+  bool _isSaving = false;
+  bool _isDeleting = false;
 
-    if (provider.securityToggles['require_pin_stock_adjustments'] == true) {
-      bool isUnlocked = await PinUnlockDialog.show(
+  void _saveAdjustments({bool isEdit = false}) async {
+    if (_isSaving || _isLoading) return;
+    _isSaving = true;
+    if (mounted) setState(() {});
+    FocusScope.of(context).unfocus();
+
+    try {
+      final provider = Provider.of<PharmacyProvider>(context, listen: false);
+
+      if (provider.securityToggles['require_pin_stock_adjustments'] == true) {
+        _isSaving = false;
+        if (mounted) setState(() {});
+        bool isUnlocked = await PinUnlockDialog.show(
           context,
           provider,
           title: "Authorization Required",
-          message: "Enter Master PIN to save stock adjustments."
-      ) ?? false;
+          message: "Enter Master PIN to save stock adjustments.",
+        );
+        if (!mounted) return;
+        if (!isUnlocked) return;
+        _isSaving = true;
+        if (mounted) setState(() {});
+      }
+
       if (!mounted) return;
-      if (!isUnlocked) return;
-    }
 
-    if (!mounted) return;
-    final currentCtx = context;
+      List<StockAdjustmentItem> adjustmentItems = [];
 
-    List<StockAdjustmentItem> adjustmentItems = [];
-
-    for (var row in _rows) {
-      if (row.selectedBatch != null && row.physicalCtrl.text.isNotEmpty) {
-        // Strict Expiry Validator Check
-        String exp = row.expiryCtrl.text.trim();
-        if (exp.isNotEmpty && exp != "--/--") {
-          final parts = exp.split(RegExp(r'[-/]'));
-          if (parts.length == 2) {
-            int? month = int.tryParse(parts[0]);
-            int? year = int.tryParse(parts[1]);
-            if (month == null || month < 1 || month > 12 || year == null) {
-              _showDialog("Invalid Expiry", "Invalid expiry month ($exp) for '${row.selectedBatch!.name}'. Must be between 01 and 12.");
+      for (var row in _rows) {
+        if (row.selectedBatch != null && row.physicalCtrl.text.isNotEmpty) {
+          String exp = row.expiryCtrl.text.trim();
+          if (exp.isNotEmpty && exp != "--/--") {
+            final parts = exp.split(RegExp(r'[-/]'));
+            if (parts.length == 2) {
+              int? month = int.tryParse(parts[0]);
+              int? year = int.tryParse(parts[1]);
+              if (month == null || month < 1 || month > 12 || year == null) {
+                _showDialog("Invalid Expiry", "Invalid expiry month ($exp) for '${row.selectedBatch!.name}'. Must be between 01 and 12.");
+                row.expiryFocus.requestFocus();
+                return;
+              }
+            } else {
+              _showDialog("Invalid Expiry", "Expiry must follow MM/YY format for '${row.selectedBatch!.name}'.");
               row.expiryFocus.requestFocus();
               return;
             }
-          } else {
-            _showDialog("Invalid Expiry", "Expiry must follow MM/YY format for '${row.selectedBatch!.name}'.");
-            row.expiryFocus.requestFocus();
-            return;
+          }
+
+          int physicalQty = int.tryParse(row.physicalCtrl.text) ?? row.selectedBatch!.stock;
+          int systemStock = row.selectedBatch!.stock;
+          if (isEdit) {
+            systemStock -= row.savedVariance;
+          }
+
+          int variance = physicalQty - systemStock;
+
+          if (variance != 0) {
+            int pSize = row.selectedBatch!.packSize > 0 ? row.selectedBatch!.packSize : 1;
+            double unitCost = row.selectedBatch!.landingCost / pSize;
+
+            adjustmentItems.add(StockAdjustmentItem(
+              product: row.selectedBatch!,
+              qty: variance,
+              purchaseRate: row.selectedBatch!.landingCost,
+              total: variance * unitCost,
+            ));
           }
         }
+      }
 
-        int physicalQty = int.tryParse(row.physicalCtrl.text) ?? row.selectedBatch!.stock;
-        
-        // Calculate variance relative to the stock BEFORE this adjustment
-        int systemStock = row.selectedBatch!.stock;
-        if (isEdit) {
-          systemStock -= row.savedVariance;
-        }
-        
-        int variance = physicalQty - systemStock;
+      if (adjustmentItems.isEmpty) {
+        _showDialog("Empty", "No variance detected. Physical stock matches system stock exactly.");
+        return;
+      }
 
-        if (variance != 0) {
-          int pSize = row.selectedBatch!.packSize > 0 ? row.selectedBatch!.packSize : 1;
-          double unitCost = row.selectedBatch!.landingCost / pSize;
-          
-          adjustmentItems.add(StockAdjustmentItem(
-            product: row.selectedBatch!,
-            qty: variance,
-            purchaseRate: row.selectedBatch!.landingCost,
-            total: variance * unitCost,
-          ));
+      bool hasError = false;
+      for (var row in _rows) {
+        row.hasProductError = false;
+        row.hasBatchError = false;
+        row.hasPhysicalError = false;
+
+        if (row.productCtrl.text.isNotEmpty) {
+          if (row.selectedBatch == null || row.batchCtrl.text.isEmpty) {
+            row.hasBatchError = true;
+            hasError = true;
+          }
+          if (row.physicalCtrl.text.isEmpty) {
+            row.hasPhysicalError = true;
+            hasError = true;
+          }
         }
       }
-    }
 
-    if (adjustmentItems.isEmpty) {
-      _showDialog("Empty", "No variance detected. Physical stock matches system stock exactly.");
-      return;
-    }
-
-    bool hasError = false;
-    for (var row in _rows) {
-      row.hasProductError = false;
-      row.hasBatchError = false;
-      row.hasPhysicalError = false;
-
-      if (row.productCtrl.text.isNotEmpty) {
-        if (row.selectedBatch == null || row.batchCtrl.text.isEmpty) {
-          row.hasBatchError = true;
-          hasError = true;
-        }
-        if (row.physicalCtrl.text.isEmpty) {
-          row.hasPhysicalError = true;
-          hasError = true;
-        }
+      if (hasError) {
+        setState(() {});
+        _showDialog("Validation Error", "Please fill in the missing fields highlighted in red.");
+        return;
       }
-    }
-    
-    if (hasError) {
-      setState(() {}); // Trigger red paints
-      _showDialog("Validation Error", "Please fill in the missing fields highlighted in red.");
-      return;
-    }
 
-    if (!mounted) return;
+      if (!mounted) return;
 
-    if (isEdit || _isExistingEntry) {
-      final diffSpans = _generateDiffSpans();
-
-      if (diffSpans.isEmpty) {
-        if (!currentCtx.mounted) return;
-        await showDialog(
-          context: currentCtx,
+      if (isEdit || _isExistingEntry) {
+        final confirmed = await showDialog<bool>(
+          context: context,
+          barrierDismissible: false,
           builder: (ctx) => AlertDialog(
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
             title: const Row(
               children: [
-                Icon(Icons.info_outline_rounded, color: Colors.blue, size: 26),
-                SizedBox(width: 8),
-                Text("No Changes Found", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                Icon(Icons.save_rounded, color: Colors.blue, size: 28),
+                SizedBox(width: 10),
+                Text("Update Stock Adjustment", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
               ],
             ),
             content: Text(
-              "No modifications were detected on Adjustment #${_entryNoCtrl.text}.\nThere are no changes to save.",
-              style: const TextStyle(fontSize: 13, height: 1.4),
+              "Are you sure you want to update Adjustment #${_entryNoCtrl.text}?\nAll modifications will be saved to your stock.",
+              style: const TextStyle(fontSize: 14, height: 1.4),
             ),
             actions: [
+              OutlinedButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text("Cancel"),
+              ),
               ElevatedButton(
-                onPressed: () => Navigator.pop(ctx),
-                style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
-                child: const Text("OK", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                onPressed: () => Navigator.pop(ctx, true),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.blue.shade800,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                ),
+                child: const Text("Update Adjustment", style: TextStyle(fontWeight: FontWeight.bold)),
               ),
             ],
           ),
         );
+        if (!mounted) return;
+        if (confirmed != true) return;
+      }
+
+      if (ServerConfigService.instance.isPureCloud && !ServerConfigService.instance.isConnected) {
+        if (!mounted) return;
+        AppDialogs.showFastDialog(
+          context: context,
+          title: "Pure Cloud Live Disconnected",
+          content: "Cannot save stock adjustment while disconnected from Supabase Cloud Server.\n\nPlease check your internet connection.",
+        );
         return;
       }
 
-      if (!currentCtx.mounted) return;
-      final confirmed = await showDialog<bool>(
-        context: currentCtx,
-        barrierDismissible: false,
-        builder: (ctx) => AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-          title: Row(
-            children: [
-              const Icon(Icons.edit_note_rounded, color: Colors.orange, size: 28),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  "Re-write Adjustment #${_entryNoCtrl.text}?",
-                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-                ),
+      String targetEntryNo = isEdit ? _entryNoCtrl.text : "";
+      if (!isEdit) {
+        final rawNo = cleanEntryNo(_entryNoCtrl.text);
+        final resolvedNo = await provider.resolveGuaranteedNextEntryNo('stock_adjustments', rawNo);
+        if (resolvedNo != rawNo && rawNo.isNotEmpty) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text("Adjustment #$rawNo already taken. Automatically saved as Adjustment #$resolvedNo"),
+                backgroundColor: Colors.blueAccent,
+                duration: const Duration(seconds: 4),
               ),
-            ],
-          ),
-          content: SizedBox(
-            width: 480,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  "The following changes will be applied to this stock adjustment:",
-                  style: TextStyle(fontSize: 13, color: Colors.grey, fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 12),
-                ConstrainedBox(
-                  constraints: const BoxConstraints(maxHeight: 250),
-                  child: Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: Colors.grey.shade50,
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Colors.grey.shade300),
-                    ),
-                    child: SingleChildScrollView(
-                      child: SelectableText.rich(
-                        TextSpan(children: diffSpans),
-                      ),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 14),
-                Text(
-                  "Are you sure you want to overwrite Adjustment #${_entryNoCtrl.text}? Stock will be updated accordingly.",
-                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: Colors.black87),
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text("NO", style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold)),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.orange.shade800,
-                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-              ),
-              child: const Text("YES, RE-WRITE", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-            ),
-          ],
-        ),
-      );
-      if (confirmed != true) return;
-    }
+            );
+            _entryNoCtrl.text = formatSaleDisplayNo(resolvedNo);
+          }
+        }
+        targetEntryNo = resolvedNo;
+      }
 
-    final String finalEntryNo = isEdit ? _entryNoCtrl.text : "";
-
-    setState(() => _isLoading = true);
-    try {
+      setState(() => _isLoading = true);
       final assignedNo = await provider.saveStockAdjustment(StockAdjustment(
-        entryNo: finalEntryNo,
+        entryNo: targetEntryNo,
         date: DateFormat('dd/MM/yyyy').parse(_dateCtrl.text),
         doneBy: _doneByCtrl.text,
         reason: _reasonCtrl.text.isEmpty ? "PHYSICAL STOCK VERIFICATION" : _reasonCtrl.text,
@@ -607,8 +654,9 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            backgroundColor: Colors.green,
-            content: Text(isEdit ? "Adjustment #$assignedNo Updated!" : "Adjustment #$assignedNo Saved!")));
+          backgroundColor: Colors.green,
+          content: Text(isEdit ? "Adjustment #$assignedNo Updated!" : "Adjustment #$assignedNo Saved!"),
+        ));
         _isDirty = false;
         _resetPage();
       }
@@ -617,7 +665,15 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
         _showDialog("Error", "Failed to save: $e");
       }
     } finally {
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted) {
+        setState(() {
+          _isSaving = false;
+          _isLoading = false;
+        });
+      } else {
+        _isSaving = false;
+        _isLoading = false;
+      }
     }
   }
 
@@ -665,86 +721,121 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
   }
 
   Widget _buildToolbar() {
-    bool canSave = !_isExistingEntry;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      decoration: BoxDecoration(color: Colors.white, border: Border(bottom: BorderSide(color: Colors.grey.shade300))),
-      child: Row(
-        children: [
-          const Text("PHYSICAL STOCK ADJUSTMENT", style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16, color: Colors.black87)),
-          const Spacer(),
-          _actionBtn(Icons.add_circle, "New (F2)", Colors.blue, onTap: _resetPage),
-          _actionBtn(
-              Icons.check_circle,
-              "Save (F10)",
-              canSave ? Colors.green : Colors.grey.shade400,
-              textColor: canSave ? Colors.black87 : Colors.grey.shade400,
-              onTap: canSave ? () => _saveAdjustments(isEdit: false) : () {}
+    bool canSave = !_isExistingEntry && !_isDeleted;
+    bool canEdit = _isExistingEntry && !_isDeleted;
+    bool canDelete = _isExistingEntry && !_isDeleted;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (_isDeleted)
+          Container(
+            width: double.infinity,
+            color: Colors.red.shade900,
+            padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 16),
+            child: Text(
+              "🗑️ DELETED ENTRY: Stock Adjustment #${_entryNoCtrl.text} is marked as DELETED and is Read-Only.",
+              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
+              textAlign: TextAlign.center,
+            ),
           ),
-          _actionBtn(
-              Icons.edit,
-              "Edit",
-              _isExistingEntry ? Colors.orange : Colors.grey.shade400,
-              textColor: _isExistingEntry ? Colors.black87 : Colors.grey.shade400,
-              onTap: _isExistingEntry ? () => _saveAdjustments(isEdit: true) : () {
-                _showDialog("Locked", "This is a new entry. Click 'Save' instead.");
-              }
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          decoration: BoxDecoration(color: Colors.white, border: Border(bottom: BorderSide(color: Colors.grey.shade300))),
+          child: Row(
+            children: [
+              const Text("PHYSICAL STOCK ADJUSTMENT", style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16, color: Colors.black87)),
+              const Spacer(),
+              _actionBtn(Icons.add_circle, "New (F2)", Colors.blue, onTap: _resetPage),
+              _actionBtn(
+                  Icons.check_circle,
+                  "Save (F10)",
+                  canSave ? Colors.green : Colors.grey.shade400,
+                  textColor: canSave ? Colors.black87 : Colors.grey.shade400,
+                  onTap: canSave ? () => _saveAdjustments(isEdit: false) : () {
+                    if (_isDeleted) _showDialog("Read Only", "This entry is deleted and cannot be edited.");
+                  }
+              ),
+              _actionBtn(
+                  Icons.edit,
+                  "Edit",
+                  canEdit ? Colors.orange : Colors.grey.shade400,
+                  textColor: canEdit ? Colors.black87 : Colors.grey.shade400,
+                  onTap: canEdit ? () => _saveAdjustments(isEdit: true) : () {
+                    if (_isDeleted) {
+                      _showDialog("Read Only", "This entry is deleted and cannot be edited.");
+                    } else {
+                      _showDialog("Locked", "This is a new entry. Click 'Save' instead.");
+                    }
+                  }
+              ),
+              _actionBtn(
+                  Icons.delete,
+                  "Delete",
+                  canDelete ? Colors.red : Colors.grey.shade400,
+                  textColor: canDelete ? Colors.black87 : Colors.grey.shade400,
+                  onTap: canDelete ? () => _confirmDeleteCurrentEntry() : () {
+                    if (_isDeleted) {
+                      _showDialog("Read Only", "This entry is already deleted.");
+                    } else {
+                      _showDialog("Delete", "No saved entry loaded to delete.");
+                    }
+                  }
+              ),
+              _actionBtn(Icons.print, "Print", Colors.blueGrey, onTap: _printAdjustmentReport),
+            ],
           ),
-          _actionBtn(
-              Icons.delete,
-              "Delete",
-              _isExistingEntry ? Colors.red : Colors.grey.shade400,
-              textColor: _isExistingEntry ? Colors.black87 : Colors.grey.shade400,
-              onTap: _isExistingEntry ? () => _confirmDeleteCurrentEntry() : () {
-                _showDialog("Delete", "No saved entry loaded to delete.");
-              }
-          ),
-          _actionBtn(Icons.print, "Print", Colors.blueGrey, onTap: _printAdjustmentReport),
-        ],
-      ),
+        ),
+      ],
     );
   }
 
-  void _confirmDeleteCurrentEntry() {
-    final entryNo = _entryNoCtrl.text.trim();
-    if (entryNo.isEmpty || !_isExistingEntry) {
-      _showDialog("Delete", "No saved entry loaded to delete.");
-      return;
-    }
+  void _confirmDeleteCurrentEntry() async {
+    if (_isDeleting || _isLoading) return;
+    _isDeleting = true;
 
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text("Confirm Delete"),
-        content: Text("Are you sure you want to delete stock adjustment #$entryNo? This will revert the physical stock changes."),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("CANCEL")),
-          ElevatedButton(
-            onPressed: () async {
-              Navigator.pop(ctx);
-              setState(() => _isLoading = true);
-              try {
-                await Provider.of<PharmacyProvider>(context, listen: false).deleteStockAdjustment(entryNo);
-                if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text("Adjustment deleted and inventory stock restored!"))
-                  );
-                  _resetPage();
+    try {
+      final entryNo = _entryNoCtrl.text.trim();
+      if (entryNo.isEmpty || !_isExistingEntry) {
+        _showDialog("Delete", "No saved entry loaded to delete.");
+        return;
+      }
+
+      await showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text("Confirm Delete"),
+          content: Text("Are you sure you want to delete stock adjustment #$entryNo? This will revert the physical stock changes."),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("CANCEL")),
+            ElevatedButton(
+              onPressed: () async {
+                Navigator.pop(ctx);
+                setState(() => _isLoading = true);
+                try {
+                  await Provider.of<PharmacyProvider>(context, listen: false).deleteStockAdjustment(entryNo);
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text("Adjustment deleted and inventory stock restored!"))
+                    );
+                    _resetPage();
+                  }
+                } catch (e) {
+                  if (mounted) {
+                    _showDialog("Delete Error", e.toString());
+                  }
+                } finally {
+                  if (mounted) setState(() => _isLoading = false);
                 }
-              } catch (e) {
-                if (mounted) {
-                  _showDialog("Delete Error", e.toString());
-                }
-              } finally {
-                if (mounted) setState(() => _isLoading = false);
-              }
-            },
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-            child: const Text("DELETE", style: TextStyle(color: Colors.white)),
-          ),
-        ],
-      ),
-    );
+              },
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+              child: const Text("DELETE", style: TextStyle(color: Colors.white)),
+            ),
+          ],
+        ),
+      );
+    } finally {
+      _isDeleting = false;
+    }
   }
 
   void _printAdjustmentReport() async {
@@ -845,13 +936,43 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
               const Text("Done By:", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
               const SizedBox(width: 8),
               SizedBox(
-                width: 150,
+                width: 130,
                 height: 28,
                 child: AppStrictAutocomplete(
                   controller: _doneByCtrl,
                   focusNode: _doneByFocus,
                   getItems: () => Provider.of<PharmacyProvider>(context, listen: false).doneByNames,
                   defaultOption: "ADMIN",
+                  isStrict: false,
+                  height: 28,
+                  onValueChanged: (val) {
+                    _markDirty();
+                  },
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(width: 20),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text("Reason:", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+              const SizedBox(width: 8),
+              SizedBox(
+                width: 220,
+                height: 28,
+                child: AppStrictAutocomplete(
+                  controller: _reasonCtrl,
+                  focusNode: _reasonFocus,
+                  getItems: () => [
+                    "PHYSICAL STOCK VERIFICATION",
+                    "EXPIRED STOCK REMOVAL",
+                    "DAMAGE / BREAKAGE",
+                    "SUPPLIER PACKING CORRECTION",
+                    "THEFT / LOSS",
+                    "ANNUAL AUDIT RECONCILIATION",
+                  ],
+                  defaultOption: "PHYSICAL STOCK VERIFICATION",
                   isStrict: false,
                   height: 28,
                   onValueChanged: (val) {
@@ -930,12 +1051,92 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
     );
   }
 
+  double _getExpiryMonths(String expStr) {
+    if (expStr.isEmpty) return 999.0;
+    final parts = expStr.split('/');
+    if (parts.length != 2) return 999.0;
+    final m = int.tryParse(parts[0]);
+    final y = int.tryParse(parts[1]);
+    if (m == null || y == null) return 999.0;
+    final fullYear = y < 100 ? 2000 + y : y;
+    final now = DateTime.now();
+    final expDate = DateTime(fullYear, m, 1);
+    final diffMonths = (expDate.year - now.year) * 12 + (expDate.month - now.month);
+    return diffMonths.toDouble();
+  }
+
+  ({Color bg, Color text})? _evalStockAdjustmentRuleStyle(PharmacyProvider provider, _AdjustmentRow row, String field) {
+    final rules = provider.getValidationRules("STOCK_ADJUSTMENT");
+    if (rules.isEmpty) return null;
+
+    final p = row.selectedProduct;
+    if (p == null) return null;
+
+    for (var rule in rules) {
+      if (!rule.enabled) continue;
+
+      bool appliesToCol = false;
+      if (rule.fieldA == "Expiry (Months)" && field == "expiry") appliesToCol = true;
+      if (rule.fieldA == "Qty" && field == "qty") appliesToCol = true;
+
+      if (!appliesToCol) continue;
+
+      double valA = 0.0;
+      switch (rule.fieldA) {
+        case "Expiry (Months)":
+          valA = _getExpiryMonths(row.expiryCtrl.text.isNotEmpty ? row.expiryCtrl.text : (row.selectedBatch?.expiry ?? p.expiry));
+          break;
+        case "Qty":
+          valA = double.tryParse(row.physicalCtrl.text) ?? 0.0;
+          break;
+        default:
+          valA = 0.0;
+      }
+
+      if (valA <= 0 && rule.fieldA != "Expiry (Months)") continue;
+
+      double valB = double.tryParse(rule.fieldB) ?? 0.0;
+
+      bool isMatch = false;
+      switch (rule.operator) {
+        case ">=":
+          isMatch = valA >= valB;
+          break;
+        case ">":
+          isMatch = valA > valB;
+          break;
+        case "<=":
+          isMatch = valA <= valB && valA > 0;
+          break;
+        case "<":
+          isMatch = valA < valB && valA > 0;
+          break;
+        case "=":
+          isMatch = (valA - valB).abs() < 0.001;
+          break;
+        case "!=":
+          isMatch = (valA - valB).abs() >= 0.001;
+          break;
+      }
+
+      if (isMatch) {
+        return (bg: Color(rule.bgColorHex), text: Color(rule.textColorHex));
+      }
+    }
+
+    return null;
+  }
+
   Widget _buildRow(int index, _AdjustmentRow row) {
     // PART 2 FIX: Wrapped in AnimatedBuilder to stop full screen lag when typing
     return AnimatedBuilder(
       animation: row.physicalCtrl,
       builder: (context, child) {
         final p = row.selectedBatch;
+        final provider = Provider.of<PharmacyProvider>(context, listen: false);
+
+        final expStyle = _evalStockAdjustmentRuleStyle(provider, row, "expiry");
+        final qtyStyle = _evalStockAdjustmentRuleStyle(provider, row, "qty");
         
         int systemStock = (p?.stock ?? 0);
         if (_isExistingEntry) {
@@ -1001,14 +1202,16 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
               Expanded(
                 flex: 10,
                 child: Container(
-                  decoration: BoxDecoration(border: Border(right: BorderSide(color: Colors.grey.shade300))),
-                  child: TextField(
+                  decoration: BoxDecoration(color: expStyle?.bg, border: Border(right: BorderSide(color: Colors.grey.shade300))),
+                  child: ErpGridTextField(
                     controller: row.expiryCtrl,
                     focusNode: row.expiryFocus,
                     textAlign: TextAlign.center,
-                    style: const TextStyle(fontSize: 12),
+                    style: TextStyle(fontSize: 12, color: expStyle?.text ?? Colors.black),
                     decoration: const InputDecoration(isDense: true, border: InputBorder.none, contentPadding: EdgeInsets.symmetric(vertical: 8)),
                     inputFormatters: [ExpiryFormatter()],
+                    onNavigatePrevious: () => row.batchFocus.requestFocus(),
+                    onNavigateNext: () => row.physicalFocus.requestFocus(),
                     onChanged: (v) {
                        if (row.selectedBatch != null) row.selectedBatch!.expiry = v;
                     },
@@ -1024,22 +1227,30 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
                 flex: 10,
                 child: Container(
                   padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-                  child: TextField(
+                  child: ErpGridTextField(
                     controller: row.physicalCtrl,
                     focusNode: row.physicalFocus,
                     textAlign: TextAlign.center,
                     keyboardType: TextInputType.number,
                     inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: qtyStyle?.text ?? Colors.black),
                     decoration: InputDecoration(
                       isDense: true,
                       hintText: "Qty",
                       hintStyle: const TextStyle(fontSize: 10, color: Colors.grey),
                       border: const OutlineInputBorder(),
                       contentPadding: const EdgeInsets.symmetric(vertical: 6),
-                      fillColor: row.hasPhysicalError ? Colors.red.shade100 : Colors.yellow.shade50,
+                      fillColor: row.hasPhysicalError ? Colors.red.shade100 : (qtyStyle?.bg ?? Colors.yellow.shade50),
                       filled: true,
                     ),
+                    onNavigatePrevious: () => row.expiryFocus.requestFocus(),
+                    onNavigateNext: () {
+                      if (index < _rows.length - 1) {
+                        _rows[index + 1].productFocus.requestFocus();
+                      } else {
+                        _addNewRow();
+                      }
+                    },
                     onChanged: (_) {
                       _markDirty();
                       setState(() {});
@@ -1161,7 +1372,7 @@ class _AdjustmentRow {
   final FocusNode batchFocus = FocusNode();
   final TextEditingController physicalCtrl = TextEditingController();
   final FocusNode physicalFocus = FocusNode();
-  final TextEditingController expiryCtrl = TextEditingController();
+  final TextEditingController expiryCtrl = ExpiryTextEditingController();
   final FocusNode expiryFocus = FocusNode();
   
   Product? selectedProduct;
@@ -1213,14 +1424,14 @@ class _Hdr extends StatelessWidget {
 }
 
 class _Cell extends StatelessWidget {
-  final String text; final double? width; final int? flex; final TextAlign align; final Color? color; final FontWeight fontWeight;
-  const _Cell(this.text, {this.width, this.flex, this.align = TextAlign.left, this.color, this.fontWeight = FontWeight.w600});
+  final String text; final double? width; final int? flex; final TextAlign align; final Color? color; final FontWeight fontWeight; final Color? bg;
+  const _Cell(this.text, {this.width, this.flex, this.align = TextAlign.left, this.color, this.fontWeight = FontWeight.w600, this.bg});
   @override Widget build(BuildContext context) {
     Widget child = Container(
       width: width, 
       padding: const EdgeInsets.symmetric(horizontal: 8), 
       alignment: align == TextAlign.left ? Alignment.centerLeft : (align == TextAlign.right ? Alignment.centerRight : Alignment.center), 
-      decoration: BoxDecoration(border: Border(right: BorderSide(color: Colors.grey.shade200))), 
+      decoration: BoxDecoration(color: bg, border: Border(right: BorderSide(color: Colors.grey.shade200))), 
       child: Text(text, style: TextStyle(fontSize: 11, color: color ?? Colors.black87, fontWeight: fontWeight), overflow: TextOverflow.ellipsis)
     );
     return flex != null ? Expanded(flex: flex!, child: child) : child;
@@ -1312,7 +1523,7 @@ class _ProductSearchCellState extends State<_ProductSearchCell> {
     return OverlayEntry(
       builder: (context) => StatefulBuilder(
         builder: (context, setPopupState) => Positioned(
-          width: 850,
+          width: 950,
           child: CompositedTransformFollower(
             link: _layerLink, showWhenUnlinked: false, offset: Offset(0, size.height),
             // ---> THE FIX: TapRegion instantly kills the overlay if you click outside! <---
@@ -1331,7 +1542,7 @@ class _ProductSearchCellState extends State<_ProductSearchCell> {
                         color: const Color(0xFF0D47A1),
                         child: const Row(
                           children: [
-                            _HdrSmall("Name", flex: 4),
+                            _HdrSmall("Name", flex: 8),
                             _HdrSmall("Stock", flex: 1, align: TextAlign.right),
                             _HdrSmall("Packin", flex: 1, align: TextAlign.right),
                             _HdrSmall("MRP", flex: 1, align: TextAlign.right),
@@ -1360,7 +1571,7 @@ class _ProductSearchCellState extends State<_ProductSearchCell> {
                                 ),
                                 child: Row(
                                   children: [
-                                    _CellSmall(p.name, flex: 4, fontWeight: FontWeight.bold),
+                                    _CellSmall(p.name, flex: 8, fontWeight: FontWeight.bold),
                                     _CellSmall(p.stock.toString(), flex: 1, align: TextAlign.right, color: Colors.blue.shade700, fontWeight: FontWeight.bold),
                                     _CellSmall(p.packSize.toString(), flex: 1, align: TextAlign.right),
                                     _CellSmall(p.mrp.toStringAsFixed(2), flex: 1, align: TextAlign.right),
@@ -1396,11 +1607,20 @@ class _ProductSearchCellState extends State<_ProductSearchCell> {
           onKeyEvent: (node, event) {
             if (event is KeyDownEvent || event is KeyRepeatEvent) {
               if (event.logicalKey == LogicalKeyboardKey.arrowDown && _overlayEntry != null) {
-                setState(() { _selectedIndex = (_selectedIndex + 1) % _results.length; _overlayEntry?.markNeedsBuild(); });
+                if (_results.isNotEmpty) {
+                  setState(() { _selectedIndex = (_selectedIndex + 1).clamp(0, _results.length - 1); _overlayEntry?.markNeedsBuild(); });
+                }
                 return KeyEventResult.handled;
               } else if (event.logicalKey == LogicalKeyboardKey.arrowUp && _overlayEntry != null) {
-                setState(() { _selectedIndex = (_selectedIndex - 1 + _results.length) % _results.length; _overlayEntry?.markNeedsBuild(); });
+                if (_results.isNotEmpty) {
+                  setState(() { _selectedIndex = (_selectedIndex - 1).clamp(0, _results.length - 1); _overlayEntry?.markNeedsBuild(); });
+                }
                 return KeyEventResult.handled;
+              } else if ((event.logicalKey == LogicalKeyboardKey.enter || event.logicalKey == LogicalKeyboardKey.numpadEnter) && _overlayEntry != null) {
+                if (_results.isNotEmpty) {
+                  _onProductChosen(_results[_selectedIndex]);
+                  return KeyEventResult.handled;
+                }
               } else if (event.logicalKey == LogicalKeyboardKey.escape) {
                 _hideOverlay();
                 return KeyEventResult.handled;
@@ -1410,6 +1630,10 @@ class _ProductSearchCellState extends State<_ProductSearchCell> {
                 if (index != null && index != -1) state?._moveFocus(index, 1);
                 return KeyEventResult.handled;
               } else if (event.logicalKey == LogicalKeyboardKey.arrowDown && _overlayEntry == null) {
+                _triggerProductSearch();
+                if (_results.isNotEmpty) {
+                  return KeyEventResult.handled;
+                }
                 final state = context.findAncestorStateOfType<_StockAdjustmentBatchScreenState>();
                 final index = state?._rows.indexWhere((r) => r.productFocus == widget.focusNode);
                 if (index != null && index != -1) state?._moveFocus(index + 1, 0);
@@ -1660,10 +1884,14 @@ class _BatchSearchCellState extends State<_BatchSearchCell> {
           onKeyEvent: (node, event) {
             if (event is KeyDownEvent || event is KeyRepeatEvent) {
               if (event.logicalKey == LogicalKeyboardKey.arrowDown && _overlayEntry != null) {
-                setState(() { _selectedIndex = (_selectedIndex + 1) % _results.length; _overlayEntry?.markNeedsBuild(); });
+                if (_results.isNotEmpty) {
+                  setState(() { _selectedIndex = (_selectedIndex + 1).clamp(0, _results.length - 1); _overlayEntry?.markNeedsBuild(); });
+                }
                 return KeyEventResult.handled;
               } else if (event.logicalKey == LogicalKeyboardKey.arrowUp && _overlayEntry != null) {
-                setState(() { _selectedIndex = (_selectedIndex - 1 + _results.length) % _results.length; _overlayEntry?.markNeedsBuild(); });
+                if (_results.isNotEmpty) {
+                  setState(() { _selectedIndex = (_selectedIndex - 1).clamp(0, _results.length - 1); _overlayEntry?.markNeedsBuild(); });
+                }
                 return KeyEventResult.handled;
               } else if (event.logicalKey == LogicalKeyboardKey.escape) {
                 _hideOverlay();

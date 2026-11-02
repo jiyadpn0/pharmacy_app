@@ -6,7 +6,6 @@ import 'dart:math';
 import 'package:intl/intl.dart';
 import '../../providers/pharmacy_provider.dart';
 import '../../providers/app_provider.dart';
-import '../../models/product_ranking.dart';
 import '../../widgets/window_controls_bar.dart';
 import '../../widgets/erp_tooltip.dart';
 
@@ -24,33 +23,51 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
   final Map<String, Map<String, dynamic>> _activeFilters = {};
   String _selectedTab = 'ORDER'; // Default active tab
   String _orderFilterMode = 'ORDER_BOOK'; // 'ORDER_BOOK', 'EXCESS_STOCK', or 'ALL'
+  String _stockMovementMode = 'SALES'; // 'SALES' or 'OUTWARDS'
+  String _wholesalerMatchTier = 'YELLOW'; // 'GREEN', 'ORANGE', or 'YELLOW'
   double _headerHeight = 52.0;
 
   List<Map<String, dynamic>> _specialOrders = [];
   List<Map<String, dynamic>> _orderSuggestions = [];
   bool _isLoadingData = false;
-  final int _orderPage = 1;
-  final int _orderPageSize = 50;
-  bool _isMoreOrderData = true;
+  int? _selectedIndex;
+  int? _lastTapIndex;
+  DateTime? _lastTapTime;
+
+  void _onOrderRowTap(int index, String productName) {
+    final now = DateTime.now();
+    setState(() => _selectedIndex = index);
+    if (_lastTapIndex == index && _lastTapTime != null && now.difference(_lastTapTime!) < const Duration(milliseconds: 350)) {
+      _lastTapTime = null;
+      _lastTapIndex = null;
+      if (productName.isNotEmpty) {
+        Provider.of<AppProvider>(context, listen: false).openStockEnquiries(initialQuery: productName);
+      }
+    } else {
+      _lastTapIndex = index;
+      _lastTapTime = now;
+    }
+  }
 
   // Toggle States for Columns
   bool _showProfile = true;
   bool _showRank = true;
   bool _showInterval = true;
 
-  DateTime _selectedDate = DateTime.now();
+  final DateTime _selectedDate = DateTime.now();
   DateTime? _intervalFromDate;
   DateTime? _intervalToDate;
 
-  int? _highlightFirstPurDays;
-  int? _highlightLastSaleDays;
+
 
   final Set<dynamic> _orderedIds = {};
   final Map<dynamic, int> _orderedQtys = {};
   final Map<dynamic, String> _orderedSuppliers = {};
+  String _lastSelectedWholesale = '';
 
   // Wholesaler Search Dropdown Filter State
-  String _selectedWholesaler = "ALL WHOLESALERS";
+  Set<String> _selectedWholesalers = {};
+  List<String> _wholesalersSortedByBillCount = [];
   Map<String, Set<String>> _wholesaler1YearMap = {};
   List<String> _availableWholesalers = [];
   final FocusNode _wholesalerFocusNode = FocusNode();
@@ -248,36 +265,25 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
   Future<void> _loadAvailableWholesalers() async {
     final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
     try {
-      final whList = await pharmacy.getWholesalerNamesWithCounts();
+      final List<String> sortedByBills = await pharmacy.getWholesalersSortedByBillCount();
+      final List<Map<String, dynamic>> whList = await pharmacy.getWholesalerNamesWithCounts();
       final List<String> namesFromCounts = whList.map((m) => m['name']?.toString() ?? '').where((n) => n.trim().isNotEmpty).toList();
-      final List<String> combined = [
+      final List<String> suppliersList = pharmacy.suppliers;
+      final List<String> combined = <String>[
+        ...sortedByBills,
         ...namesFromCounts,
-        ...pharmacy.suppliers,
+        ...suppliersList,
       ].where((s) => s.trim().isNotEmpty && s != 'General Wholesale' && s != '-').toSet().toList();
-
-      combined.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
 
       if (mounted) {
         setState(() {
+          _wholesalersSortedByBillCount = sortedByBills.isNotEmpty ? sortedByBills : combined;
           _availableWholesalers = combined;
         });
       }
     } catch (e) {
       debugPrint("Error loading available wholesalers: $e");
     }
-  }
-
-  void _onWholesalerSelected(String wholesaler) {
-    final clean = wholesaler.trim();
-    final newSel = (clean.isEmpty || clean.toUpperCase() == "ALL" || clean.toUpperCase() == "ALL WHOLESALERS")
-        ? "ALL WHOLESALERS"
-        : clean;
-
-    if (newSel == _selectedWholesaler) return;
-
-    setState(() {
-      _selectedWholesaler = newSel;
-    });
   }
 
   Future<void> _fetchData() async {
@@ -287,6 +293,10 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
     try {
       if (_selectedTab == 'SPECIAL_ORDERS') {
         final orders = await p.fetchSpecialOrders(filterDate: _selectedDate);
+        final Set<String> validMasterNames = p.productMaster
+            .map((pm) => pm.name.trim().toLowerCase())
+            .where((n) => n.isNotEmpty)
+            .toSet();
 
         final List<Map<String, dynamic>> allItems = [];
         for (var s in orders) {
@@ -294,11 +304,15 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
             DateTime date = DateTime.tryParse(s['date'].toString()) ?? DateTime.now();
             List<dynamic> list = jsonDecode(s['special_order_json']);
             for (var item in list) {
+              final String prodName = (item['name'] ?? '').toString().trim();
+              if (prodName.isEmpty) continue;
+              if (!validMasterNames.contains(prodName.toLowerCase())) continue;
+
               allItems.add({
                 'entry_no': s['entry_no'],
                 'agent': s['agent'] ?? "Admin",
                 'date': DateFormat('dd/MM/yyyy HH:mm').format(date),
-                'product': item['name'],
+                'product': prodName,
                 'qty': item['qty'],
                 'phone': (s['special_customer_phone']?.toString().isNotEmpty ?? false) ? s['special_customer_phone'] : s['mobile'],
                 'name': (s['special_customer_name']?.toString().isNotEmpty ?? false) ? s['special_customer_name'] : s['patient'],
@@ -333,7 +347,6 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
           fromDate: _showInterval ? _intervalFromDate : _selectedDate.subtract(const Duration(days: 30)),
           toDate: _showInterval ? _intervalToDate : _selectedDate,
         );
-        _isMoreOrderData = false;
         if (mounted && fullData.isNotEmpty) {
           setState(() {
             _orderSuggestions = fullData;
@@ -642,67 +655,73 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.center,
-                  children: [
-                    // LEFT SIDE: Title + Date Range + Tab Selectors
-                    Text("Order Book",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.w900, color: textColor, letterSpacing: -0.5)),
-                    if (_showInterval) ...[
-                      const SizedBox(width: 12),
-                      _buildMergedIntervalRangePicker(textColor),
-                    ],
-                    const SizedBox(width: 12),
-                    _buildTabSelector(),
-
-                    const Spacer(),
-
-                    // RIGHT SIDE: Checkboxes on Top, Mode Switch & Dropdowns Below
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        // Top Sub-Row: Checkboxes PROFILE, RANK, INTERVAL
-                        Row(
-                          mainAxisSize: MainAxisSize.min,
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    return SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: ConstrainedBox(
+                        constraints: BoxConstraints(minWidth: constraints.maxWidth),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
                           children: [
-                            _buildToggle("PROFILE", _showProfile, (v) => setState(() => _showProfile = v), textColor),
-                            const SizedBox(width: 12),
-                            _buildToggle("RANK", _showRank, (v) => setState(() => _showRank = v), textColor),
-                            const SizedBox(width: 12),
-                            _buildToggle("INTERVAL", _showInterval, (v) {
-                              setState(() {
-                                _showInterval = v;
-                                _fetchData();
-                              });
-                            }, textColor),
+                            // LEFT SIDE: Title + Date Range + Tab Selectors
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text("Order Book",
+                                    style: TextStyle(fontSize: 24, fontWeight: FontWeight.w900, color: textColor, letterSpacing: -0.5)),
+                                const SizedBox(width: 12),
+                                if (_showInterval) ...[
+                                  _buildMergedIntervalRangePicker(textColor),
+                                  const SizedBox(width: 8),
+                                ],
+                                _buildStockMovementDropdown(textColor),
+                                const SizedBox(width: 8),
+                                _buildSingleViewModeButton(textColor),
+                                const SizedBox(width: 8),
+                                _buildWholesalerHeaderDropdown(),
+                              ],
+                            ),
+
+                            const SizedBox(width: 16),
+
+                            // RIGHT SIDE: Checkboxes on Top, Mode Switch & Dropdowns Below
+                            Column(
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                // Top Sub-Row: Checkboxes PROFILE, RANK, INTERVAL
+                                Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    _buildToggle("PROFILE", _showProfile, (v) => setState(() => _showProfile = v), textColor),
+                                    const SizedBox(width: 12),
+                                    _buildToggle("RANK", _showRank, (v) => setState(() => _showRank = v), textColor),
+                                    const SizedBox(width: 12),
+                                    _buildToggle("INTERVAL", _showInterval, (v) {
+                                      setState(() {
+                                        _showInterval = v;
+                                        _fetchData();
+                                      });
+                                    }, textColor),
+                                  ],
+                                ),
+                                const SizedBox(height: 4),
+                                if (_selectedTab == 'ORDER')
+                                  Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      _buildModeSwitch(),
+                                    ],
+                                  ),
+                              ],
+                            ),
                           ],
                         ),
-                        const SizedBox(height: 4),
-                        // Bottom Sub-Row: Mode Switch (ORDER BOOK / EXCESS STOCK) + Dropdowns 1st Pur > and Last Sale >
-                        Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            if (_selectedTab == 'ORDER') ...[
-                              _buildModeSwitch(),
-                              const SizedBox(width: 8),
-                            ],
-                            _buildHighlightDaysPicker(
-                              label: "1st Pur >",
-                              selectedDays: _highlightFirstPurDays,
-                              onDaysChanged: (d) => setState(() => _highlightFirstPurDays = d),
-                            ),
-                            const SizedBox(width: 8),
-                            _buildHighlightDaysPicker(
-                              label: "Last Sale >",
-                              selectedDays: _highlightLastSaleDays,
-                              onDaysChanged: (d) => setState(() => _highlightLastSaleDays = d),
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
-                  ],
+                      ),
+                    );
+                  },
                 ),
                 const SizedBox(height: 8),
                 Expanded(
@@ -729,131 +748,11 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
     );
   }
 
-  Widget _buildDateSelector(Color textColor) {
-    String formattedDate = DateFormat('dd/MM/yyyy').format(_selectedDate);
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Container(
-          height: 32,
-          padding: const EdgeInsets.symmetric(horizontal: 12),
-          decoration: BoxDecoration(
-            color: _isDarkMode ? Colors.white.withValues(alpha: 0.05) : Colors.white,
-            border: Border.all(color: _isDarkMode ? Colors.white24 : Colors.grey.shade300),
-            borderRadius: BorderRadius.circular(4),
-          ),
-          alignment: Alignment.center,
-          child: Text(formattedDate, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: textColor)),
-        ),
-        const SizedBox(width: 4),
-        Builder(
-          builder: (context) {
-            return InkWell(
-              onTap: () => _showCalendarPopup(context),
-              child: Container(
-                height: 32,
-                width: 40,
-                decoration: BoxDecoration(
-                  color: _isDarkMode ? Colors.white.withValues(alpha: 0.1) : Colors.grey.shade100,
-                  border: Border.all(color: _isDarkMode ? Colors.white24 : Colors.grey.shade300),
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.calendar_month_outlined, size: 16, color: textColor),
-                    Icon(Icons.arrow_drop_down, size: 14, color: textColor),
-                  ],
-                ),
-              ),
-            );
-          }
-        ),
-      ],
-    );
-  }
 
-  void _showCalendarPopup(BuildContext context) async {
-    final RenderBox button = context.findRenderObject() as RenderBox;
-    final RenderBox overlay = Navigator.of(context).overlay!.context.findRenderObject() as RenderBox;
-    
-    // Calculate position
-    final Offset offset = button.localToGlobal(Offset.zero, ancestor: overlay);
-    
-    final DateTime? picked = await showDialog<DateTime>(
-      context: context,
-      barrierColor: Colors.transparent,
-      builder: (ctx) => Stack(
-        children: [
-          Positioned(
-            top: offset.dy + button.size.height + 5,
-            left: offset.dx - 100, // Slightly offset to the left to center better
-            child: Material(
-              elevation: 12,
-              shadowColor: Colors.black45,
-              borderRadius: BorderRadius.circular(8),
-              child: Container(
-                width: 280,
-                height: 320,
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.grey.shade300),
-                ),
-                child: Column(
-                  children: [
-                    Expanded(
-                      child: Theme(
-                        data: ThemeData.light().copyWith(
-                          colorScheme: const ColorScheme.light(
-                            primary: Colors.blueAccent,
-                            onPrimary: Colors.white,
-                            onSurface: Colors.black87,
-                          ),
-                          textTheme: const TextTheme(
-                            bodyMedium: TextStyle(fontSize: 12),
-                          ),
-                        ),
-                        child: CalendarDatePicker(
-                          initialDate: _selectedDate,
-                          firstDate: DateTime(2000),
-                          lastDate: DateTime(2100),
-                          onDateChanged: (date) {
-                            Navigator.pop(ctx, date);
-                          },
-                        ),
-                      ),
-                    ),
-                    const Divider(height: 1),
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 4),
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Text(
-                            "Today: ${DateFormat('dd/MM/yyyy').format(DateTime.now())}",
-                            style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.blueGrey),
-                          ),
-                        ],
-                      ),
-                    )
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
 
-    if (picked != null && picked != _selectedDate) {
-      setState(() {
-        _selectedDate = picked;
-        _fetchData();
-      });
-    }
-  }
+
+
+
 
   Widget _buildToggle(String label, bool value, Function(bool) onChanged, Color textColor) {
     return Row(
@@ -945,192 +844,140 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
     );
   }
 
-  Widget _buildTabSelector() {
-    return Container(
-      padding: const EdgeInsets.all(4),
-      decoration: BoxDecoration(
-        color: _isDarkMode ? Colors.white10 : Colors.black.withValues(alpha: 0.05),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          _buildTabItem("ORDER ANALYSIS", 'ORDER'),
-          _buildTabItem("SPECIAL ORDERS", 'SPECIAL_ORDERS'),
-          if (_selectedTab == 'ORDER') ...[
-            const SizedBox(width: 8),
-            _buildWholesalerHeaderDropdown(),
+
+
+  Widget _buildWholesalerHeaderDropdown() {
+    final bool isFiltered = _selectedWholesalers.isNotEmpty &&
+        _selectedWholesalers.length < _availableWholesalers.length;
+
+    String displayText = "ALL WHOLESALERS";
+    if (_selectedWholesalers.length == 1) {
+      displayText = _selectedWholesalers.first;
+    } else if (isFiltered) {
+      displayText = "${_selectedWholesalers.length} Selected";
+    }
+
+    String tierLabel = "🟡 Same Company / All";
+    if (_wholesalerMatchTier == 'GREEN') tierLabel = "🟢 Exact Bought";
+    if (_wholesalerMatchTier == 'ORANGE') tierLabel = "🟠 Exact + Variant";
+
+    return InkWell(
+      onTap: () {
+        _showWholesalerFilterDialog(context);
+      },
+      borderRadius: BorderRadius.circular(6),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration: BoxDecoration(
+          color: isFiltered
+              ? (_isDarkMode ? const Color(0xFF1E3A8A) : const Color(0xFFEFF6FF))
+              : (_isDarkMode ? const Color(0xFF1E293B) : Colors.white),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(
+            color: isFiltered
+                ? const Color(0xFF2563EB)
+                : (_isDarkMode ? Colors.blueGrey.shade700 : Colors.grey.shade300),
+            width: isFiltered ? 1.5 : 1.0,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Icon(
+              Icons.storefront_outlined,
+              size: 14,
+              color: isFiltered
+                  ? const Color(0xFF2563EB)
+                  : (_isDarkMode ? Colors.tealAccent : const Color(0xFF2563EB)),
+            ),
+            const SizedBox(width: 6),
+            Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  displayText,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: isFiltered ? FontWeight.w900 : FontWeight.w700,
+                    color: isFiltered
+                        ? (_isDarkMode ? Colors.white : const Color(0xFF1E40AF))
+                        : (_isDarkMode ? Colors.white70 : const Color(0xFF1E293B)),
+                  ),
+                ),
+                const SizedBox(height: 1),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                  decoration: BoxDecoration(
+                    color: _isDarkMode ? Colors.white10 : Colors.grey.shade200,
+                    borderRadius: BorderRadius.circular(3),
+                  ),
+                  child: Text(
+                    tierLabel,
+                    style: TextStyle(
+                      fontSize: 9,
+                      fontWeight: FontWeight.bold,
+                      color: _isDarkMode ? Colors.tealAccent : const Color(0xFF1E40AF),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(width: 4),
+            if (isFiltered)
+              GestureDetector(
+                onTap: () {
+                  setState(() {
+                    _selectedWholesalers.clear();
+                  });
+                },
+                child: const Padding(
+                  padding: EdgeInsets.only(left: 4),
+                  child: Icon(
+                    Icons.close,
+                    size: 14,
+                    color: Color(0xFF2563EB),
+                  ),
+                ),
+              )
+            else
+              const Padding(
+                padding: EdgeInsets.only(left: 2),
+                child: Icon(
+                  Icons.arrow_drop_down,
+                  size: 16,
+                  color: Colors.grey,
+                ),
+              ),
           ],
-        ],
+        ),
       ),
     );
   }
 
-  Widget _buildWholesalerHeaderDropdown() {
-    final List<String> options = [
-      "ALL WHOLESALERS",
-      ..._availableWholesalers,
-    ].toSet().toList();
-
-    final bool isSelected = _selectedWholesaler.isNotEmpty &&
-        _selectedWholesaler != "ALL WHOLESALERS" &&
-        _selectedWholesaler != "ALL";
-
-    return Container(
-      width: 210,
-      height: 30,
-      padding: const EdgeInsets.symmetric(horizontal: 6),
-      decoration: BoxDecoration(
-        color: isSelected
-            ? (_isDarkMode ? const Color(0xFF1E3A8A) : const Color(0xFFEFF6FF))
-            : (_isDarkMode ? const Color(0xFF1E293B) : Colors.white),
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(
-          color: isSelected
-              ? const Color(0xFF2563EB)
-              : (_isDarkMode ? Colors.blueGrey.shade700 : Colors.grey.shade300),
-          width: isSelected ? 1.5 : 1.0,
-        ),
-      ),
-      child: Row(
-        children: [
-          Icon(
-            Icons.storefront_outlined,
-            size: 14,
-            color: isSelected
-                ? const Color(0xFF2563EB)
-                : (_isDarkMode ? Colors.tealAccent : const Color(0xFF2563EB)),
-          ),
-          const SizedBox(width: 4),
-          Expanded(
-            child: Autocomplete<String>(
-              initialValue: TextEditingValue(text: _selectedWholesaler),
-              optionsBuilder: (TextEditingValue textEditingValue) {
-                final String query = textEditingValue.text.trim().toLowerCase();
-                if (query.isEmpty || query == "all wholesalers" || query == "all") {
-                  return options;
-                }
-                return options.where((String option) => option.toLowerCase().contains(query));
-              },
-              onSelected: (String selection) {
-                _onWholesalerSelected(selection);
-              },
-              fieldViewBuilder: (context, textController, fieldFocusNode, onFieldSubmitted) {
-                if (!fieldFocusNode.hasFocus &&
-                    textController.text != _selectedWholesaler) {
-                  textController.text = _selectedWholesaler;
-                }
-
-                return TextField(
-                  controller: textController,
-                  focusNode: fieldFocusNode,
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: isSelected ? FontWeight.w900 : FontWeight.w700,
-                    color: isSelected
-                        ? (_isDarkMode ? Colors.white : const Color(0xFF1E40AF))
-                        : (_isDarkMode ? Colors.white70 : const Color(0xFF1E293B)),
-                  ),
-                  decoration: const InputDecoration(
-                    isDense: true,
-                    contentPadding: EdgeInsets.symmetric(vertical: 6),
-                    border: InputBorder.none,
-                    hintText: "Select Wholesaler...",
-                    hintStyle: TextStyle(fontSize: 11, color: Colors.grey),
-                  ),
-                  onSubmitted: (val) {
-                    _onWholesalerSelected(val);
-                  },
-                );
-              },
-              optionsViewBuilder: (context, onSelected, options) {
-                return Align(
-                  alignment: Alignment.topLeft,
-                  child: Material(
-                    elevation: 6.0,
-                    borderRadius: BorderRadius.circular(8),
-                    color: _isDarkMode ? const Color(0xFF1E293B) : Colors.white,
-                    child: Container(
-                      width: 250,
-                      constraints: const BoxConstraints(maxHeight: 260),
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: _isDarkMode ? Colors.blueGrey.shade700 : Colors.grey.shade300),
-                      ),
-                      child: ListView.separated(
-                        padding: const EdgeInsets.symmetric(vertical: 4),
-                        shrinkWrap: true,
-                        itemCount: options.length,
-                        separatorBuilder: (context, index) => Divider(
-                          height: 1,
-                          color: _isDarkMode ? Colors.white10 : Colors.grey.shade200,
-                        ),
-                        itemBuilder: (context, index) {
-                          final option = options.elementAt(index);
-                          final isAll = option == "ALL WHOLESALERS";
-                          final isCurrent = option == _selectedWholesaler;
-
-                          return InkWell(
-                            onTap: () => onSelected(option),
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                              color: isCurrent
-                                  ? (_isDarkMode ? Colors.blue.withValues(alpha: 0.3) : Colors.blue.shade50)
-                                  : Colors.transparent,
-                              child: Row(
-                                children: [
-                                  Icon(
-                                    isAll ? Icons.all_inclusive : Icons.business,
-                                    size: 14,
-                                    color: isCurrent ? Colors.blue : Colors.grey,
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: Text(
-                                      option,
-                                      style: TextStyle(
-                                        fontSize: 11,
-                                        fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
-                                        color: isCurrent
-                                            ? Colors.blue
-                                            : (_isDarkMode ? Colors.white : Colors.black87),
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
-          if (isSelected)
-            GestureDetector(
-              onTap: () {
-                _onWholesalerSelected("ALL WHOLESALERS");
-              },
-              child: const Padding(
-                padding: EdgeInsets.only(left: 2),
-                child: Icon(
-                  Icons.close,
-                  size: 14,
-                  color: Color(0xFF2563EB),
-                ),
-              ),
-            )
-          else
-            const Icon(
-              Icons.arrow_drop_down,
-              size: 16,
-              color: Colors.grey,
-            ),
-        ],
-      ),
+  void _showWholesalerFilterDialog(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return WholesalerMultiSelectDialog(
+          availableWholesalers: _availableWholesalers,
+          selectedWholesalers: _selectedWholesalers,
+          wholesalerMatchTier: _wholesalerMatchTier,
+          isDarkMode: _isDarkMode,
+          onApply: (Set<String> newSelection, String newTier) {
+            setState(() {
+              _selectedWholesalers = newSelection;
+              _wholesalerMatchTier = newTier;
+              if (_selectedWholesalers.length == 1) {
+                _lastSelectedWholesale = _selectedWholesalers.first;
+              }
+            });
+          },
+        );
+      },
     );
   }
 
@@ -1200,17 +1047,7 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
     );
   }
 
-  bool _isDateOnOrAfter(String? dateStr, DateTime? targetDate) {
-    if (dateStr == null || dateStr.isEmpty || dateStr == '-' || targetDate == null) return false;
-    try {
-      final parsed = DateTime.parse(dateStr);
-      final dateOnly = DateTime(parsed.year, parsed.month, parsed.day);
-      final targetOnly = DateTime(targetDate.year, targetDate.month, targetDate.day);
-      return !dateOnly.isBefore(targetOnly);
-    } catch (_) {
-      return false;
-    }
-  }
+
 
   String _formatDate(dynamic d) {
     if (d == null || d.toString().isEmpty || d.toString() == '-') return '-';
@@ -1221,12 +1058,7 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
     }
   }
 
-  DateTime? _getCutoffDateFromDays(int? days) {
-    if (days == null || days <= 0) return null;
-    final now = DateTime.now();
-    final todayOnly = DateTime(now.year, now.month, now.day);
-    return todayOnly.subtract(Duration(days: days));
-  }
+
 
   void _showDaysPickerPopup(BuildContext context, String title, int? currentDays, Function(int?) onSelected) async {
     final TextEditingController customCtrl = TextEditingController();
@@ -1313,114 +1145,222 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
     }
   }
 
-  Widget _buildHighlightDaysPicker({
-    required String label,
-    required int? selectedDays,
-    required Function(int?) onDaysChanged,
-  }) {
-    final hasDays = selectedDays != null && selectedDays > 0;
-    final displayTxt = hasDays ? "$selectedDays Days" : "Days";
+  ({Color bg, Color text})? _evalOrderBookRuleStyle(PharmacyProvider provider, Map<String, dynamic> item, String colKey) {
+    final rules = provider.getValidationRules("ORDER_BOOK");
+    if (rules.isEmpty) return null;
 
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: BoxDecoration(
-        color: hasDays
-            ? (_isDarkMode ? const Color(0xFF450A0A) : const Color(0xFFFEF2F2))
-            : (_isDarkMode ? const Color(0xFF1E293B) : Colors.white),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(
-          color: hasDays ? Colors.red.shade400 : (_isDarkMode ? Colors.blueGrey.shade700 : Colors.grey.shade300),
-          width: hasDays ? 1.5 : 1.0,
-        ),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(
-            Icons.circle,
-            size: 6,
-            color: hasDays ? Colors.red : Colors.grey.shade400,
-          ),
-          const SizedBox(width: 4),
-          Text(
-            label,
-            style: TextStyle(
-              fontSize: 11,
-              fontWeight: FontWeight.w800,
-              color: hasDays ? Colors.red.shade700 : (_isDarkMode ? Colors.white70 : Colors.blueGrey.shade800),
-            ),
-          ),
-          const SizedBox(width: 4),
-          InkWell(
-            onTap: () => _showDaysPickerPopup(context, label, selectedDays, onDaysChanged),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-              decoration: BoxDecoration(
-                color: hasDays ? Colors.red.shade600 : (_isDarkMode ? Colors.blueGrey.shade800 : const Color(0xFFE2E8F0)),
-                borderRadius: BorderRadius.circular(5),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    displayTxt,
-                    style: TextStyle(
-                      fontSize: 11,
-                      fontWeight: FontWeight.bold,
-                      color: hasDays ? Colors.white : (_isDarkMode ? Colors.white : const Color(0xFF1E293B)),
-                    ),
-                  ),
-                  const SizedBox(width: 2),
-                  Icon(
-                    Icons.arrow_drop_down,
-                    size: 14,
-                    color: hasDays ? Colors.white : (_isDarkMode ? Colors.tealAccent : const Color(0xFF2563EB)),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          if (hasDays) ...[
-            const SizedBox(width: 4),
-            InkWell(
-              onTap: () => onDaysChanged(null),
-              child: const Padding(
-                padding: EdgeInsets.all(2.0),
-                child: Icon(Icons.close, size: 14, color: Colors.red),
-              ),
-            ),
-          ],
-        ],
-      ),
-    );
+    for (var rule in rules) {
+      if (!rule.enabled) continue;
+
+      bool appliesToCol = false;
+      if (rule.fieldA == "1st Purchase (Days)" && colKey == "firstPurchaseDate") appliesToCol = true;
+      if (rule.fieldA == "Last Sale (Days)" && colKey == "lastSaleDate") appliesToCol = true;
+      if (rule.fieldA == "Current Stock" && colKey == "currentStock") appliesToCol = true;
+      if (rule.fieldA == "Order Qty" && colKey == "orderQty") appliesToCol = true;
+      if (rule.fieldA == "Purchase Rate" && colKey == "purchaseRate") appliesToCol = true;
+      if (rule.fieldA == "MRP" && colKey == "mrp") appliesToCol = true;
+
+      if (!appliesToCol) continue;
+
+      double valA = 0.0;
+      switch (rule.fieldA) {
+        case "1st Purchase (Days)":
+          valA = _getDaysAgo(item['firstPurchaseDate']?.toString());
+          break;
+        case "Last Sale (Days)":
+          valA = _getDaysAgo(item['lastSaleDate']?.toString());
+          break;
+        case "Current Stock":
+          valA = (item['currentStock'] as num?)?.toDouble() ?? 0.0;
+          break;
+        case "Order Qty":
+          valA = (item['orderQty'] as num?)?.toDouble() ?? 0.0;
+          break;
+        case "Purchase Rate":
+          valA = (item['purchaseRate'] as num?)?.toDouble() ?? 0.0;
+          break;
+        case "MRP":
+          valA = (item['mrp'] as num?)?.toDouble() ?? 0.0;
+          break;
+        default:
+          valA = 0.0;
+      }
+
+      double valB = 0.0;
+      if (rule.isFieldBHeading) {
+        switch (rule.fieldB) {
+          case "Current Stock":
+            valB = (item['currentStock'] as num?)?.toDouble() ?? 0.0;
+            break;
+          case "Reorder Level":
+            valB = (item['reorderLevel'] as num?)?.toDouble() ?? 0.0;
+            break;
+          case "Max Level":
+            valB = (item['maxLevel'] as num?)?.toDouble() ?? 0.0;
+            break;
+          case "Order Qty":
+            valB = (item['orderQty'] as num?)?.toDouble() ?? 0.0;
+            break;
+          default:
+            valB = 0.0;
+        }
+      } else {
+        valB = double.tryParse(rule.fieldB) ?? 0.0;
+      }
+
+      bool isMatch = false;
+      switch (rule.operator) {
+        case ">=":
+          isMatch = valA >= valB;
+          break;
+        case ">":
+          isMatch = valA > valB;
+          break;
+        case "<=":
+          isMatch = valA <= valB;
+          break;
+        case "<":
+          isMatch = valA < valB;
+          break;
+        case "=":
+          isMatch = (valA - valB).abs() < 0.001;
+          break;
+        case "!=":
+          isMatch = (valA - valB).abs() >= 0.001;
+          break;
+      }
+
+      if (isMatch) {
+        return (bg: Color(rule.bgColorHex), text: Color(rule.textColorHex));
+      }
+    }
+
+    return null;
   }
 
-  Widget _buildTabItem(String label, String tab) {
-    final isSelected = _selectedTab == tab;
-    return GestureDetector(
+  double _getDaysAgo(String? dateStr) {
+    if (dateStr == null || dateStr.trim().isEmpty) return 0.0;
+    try {
+      DateTime? dt;
+      final parts = dateStr.split(RegExp(r'[-/]'));
+      if (parts.length == 3) {
+        int p1 = int.parse(parts[0]);
+        int p2 = int.parse(parts[1]);
+        int p3 = int.parse(parts[2]);
+        if (p1 > 1000) {
+          dt = DateTime(p1, p2, p3);
+        } else {
+          if (p3 < 100) p3 += 2000;
+          dt = DateTime(p3, p2, p1);
+        }
+      } else {
+        dt = DateTime.tryParse(dateStr);
+      }
+      if (dt != null) {
+        final now = DateTime.now();
+        final diff = now.difference(dt).inDays;
+        return diff < 0 ? 0.0 : diff.toDouble();
+      }
+    } catch (_) {}
+    return 0.0;
+  }
+
+
+
+  Widget _buildSingleViewModeButton(Color textColor) {
+    final bool isOrderAnalysis = _selectedTab == 'ORDER';
+    final String label = isOrderAnalysis ? "ORDER ANALYSIS" : "SPECIAL ORDERS";
+
+    return InkWell(
       onTap: () {
         setState(() {
-          _selectedTab = tab;
+          _selectedTab = isOrderAnalysis ? 'SPECIAL_ORDERS' : 'ORDER';
           _fetchData();
         });
       },
+      borderRadius: BorderRadius.circular(4),
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        height: 28,
+        padding: const EdgeInsets.symmetric(horizontal: 10),
         decoration: BoxDecoration(
-          color: isSelected ? Colors.blueAccent : Colors.transparent,
-          borderRadius: BorderRadius.circular(6),
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            fontSize: 11,
-            fontWeight: FontWeight.w900,
-            color: isSelected ? Colors.white : (_isDarkMode ? Colors.white54 : Colors.blueGrey),
+          color: isOrderAnalysis
+              ? (_isDarkMode ? const Color(0xFF1E293B) : Colors.white)
+              : (_isDarkMode ? const Color(0xFF1E3A8A) : const Color(0xFFEFF6FF)),
+          border: Border.all(
+            color: isOrderAnalysis
+                ? (_isDarkMode ? Colors.white24 : Colors.grey.shade300)
+                : const Color(0xFF2563EB),
+            width: isOrderAnalysis ? 1.0 : 1.5,
           ),
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              isOrderAnalysis ? Icons.analytics_outlined : Icons.assignment_outlined,
+              size: 14,
+              color: isOrderAnalysis
+                  ? (_isDarkMode ? Colors.tealAccent : const Color(0xFF2563EB))
+                  : const Color(0xFF2563EB),
+            ),
+            const SizedBox(width: 6),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+                color: isOrderAnalysis
+                    ? textColor
+                    : (_isDarkMode ? Colors.white : const Color(0xFF1E40AF)),
+              ),
+            ),
+            const SizedBox(width: 6),
+            Icon(
+              Icons.swap_horiz_rounded,
+              size: 14,
+              color: isOrderAnalysis
+                  ? Colors.grey
+                  : const Color(0xFF2563EB),
+            ),
+          ],
         ),
       ),
     );
   }
+
+  Widget _buildStockMovementDropdown(Color textColor) {
+    return Container(
+      height: 28,
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      decoration: BoxDecoration(
+        color: _isDarkMode ? const Color(0xFF1E293B) : Colors.white,
+        border: Border.all(color: _isDarkMode ? Colors.white24 : Colors.grey.shade300),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<String>(
+          value: _stockMovementMode,
+          isDense: true,
+          style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: textColor),
+          items: const [
+            DropdownMenuItem(value: 'SALES', child: Text("SALES MOVEMENT")),
+            DropdownMenuItem(value: 'OUTWARDS', child: Text("OUTWARDS MOVEMENT")),
+          ],
+          onChanged: (val) {
+            if (val != null) {
+              setState(() {
+                _stockMovementMode = val;
+                _fetchData();
+              });
+            }
+          },
+        ),
+      ),
+    );
+  }
+
+
 
   Widget _buildOrderView(PharmacyProvider pharmacy, Color textColor, Color subTextColor, Color cardColor, Color borderColor) {
     final filtered = _orderSuggestions.where((item) {
@@ -1513,22 +1453,28 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
       }
 
       // Wholesaler Search Dropdown Filter (Check 1 Year Purchases & Mapped/Preferred Wholesaler)
-      if (_selectedWholesaler.isNotEmpty &&
-          _selectedWholesaler != "ALL WHOLESALERS" &&
-          _selectedWholesaler != "ALL") {
+      if (_selectedWholesalers.isNotEmpty) {
         final String itemId = item['id']?.toString() ?? '';
-        final String selLower = _selectedWholesaler.toLowerCase().trim();
-        final Set<String> validPids = _wholesaler1YearMap[selLower] ?? {};
-
         final String bestProf = (item['bestProfitWholesale'] ?? '').toString().toLowerCase().trim();
         final String pref = (item['preferred_wholesale'] ?? '').toString().toLowerCase().trim();
         final String mapped = (item['mappedWholesaler'] ?? item['mappedName'] ?? '').toString().toLowerCase().trim();
         final String orderedSup = (_orderedSuppliers[item['id']] ?? '').toString().toLowerCase().trim();
 
-        final bool in1YearPurchased = validPids.contains(itemId);
-        final bool matchesPreferred = bestProf == selLower || pref == selLower || mapped == selLower || orderedSup == selLower;
+        bool isMatch = false;
+        for (final sel in _selectedWholesalers) {
+          final String selLower = sel.toLowerCase().trim();
+          final Set<String> validPids = _wholesaler1YearMap[selLower] ?? {};
 
-        if (!in1YearPurchased && !matchesPreferred) return false;
+          final bool in1YearPurchased = validPids.contains(itemId);
+          final bool matchesPreferred = bestProf == selLower || pref == selLower || mapped == selLower || orderedSup == selLower;
+
+          if (in1YearPurchased || matchesPreferred) {
+            isMatch = true;
+            break;
+          }
+        }
+
+        if (!isMatch) return false;
       }
 
       return true;
@@ -1538,12 +1484,12 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
     if (_showProfile) {
       rightTotalWidth += _colWidths['rack']! + _colWidths['classification']! + _colWidths['content']! + _colWidths['brand']!;
     }
-    rightTotalWidth += _colWidths['bestProfitWholesale']! + _colWidths['latestOffer']! + _colWidths['mrp']! + _colWidths['pRate']! + _colWidths['packSize']!;
+    rightTotalWidth += _colWidths['latestOffer']! + _colWidths['mrp']! + _colWidths['pRate']!;
     if (_showRank) {
       rightTotalWidth += _colWidths['min_level']! + _colWidths['max_level']!;
     }
     rightTotalWidth += _colWidths['lastOrderType']!;
-    rightTotalWidth += _colWidths['rank']!;
+    rightTotalWidth += _colWidths['bestProfitWholesale']! + _colWidths['rank']!;
     rightTotalWidth += _colWidths['stock']! + _colWidths['pending_order']! + _colWidths['ordered']! + _colWidths['wholesale']!;
     if (_showRank) {
       rightTotalWidth += _colWidths['warning']!;
@@ -1558,15 +1504,31 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
     final oddRowColor = _isDarkMode ? const Color(0xFF0F172A) : const Color(0xFFF8FAFC);
 
     final ScrollController horizontalScroll = ScrollController();
-    final double leftPaneWidth = 45 + _colWidths['product']!;
+    final double leftPaneWidth = 45 + _colWidths['product']! + _colWidths['packSize']!;
 
     return Column(
       children: [
+        // 1-LINE COLOR LEGEND
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+          color: _isDarkMode ? const Color(0xFF1E293B) : Colors.grey.shade100,
+          child: const Row(
+            children: [
+              Text("WHOLESALER MATCH LEGEND: ", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey)),
+              SizedBox(width: 8),
+              Text("🟢 Exact Bought", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.green)),
+              SizedBox(width: 12),
+              Text("🟠 Variant Bought", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.orange)),
+              SizedBox(width: 12),
+              Text("🟡 Same Company", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.amber)),
+            ],
+          ),
+        ),
         Expanded(
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              // LEFT FROZEN PANE (SL NUMBER AND PRODUCT BOX)
+              // LEFT FROZEN PANE (SL NUMBER, PRODUCT NAME & PACK SIZE)
               SizedBox(
                 width: leftPaneWidth,
                 child: Column(
@@ -1578,6 +1540,7 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
                         children: [
                           const SizedBox(width: 45, child: Center(child: Text("SL", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.white)))),
                           _hdr("PRODUCT", 'product', width: _colWidths['product']!),
+                          _hdr("PACK", 'packSize', width: _colWidths['packSize']!),
                         ],
                       ),
                     ),
@@ -1588,14 +1551,19 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
                         itemExtent: 36.0,
                         itemBuilder: (context, index) {
                           final item = filtered[index];
-                          return Container(
-                            key: ValueKey("left_${item['id']}"),
-                            decoration: BoxDecoration(border: Border(bottom: BorderSide(color: borderColor)), color: index % 2 == 0 ? cardColor : oddRowColor),
-                            child: Row(
-                              children: [
-                                _Cell("${index + 1}", width: 45, align: TextAlign.center, color: _isDarkMode ? Colors.white38 : Colors.grey, isDarkMode: _isDarkMode),
-                                _Cell(item['name']?.toString() ?? "", width: _colWidths['product']!, fontWeight: FontWeight.bold, color: textColor, isDarkMode: _isDarkMode),
-                              ],
+                          final bool isSelected = (index == _selectedIndex);
+                          return InkWell(
+                            onTap: () => _onOrderRowTap(index, item['name']?.toString() ?? ""),
+                            child: Container(
+                              key: ValueKey("left_${item['id']}"),
+                              decoration: BoxDecoration(border: Border(bottom: BorderSide(color: isSelected ? Colors.blue.shade300 : borderColor)), color: isSelected ? const Color(0xFFBAE6FD) : (index % 2 == 0 ? cardColor : oddRowColor)),
+                              child: Row(
+                                children: [
+                                  _Cell("${index + 1}", width: 45, align: TextAlign.center, color: _isDarkMode ? Colors.white38 : Colors.grey, isDarkMode: _isDarkMode),
+                                  _Cell(item['name']?.toString() ?? "", width: _colWidths['product']!, fontWeight: FontWeight.bold, color: textColor, isDarkMode: _isDarkMode),
+                                  _Cell(item['packSize']?.toString() ?? "1x10", width: _colWidths['packSize']!, align: TextAlign.center, isDarkMode: _isDarkMode),
+                                ],
+                              ),
                             ),
                           );
                         },
@@ -1631,16 +1599,15 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
                                   _hdr("CONTENT", 'content', width: _colWidths['content']!),
                                   _hdr("BRAND", 'brand', width: _colWidths['brand']!),
                                 ],
-                                _hdr("BEST WHOLESALE", 'bestProfitWholesale', width: _colWidths['bestProfitWholesale']!),
-                                _hdr("OFFER", 'latestOffer', width: _colWidths['latestOffer']!),
                                 _hdr("MRP", 'mrp', width: _colWidths['mrp']!),
                                 _hdr("P.RATE", 'pRate', width: _colWidths['pRate']!),
-                                _hdr("PACK SIZE", 'packSize', width: _colWidths['packSize']!),
                                 if (_showRank) ...[
                                   _hdr("MIN LEVEL", 'min_level', width: _colWidths['min_level']!),
                                   _hdr("MAX LEVEL", 'max_level', width: _colWidths['max_level']!),
                                 ],
                                 _hdr("ORDER TYPE", 'lastOrderType', width: _colWidths['lastOrderType']!),
+                                _hdr("PREFERRED WHOLESALE", 'bestProfitWholesale', width: _colWidths['bestProfitWholesale']!),
+                                _hdr("OFFER", 'latestOffer', width: _colWidths['latestOffer']!),
                                 _hdr("RANK", 'rank', width: _colWidths['rank']!),
                                 _hdr("CURR. STOCK", 'stock', width: _colWidths['stock']!),
                                 _hdr("PENDING ORDER", 'pending_order', width: _colWidths['pending_order']!),
@@ -1701,6 +1668,9 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
                                   }
 
                                   // WARNING Calculation & Column Red Highlights
+                                  final pharma = Provider.of<PharmacyProvider>(context, listen: false);
+                                  final lastSaleStyle = _evalOrderBookRuleStyle(pharma, item, "lastSaleDate");
+                                  final firstPurStyle = _evalOrderBookRuleStyle(pharma, item, "firstPurchaseDate");
                                   final double lastSaleQty = double.tryParse(item['lastSaleQty']?.toString() ?? "0") ?? 0;
                                   final double maxSingle4M = double.tryParse(item['maxSingleTxn4M']?.toString() ?? "0") ?? 0;
                                   final double warningTarget = max(databaseWarning, max(lastSaleQty, maxSingle4M));
@@ -1726,11 +1696,8 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
                                           _Cell(item['content']?.toString() ?? "", width: _colWidths['content']!, isDarkMode: _isDarkMode),
                                           _Cell(item['brand']?.toString() ?? "", width: _colWidths['brand']!, isDarkMode: _isDarkMode),
                                         ],
-                                        _Cell(item['bestProfitWholesale']?.toString() ?? "-", width: _colWidths['bestProfitWholesale']!, isDarkMode: _isDarkMode),
-                                        _Cell(_formatOffer(item['latestOffer']?.toString() ?? "-"), width: _colWidths['latestOffer']!, color: Colors.green.shade700, fontWeight: FontWeight.bold, isDarkMode: _isDarkMode),
                                         _Cell(item['mrp']?.toString() ?? "0", width: _colWidths['mrp']!, align: TextAlign.right, isDarkMode: _isDarkMode),
                                         _Cell(item['pRate']?.toString() ?? "0", width: _colWidths['pRate']!, align: TextAlign.right, isDarkMode: _isDarkMode),
-                                        _Cell(item['packSize']?.toString() ?? "", width: _colWidths['packSize']!, align: TextAlign.center, isDarkMode: _isDarkMode),
                                         if (_showRank) ...[
                                           _Cell(
                                             effectiveMinLevel.toStringAsFixed(1),
@@ -1762,6 +1729,8 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
                                           bgColor: _getOrderTypeBgColor(item['lastOrderType']),
                                           isDarkMode: _isDarkMode,
                                         ),
+                                        _Cell(item['bestProfitWholesale']?.toString() ?? "-", width: _colWidths['bestProfitWholesale']!, isDarkMode: _isDarkMode),
+                                        _Cell(_formatOffer(item['latestOffer']?.toString() ?? "-"), width: _colWidths['latestOffer']!, color: Colors.green.shade700, fontWeight: FontWeight.bold, isDarkMode: _isDarkMode),
                                         _Cell(
                                           databaseRank.toStringAsFixed(1),
                                           width: _colWidths['rank']!,
@@ -1773,7 +1742,7 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
                                           borderColor: const Color(0xFFFFD700),
                                         ),
                                         _Cell(
-                                          item['currentBalance']?.toString() ?? "0",
+                                          stockInPacks.toStringAsFixed(1),
                                           width: _colWidths['stock']!,
                                           align: TextAlign.center,
                                           color: Colors.white,
@@ -1868,6 +1837,22 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
                                                         if (parsed != null && parsed > 0) {
                                                           _orderedIds.add(item['id']);
                                                           _orderedQtys[item['id']] = parsed;
+                                                          if (_selectedWholesalers.isNotEmpty && _selectedWholesalers.length == 1) {
+                                                            _orderedSuppliers[item['id']] = _selectedWholesalers.first;
+                                                            _lastSelectedWholesale = _selectedWholesalers.first;
+                                                          } else if ((_orderedSuppliers[item['id']] ?? '').trim().isEmpty) {
+                                                            if (_lastSelectedWholesale.isNotEmpty) {
+                                                              _orderedSuppliers[item['id']] = _lastSelectedWholesale;
+                                                            } else {
+                                                              final String defSup = (item['bestProfitWholesale'] ?? item['preferred_wholesale'] ?? "").toString().trim();
+                                                              if (defSup.isNotEmpty && defSup != '-' && defSup != 'General Wholesale') {
+                                                                _orderedSuppliers[item['id']] = defSup;
+                                                                _lastSelectedWholesale = defSup;
+                                                              }
+                                                            }
+                                                          } else {
+                                                            _lastSelectedWholesale = _orderedSuppliers[item['id']]!.trim();
+                                                          }
                                                         } else {
                                                           _orderedIds.remove(item['id']);
                                                           _orderedQtys.remove(item['id']);
@@ -1889,6 +1874,22 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
                                                       if (v == true) {
                                                         _orderedIds.add(item['id']);
                                                         _orderedQtys[item['id']] = pendingOrderQty > 0 ? pendingOrderQty : 1;
+                                                        if (_selectedWholesalers.isNotEmpty && _selectedWholesalers.length == 1) {
+                                                          _orderedSuppliers[item['id']] = _selectedWholesalers.first;
+                                                          _lastSelectedWholesale = _selectedWholesalers.first;
+                                                        } else if ((_orderedSuppliers[item['id']] ?? '').trim().isEmpty) {
+                                                          if (_lastSelectedWholesale.isNotEmpty) {
+                                                            _orderedSuppliers[item['id']] = _lastSelectedWholesale;
+                                                          } else {
+                                                            final String defSup = (item['bestProfitWholesale'] ?? item['preferred_wholesale'] ?? "").toString().trim();
+                                                            if (defSup.isNotEmpty && defSup != '-' && defSup != 'General Wholesale') {
+                                                              _orderedSuppliers[item['id']] = defSup;
+                                                              _lastSelectedWholesale = defSup;
+                                                            }
+                                                          }
+                                                        } else {
+                                                          _lastSelectedWholesale = _orderedSuppliers[item['id']]!.trim();
+                                                        }
                                                       } else {
                                                         _orderedIds.remove(item['id']);
                                                         _orderedQtys.remove(item['id']);
@@ -1911,7 +1912,8 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
                                               builder: (context) {
                                                 final dynamic itemId = item['id'];
                                                 final String defaultSupplier = (item['bestProfitWholesale'] ?? item['preferred_wholesale'] ?? "").toString().trim();
-                                                final String rawSelected = _orderedSuppliers[itemId] ?? (defaultSupplier.isNotEmpty && defaultSupplier != '-' && defaultSupplier != 'General Wholesale' ? defaultSupplier : "");
+                                                final String headerWholesaler = (_selectedWholesalers.isNotEmpty && _selectedWholesalers.length == 1) ? _selectedWholesalers.first : "";
+                                                final String rawSelected = _orderedSuppliers[itemId] ?? (headerWholesaler.isNotEmpty ? headerWholesaler : (defaultSupplier.isNotEmpty && defaultSupplier != '-' && defaultSupplier != 'General Wholesale' ? defaultSupplier : ""));
                                                 final String currentVal = rawSelected == "General Wholesale" ? "" : rawSelected;
 
                                                 final Color bgCol = _getSupplierBgColor(currentVal, _isDarkMode);
@@ -1919,7 +1921,11 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
 
                                                 void applyWholesaleSelection(String supplier) {
                                                   setState(() {
+                                                    final String clean = supplier.trim();
                                                     _orderedSuppliers[itemId] = supplier;
+                                                    if (clean.isNotEmpty && clean != '-' && clean != 'General Wholesale') {
+                                                      _lastSelectedWholesale = clean;
+                                                    }
                                                     if (supplier.trim().isNotEmpty) {
                                                       _orderedIds.add(itemId);
                                                       if (!_orderedQtys.containsKey(itemId) || _orderedQtys[itemId] == 0) {
@@ -1930,19 +1936,25 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
                                                 }
 
                                                 return Autocomplete<String>(
+                                                  key: ValueKey("wh_auto_${itemId}_$currentVal"),
                                                   initialValue: TextEditingValue(text: currentVal),
                                                   optionsBuilder: (TextEditingValue textEditingValue) {
                                                     final String query = textEditingValue.text.trim().toLowerCase();
+                                                    final List<String> wholesalersSource = _wholesalersSortedByBillCount.isNotEmpty
+                                                        ? _wholesalersSortedByBillCount
+                                                        : _availableWholesalers;
+
                                                     final List<String> allOptions = [
+                                                      if (_lastSelectedWholesale.isNotEmpty && _lastSelectedWholesale != '-' && _lastSelectedWholesale != 'General Wholesale') _lastSelectedWholesale,
                                                       if (defaultSupplier.isNotEmpty && defaultSupplier != '-' && defaultSupplier != 'General Wholesale') defaultSupplier,
-                                                      ...pharmacy.suppliers,
+                                                      ...wholesalersSource,
                                                     ].where((s) => s.trim().isNotEmpty && s != 'General Wholesale').toSet().toList();
 
                                                     if (query.isEmpty) {
                                                       return allOptions;
                                                     }
                                                     return allOptions.where((String option) {
-                                                      return option.toLowerCase().contains(query);
+                                                      return option.toLowerCase().startsWith(query);
                                                     });
                                                   },
                                                   onSelected: (String selection) {
@@ -1957,7 +1969,7 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
                                                         color: _isDarkMode ? const Color(0xFF1E293B) : Colors.white,
                                                         child: Container(
                                                           width: 300, // Wide overlay so names fit on ONE LINE ONLY!
-                                                          constraints: const BoxConstraints(maxHeight: 250),
+                                                          constraints: const BoxConstraints(maxHeight: 238), // Show 7 items max before scrolling
                                                           decoration: BoxDecoration(
                                                             borderRadius: BorderRadius.circular(8),
                                                             border: Border.all(color: _isDarkMode ? Colors.blueGrey.shade700 : Colors.grey.shade300),
@@ -2088,18 +2100,9 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
                                           width: _colWidths['lastSaleDate']!,
                                           align: TextAlign.center,
                                           isDarkMode: _isDarkMode,
-                                          bgColor: _isDateOnOrAfter(item['lastSaleDate']?.toString(), _getCutoffDateFromDays(_highlightLastSaleDays))
-                                              ? (_isDarkMode ? const Color(0xFF7F1D1D) : const Color(0xFFFEE2E2))
-                                              : null,
-                                          color: _isDateOnOrAfter(item['lastSaleDate']?.toString(), _getCutoffDateFromDays(_highlightLastSaleDays))
-                                              ? (_isDarkMode ? Colors.white : const Color(0xFF991B1B))
-                                              : null,
-                                          fontWeight: _isDateOnOrAfter(item['lastSaleDate']?.toString(), _getCutoffDateFromDays(_highlightLastSaleDays))
-                                              ? FontWeight.bold
-                                              : FontWeight.normal,
-                                          borderColor: _isDateOnOrAfter(item['lastSaleDate']?.toString(), _getCutoffDateFromDays(_highlightLastSaleDays))
-                                              ? Colors.red.shade400
-                                              : null,
+                                          bgColor: lastSaleStyle?.bg,
+                                          color: lastSaleStyle?.text,
+                                          fontWeight: lastSaleStyle != null ? FontWeight.bold : FontWeight.normal,
                                         ),
                                         _Cell(
                                           _formatNumberString(maxSingle4M),
@@ -2118,18 +2121,9 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
                                             width: _colWidths['firstPurchaseDate']!,
                                             align: TextAlign.center,
                                             isDarkMode: _isDarkMode,
-                                            bgColor: _isDateOnOrAfter(item['firstPurchaseDate']?.toString(), _getCutoffDateFromDays(_highlightFirstPurDays))
-                                                ? (_isDarkMode ? const Color(0xFF7F1D1D) : const Color(0xFFFEE2E2))
-                                                : null,
-                                            color: _isDateOnOrAfter(item['firstPurchaseDate']?.toString(), _getCutoffDateFromDays(_highlightFirstPurDays))
-                                                ? (_isDarkMode ? Colors.white : const Color(0xFF991B1B))
-                                                : null,
-                                            fontWeight: _isDateOnOrAfter(item['firstPurchaseDate']?.toString(), _getCutoffDateFromDays(_highlightFirstPurDays))
-                                                ? FontWeight.bold
-                                                : FontWeight.normal,
-                                            borderColor: _isDateOnOrAfter(item['firstPurchaseDate']?.toString(), _getCutoffDateFromDays(_highlightFirstPurDays))
-                                                ? Colors.red.shade400
-                                                : null,
+                                            bgColor: firstPurStyle?.bg,
+                                            color: firstPurStyle?.text,
+                                            fontWeight: firstPurStyle != null ? FontWeight.bold : FontWeight.normal,
                                           ),
                                         ],
                                         _Cell(item['mappedName']?.toString() ?? item['mappedWholesaler']?.toString() ?? "", width: _colWidths['mappedName']!, isDarkMode: _isDarkMode),
@@ -2236,6 +2230,55 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
 
     return Column(
       children: [
+        // CONSOLIDATE STOCK POSITION BUTTON BAR (Matching Exact Photo Styling)
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          color: _isDarkMode ? const Color(0xFF1E293B) : Colors.grey.shade100,
+          child: Row(
+            children: [
+              Text(
+                "Active Special Orders: ${filtered.length}",
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: textColor),
+              ),
+              const Spacer(),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF3F51B5), // Indigo Blue matching exact photo
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  elevation: 2,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                ),
+                onPressed: filtered.isEmpty
+                    ? null
+                    : () {
+                        setState(() {
+                          for (var s in filtered) {
+                            String prodName = s['product']?.toString() ?? "";
+                            int qty = int.tryParse(s['qty']?.toString() ?? "1") ?? 1;
+                            final matches = pharmacy.searchProducts(prodName, includeGenerics: false);
+                            if (matches.isNotEmpty) {
+                              pharmacy.addCustomExtraOrderItem(matches.first, qty);
+                            }
+                          }
+                          _selectedTab = 'ORDER'; // Switch to Order Analysis view
+                        });
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text("Consolidated ${filtered.length} Special Orders into Order Book!"),
+                            backgroundColor: Colors.indigo,
+                          ),
+                        );
+                      },
+                icon: const Icon(Icons.sync_alt_rounded, size: 18, color: Colors.white),
+                label: const Text(
+                  "CONSOLIDATE STOCK POSITION",
+                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, letterSpacing: 0.5, color: Colors.white),
+                ),
+              ),
+            ],
+          ),
+        ),
         Expanded(
           child: Scrollbar(
             controller: horizontalScroll,
@@ -2310,8 +2353,10 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
                                           );
 
                                           if (confirm == true) {
-                                            await pharmacy.deleteSpecialOrderItem(item['entry_no'], item['product']);
-                                            _fetchData();
+                                            if (context.mounted) {
+                                              await pharmacy.deleteSpecialOrderItem(item['entry_no'], item['product']);
+                                              if (context.mounted) _fetchData();
+                                            }
                                           }
                                         },
                                       ),
@@ -2346,6 +2391,343 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
       onAdvancedTap: (pos) => _openAdvancedFilter(key, title, pos),
       onResize: (v) => setState(() => _colWidths[key] = v.clamp(40, 500)),
       onHeightResize: (v) => setState(() => _headerHeight = v.clamp(40, 150)),
+    );
+  }
+}
+
+class WholesalerMultiSelectDialog extends StatefulWidget {
+  final List<String> availableWholesalers;
+  final Set<String> selectedWholesalers;
+  final String wholesalerMatchTier;
+  final bool isDarkMode;
+  final Function(Set<String> selectedWholesalers, String matchTier) onApply;
+
+  const WholesalerMultiSelectDialog({
+    super.key,
+    required this.availableWholesalers,
+    required this.selectedWholesalers,
+    required this.wholesalerMatchTier,
+    required this.isDarkMode,
+    required this.onApply,
+  });
+
+  @override
+  State<WholesalerMultiSelectDialog> createState() => _WholesalerMultiSelectDialogState();
+}
+
+class _WholesalerMultiSelectDialogState extends State<WholesalerMultiSelectDialog> {
+  late Set<String> _tempSelected;
+  late String _tempMatchTier;
+  String _searchQuery = "";
+  final TextEditingController _searchController = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.selectedWholesalers.isEmpty) {
+      _tempSelected = Set<String>.from(widget.availableWholesalers);
+    } else {
+      _tempSelected = Set<String>.from(widget.selectedWholesalers);
+    }
+    _tempMatchTier = widget.wholesalerMatchTier;
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = widget.isDarkMode;
+    final List<String> filteredWholesalers = widget.availableWholesalers.where((w) {
+      if (_searchQuery.trim().isEmpty) return true;
+      return w.toLowerCase().contains(_searchQuery.trim().toLowerCase());
+    }).toList();
+
+    final bool isAllSelected = widget.availableWholesalers.isNotEmpty &&
+        _tempSelected.length == widget.availableWholesalers.length;
+
+    return Dialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      backgroundColor: isDark ? const Color(0xFF1E293B) : const Color(0xFFF1F5F9),
+      child: Container(
+        width: 340,
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: isDark ? const Color(0xFF334155) : Colors.white,
+                    border: Border.all(color: Colors.grey.shade400),
+                    borderRadius: const BorderRadius.only(
+                      topLeft: Radius.circular(4),
+                      topRight: Radius.circular(4),
+                    ),
+                  ),
+                  child: Text(
+                    "Values",
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      color: isDark ? Colors.white : Colors.black87,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            Container(
+              decoration: BoxDecoration(
+                color: isDark ? const Color(0xFF0F172A) : Colors.white,
+                border: Border.all(color: Colors.grey.shade400),
+                borderRadius: const BorderRadius.only(
+                  topRight: Radius.circular(4),
+                  bottomLeft: Radius.circular(4),
+                  bottomRight: Radius.circular(4),
+                ),
+              ),
+              padding: const EdgeInsets.all(8),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    height: 32,
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    decoration: BoxDecoration(
+                      color: isDark ? const Color(0xFF1E293B) : Colors.white,
+                      border: Border.all(color: Colors.grey.shade300),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: _searchController,
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: isDark ? Colors.white : Colors.black87,
+                            ),
+                            decoration: const InputDecoration(
+                              hintText: "Enter text to search...",
+                              hintStyle: TextStyle(fontSize: 11, color: Colors.grey),
+                              border: InputBorder.none,
+                              isDense: true,
+                              contentPadding: EdgeInsets.symmetric(vertical: 6),
+                            ),
+                            onChanged: (val) {
+                              setState(() {
+                                _searchQuery = val;
+                              });
+                            },
+                          ),
+                        ),
+                        const Icon(Icons.search, size: 16, color: Colors.grey),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Container(
+                    height: 200,
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.grey.shade300),
+                      color: isDark ? const Color(0xFF1E293B) : Colors.white,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: ListView(
+                      padding: const EdgeInsets.symmetric(vertical: 2),
+                      children: [
+                        InkWell(
+                          onTap: () {
+                            setState(() {
+                              if (isAllSelected) {
+                                _tempSelected.clear();
+                              } else {
+                                _tempSelected = Set<String>.from(widget.availableWholesalers);
+                              }
+                            });
+                          },
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            child: Row(
+                              children: [
+                                SizedBox(
+                                  width: 20,
+                                  height: 20,
+                                  child: Checkbox(
+                                    value: isAllSelected,
+                                    activeColor: Colors.blue,
+                                    onChanged: (val) {
+                                      setState(() {
+                                        if (val == true) {
+                                          _tempSelected = Set<String>.from(widget.availableWholesalers);
+                                        } else {
+                                          _tempSelected.clear();
+                                        }
+                                      });
+                                    },
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Text(
+                                  "(All)",
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.bold,
+                                    color: isDark ? Colors.white : Colors.black87,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        Divider(height: 1, color: isDark ? Colors.white10 : Colors.grey.shade200),
+                        ...filteredWholesalers.map((w) {
+                          final bool isChecked = _tempSelected.contains(w);
+                          return InkWell(
+                            onTap: () {
+                              setState(() {
+                                if (_tempSelected.contains(w)) {
+                                  _tempSelected.remove(w);
+                                } else {
+                                  _tempSelected.add(w);
+                                }
+                              });
+                            },
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              child: Row(
+                                children: [
+                                  SizedBox(
+                                    width: 20,
+                                    height: 20,
+                                    child: Checkbox(
+                                      value: isChecked,
+                                      activeColor: Colors.blue,
+                                      onChanged: (val) {
+                                        setState(() {
+                                          if (val == true) {
+                                            _tempSelected.add(w);
+                                          } else {
+                                            _tempSelected.remove(w);
+                                          }
+                                        });
+                                      },
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      w,
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        color: isDark ? Colors.white70 : Colors.black87,
+                                      ),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          );
+                        }),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  // MATCH MODE (SAME COMPANY / ALL FILTER UNDER ALL WHOLESALERS)
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: isDark ? const Color(0xFF1E293B) : Colors.grey.shade100,
+                      border: Border.all(color: isDark ? Colors.white24 : Colors.grey.shade300),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          "MATCH MODE",
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                            color: isDark ? Colors.tealAccent : const Color(0xFF2563EB),
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        DropdownButtonHideUnderline(
+                          child: DropdownButton<String>(
+                            value: _tempMatchTier,
+                            isDense: true,
+                            isExpanded: true,
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                              color: isDark ? Colors.white : Colors.black87,
+                            ),
+                            dropdownColor: isDark ? const Color(0xFF1E293B) : Colors.white,
+                            items: const [
+                              DropdownMenuItem(value: 'GREEN', child: Text("🟢 Exact Bought Only")),
+                              DropdownMenuItem(value: 'ORANGE', child: Text("🟠 Exact + Variants")),
+                              DropdownMenuItem(value: 'YELLOW', child: Text("🟡 Same Company / All")),
+                            ],
+                            onChanged: (val) {
+                              if (val != null) {
+                                setState(() {
+                                  _tempMatchTier = val;
+                                });
+                              }
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      OutlinedButton(
+                        style: OutlinedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+                        ),
+                        onPressed: () {
+                          setState(() {
+                            _tempSelected.clear();
+                            _searchQuery = "";
+                            _searchController.clear();
+                            _tempMatchTier = 'YELLOW';
+                          });
+                        },
+                        child: const Text("Clear Filter", style: TextStyle(fontSize: 11)),
+                      ),
+                      ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF2563EB),
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+                        ),
+                        onPressed: () {
+                          widget.onApply(_tempSelected, _tempMatchTier);
+                          Navigator.of(context).pop();
+                        },
+                        child: const Text("Close", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

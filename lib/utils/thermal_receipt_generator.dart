@@ -119,7 +119,40 @@ class ThermalReceiptGenerator {
                   pw.Text("INR ${invoice.grandTotal.toStringAsFixed(2)}", style: pw.TextStyle(fontSize: 10, fontWeight: pw.FontWeight.bold)),
                 ],
               ),
-              pw.SizedBox(height: 10),
+              pw.SizedBox(height: 8),
+
+              // Dynamic UPI QR Code on Thermal Receipt
+              () {
+                final cleanVpa = company.upiVpaId.isNotEmpty ? company.upiVpaId : "sahakarmedicals@upi";
+                final payeeName = company.upiPayeeName.isNotEmpty ? company.upiPayeeName : company.name;
+                final amt = invoice.grandTotal.toStringAsFixed(2);
+                final ref = Uri.encodeComponent("Bill-${invoice.entryNo}");
+                final upiPayload = "upi://pay?pa=$cleanVpa&pn=${Uri.encodeComponent(payeeName)}&am=$amt&tn=$ref&cu=INR";
+
+                return pw.Center(
+                  child: pw.Column(
+                    children: [
+                      pw.Divider(borderStyle: pw.BorderStyle.dashed, thickness: 0.5),
+                      pw.Text("SCAN & PAY VIA UPI", style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold)),
+                      pw.SizedBox(height: 4),
+                      pw.Container(
+                        width: 90,
+                        height: 90,
+                        child: pw.BarcodeWidget(
+                          barcode: pw.Barcode.qrCode(),
+                          data: upiPayload,
+                          drawText: false,
+                        ),
+                      ),
+                      pw.SizedBox(height: 2),
+                      pw.Text("UPI ID: $cleanVpa", style: const pw.TextStyle(fontSize: 7)),
+                      pw.Divider(borderStyle: pw.BorderStyle.dashed, thickness: 0.5),
+                    ],
+                  ),
+                );
+              }(),
+
+              pw.SizedBox(height: 6),
               pw.Center(
                 child: pw.Text("Thank You! Visit Again.", style: pw.TextStyle(fontSize: 8, fontStyle: pw.FontStyle.italic)),
               ),

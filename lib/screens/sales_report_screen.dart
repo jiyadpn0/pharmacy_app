@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -7,6 +8,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:excel/excel.dart' as ex;
 import '../providers/pharmacy_provider.dart';
 import '../providers/app_provider.dart';
+import '../services/app_notification_service.dart';
 import '../widgets/app_date_picker.dart';
 import 'package:intl/intl.dart';
 import '../widgets/pin_unlock_dialog.dart';
@@ -14,6 +16,10 @@ import '../widgets/erp_tooltip.dart';
 import '../utils/report_pdf_generator.dart';
 import '../utils/printer_service.dart';
 import '../utils/theme_constants.dart';
+import '../utils/app_formatters.dart';
+import '../widgets/server_discrepancy_dialog.dart';
+import '../services/server_config_service.dart';
+import '../services/supabase_sync_service.dart';
 
 class SalesReportScreen extends StatefulWidget {
   const SalesReportScreen({super.key});
@@ -43,41 +49,109 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
   ReportType _reportType = ReportType.detailed;
   double _headerHeight = 52.0;
 
+  // Sorting state
+  String? _sortColumnKey;
+  bool _isAscending = true;
+
   // Stores advanced filter rules per column
   final Map<String, Map<String, dynamic>> _activeFilters = {};
   final Map<String, AggregationType> _columnAggregations = {};
+  bool _hideDeletedEntries = false;
 
   List<dynamic> _masterData = [];
   List<dynamic> _displayData = [];
   List<_ColInfo>? _cachedCols;
 
+  // Row selection & double-tap variables
+  int? _selectedIndex;
+  DateTime? _lastTapTime;
+  int? _lastTapIndex;
+
   // Pagination Variables
-  int _offset = 0;
-  final int _pageSize = 50;
   bool _hasMore = true;
   bool _isLoading = false;
+  bool _isLoadingMore = false;
+  int _currentOffset = 0;
+  static const int _pageSize = 100;
   final ScrollController _scrollController = ScrollController();
   final ScrollController _horizontalScrollController = ScrollController();
+
+  StreamSubscription<AppNotification>? _watchdogSub;
+  Timer? _watchdogDebounceTimer;
 
   @override
   void initState() {
     super.initState();
+    final now = DateTime.now();
+    _from = DateTime(now.year, now.month, now.day);
     _cachedCols = _getColumns();
     _scrollController.addListener(_onScroll);
     WidgetsBinding.instance.addPostFrameCallback((_) => _search());
+
+    _watchdogSub = AppNotificationService.instance.watchdogStream.listen((notif) {
+      if (!mounted) return;
+      final cat = notif.detectedCategory;
+      if (cat == 'SALES' || cat == 'RETURNS') {
+        _watchdogDebounceTimer?.cancel();
+        _watchdogDebounceTimer = Timer(const Duration(milliseconds: 500), () {
+          if (mounted) _search();
+        });
+      }
+    });
   }
 
   @override
   void dispose() {
+    _watchdogDebounceTimer?.cancel();
+    _watchdogSub?.cancel();
     _scrollController.dispose();
     _horizontalScrollController.dispose();
     super.dispose();
   }
 
   void _onScroll() {
-    if (_scrollController.position.pixels >= _scrollController.position.maxScrollExtent - 200) {
-      if (!_isLoading && _hasMore && _activeFilters.isEmpty) {
-        _loadMore();
+    if (!_hasMore || _isLoading || _isLoadingMore) return;
+    if (_reportType != ReportType.detailed && _reportType != ReportType.productVs) return;
+
+    if (_scrollController.hasClients &&
+        _scrollController.position.pixels >= _scrollController.position.maxScrollExtent - 200) {
+      _loadMoreData();
+    }
+  }
+
+  Future<void> _loadMoreData() async {
+    if (_isLoadingMore || !_hasMore) return;
+    setState(() => _isLoadingMore = true);
+
+    try {
+      final provider = Provider.of<PharmacyProvider>(context, listen: false);
+      final moreSales = await provider.fetchSalesInDateRange(
+        _from,
+        _to,
+        loadItems: true,
+        limit: _pageSize,
+        offset: _currentOffset,
+        includeDeleted: true,
+      );
+
+      final newRows = _processData(moreSales);
+      if (!mounted) return;
+
+      setState(() {
+        if (newRows.isEmpty || newRows.length < _pageSize) {
+          _hasMore = false;
+        } else {
+          _hasMore = true;
+        }
+        _currentOffset += newRows.length;
+        _masterData.addAll(newRows);
+        _isLoadingMore = false;
+        _applyFilters(notify: true);
+      });
+    } catch (e) {
+      debugPrint("Sales Load More Error: $e");
+      if (mounted) {
+        setState(() => _isLoadingMore = false);
       }
     }
   }
@@ -87,23 +161,28 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
     setState(() {
       _masterData = [];
       _displayData = [];
-      _offset = 0;
-      _hasMore = true;
+      _currentOffset = 0;
+      _hasMore = false;
       _isLoading = true;
     });
 
     try {
       final provider = Provider.of<PharmacyProvider>(context, listen: false);
-      final filteredSales = await provider.fetchSalesInDateRange(_from, _to, loadItems: true, limit: _pageSize, offset: 0, includeDeleted: true);
 
-      if (!mounted) return;
-      setState(() {
-        _masterData = _processData(filteredSales);
-        _offset = filteredSales.length;
-        _hasMore = filteredSales.length == _pageSize;
-        _isLoading = false;
-        _applyFilters(notify: false); // Update _displayData without redundant setState
-      });
+      // Non-blocking background cloud check: displays local data immediately (<50ms)
+      if (ServerConfigService.instance.isServerModeEnabled && ServerConfigService.instance.isConnected) {
+        unawaited(
+          SupabaseSyncService.instance.refreshDateRangeTransactionsCloudDirect(_from, _to, pharmacy: provider).then((synced) {
+            if (synced && mounted) {
+              _loadLocalData(provider, silent: true);
+            }
+          }).catchError((e) {
+            debugPrint("Non-blocking background sync error: $e");
+          }),
+        );
+      }
+
+      await _loadLocalData(provider, silent: false);
     } catch (e) {
       debugPrint("Sales Search Error: $e");
       if (mounted) {
@@ -115,27 +194,46 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
     }
   }
 
-  void _loadMore() async {
-    if (_isLoading || !_hasMore) return;
-
-    setState(() => _isLoading = true);
-
+  Future<void> _loadLocalData(PharmacyProvider provider, {bool silent = false}) async {
+    if (!silent) {
+      if (!mounted) return;
+      setState(() => _isLoading = true);
+    }
     try {
-      final provider = Provider.of<PharmacyProvider>(context, listen: false);
-      final nextSales = await provider.fetchSalesInDateRange(_from, _to, loadItems: true, limit: _pageSize, offset: _offset, includeDeleted: true);
+      List<dynamic> processedData;
+      if (_reportType == ReportType.summary) {
+        processedData = await provider.fetchDailySalesSummary(_from, _to, includeDeleted: true);
+        _hasMore = false;
+      } else if (_reportType == ReportType.accounts) {
+        processedData = await provider.fetchAccountsSalesSummary(_from, _to, includeDeleted: true);
+        _hasMore = false;
+      } else if (_reportType == ReportType.productVsSummary) {
+        processedData = await provider.fetchProductSalesSummary(_from, _to, includeDeleted: true);
+        _hasMore = false;
+      } else {
+        _currentOffset = 0;
+        final filteredSales = await provider.fetchSalesInDateRange(
+          _from, 
+          _to, 
+          loadItems: true, 
+          limit: _pageSize, 
+          offset: 0, 
+          includeDeleted: true,
+        );
+        processedData = _processData(filteredSales);
+        _currentOffset = processedData.length;
+        _hasMore = processedData.length >= _pageSize;
+      }
 
       if (!mounted) return;
       setState(() {
-        final processed = _processData(nextSales);
-        _masterData.addAll(processed);
-        _offset += nextSales.length;
-        _hasMore = nextSales.length == _pageSize;
+        _masterData = processedData;
         _isLoading = false;
-        _applyFilters(notify: false);
+        _applyFilters(notify: false); // Update _displayData with loaded rows
       });
     } catch (e) {
-      debugPrint("Sales Load More Error: $e");
-      if (mounted) {
+      debugPrint("Sales Local Load Error: $e");
+      if (mounted && !silent) {
         setState(() {
           _isLoading = false;
           _hasMore = false;
@@ -143,6 +241,8 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
       }
     }
   }
+
+
 
   DateTime? _parseFlexibleDate(String dateStr) {
     if (dateStr.isEmpty) return null;
@@ -162,6 +262,7 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
   }
 
   void _applyFilters({bool notify = true}) {
+    _selectedIndex = null;
     List<dynamic> filtered;
     if (_activeFilters.isEmpty) {
       filtered = List.from(_masterData);
@@ -243,11 +344,64 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
       }).toList();
     }
 
+    if (_hideDeletedEntries) {
+      filtered = filtered.where((row) => row['status'] != 'DELETED ENTRY').toList();
+    }
+
+    // Apply Column Header Sorting (A-Z / Z-A for Text/Date, 0-9 / 9-0 for Numbers)
+    if (_sortColumnKey != null) {
+      final colDef = _getColumns().firstWhere((c) => c.key == _sortColumnKey, orElse: () => _getColumns().first);
+      final isNum = colDef.type == ColumnType.numeric;
+      final isDate = colDef.type == ColumnType.date;
+
+      filtered.sort((a, b) {
+        dynamic valA = a[_sortColumnKey];
+        dynamic valB = b[_sortColumnKey];
+
+        int comp = 0;
+        if (isNum) {
+          double numA = (valA is num) ? valA.toDouble() : (double.tryParse(formatSaleDisplayNo(valA?.toString() ?? '')) ?? 0.0);
+          double numB = (valB is num) ? valB.toDouble() : (double.tryParse(formatSaleDisplayNo(valB?.toString() ?? '')) ?? 0.0);
+          comp = numA.compareTo(numB);
+        } else if (isDate) {
+          DateTime? dateA = (a['raw_date'] is DateTime && _sortColumnKey == 'date') ? a['raw_date'] : _parseFlexibleDate(valA?.toString() ?? '');
+          DateTime? dateB = (b['raw_date'] is DateTime && _sortColumnKey == 'date') ? b['raw_date'] : _parseFlexibleDate(valB?.toString() ?? '');
+          if (dateA == null && dateB == null) {
+            comp = 0;
+          } else if (dateA == null) comp = -1;
+          else if (dateB == null) comp = 1;
+          else comp = dateA.compareTo(dateB);
+        } else {
+          String strA = valA?.toString().toLowerCase() ?? '';
+          String strB = valB?.toString().toLowerCase() ?? '';
+          comp = strA.compareTo(strB);
+        }
+        return _isAscending ? comp : -comp;
+      });
+    }
+
     if (notify) {
       setState(() => _displayData = filtered);
     } else {
       _displayData = filtered;
     }
+  }
+
+  void _onColumnHeaderTap(String key) {
+    setState(() {
+      if (_sortColumnKey == key) {
+        if (_isAscending) {
+          _isAscending = false;
+        } else {
+          _sortColumnKey = null;
+          _isAscending = true;
+        }
+      } else {
+        _sortColumnKey = key;
+        _isAscending = true;
+      }
+      _applyFilters();
+    });
   }
 
   void _showSettlementDialog(String entryNo) {
@@ -303,12 +457,19 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
     // Filter out Special Orders as they belong in the Order Book, not Sales Analysis
     final sales = inputSales.where((s) => s.customerAcc != "Special Order").toList();
 
+    // Sort sales by numerical Entry No descending (greatest entry number on top, lowest on bottom)
+    sales.sort((a, b) {
+      int numA = int.tryParse(formatSaleDisplayNo(a.entryNo)) ?? 0;
+      int numB = int.tryParse(formatSaleDisplayNo(b.entryNo)) ?? 0;
+      if (numA != numB) {
+        return numB.compareTo(numA);
+      }
+      return b.date.compareTo(a.date);
+    });
+
     switch (_reportType) {
       case ReportType.detailed:
         return sales.map((s) {
-          // The true Gross is the sum of all items at MRP before any discounts
-          double trueGrossInclusive = s.items.fold(0.0, (sum, item) => sum + ((item.mrp / (item.packin > 0 ? item.packin : 1)) * item.qty));
-
           double totalItemDiscounts = s.items.fold(0.0, (sum, item) => sum + item.discAmt);
           double totalGst = s.items.fold(0.0, (sum, item) => sum + item.gstAmt);
 
@@ -329,24 +490,48 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
             netGst = totalGst * ratio;
           }
 
+          double totalDiscount = totalItemDiscounts + s.discount;
+          double grossMRP = netTaxable + totalDiscount;
+
           // LCWT = Taxable Base - Profit (Since profit is strictly exclusive of GST now)
           double lcwt = netTaxable - profit;
+
+          String pcIdentity = "PC 1";
+          final String canonicalKey = s.entryNo.toUpperCase();
+          if (canonicalKey.startsWith("T1-")) {
+            pcIdentity = "PC 1";
+          } else if (canonicalKey.startsWith("T2-")) {
+            pcIdentity = "PC 2";
+          } else if (canonicalKey.startsWith("T3-")) {
+            pcIdentity = "PC 3";
+          } else if (canonicalKey.contains("_")) {
+            final prefix = canonicalKey.substring(0, canonicalKey.indexOf("_")).trim();
+            if (prefix.isNotEmpty) pcIdentity = prefix;
+          }
+          final String agentName = s.agent.trim();
+          if (agentName.isNotEmpty && agentName.toLowerCase() != "admin") {
+            pcIdentity = "$pcIdentity ($agentName)";
+          } else if (agentName.isNotEmpty) {
+            pcIdentity = "$pcIdentity (Admin)";
+          }
 
           return {
             'date': DateFormat('dd/MM/yyyy').format(s.date),
             'raw_date': s.date,
             'time': DateFormat('hh:mm a').format(s.date),
-            'entry_no': s.entryNo,
+            'entry_no': formatSaleDisplayNo(s.entryNo),
+            'raw_entry_no': s.entryNo,
             'customer': s.customerAcc,
             'mobile': s.mobile,
             'patient': s.patient,
             'doctor': s.doctor,
-            'agent': s.agent,
+            'agent': s.agent.isEmpty ? "Admin" : s.agent,
+            'computer': pcIdentity,
             'tax': s.taxType,
             'is_tax': s.taxType == 'Gst' ? 'Yes' : 'No',
-            'gross': s.subTotal, // Raw MRP sum
-            'discount': totalItemDiscounts + s.discount, // Total of all discounts
-            'net': netTaxable, // CA needs Net to be the Taxable Base
+            'gross': grossMRP, // MRP sum before discount (Gross - Discount = Net)
+            'discount': totalDiscount, // Total of all discounts
+            'net': netTaxable, // Net amount after discount given to customer
             'gst': netGst,
             'total': netTaxable + netGst, // Pre-return total
             'other_disc': s.discount, // Footer discount
@@ -363,16 +548,37 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
       case ReportType.productVs:
         List<Map<String, dynamic>> items = [];
         for (var s in sales) {
+          String pcIdentity = "PC 1";
+          final String canonicalKey = s.entryNo.toUpperCase();
+          if (canonicalKey.startsWith("T1-")) {
+            pcIdentity = "PC 1";
+          } else if (canonicalKey.startsWith("T2-")) {
+            pcIdentity = "PC 2";
+          } else if (canonicalKey.startsWith("T3-")) {
+            pcIdentity = "PC 3";
+          } else if (canonicalKey.contains("_")) {
+            final prefix = canonicalKey.substring(0, canonicalKey.indexOf("_")).trim();
+            if (prefix.isNotEmpty) pcIdentity = prefix;
+          }
+          final String agentName = s.agent.trim();
+          if (agentName.isNotEmpty && agentName.toLowerCase() != "admin") {
+            pcIdentity = "$pcIdentity ($agentName)";
+          } else if (agentName.isNotEmpty) {
+            pcIdentity = "$pcIdentity (Admin)";
+          }
+
           for (var item in s.items) {
             items.add({
               'date': DateFormat('dd/MM/yyyy').format(s.date),
               'time': DateFormat('hh:mm a').format(s.date),
-              'entry_no': s.entryNo,
+              'entry_no': formatSaleDisplayNo(s.entryNo),
+              'raw_entry_no': s.entryNo,
               'customer': s.customerAcc,
               'mobile': s.mobile,
               'patient': s.patient,
               'doctor': s.doctor,
-              'agent': s.agent,
+              'agent': s.agent.isEmpty ? "Admin" : s.agent,
+              'computer': pcIdentity,
               'product': item.product.name,
               'category': item.product.category,
               'sub_category': item.product.subCategory,
@@ -500,6 +706,7 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
           _ColInfo("patient", "Patient", flex: 1.1),
           _ColInfo("doctor", "Doctor", flex: 1.1),
           _ColInfo("agent", "Agent", flex: 1.1),
+          _ColInfo("computer", "Saved/Edited By (PC)", flex: 1.3),
           _ColInfo("tax", "Tax", flex: 1.0),
           _ColInfo("gross", "Gross", flex: 1.0, align: TextAlign.right, type: ColumnType.numeric),
           _ColInfo("discount", "Discount", flex: 1.0, align: TextAlign.right, type: ColumnType.numeric),
@@ -521,6 +728,7 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
           _ColInfo("patient", "Patient", flex: 1.1),
           _ColInfo("doctor", "Doctor", flex: 1.1),
           _ColInfo("agent", "Agent", flex: 1.1),
+          _ColInfo("computer", "Saved/Edited By (PC)", flex: 1.3),
           _ColInfo("product", "Product", flex: 2.2),
           _ColInfo("category", "Category", flex: 1.3),
           _ColInfo("patent_name", "Patent name", flex: 1.3),
@@ -640,6 +848,7 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
   }
 
   Widget _buildSidebar(AppThemeColors c) {
+    final now = DateTime.now();
     return Container(
       width: 250,
       color: c.cardBg,
@@ -654,6 +863,52 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
               Expanded(child: _datePicker("To", _to, (d) { setState(() => _to = d); _search(); })),
             ],
           ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: () {
+                    setState(() {
+                      _from = DateTime(now.year, now.month, 1);
+                      _to = DateTime(now.year, now.month + 1, 0);
+                    });
+                    _search();
+                  },
+                  style: OutlinedButton.styleFrom(padding: EdgeInsets.zero, visualDensity: VisualDensity.compact),
+                  child: const Text("This Month", style: TextStyle(fontSize: 9)),
+                ),
+              ),
+              const SizedBox(width: 4),
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: () {
+                    setState(() {
+                      _from = DateTime(now.month >= 4 ? now.year : now.year - 1, 4, 1);
+                      _to = DateTime(now.month >= 4 ? now.year + 1 : now.year, 3, 31);
+                    });
+                    _search();
+                  },
+                  style: OutlinedButton.styleFrom(padding: EdgeInsets.zero, visualDensity: VisualDensity.compact),
+                  child: const Text("FY", style: TextStyle(fontSize: 9)),
+                ),
+              ),
+              const SizedBox(width: 4),
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: () {
+                    setState(() {
+                      _from = DateTime(2000, 1, 1);
+                      _to = DateTime(2100, 12, 31);
+                    });
+                    _search();
+                  },
+                  style: OutlinedButton.styleFrom(padding: EdgeInsets.zero, visualDensity: VisualDensity.compact),
+                  child: const Text("All Time", style: TextStyle(fontSize: 9)),
+                ),
+              ),
+            ],
+          ),
           const SizedBox(height: 15),
           Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -665,12 +920,45 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
               _reportTypeRadio(ReportType.accounts, "Accounts"),
             ],
           ),
+          const SizedBox(height: 10),
+          InkWell(
+            onTap: () {
+              setState(() {
+                _hideDeletedEntries = !_hideDeletedEntries;
+                _applyFilters();
+              });
+            },
+            child: Row(
+              children: [
+                Checkbox(
+                  value: _hideDeletedEntries,
+                  onChanged: (v) {
+                    setState(() {
+                      _hideDeletedEntries = v ?? false;
+                      _applyFilters();
+                    });
+                  },
+                  visualDensity: VisualDensity.compact,
+                ),
+                const Expanded(
+                  child: Text(
+                    "Hide Deleted",
+                    style: TextStyle(fontSize: 11, fontWeight: FontWeight.w500),
+                  ),
+                ),
+              ],
+            ),
+          ),
           const Spacer(),
           Row(
             children: [
               Expanded(child: _sideActionBtn("Export", Icons.exit_to_app, onPressed: _exportExcel)),
-              const SizedBox(width: 8),
+              const SizedBox(width: 4),
               Expanded(child: _sideActionBtn("Print", Icons.print, onPressed: _printReport)),
+              const SizedBox(width: 4),
+              Expanded(child: _sideActionBtn("Audit", Icons.youtube_searched_for_rounded, onPressed: () {
+                ServerDiscrepancyDialog.show(context, initialCategoryKey: 'sales_invoices');
+              })),
             ],
           )
         ],
@@ -688,28 +976,76 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
     );
 
     if (outputFile != null) {
-      final excel = ex.Excel.createExcel();
-      final sheet = excel['Sales Report'];
-      excel.delete('Sheet1');
+      if (!mounted) return;
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => const Center(
+          child: Card(
+            child: Padding(
+              padding: EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CircularProgressIndicator(strokeWidth: 3),
+                  SizedBox(width: 16),
+                  Text("Exporting Sales Report to Excel...", style: TextStyle(fontWeight: FontWeight.bold)),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
 
-      final columns = _getColumns().where((c) => c.key != "actions").toList();
-      sheet.appendRow(columns.map((c) => ex.TextCellValue(c.label)).toList());
+      try {
+        final provider = Provider.of<PharmacyProvider>(context, listen: false);
+        List<dynamic> exportRows;
+        if (_hasMore && (_reportType == ReportType.detailed || _reportType == ReportType.productVs)) {
+          final allSales = await provider.fetchSalesInDateRange(
+            _from,
+            _to,
+            loadItems: true,
+            limit: null,
+            offset: null,
+            includeDeleted: true,
+          );
+          exportRows = _processData(allSales);
+        } else {
+          exportRows = _displayData;
+        }
 
-      for (var row in _displayData) {
-        sheet.appendRow(columns.map((col) {
-          final val = row[col.key];
-          if (val is double) return ex.DoubleCellValue(val);
-          if (val is int) return ex.IntCellValue(val);
-          return ex.TextCellValue(val?.toString() ?? '');
-        }).toList());
-      }
+        final excel = ex.Excel.createExcel();
+        final sheet = excel['Sales Report'];
+        excel.delete('Sheet1');
 
-      final bytes = excel.encode();
-      if (bytes != null) {
-        await File(outputFile).writeAsBytes(bytes);
+        final columns = _getColumns().where((c) => c.key != "actions").toList();
+        sheet.appendRow(columns.map((c) => ex.TextCellValue(c.label)).toList());
+
+        for (var row in exportRows) {
+          sheet.appendRow(columns.map((col) {
+            final val = row[col.key];
+            if (val is double) return ex.DoubleCellValue(val);
+            if (val is int) return ex.IntCellValue(val);
+            return ex.TextCellValue(val?.toString() ?? '');
+          }).toList());
+        }
+
+        final bytes = excel.encode();
+        if (bytes != null) {
+          await File(outputFile).writeAsBytes(bytes);
+        }
+
         if (mounted) {
+          Navigator.of(context, rootNavigator: true).pop();
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text("Sales Report Exported to Excel!"), backgroundColor: Colors.green),
+          );
+        }
+      } catch (e) {
+        if (mounted) {
+          Navigator.of(context, rootNavigator: true).pop();
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Excel Export Error: $e"), backgroundColor: Colors.red),
           );
         }
       }
@@ -768,24 +1104,28 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
           });
           _search();
         },
-        child: Row(
-          children: [
-            Radio<ReportType>(
-              value: type,
-              groupValue: _reportType,
-              onChanged: (v) {
-                setState(() {
-                  _reportType = v!;
-                  _cachedCols = null;
-                  _activeFilters.clear();
-                  _columnAggregations.clear();
-                });
-                _search();
-              },
-              visualDensity: VisualDensity.compact,
-            ),
-            Expanded(child: Text(label, style: const TextStyle(fontSize: 11), overflow: TextOverflow.ellipsis)),
-          ],
+        child: RadioGroup<ReportType>(
+          groupValue: _reportType,
+          onChanged: (v) {
+            if (v != null) {
+              setState(() {
+                _reportType = v;
+                _cachedCols = null;
+                _activeFilters.clear();
+                _columnAggregations.clear();
+              });
+              _search();
+            }
+          },
+          child: Row(
+            children: [
+              Radio<ReportType>(
+                value: type,
+                visualDensity: VisualDensity.compact,
+              ),
+              Expanded(child: Text(label, style: const TextStyle(fontSize: 11), overflow: TextOverflow.ellipsis)),
+            ],
+          ),
         ),
       ),
     );
@@ -810,43 +1150,113 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
   void _printReport() async {
     if (_displayData.isEmpty) return;
     final pharma = Provider.of<PharmacyProvider>(context, listen: false);
-    final columns = _getColumns().where((c) => c.key != "actions").toList();
-    
-    final headers = columns.map((c) => c.label).toList();
-    final data = _displayData.map((row) {
-      return columns.map((col) {
-        final val = row[col.key];
-        if (val == null) return "";
-        if (val is double) return val.toStringAsFixed(2);
-        return val.toString();
+
+    bool shouldShowDialog = _hasMore && (_reportType == ReportType.detailed || _reportType == ReportType.productVs);
+    if (shouldShowDialog) {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => const Center(
+          child: Card(
+            child: Padding(
+              padding: EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CircularProgressIndicator(strokeWidth: 3),
+                  SizedBox(width: 16),
+                  Text("Preparing Complete Report for Print...", style: TextStyle(fontWeight: FontWeight.bold)),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    try {
+      List<dynamic> printRows;
+      if (_hasMore && (_reportType == ReportType.detailed || _reportType == ReportType.productVs)) {
+        final allSales = await pharma.fetchSalesInDateRange(
+          _from,
+          _to,
+          loadItems: true,
+          limit: null,
+          offset: null,
+          includeDeleted: true,
+        );
+        printRows = _processData(allSales);
+        if (mounted) Navigator.of(context, rootNavigator: true).pop();
+      } else {
+        printRows = _displayData;
+      }
+
+      final columns = _getColumns().where((c) => c.key != "actions").toList();
+      final headers = columns.map((c) => c.label).toList();
+      final data = printRows.map((row) {
+        return columns.map((col) {
+          final val = row[col.key];
+          if (val == null) return "";
+          if (val is double) return val.toStringAsFixed(2);
+          return val.toString();
+        }).toList();
       }).toList();
-    }).toList();
 
-    final doc = await ReportPdfGenerator.buildReportPdf(
-      title: "Sales Report (${_reportType.name.toUpperCase()})",
-      headers: headers,
-      data: data,
-      company: pharma.companyProfile,
-      subtitle: "From: ${DateFormat('dd/MM/yyyy').format(_from)} To: ${DateFormat('dd/MM/yyyy').format(_to)}",
-    );
+      final doc = await ReportPdfGenerator.buildReportPdf(
+        title: "Sales Report (${_reportType.name.toUpperCase()})",
+        headers: headers,
+        data: data,
+        company: pharma.companyProfile,
+        subtitle: "From: ${DateFormat('dd/MM/yyyy').format(_from)} To: ${DateFormat('dd/MM/yyyy').format(_to)}",
+      );
 
-    if (!mounted) return;
-    PrinterService.showProfessionalPreview(
-      context: context,
-      doc: doc,
-      title: "Sales Report Preview",
-    );
+      if (!mounted) return;
+      PrinterService.showProfessionalPreview(
+        context: context,
+        doc: doc,
+        title: "Sales Report Preview",
+      );
+    } catch (e) {
+      if (mounted && shouldShowDialog) {
+        Navigator.of(context, rootNavigator: true).pop();
+      }
+      debugPrint("Print Report Error: $e");
+    }
   }
 
   Widget _buildReportHeader() {
     return Container(
       width: double.infinity,
       color: const Color(0xFFD1D9E1),
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Text(
-        "Report Summary From: ${DateFormat('dd/MM/yyyy').format(_from)} To: ${DateFormat('dd/MM/yyyy').format(_to)}",
-        textAlign: TextAlign.center,
-        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF2C3E50)),
+      padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 12),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              "Report Summary From: ${DateFormat('dd/MM/yyyy').format(_from)} To: ${DateFormat('dd/MM/yyyy').format(_to)}",
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF2C3E50)),
+            ),
+          ),
+          InkWell(
+            onTap: () => ServerDiscrepancyDialog.show(context, initialCategoryKey: 'sales_invoices'),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: Colors.red.shade700,
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.youtube_searched_for_rounded, size: 14, color: Colors.white),
+                  SizedBox(width: 4),
+                  Text('Cloud Audit', style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold)),
+                ],
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -913,6 +1323,9 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
                           (idx) => _GridHeaderCell(
                             col: columns[idx],
                             width: scaledWidths[idx],
+                            isSorted: _sortColumnKey == columns[idx].key,
+                            isAscending: _isAscending,
+                            onSortTap: () => _onColumnHeaderTap(columns[idx].key),
                             onAdvancedTap: (pos) => _openAdvancedFilterDialog(columns[idx], pos),
                             onResize: (newWidth) => setState(() => columns[idx].width = newWidth.clamp(40, 500)),
                             onHeightResize: (newHeight) => setState(() => _headerHeight = newHeight.clamp(40, 150)),
@@ -1039,18 +1452,35 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
 
   Widget _buildGridRow(Map<String, dynamic> row, List<_ColInfo> columns, List<double> scaledWidths, int index) {
     bool isDeleted = row['status'] == 'DELETED ENTRY';
+    bool isSelected = (index == _selectedIndex);
     final provider = Provider.of<PharmacyProvider>(context, listen: false);
+
+    Color rowBg = isSelected
+        ? const Color(0xFFBAE6FD)
+        : (isDeleted ? const Color(0xFFFEF2F2) : (index % 2 == 0 ? Colors.white : const Color(0xFFF9F9F9)));
 
     return InkWell(
       onTap: () {
-        final entryNo = row['entry_no']?.toString();
-        if (entryNo != null && (_reportType == ReportType.detailed || _reportType == ReportType.productVs)) {
-          _handleEdit(row['entry_no'], row['raw_date']);
+        final now = DateTime.now();
+        setState(() {
+          _selectedIndex = index;
+        });
+
+        if (_lastTapIndex == index && _lastTapTime != null && now.difference(_lastTapTime!) < const Duration(milliseconds: 350)) {
+          _lastTapTime = null;
+          _lastTapIndex = null;
+          final entryNo = row['raw_entry_no']?.toString() ?? row['entry_no']?.toString();
+          if (entryNo != null && entryNo.isNotEmpty) {
+            _handleEdit(entryNo, row['raw_date']);
+          }
+        } else {
+          _lastTapIndex = index;
+          _lastTapTime = now;
         }
       },
       child: Container(
         height: 25,
-        color: isDeleted ? const Color(0xFFFEF2F2) : (index % 2 == 0 ? Colors.white : const Color(0xFFF9F9F9)),
+        color: rowBg,
         child: ClipRect(
           child: SingleChildScrollView(
             scrollDirection: Axis.horizontal,
@@ -1063,6 +1493,7 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
               if (col.key == "actions") {
                 bool isCredit = row['customer'] == 'Credit';
                 bool isPaid = row['is_paid'] ?? true;
+                final targetEntryNo = row['raw_entry_no']?.toString() ?? row['entry_no']?.toString() ?? '';
                 return Container(
                   width: cellWidth,
                   padding: const EdgeInsets.symmetric(horizontal: 2),
@@ -1080,7 +1511,7 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
                                 Tooltip(
                                   message: "Settle",
                                   child: InkWell(
-                                    onTap: () => _showSettlementDialog(row['entry_no']),
+                                    onTap: () => _showSettlementDialog(targetEntryNo),
                                     child: const Padding(
                                       padding: EdgeInsets.symmetric(horizontal: 3, vertical: 2),
                                       child: Icon(Icons.account_balance_wallet_rounded, color: Colors.blue, size: 14),
@@ -1090,7 +1521,7 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
                               Tooltip(
                                 message: "Delete",
                                 child: InkWell(
-                                  onTap: () => _handleDelete(row['entry_no'], row['raw_date']),
+                                  onTap: () => _handleDelete(targetEntryNo, row['raw_date']),
                                   child: const Padding(
                                     padding: EdgeInsets.symmetric(horizontal: 3, vertical: 2),
                                     child: Icon(Icons.delete_forever_rounded, color: Colors.redAccent, size: 14),
@@ -1189,6 +1620,7 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
 
       cells.add(
         GestureDetector(
+          onTapDown: (details) => _showAggregationMenu(details.globalPosition, col.key),
           onSecondaryTapDown: (details) => _showAggregationMenu(details.globalPosition, col.key),
           child: ERPTooltip(
             message: result,
@@ -1260,44 +1692,63 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
   }
 
   void _showAggregationMenu(Offset position, String colKey) {
-    showMenu<AggregationType>(
-      context: context,
-      position: RelativeRect.fromLTRB(position.dx, position.dy, position.dx, position.dy),
-      items: [
-        _buildPopupItem(AggregationType.sum, "Sum", Icons.functions),
-        _buildPopupItem(AggregationType.min, "Min", Icons.bar_chart),
-        _buildPopupItem(AggregationType.max, "Max", Icons.bar_chart),
-        _buildPopupItem(AggregationType.count, "Count", Icons.numbers),
-        _buildPopupItem(AggregationType.average, "Average", Icons.abc),
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
+    final currentAgg = _columnAggregations[colKey] ?? AggregationType.none;
+    final resultStr = _calculateAggregation(colKey, currentAgg);
+
+    final List<PopupMenuEntry<dynamic>> items = [
+      _buildPopupItem(AggregationType.sum, "Sum", Icons.functions),
+      _buildPopupItem(AggregationType.min, "Min", Icons.bar_chart),
+      _buildPopupItem(AggregationType.max, "Max", Icons.bar_chart),
+      _buildPopupItem(AggregationType.count, "Count", Icons.numbers),
+      _buildPopupItem(AggregationType.average, "Average", Icons.abc),
+      const PopupMenuDivider(),
+      _buildPopupItem(AggregationType.none, "None", Icons.check),
+    ];
+
+    if (resultStr.isNotEmpty) {
+      items.addAll([
         const PopupMenuDivider(),
-        _buildPopupItem(AggregationType.none, "None", Icons.check),
-      ],
+        PopupMenuItem<String>(
+          value: "COPY_VALUE",
+          height: 32,
+          child: Row(
+            children: [
+              const Icon(Icons.copy, size: 14, color: Colors.blue),
+              const SizedBox(width: 8),
+              Text("Copy ($resultStr)", style: const TextStyle(fontSize: 11)),
+            ],
+          ),
+        ),
+      ]);
+    }
+
+    showMenu<dynamic>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(position.dx, position.dy, 0, 0),
+        Offset.zero & overlay.size,
+      ),
+      items: items,
     ).then((selected) {
-      if (selected != null) {
+      if (selected is AggregationType) {
         setState(() => _columnAggregations[colKey] = selected);
+      } else if (selected == "COPY_VALUE") {
+        Clipboard.setData(ClipboardData(text: resultStr));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Copied $resultStr to clipboard"), duration: const Duration(seconds: 1)),
+          );
+        }
       }
     });
   }
 
-  void _handleEdit(String entryNo, DateTime date) async {
-    final provider = Provider.of<PharmacyProvider>(context, listen: false);
+  void _handleEdit(String entryNo, dynamic date) {
+    if (entryNo.toString().isEmpty) return;
     final appProvider = Provider.of<AppProvider>(context, listen: false);
-
-    bool isOldLocked = provider.isEditLocked(date);
-
-    if (isOldLocked && !provider.isAdminSessionActive()) {
-      bool isUnlocked = await PinUnlockDialog.show(
-          context,
-          provider,
-          title: "Locked Invoice",
-          message: "This invoice is from a previous day. Enter Master Password to unlock it for editing."
-      ) ?? false;
-      if (!isUnlocked) return;
-      provider.refreshAdminSession();
-      provider.logAudit('UNLOCK_OLD_INVOICE', 'Unlocked old invoice $entryNo from ${DateFormat('yyyy-MM-dd').format(date)} for editing.');
-    }
-
-    appProvider.openSales(invoiceNo: entryNo);
+    appProvider.openSales(invoiceNo: entryNo.toString());
   }
 
   void _handleDelete(String entryNo, DateTime date) async {
@@ -1310,7 +1761,7 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
             provider,
             title: "Confirm Deletion",
             message: "Enter Master Password to permanently delete Invoice $entryNo."
-        ) ?? false;
+        );
         if (!mounted) return;
         if (!isUnlocked) return;
         provider.refreshAdminSession();
@@ -1318,26 +1769,25 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
     }
 
     if (!mounted) return;
-    final currentCtx = context;
 
     // PREVIOUS DAY LOCK CHECK
     bool isOldLocked = provider.isEditLocked(date);
     if (isOldLocked && !provider.isAdminSessionActive()) {
       bool isUnlocked = await PinUnlockDialog.show(
-          currentCtx,
+          context,
           provider,
           title: "Locked Entry",
           message: "This entry is from a previous day. Enter Master Password to unlock it for deletion."
-      ) ?? false;
+      );
       if (!mounted) return;
       if (!isUnlocked) return;
       provider.refreshAdminSession();
       provider.logAudit('UNLOCK_OLD_ENTRY_DELETE', 'Unlocked old entry $entryNo from ${DateFormat('yyyy-MM-dd').format(date)} for deletion.');
     }
 
-    if (!currentCtx.mounted) return;
+    if (!context.mounted) return;
     bool? confirm = await showDialog<bool>(
-      context: currentCtx,
+      context: context,
       barrierDismissible: false,
       builder: (ctx) {
         int focusedIdx = 1; // 1: Delete (Right), 2: Cancel (Left)
@@ -1417,12 +1867,25 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
 class _GridHeaderCell extends StatefulWidget {
   final _ColInfo col;
   final double width;
+  final bool isSorted;
+  final bool isAscending;
+  final VoidCallback? onSortTap;
   final Function(Offset) onAdvancedTap;
   final Function(String condition, String value) onQuickFilter;
   final Function(double) onResize;
   final Function(double) onHeightResize;
 
-  const _GridHeaderCell({required this.col, required this.width, required this.onAdvancedTap, required this.onQuickFilter, required this.onResize, required this.onHeightResize});
+  const _GridHeaderCell({
+    required this.col,
+    required this.width,
+    this.isSorted = false,
+    this.isAscending = true,
+    this.onSortTap,
+    required this.onAdvancedTap,
+    required this.onQuickFilter,
+    required this.onResize,
+    required this.onHeightResize,
+  });
 
   @override
   State<_GridHeaderCell> createState() => _GridHeaderCellState();
@@ -1479,11 +1942,13 @@ class _GridHeaderCellState extends State<_GridHeaderCell> {
       items = ['Equals', 'Before', 'After', 'Between'];
     }
 
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
     final result = await showMenu<String>(
       context: context,
-      position: RelativeRect.fromLTRB(
-        details.globalPosition.dx, details.globalPosition.dy + 10,
-        details.globalPosition.dx, 0,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(details.globalPosition.dx, details.globalPosition.dy + 10, 0, 0),
+        Offset.zero & overlay.size,
       ),
       items: items.map((e) => PopupMenuItem(value: e, height: 30, child: Text(e, style: const TextStyle(fontSize: 11)))).toList(),
     );
@@ -1515,17 +1980,39 @@ class _GridHeaderCellState extends State<_GridHeaderCell> {
               Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  // Row 1: Title and Advanced Filter Icon
+                  // Row 1: Title and Advanced Filter Icon (Click header title to sort A-Z/Z-A or 0-9/9-0)
                   Row(
                     children: [
                       Expanded(
-                        child: Padding(
-                          padding: const EdgeInsets.only(left: 6, top: 4, bottom: 2),
-                          child: Text(
-                            widget.col.label,
-                            style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey.shade800),
-                            overflow: TextOverflow.ellipsis,
-                            maxLines: 1,
+                        child: InkWell(
+                          onTap: widget.onSortTap,
+                          child: Padding(
+                            padding: const EdgeInsets.only(left: 6, top: 4, bottom: 2),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Flexible(
+                                  child: Text(
+                                    widget.col.label,
+                                    style: TextStyle(
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.bold,
+                                      color: widget.isSorted ? Colors.blue.shade900 : Colors.grey.shade800,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                    maxLines: 1,
+                                  ),
+                                ),
+                                if (widget.isSorted) ...[
+                                  const SizedBox(width: 2),
+                                  Icon(
+                                    widget.isAscending ? Icons.arrow_upward : Icons.arrow_downward,
+                                    size: 11,
+                                    color: Colors.blue.shade900,
+                                  ),
+                                ],
+                              ],
+                            ),
                           ),
                         ),
                       ),

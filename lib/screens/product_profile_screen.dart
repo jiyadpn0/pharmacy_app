@@ -259,13 +259,13 @@ class _ProductProfileScreenState extends State<ProductProfileScreen> with Single
             link: _layerLink,
             child: Focus(
               onKeyEvent: (node, event) {
-                if (event is KeyDownEvent && _overlayEntry != null) {
+                if (event is KeyDownEvent && _overlayEntry != null && _searchResults.isNotEmpty) {
                   if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
-                    setState(() { _searchIndex = (_searchIndex + 1) % _searchResults.length; });
+                    setState(() { _searchIndex = (_searchIndex + 1).clamp(0, _searchResults.length - 1); });
                     _overlayEntry?.markNeedsBuild();
                     return KeyEventResult.handled;
                   } else if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
-                    setState(() { _searchIndex = (_searchIndex - 1 + _searchResults.length) % _searchResults.length; });
+                    setState(() { _searchIndex = (_searchIndex - 1).clamp(0, _searchResults.length - 1); });
                     _overlayEntry?.markNeedsBuild();
                     return KeyEventResult.handled;
                   }

@@ -71,7 +71,7 @@ mixin WatchdogMixin<T extends StatefulWidget> on State<T> {
   Future<R?> watchdogPageInit<R>({
     required Future<R> Function() loadAction,
     required String pageName,
-    Duration timeout = const Duration(seconds: 5),
+    Duration timeout = const Duration(seconds: 15),
     R? fallbackValue,
   }) async {
     return await AppWatchdog.runWithTimeout<R>(

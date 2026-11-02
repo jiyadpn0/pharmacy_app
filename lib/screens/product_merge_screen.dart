@@ -25,68 +25,78 @@ class _ProductMergeScreenState extends State<ProductMergeScreen> {
     super.dispose();
   }
 
+  bool _isMerging = false;
+
   Future<void> _executeMerge(PharmacyProvider provider) async {
-    if (_duplicateProduct == null || _targetProduct == null) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Please select both source and target products.")));
-      return;
-    }
+    if (_isMerging) return;
+    setState(() => _isMerging = true);
 
-    if (_duplicateProduct!.id == _targetProduct!.id) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Cannot merge a product into itself.")));
-      return;
-    }
-
-    if (provider.securityToggles['require_pin_merge_products'] == true) {
-      bool isUnlocked = await PinUnlockDialog.show(
-        context, 
-        provider, 
-        title: "Security Clearance", 
-        message: "Enter Master PIN to authorize product consolidation.",
-      );
-      if (!mounted) return;
-      if (!isUnlocked) return; 
-    }
-
-    if (!mounted) return;
-    final currentCtx = context;
-    bool confirm = await showDialog<bool>(
-      context: currentCtx,
-      builder: (ctx) => AlertDialog(
-        title: const Text("Confirm Product Merge"),
-        content: Text("Are you sure you want to merge '${_duplicateProduct!.name}' into '${_targetProduct!.name}'?\n\nAll historical sales, purchases, and stock batches will transfer to '${_targetProduct!.name}', and '${_duplicateProduct!.name}' will be permanently deleted."),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text("CANCEL")),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text("YES, MERGE NOW", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-          )
-        ],
-      ),
-    ) ?? false;
-
-    if (!confirm) return;
-
-    await provider.mergeProducts(
-      keepProductId: _targetProduct!.id,
-      deleteProductId: _duplicateProduct!.id,
-    );
-
-    if (provider.errorMessage.isEmpty) {
-      provider.logAudit('MERGE_PRODUCTS', 'Merged duplicate [${_duplicateProduct!.name}] into target [${_targetProduct!.name}].');
-      
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(backgroundColor: Colors.green, content: Text("Products successfully merged!")));
-        setState(() {
-          _duplicateProduct = null;
-          _targetProduct = null;
-          _dupCtrl.clear();
-          _targetCtrl.clear();
-        });
+    try {
+      if (_duplicateProduct == null || _targetProduct == null) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Please select both source and target products.")));
+        return;
       }
-    } else {
+
+      if (_duplicateProduct!.id == _targetProduct!.id) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Cannot merge a product into itself.")));
+        return;
+      }
+
+      if (provider.securityToggles['require_pin_merge_products'] == true) {
+        bool isUnlocked = await PinUnlockDialog.show(
+          context, 
+          provider, 
+          title: "Security Clearance", 
+          message: "Enter Master PIN to authorize product consolidation.",
+        );
+        if (!mounted) return;
+        if (!isUnlocked) return; 
+      }
+
+      if (!mounted) return;
+      bool confirm = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text("Confirm Product Merge"),
+          content: Text("Are you sure you want to merge '${_duplicateProduct!.name}' into '${_targetProduct!.name}'?\n\nAll historical sales, purchases, and stock batches will transfer to '${_targetProduct!.name}', and '${_duplicateProduct!.name}' will be permanently deleted."),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text("CANCEL")),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text("YES, MERGE NOW", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+            )
+          ],
+        ),
+      ) ?? false;
+
+      if (!confirm) return;
+
+      await provider.mergeProducts(
+        keepProductId: _targetProduct!.id,
+        deleteProductId: _duplicateProduct!.id,
+      );
+
+      if (provider.errorMessage.isEmpty) {
+        provider.logAudit('MERGE_PRODUCTS', 'Merged duplicate [${_duplicateProduct!.name}] into target [${_targetProduct!.name}].');
+        
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(backgroundColor: Colors.green, content: Text("Products successfully merged!")));
+          setState(() {
+            _duplicateProduct = null;
+            _targetProduct = null;
+            _dupCtrl.clear();
+            _targetCtrl.clear();
+          });
+        }
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(provider.errorMessage), backgroundColor: Colors.red));
+        }
+      }
+    } finally {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(provider.errorMessage), backgroundColor: Colors.red));
+        setState(() => _isMerging = false);
       }
     }
   }
@@ -196,9 +206,11 @@ class _ProductMergeScreenState extends State<ProductMergeScreen> {
                       backgroundColor: Colors.redAccent,
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                     ),
-                    icon: const Icon(Icons.merge_type_rounded, color: Colors.white, size: 18),
-                    label: const Text("EXECUTE DATABASE MERGE", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13)),
-                    onPressed: () => _executeMerge(provider),
+                    icon: _isMerging 
+                        ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                        : const Icon(Icons.merge_type_rounded, color: Colors.white, size: 18),
+                    label: Text(_isMerging ? "MERGING..." : "EXECUTE DATABASE MERGE", style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13)),
+                    onPressed: _isMerging ? null : () => _executeMerge(provider),
                   ),
                 ),
               )

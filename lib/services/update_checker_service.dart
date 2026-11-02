@@ -7,11 +7,13 @@ import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../utils/theme_constants.dart';
+import 'app_notification_service.dart';
+import 'supabase_sync_service.dart';
 
 class UpdateCheckerService {
   static const String _defaultRepoOwner = 'jiyadpn0';
   static const String _defaultRepoName = 'pharmacy_app';
-  static const String defaultCodeVersion = '2.4.7';
+  static const String defaultCodeVersion = '3.3.9';
 
   static String _activeVersion = defaultCodeVersion;
 
@@ -23,7 +25,7 @@ class UpdateCheckerService {
     try {
       String foundVersion = defaultCodeVersion;
 
-      // 1. Try reading version.json in app directory
+      // Read version.json in app directory (ground truth for actual files on disk)
       try {
         final appExePath = Platform.resolvedExecutable;
         final appDir = File(appExePath).parent.path;
@@ -32,18 +34,9 @@ class UpdateCheckerService {
           final content = await versionFile.readAsString();
           final Map<String, dynamic> data = jsonDecode(content);
           final String fileVer = (data['version'] ?? '').toString().trim();
-          if (fileVer.isNotEmpty && compareSemver(fileVer, foundVersion) > 0) {
+          if (fileVer.isNotEmpty) {
             foundVersion = fileVer;
           }
-        }
-      } catch (_) {}
-
-      // 2. Try reading from SharedPreferences
-      try {
-        final prefs = await SharedPreferences.getInstance();
-        final prefVer = prefs.getString('installed_app_version')?.trim() ?? '';
-        if (prefVer.isNotEmpty && compareSemver(prefVer, foundVersion) > 0) {
-          foundVersion = prefVer;
         }
       } catch (_) {}
 
@@ -164,6 +157,12 @@ class UpdateCheckerService {
         final cleanLatest = tagName.replaceAll(RegExp(r'^[vV]'), '').trim();
 
         if (cleanLatest.isNotEmpty && isVersionNewer(cleanLatest, currentVersion)) {
+          AppNotificationService.instance.addNotification(
+            title: "Software Update Available",
+            message: "New version v$cleanLatest ($releaseName) is available to download.",
+            type: NotificationType.security,
+            actionRoute: "server",
+          );
           if (context.mounted) {
             _showUpdateAvailableDialog(
               context: context,
@@ -446,18 +445,34 @@ class UpdateCheckerService {
         throw Exception("Failed to extract update package: ${extractResult.stderr}");
       }
 
-      String sourceFolderPath = extractDir.path;
-      final extractedItems = extractDir.listSync();
-      if (extractedItems.length == 1 && extractedItems.first is Directory) {
-        sourceFolderPath = extractedItems.first.path;
-      }
+      // Recursively locate the folder containing application binaries (pharmacy_app.exe or flutter_windows.dll)
+      Directory sourceDir = extractDir;
+      try {
+        final exeCandidates = extractDir.listSync(recursive: true).whereType<File>().where((f) {
+          final name = f.uri.pathSegments.last.toLowerCase();
+          return name == 'pharmacy_app.exe' || name == 'flutter_windows.dll';
+        });
+        if (exeCandidates.isNotEmpty) {
+          sourceDir = exeCandidates.first.parent;
+        }
+      } catch (_) {}
+      String sourceFolderPath = sourceDir.path;
 
       final cleanVer = targetVersion.replaceAll(RegExp(r'^[vV]'), '').trim();
       statusNotifier.value = "Applying update (v$cleanVer) and restarting application...";
       progressNotifier.value = 1.0;
 
-      // Persist the updated version prior to restart
-      await saveInstalledVersion(cleanVer);
+      // Cancel active cloud sync jobs and allow HTTP connections to drain cleanly before restart
+      try {
+        SupabaseSyncService.instance.cancelSync();
+        await Future.delayed(const Duration(milliseconds: 500));
+      } catch (_) {}
+
+      // Write version.json into the source update directory so xcopy transfers it along with binaries
+      try {
+        final sourceVersionFile = File('$sourceFolderPath${Platform.pathSeparator}version.json');
+        await sourceVersionFile.writeAsString(jsonEncode({'version': cleanVer}));
+      } catch (_) {}
 
       final appExePath = Platform.resolvedExecutable;
       final appExeFile = File(appExePath);
@@ -470,7 +485,7 @@ class UpdateCheckerService {
 @echo off
 set "EXE_NAME=$exeName"
 
-timeout /t 1 /nobreak > nul
+timeout /t 2 /nobreak > nul
 taskkill /F /IM %EXE_NAME% > nul 2>&1
 
 :wait_loop
@@ -480,6 +495,10 @@ if "%ERRORLEVEL%"=="0" goto wait_loop
 
 timeout /t 1 /nobreak > nul
 xcopy /E /Y /I /Q "$sourceFolderPath\\*" "$appDir\\"
+
+if %ERRORLEVEL% NEQ 0 (
+    powershell -Command "Start-Process cmd -ArgumentList '/c xcopy /E /Y /I /Q "$sourceFolderPath\\*" "$appDir\\"' -Verb RunAs -Wait"
+)
 
 start "" "$appExePath"
 del "%~f0"
@@ -491,15 +510,19 @@ del "%~f0"
         if (context.mounted && Navigator.canPop(context)) {
           Navigator.pop(context);
         }
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Update downloaded to ${zipFile.path}. Please replace application files manually.')),
-        );
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Update downloaded to ${zipFile.path}. Please replace application files manually.')),
+          );
+        }
       }
     } catch (e) {
-      if (context.mounted && Navigator.canPop(context)) {
-        Navigator.pop(context);
+      if (context.mounted) {
+        if (Navigator.canPop(context)) {
+          Navigator.pop(context);
+        }
+        _showErrorDialog(context, "Direct Update Failed", "Unable to download or apply update directly.\n\nError: $e");
       }
-      _showErrorDialog(context, "Direct Update Failed", "Unable to download or apply update directly.\n\nError: $e");
     }
   }
 

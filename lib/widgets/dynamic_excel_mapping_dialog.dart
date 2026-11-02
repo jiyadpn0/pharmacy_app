@@ -98,7 +98,12 @@ class _DynamicExcelMappingDialogState extends State<DynamicExcelMappingDialog> {
               if (field == 'Mrp' && (cleanH.contains('vaton') || cleanH.contains('vat_on') || cleanH.contains('tax_on') || cleanH.contains('taxonsch'))) {
                 continue;
               }
-              if (savedKeywords.any((m) => m.toLowerCase() == cleanH)) {
+              if (savedKeywords.any((m) {
+                String cleanM = m.trim().toLowerCase();
+                String normM = cleanM.replaceAll(RegExp(r'[^a-z0-9]'), '');
+                String normH = cleanH.replaceAll(RegExp(r'[^a-z0-9]'), '');
+                return cleanM == cleanH || (normM.isNotEmpty && normM == normH);
+              })) {
                 matchedHeader = h;
                 break;
               }
@@ -335,10 +340,21 @@ class _DynamicExcelMappingDialogState extends State<DynamicExcelMappingDialog> {
     Color bgColor = isPdfContext ? Colors.red.shade50 : Colors.blue.shade50;
     String typeSuffix = isPdfContext ? " - PDF" : " - EXCEL";
 
-    List<ImportMapping> availableCopyFormats = widget.provider.importMappings.where((m) {
-      bool isPdfFormat = m.name.toUpperCase().endsWith('- PDF');
-      return isPdfContext ? isPdfFormat : !isPdfFormat;
-    }).toList();
+    Map<String, ImportMapping> uniqueCopyFormats = {};
+    for (var m in widget.provider.importMappings) {
+      String cleanBaseName = m.name
+          .replaceAll(' - PDF', '')
+          .replaceAll(' - EXCEL', '')
+          .replaceAll(' - pdf', '')
+          .replaceAll(' - excel', '')
+          .trim()
+          .toUpperCase();
+
+      if (cleanBaseName.isNotEmpty && cleanBaseName != "DEFAULT") {
+        uniqueCopyFormats[cleanBaseName] = m;
+      }
+    }
+    List<ImportMapping> availableCopyFormats = uniqueCopyFormats.values.toList();
 
     return Focus(
       autofocus: true,
@@ -372,10 +388,11 @@ class _DynamicExcelMappingDialogState extends State<DynamicExcelMappingDialog> {
                 Autocomplete<String>(
                   initialValue: TextEditingValue(text: _wholesalerNameCtrl.text),
                   optionsBuilder: (TextEditingValue textEditingValue) {
+                    final List<String> uniqueSuppliers = widget.provider.suppliers;
                     if (textEditingValue.text.isEmpty) {
-                      return widget.provider.suppliers;
+                      return uniqueSuppliers;
                     }
-                    return widget.provider.suppliers.where((String option) {
+                    return uniqueSuppliers.where((String option) {
                       return option.toLowerCase().contains(textEditingValue.text.toLowerCase());
                     });
                   },
@@ -475,9 +492,7 @@ class _DynamicExcelMappingDialogState extends State<DynamicExcelMappingDialog> {
                 if (availableCopyFormats.isNotEmpty && !isVisualPdf)
                   DropdownButtonFormField<ImportMapping>(
                     decoration: InputDecoration(
-                      labelText: isPdfContext
-                          ? "Copy settings from an existing PDF format (Optional)"
-                          : "Copy settings from an existing Excel format (Optional)",
+                      labelText: "Copy settings from an existing format (Optional)",
                       border: const OutlineInputBorder(),
                       isDense: true,
                       filled: true,
@@ -485,14 +500,17 @@ class _DynamicExcelMappingDialogState extends State<DynamicExcelMappingDialog> {
                       prefixIcon: Icon(Icons.copy, size: 18, color: highlightColor),
                     ),
                     initialValue: _selectedTemplate,
-                    hint: Text(
-                        isPdfContext ? "Select a saved PDF format to copy..." : "Select a saved Excel format to copy...",
-                        style: const TextStyle(fontSize: 12)
-                    ),
+                    hint: const Text("Select a saved format to copy...", style: TextStyle(fontSize: 12)),
                     items: availableCopyFormats.map((m) {
+                      String cleanName = m.name
+                          .replaceAll(' - PDF', '')
+                          .replaceAll(' - EXCEL', '')
+                          .replaceAll(' - pdf', '')
+                          .replaceAll(' - excel', '')
+                          .trim();
                       return DropdownMenuItem<ImportMapping>(
                         value: m,
-                        child: Text(m.name.replaceAll(' - PDF', '').replaceAll(' - EXCEL', ''), style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
+                        child: Text(cleanName, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
                       );
                     }).toList(),
                     onChanged: (ImportMapping? val) {

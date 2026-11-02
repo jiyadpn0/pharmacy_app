@@ -12,14 +12,24 @@ import 'package:synchronized/synchronized.dart';
 import 'package:flutter/material.dart';
 import '../models/erp_models.dart';
 import '../models/product_ranking.dart';
+import '../models/validation_rule.dart';
 export '../models/erp_models.dart';
+export '../models/validation_rule.dart';
 import '../database/db_helper.dart';
+import '../utils/app_logger.dart';
 import '../utils/security_crypto.dart';
 import '../utils/tax_calculator.dart';
 import '../utils/app_formatters.dart';
 import '../utils/app_watchdog.dart';
-import '../utils/app_dialogs.dart';
 import '../services/excel_worker_service.dart';
+import '../services/supabase_sync_service.dart';
+import '../services/supabase_realtime_service.dart';
+import '../services/delta_sync_service.dart';
+import '../services/server_config_service.dart';
+import '../services/lan_sync_service.dart';
+import '../services/sync_event_bus.dart';
+import '../services/invoice_recovery_service.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 typedef Transaction = sql.Transaction;
 
@@ -365,8 +375,8 @@ class PharmacyProvider extends ChangeNotifier {
     if (target.isNotEmpty) {
       final int targetRowId = (target.first['rowid'] as num).toInt();
       await txn.rawUpdate(
-        'UPDATE stock_batches SET current_stock = current_stock + ? WHERE rowid = ?',
-        [qtyToRestore, targetRowId]
+        'UPDATE stock_batches SET current_stock = current_stock + ?, is_synced = 0, updated_at = ? WHERE rowid = ?',
+        [qtyToRestore, DateTime.now().toUtc().toIso8601String(), targetRowId]
       );
     } else if (cleanBatch.isNotEmpty) {
       await txn.insert('stock_batches', {
@@ -410,8 +420,20 @@ class PharmacyProvider extends ChangeNotifier {
 
   String get selectedFinancialYear => _selectedFinancialYear;
 
+  // Cache of sorted entry numbers per table and FY for ultra-fluent < > navigation
+  final Map<String, List<String>> _navEntryKeysCache = {};
+
+  void invalidateNavCache([String? table]) {
+    if (table != null) {
+      _navEntryKeysCache.removeWhere((key, _) => key.startsWith('$table|'));
+    } else {
+      _navEntryKeysCache.clear();
+    }
+  }
+
   void setSelectedFinancialYear(String year) {
     _selectedFinancialYear = year;
+    invalidateNavCache();
     loadFromDatabase(); // Reload data for the selected year
     notifyListeners();
   }
@@ -504,18 +526,35 @@ class PharmacyProvider extends ChangeNotifier {
   void addSyncTask({
     required String title,
     required String type,
+    String? cachedFilePath,
     required Future<Map<String, dynamic>> Function(Function(double, String) onProgress) taskRunner,
   }) {
     final task = SyncTask(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       title: title,
       type: type,
+      cachedFilePath: cachedFilePath,
     );
     _syncQueue.add(task);
     _pendingSyncQueue.add(_PendingSyncTask(task: task, taskRunner: taskRunner));
     notifyListeners();
 
     _processSyncQueue();
+  }
+
+  void cancelSyncTask(String taskId) {
+    _cancelImport = true;
+    _pendingSyncQueue.removeWhere((item) => item.task.id == taskId);
+    final taskIdx = _syncQueue.indexWhere((t) => t.id == taskId);
+    if (taskIdx != -1) {
+      _syncQueue[taskIdx].status = 'Failed';
+      _syncQueue[taskIdx].statusMessage = 'Cancelled by user';
+      notifyListeners();
+    }
+    if (SupabaseSyncService.instance.isBulkImportActive) {
+      SupabaseSyncService.instance.setBulkImportActive(false);
+      SupabaseSyncService.instance.resumeSync();
+    }
   }
 
   void _processSyncQueue() async {
@@ -534,13 +573,14 @@ class PharmacyProvider extends ChangeNotifier {
       int lastNotifyTime = DateTime.now().millisecondsSinceEpoch;
 
       try {
+        SupabaseSyncService.instance.setBulkImportActive(true);
         final res = await pendingItem.taskRunner((p, statusMsg) {
           task.progress = p.clamp(0.0, 1.0);
           task.statusMessage = statusMsg;
 
-          // Throttle UI rebuilds to max once per 100ms or on completion to keep UI smooth
+          // Throttle UI rebuilds to max once per 250ms or on completion to keep UI smooth
           final now = DateTime.now().millisecondsSinceEpoch;
-          if (now - lastNotifyTime >= 100 || p >= 1.0) {
+          if (now - lastNotifyTime >= 250 || p >= 1.0) {
             lastNotifyTime = now;
             notifyListeners();
           }
@@ -557,6 +597,10 @@ class PharmacyProvider extends ChangeNotifier {
       } catch (e) {
         task.status = 'Failed';
         task.resultMessage = 'Error: $e';
+      } finally {
+        if (_pendingSyncQueue.isEmpty) {
+          SupabaseSyncService.instance.setBulkImportActive(false);
+        }
       }
 
       notifyListeners();
@@ -1183,7 +1227,8 @@ class PharmacyProvider extends ChangeNotifier {
           'stock_write_offs',
           'supplier_payments', 'supplier_credit_notes',
           'prescriptions', 'prescription_items',
-          'stock_batches' // Tied to transactions
+          'stock_batches', // Tied to transactions
+          'voucher_sequences'
         ];
 
         for (var table in tables) {
@@ -1282,21 +1327,26 @@ class PharmacyProvider extends ChangeNotifier {
           throw "Cannot deactivate product while $totalStock units of stock remain in inventory.";
         }
 
-        // 2. Soft-delete by marking inactive instead of physical removal
-        await txn.update(
+        // 2. Soft-delete by marking inactive, is_synced = 0, and updated_at
+        await DbHelper.instance.markDirtyAndUpdate(
           'product_master',
-          {'is_active': 0},
-          where: 'id = ?',
-          whereArgs: [productId],
+          {'is_active': 0, 'is_deleted': 1},
+          'id = ?',
+          [productId],
+          executor: txn,
         );
 
         // Deactivate associated empty batches
-        await txn.update(
+        await DbHelper.instance.markDirtyAndUpdate(
           'stock_batches',
-          {'is_active': 0},
-          where: 'product_id = ?',
-          whereArgs: [productId],
+          {'is_active': 0, 'is_deleted': 1},
+          'product_id = ?',
+          [productId],
+          executor: txn,
         );
+
+        // Queue tombstone record for Supabase sync
+        await DbHelper.instance.queueDeletion('product_master', productId, executor: txn);
       });
 
       // Synchronize in-memory caches
@@ -1363,6 +1413,17 @@ class PharmacyProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Lightweight live stock refresh for Watchdog real-time auto-refresh
+  Future<void> refreshLiveStock() async {
+    if (kIsWeb) return;
+    try {
+      invalidateSearchProductsCache();
+      await loadFromDatabase();
+    } catch (e) {
+      debugPrint("refreshLiveStock error: $e");
+    }
+  }
+
   Future<void> loadFromDatabase() async {
     if (kIsWeb) return;
     try {
@@ -1374,6 +1435,9 @@ class PharmacyProvider extends ChangeNotifier {
 
       // Auto-heal and clamp any negative stock rows in SQLite database
       await healNegativeStockBatches(db);
+
+      // Auto-heal and deduplicate any duplicate line items across sales and purchases
+      await DbHelper.instance.cleanDuplicateLineItems(db);
 
       // confirm counts for the user log
       final countResult = await db.rawQuery('SELECT COUNT(*) as total FROM product_master');
@@ -2306,6 +2370,10 @@ class PharmacyProvider extends ChangeNotifier {
   }
 
   Future<String> getNextSaleEntryNo() async {
+    final prefix = ServerConfigService.instance.terminalPrefix;
+    if (prefix.isNotEmpty) {
+      return _peekNextNo('sales_invoices', 'entry_no', _selectedFinancialYear, prefix: prefix);
+    }
     return _peekNextNo('sales_invoices', 'entry_no', _selectedFinancialYear, excludePrefix: 'SO-');
   }
 
@@ -2323,7 +2391,15 @@ class PharmacyProvider extends ChangeNotifier {
 
   Future<String> _peekNextNo(String table, String column, String fy, {String? excludePrefix, String? prefix}) async {
     final db = await DbHelper.instance.database;
-    final String voucherKey = prefix != null ? '${table}_$prefix' : table;
+    final coreTransactionTables = [
+      'sales_invoices',
+      'purchase_entries',
+      'sales_return_invoices',
+      'purchase_return_entries',
+      'stock_adjustments',
+    ];
+    final String effectivePrefix = prefix ?? (coreTransactionTables.contains(table) ? ServerConfigService.instance.terminalPrefix : '');
+    final String voucherKey = effectivePrefix.isNotEmpty ? '${table}_$effectivePrefix' : (prefix != null ? '${table}_$prefix' : table);
 
     final res = await db.query(
       'voucher_sequences',
@@ -2337,44 +2413,109 @@ class PharmacyProvider extends ChangeNotifier {
       lastSeq = (res.first['last_sequence'] as int? ?? 0);
     }
 
-    String cleanColExpr = prefix != null
-        ? "REPLACE($column, '$prefix', '')"
-        : "CASE WHEN instr($column, '_') > 0 THEN substr($column, instr($column, '_') + 1) ELSE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE($column, 'SRET-', ''), 'PRET-', ''), 'ADJ-', ''), 'ORD-', ''), 'SO-', '') END";
+    int maxInDb = 0;
+    if (effectivePrefix.isNotEmpty) {
+      final maxRes = await db.rawQuery(
+        "SELECT MAX(CAST(REPLACE($column, '$effectivePrefix', '') AS INTEGER)) as max_no FROM $table WHERE financial_year = ? AND $column LIKE ? AND CAST(REPLACE($column, '$effectivePrefix', '') AS INTEGER) < 100000000",
+        [fy, '$effectivePrefix%'],
+      );
+      maxInDb = (maxRes.first['max_no'] as num?)?.toInt() ?? 0;
+    } else {
+      String cleanColExpr = prefix != null
+          ? "REPLACE($column, '$prefix', '')"
+          : "SUBSTR($column, INSTR($column, '_') + 1)";
 
-    String where = "financial_year = ? AND CAST($cleanColExpr AS INTEGER) < 100000000";
-    List<dynamic> args = [fy];
+      String where = "financial_year = ? AND CAST($cleanColExpr AS INTEGER) < 100000000";
+      List<dynamic> args = [fy];
 
-    if (prefix != null) {
-      where += " AND $column LIKE ?";
-      args.add("$prefix%");
-    } else if (excludePrefix != null) {
-      where += " AND $column NOT LIKE ?";
-      args.add("$excludePrefix%");
+      if (prefix != null) {
+        where += " AND $column LIKE ?";
+        args.add("$prefix%");
+      } else if (excludePrefix != null) {
+        where += " AND $column NOT LIKE ?";
+        args.add("$excludePrefix%");
+      }
+
+      final maxRes = await db.rawQuery(
+          "SELECT MAX(CAST($cleanColExpr AS INTEGER)) as max_no FROM $table WHERE $where", 
+          args
+      );
+      maxInDb = (maxRes.first['max_no'] as num?)?.toInt() ?? 0;
     }
 
-    final maxRes = await db.rawQuery(
-        "SELECT MAX(CAST($cleanColExpr AS INTEGER)) as max_no FROM $table WHERE $where", 
-        args
-    );
-    int maxInDb = (maxRes.first['max_no'] as num?)?.toInt() ?? 0;
     int effectiveLast = maxInDb > lastSeq ? maxInDb : lastSeq;
+
+    // Fallback: Query local SQLite table rows directly and parse sequence number using regex
+    // to catch cases where SQL CAST failed due to prefixes like 'T2-1' or '2026-27_T2-1'
+    try {
+      final dbRows = await db.query(
+        table,
+        columns: [column],
+        where: 'financial_year = ? OR financial_year IS NULL OR financial_year = \'\'',
+        whereArgs: [fy],
+        orderBy: 'rowid DESC',
+        limit: 100,
+      );
+      for (var r in dbRows) {
+        final val = r[column]?.toString() ?? '';
+        if (val.isNotEmpty) {
+          int parsed = parseSequenceNumber(val);
+          if (parsed < 100000000 && parsed > effectiveLast) {
+            effectiveLast = parsed;
+          }
+        }
+      }
+    } catch (_) {}
+
+    if (effectivePrefix.isNotEmpty && maxInDb == 0 && lastSeq == 0) {
+      final oldMaxRes = await db.rawQuery(
+        "SELECT MAX(CAST($column AS INTEGER)) as max_no FROM $table WHERE financial_year = ? AND $column NOT LIKE '%-%' AND CAST($column AS INTEGER) < 100000000",
+        [fy],
+      );
+      int oldMax = (oldMaxRes.first['max_no'] as num?)?.toInt() ?? 0;
+      if (oldMax > effectiveLast) {
+        effectiveLast = oldMax;
+      }
+    }
 
     if (table == 'purchase_entries' && _purchases.isNotEmpty) {
       for (var p in _purchases) {
-        String clean = cleanEntryNo(p.entryNo);
-        int? parsed = int.tryParse(clean);
-        if (parsed != null && parsed < 100000000 && parsed > effectiveLast) {
+        int parsed = parseSequenceNumber(p.entryNo);
+        if (parsed < 100000000 && parsed > effectiveLast) {
           effectiveLast = parsed;
         }
       }
     } else if (table == 'sales_invoices' && _sales.isNotEmpty) {
       for (var s in _sales) {
-        String clean = cleanEntryNo(s.entryNo);
-        int? parsed = int.tryParse(clean);
-        if (parsed != null && parsed < 100000000 && parsed > effectiveLast) {
+        String eNo = s.invoiceNo.isNotEmpty ? s.invoiceNo : s.entryNo;
+        int parsed = parseSequenceNumber(eNo);
+        if (parsed < 100000000 && parsed > effectiveLast) {
           effectiveLast = parsed;
         }
       }
+    }
+
+    final config = ServerConfigService.instance;
+    if (config.isServerModeEnabled && config.isConnected) {
+      try {
+        final remoteVal = await SupabaseSyncService.instance.fetchRemoteNextEntryNo(
+          table,
+          fy,
+          prefix: effectivePrefix.isNotEmpty ? effectivePrefix : prefix,
+        );
+        if (remoteVal != null && remoteVal.isNotEmpty) {
+          bool matchesPrefix = true;
+          if (effectivePrefix.isNotEmpty) {
+            matchesPrefix = remoteVal.contains(effectivePrefix);
+          }
+          if (matchesPrefix) {
+            final remoteSeq = parseSequenceNumber(remoteVal);
+            if (remoteSeq > effectiveLast) {
+              effectiveLast = remoteSeq;
+            }
+          }
+        }
+      } catch (_) {}
     }
 
     if (effectiveLast > lastSeq || res.isEmpty) {
@@ -2386,7 +2527,20 @@ class PharmacyProvider extends ChangeNotifier {
     }
 
     int nextSeq = effectiveLast + 1;
-    return prefix != null ? "$prefix$nextSeq" : nextSeq.toString();
+    if (table == 'sales_invoices' && effectiveLast > _lastKnownSalesSeq) {
+      _lastKnownSalesSeq = effectiveLast;
+    } else if (table == 'purchase_entries' && effectiveLast > _lastKnownPurchaseSeq) {
+      _lastKnownPurchaseSeq = effectiveLast;
+    }
+    final finalEntryStr = effectivePrefix.isNotEmpty ? "$effectivePrefix$nextSeq" : (prefix != null ? "$prefix$nextSeq" : nextSeq.toString());
+    
+    AppLogger.instance.sequence(
+      "BUSINESS",
+      "Calculated next sequence/entry number for '$table' ($fy) -> Assigned: '$finalEntryStr'",
+      details: "Max in local DB: $maxInDb | Sequence Table Last: $lastSeq | Effective Max Found: $effectiveLast | Increment: +1",
+    );
+
+    return finalEntryStr;
   }
 
   Future<void> syncVoucherSequences() async {
@@ -2400,9 +2554,12 @@ class PharmacyProvider extends ChangeNotifier {
         {'table': 'stock_adjustments', 'col': 'entry_no'},
       ];
 
+      final termPrefix = ServerConfigService.instance.terminalPrefix;
+
       for (var t in tables) {
         String table = t['table']!;
         String col = t['col']!;
+        String voucherKey = termPrefix.isNotEmpty ? '${table}_$termPrefix' : table;
         
         final fyList = await db.rawQuery("SELECT DISTINCT financial_year FROM $table WHERE financial_year IS NOT NULL AND financial_year != ''");
         List<String> fys = fyList.map((r) => r['financial_year'] as String).toList();
@@ -2411,23 +2568,32 @@ class PharmacyProvider extends ChangeNotifier {
         }
 
         for (String fy in fys) {
-          String cleanColExpr = "CASE WHEN instr($col, '_') > 0 THEN substr($col, instr($col, '_') + 1) ELSE REPLACE(REPLACE(REPLACE($col, 'SRET-', ''), 'PRET-', ''), 'ADJ-', '') END";
-          final maxRes = await db.rawQuery("SELECT MAX(CAST($cleanColExpr AS INTEGER)) as max_no FROM $table WHERE financial_year = ?", [fy]);
-          int maxInDb = (maxRes.first['max_no'] as num?)?.toInt() ?? 0;
+          int maxInDb = 0;
+          if (termPrefix.isNotEmpty) {
+            final maxRes = await db.rawQuery(
+              "SELECT MAX(CAST(REPLACE($col, '$termPrefix', '') AS INTEGER)) as max_no FROM $table WHERE financial_year = ? AND $col LIKE ? AND CAST(REPLACE($col, '$termPrefix', '') AS INTEGER) < 100000000",
+              [fy, '$termPrefix%'],
+            );
+            maxInDb = (maxRes.first['max_no'] as num?)?.toInt() ?? 0;
+          } else {
+            String cleanColExpr = "CASE WHEN instr($col, '_') > 0 THEN substr($col, instr($col, '_') + 1) ELSE REPLACE(REPLACE(REPLACE($col, 'SRET-', ''), 'PRET-', ''), 'ADJ-', '') END";
+            final maxRes = await db.rawQuery("SELECT MAX(CAST($cleanColExpr AS INTEGER)) as max_no FROM $table WHERE financial_year = ?", [fy]);
+            maxInDb = (maxRes.first['max_no'] as num?)?.toInt() ?? 0;
+          }
 
           if (maxInDb > 0) {
             final res = await db.query(
               'voucher_sequences',
               where: 'voucher_type = ? AND financial_year = ?',
-              whereArgs: [table, fy],
+              whereArgs: [voucherKey, fy],
             );
             if (res.isNotEmpty) {
               int lastSeq = (res.first['last_sequence'] as int? ?? 0);
               if (maxInDb > lastSeq) {
-                await db.update('voucher_sequences', {'last_sequence': maxInDb}, where: 'voucher_type = ? AND financial_year = ?', whereArgs: [table, fy]);
+                await db.update('voucher_sequences', {'last_sequence': maxInDb}, where: 'voucher_type = ? AND financial_year = ?', whereArgs: [voucherKey, fy]);
               }
             } else {
-              await db.insert('voucher_sequences', {'voucher_type': table, 'financial_year': fy, 'last_sequence': maxInDb});
+              await db.insert('voucher_sequences', {'voucher_type': voucherKey, 'financial_year': fy, 'last_sequence': maxInDb});
             }
           }
         }
@@ -2492,6 +2658,10 @@ class PharmacyProvider extends ChangeNotifier {
     }
     _rebuildSearchIndex();
     trackProductModified(p);
+
+    if (ServerConfigService.instance.isServerModeEnabled && ServerConfigService.instance.isConnected) {
+      unawaited(SupabaseSyncService.instance.pushProduct(p.toMasterMap()));
+    }
   }
 
   void updateProduct(Product p) async {
@@ -2551,6 +2721,10 @@ class PharmacyProvider extends ChangeNotifier {
     }
     _rebuildSearchIndex();
     trackProductModified(p);
+
+    if (ServerConfigService.instance.isServerModeEnabled && ServerConfigService.instance.isConnected) {
+      unawaited(SupabaseSyncService.instance.pushProduct(p.toMasterMap()));
+    }
   }
 
 
@@ -2626,7 +2800,8 @@ class PharmacyProvider extends ChangeNotifier {
 
   Future<void> deleteSupplier(String id) async {
     final db = await DbHelper.instance.database;
-    await db.delete('suppliers', where: 'id = ?', whereArgs: [id]);
+    await DbHelper.instance.markDirtyAndUpdate('suppliers', {'is_deleted': 1}, 'id = ?', [id]);
+    await DbHelper.instance.queueDeletion('suppliers', id);
 
     int idx = _supplierMaster.indexWhere((it) => it.id == id);
     if (idx != -1) {
@@ -2723,10 +2898,12 @@ class PharmacyProvider extends ChangeNotifier {
     if (usage.isNotEmpty) {
       // Soft Delete: Rename and Deactivate
       String deletedName = "${account.name} [DELETED]";
-      await db.update('accounts', {
+      await DbHelper.instance.markDirtyAndUpdate('accounts', {
         'name': deletedName,
         'is_active': 0,
-      }, where: 'id = ?', whereArgs: [id]);
+        'is_deleted': 1,
+      }, 'id = ?', [id]);
+      await DbHelper.instance.queueDeletion('accounts', id);
       
       account.name = deletedName;
       account.isActive = false;
@@ -2735,7 +2912,8 @@ class PharmacyProvider extends ChangeNotifier {
       if (sIdx != -1) _accounts[sIdx] = deletedName;
     } else {
       // Hard Delete: Not used anywhere
-      await db.delete('accounts', where: 'id = ?', whereArgs: [id]);
+      await DbHelper.instance.markDirtyAndUpdate('accounts', {'is_deleted': 1}, 'id = ?', [id]);
+      await DbHelper.instance.queueDeletion('accounts', id);
       _accounts.remove(account.name);
       _accountMaster.removeAt(idx);
     }
@@ -2784,7 +2962,7 @@ class PharmacyProvider extends ChangeNotifier {
 
   Future<void> updatePatient(Patient p) async {
     final db = await DbHelper.instance.database;
-    await db.update('patients', p.toMap(), where: 'id = ?', whereArgs: [p.id]);
+    await DbHelper.instance.markDirtyAndUpdate('patients', p.toMap(), 'id = ?', [p.id]);
 
     int idx = _patientMaster.indexWhere((it) => it.id == p.id);
     if (idx != -1) {
@@ -2798,7 +2976,8 @@ class PharmacyProvider extends ChangeNotifier {
 
   Future<void> deletePatient(String id) async {
     final db = await DbHelper.instance.database;
-    await db.delete('patients', where: 'id = ?', whereArgs: [id]);
+    await DbHelper.instance.markDirtyAndUpdate('patients', {'is_deleted': 1}, 'id = ?', [id]);
+    await DbHelper.instance.queueDeletion('patients', id);
 
     int idx = _patientMaster.indexWhere((it) => it.id == id);
     if (idx != -1) {
@@ -2819,7 +2998,7 @@ class PharmacyProvider extends ChangeNotifier {
 
   Future<void> updateDoctor(Doctor d) async {
     final db = await DbHelper.instance.database;
-    await db.update('doctors', d.toMap(), where: 'id = ?', whereArgs: [d.id]);
+    await DbHelper.instance.markDirtyAndUpdate('doctors', d.toMap(), 'id = ?', [d.id]);
     int idx = _doctorMaster.indexWhere((it) => it.id == d.id);
     if (idx != -1) {
       String oldName = _doctorMaster[idx].name;
@@ -2832,7 +3011,8 @@ class PharmacyProvider extends ChangeNotifier {
 
   Future<void> deleteDoctor(String id) async {
     final db = await DbHelper.instance.database;
-    await db.delete('doctors', where: 'id = ?', whereArgs: [id]);
+    await DbHelper.instance.markDirtyAndUpdate('doctors', {'is_deleted': 1}, 'id = ?', [id]);
+    await DbHelper.instance.queueDeletion('doctors', id);
     int idx = _doctorMaster.indexWhere((it) => it.id == id);
     if (idx != -1) {
       String name = _doctorMaster[idx].name;
@@ -2900,14 +3080,15 @@ class PharmacyProvider extends ChangeNotifier {
 
   Future<void> deleteStaff(String id) async {
     final db = await DbHelper.instance.database;
-    await db.delete('staff', where: 'id = ?', whereArgs: [id]);
+    await DbHelper.instance.markDirtyAndUpdate('staff', {'is_deleted': 1}, 'id = ?', [id]);
+    await DbHelper.instance.queueDeletion('staff', id);
     _staffMaster.removeWhere((it) => it.id == id);
     notifyListeners();
   }
 
   Future<void> toggleStaffActive(String id, bool isActive) async {
     final db = await DbHelper.instance.database;
-    await db.update('staff', {'is_active': isActive ? 1 : 0}, where: 'id = ?', whereArgs: [id]);
+    await DbHelper.instance.markDirtyAndUpdate('staff', {'is_active': isActive ? 1 : 0}, 'id = ?', [id]);
     int idx = _staffMaster.indexWhere((it) => it.id == id);
     if (idx != -1) {
       _staffMaster[idx].isActive = isActive;
@@ -3411,7 +3592,8 @@ class PharmacyProvider extends ChangeNotifier {
           // Get products currently in this rack to log detailed history
           final products = await txn.query('product_master', where: 'rack_id = ?', whereArgs: [cleanName]);
 
-          await txn.delete('racks', where: 'id = ?', whereArgs: [cleanName]);
+          await DbHelper.instance.markDirtyAndUpdate('racks', {'is_deleted': 1}, 'id = ?', [cleanName], executor: txn);
+          await DbHelper.instance.queueDeletion('racks', cleanName, executor: txn);
           await txn.update('product_master', {'rack_id': ''}, where: 'rack_id = ?', whereArgs: [cleanName]);
 
           final now = DateTime.now().toIso8601String();
@@ -4452,14 +4634,14 @@ class PharmacyProvider extends ChangeNotifier {
         if (fy == null || fy == 'All Years' || fy.isEmpty) {
           await txn.rawDelete('DELETE FROM sales_items');
           await txn.rawDelete('DELETE FROM sales_invoices');
-          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type = 'sales_invoices'");
+          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'sales_invoices%'");
         } else {
           await txn.rawDelete(
             'DELETE FROM sales_items WHERE invoice_no IN (SELECT entry_no FROM sales_invoices WHERE financial_year = ?)',
             [fy],
           );
           await txn.rawDelete('DELETE FROM sales_invoices WHERE financial_year = ?', [fy]);
-          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type = 'sales_invoices' AND financial_year = ?", [fy]);
+          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'sales_invoices%' AND financial_year = ?", [fy]);
         }
       });
       await loadFromDatabase();
@@ -4477,14 +4659,14 @@ class PharmacyProvider extends ChangeNotifier {
         if (fy == null || fy == 'All Years' || fy.isEmpty) {
           await txn.rawDelete('DELETE FROM purchase_items');
           await txn.rawDelete('DELETE FROM purchase_entries');
-          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type = 'purchase_entries'");
+          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'purchase_entries%'");
         } else {
           await txn.rawDelete(
             'DELETE FROM purchase_items WHERE entry_no IN (SELECT entry_no FROM purchase_entries WHERE financial_year = ?)',
             [fy],
           );
           await txn.rawDelete('DELETE FROM purchase_entries WHERE financial_year = ?', [fy]);
-          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type = 'purchase_entries' AND financial_year = ?", [fy]);
+          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'purchase_entries%' AND financial_year = ?", [fy]);
         }
       });
       await loadFromDatabase();
@@ -4502,14 +4684,14 @@ class PharmacyProvider extends ChangeNotifier {
         if (fy == null || fy == 'All Years' || fy.isEmpty) {
           await txn.rawDelete('DELETE FROM sales_return_items');
           await txn.rawDelete('DELETE FROM sales_return_invoices');
-          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type = 'sales_return_invoices'");
+          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'sales_return_invoices%'");
         } else {
           await txn.rawDelete(
             'DELETE FROM sales_return_items WHERE return_no IN (SELECT entry_no FROM sales_return_invoices WHERE financial_year = ?)',
             [fy],
           );
           await txn.rawDelete('DELETE FROM sales_return_invoices WHERE financial_year = ?', [fy]);
-          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type = 'sales_return_invoices' AND financial_year = ?", [fy]);
+          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'sales_return_invoices%' AND financial_year = ?", [fy]);
         }
       });
       await loadFromDatabase();
@@ -4527,14 +4709,14 @@ class PharmacyProvider extends ChangeNotifier {
         if (fy == null || fy == 'All Years' || fy.isEmpty) {
           await txn.rawDelete('DELETE FROM purchase_return_items');
           await txn.rawDelete('DELETE FROM purchase_return_entries');
-          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type = 'purchase_return_entries'");
+          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'purchase_return_entries%'");
         } else {
           await txn.rawDelete(
             'DELETE FROM purchase_return_items WHERE return_no IN (SELECT entry_no FROM purchase_return_entries WHERE financial_year = ?)',
             [fy],
           );
           await txn.rawDelete('DELETE FROM purchase_return_entries WHERE financial_year = ?', [fy]);
-          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type = 'purchase_return_entries' AND financial_year = ?", [fy]);
+          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'purchase_return_entries%' AND financial_year = ?", [fy]);
         }
       });
       await loadFromDatabase();
@@ -4551,10 +4733,10 @@ class PharmacyProvider extends ChangeNotifier {
       await db.transaction((txn) async {
         if (fy == null || fy == 'All Years' || fy.isEmpty) {
           await txn.rawDelete('DELETE FROM stock_write_offs');
-          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type = 'stock_write_offs'");
+          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'stock_write_offs%'");
         } else {
           await txn.rawDelete('DELETE FROM stock_write_offs WHERE financial_year = ?', [fy]);
-          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type = 'stock_write_offs' AND financial_year = ?", [fy]);
+          await txn.rawDelete("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'stock_write_offs%' AND financial_year = ?", [fy]);
         }
       });
       await loadFromDatabase();
@@ -4581,6 +4763,11 @@ class PharmacyProvider extends ChangeNotifier {
     } catch (e) {
       return {'success': false, 'message': 'Failed to delete inventory records: $e'};
     }
+  }
+
+  Future<void> resetVoucherSequences() async {
+    final db = await DbHelper.instance.database;
+    await db.execute("DELETE FROM voucher_sequences");
   }
 
   Future<double> _calculateUnitsSoldForBatch(String productId, String batch, [sql.DatabaseExecutor? executor]) async {
@@ -4687,7 +4874,6 @@ class PharmacyProvider extends ChangeNotifier {
 
     String extension = filePath.split('.').last.toLowerCase();
 
-    // 1. Check for unsupported or incompatible formats
     if (extension != 'xlsx' && extension != 'xls' && extension != 'csv') {
       return {
         'success': false, 
@@ -4695,37 +4881,17 @@ class PharmacyProvider extends ChangeNotifier {
       };
     }
 
-    try {
-      // 2. Extra safety check for legacy Excel 97-2003 binary format if needed
-      if (extension == 'xls') {
-        final raf = await file.open();
-        final startBytes = await raf.read(8);
-        await raf.close();
-
-        // Check for OLE2 compound file signature or corrupted header
-        bool isBiff8 = startBytes.length >= 8 && startBytes[0] == 0xD0 && startBytes[1] == 0xCF && startBytes[2] == 0x11 && startBytes[3] == 0xE0;
-        if (isBiff8) {
-          return {
-            'success': false,
-            'message': 'Legacy Excel 97-2003 (.xls) format detected. Please open the file in Excel/Calc and "Save As" an .xlsx workbook before importing.'
-          };
-        }
-      }
-
-      // Proceed with normal import logic...
-      return {'success': true, 'message': 'Format is valid.'};
-    } catch (e) {
-      return {
-        'success': false, 
-        'message': 'Format check failed: The file structure is corrupted or unreadable.'
-      };
-    }
+    // Remove the strict OLE2 / isBiff8 block here so ExcelWorkerService can parse .xls files successfully!
+    return {'success': true, 'message': 'Format is valid.'};
   }
 
   Future<Map<String, dynamic>> importGenericsFromExcel(String filePath) async {
     final validation = await validateAndImportFile(filePath);
     if (!validation['success']) return validation;
 
+    DeltaSyncService.instance.stopPeriodicSync();
+    SupabaseRealtimeService.instance.pauseSubscriptions();
+    await SupabaseSyncService.instance.pauseSyncAndAwaitIdle(timeout: const Duration(seconds: 15));
     try {
       final rawRows = await ExcelWorkerService.parseExcelRawRowsInBackground(filePath);
       if (rawRows.length <= 1) {
@@ -4781,6 +4947,9 @@ class PharmacyProvider extends ChangeNotifier {
       return {'success': true, 'imported': imported, 'updated': updated};
     } catch (e) {
       return {'success': false, 'message': e.toString()};
+    } finally {
+      SupabaseRealtimeService.instance.resumeSubscriptions();
+      SupabaseSyncService.instance.resumeSync();
     }
   }
 
@@ -4788,6 +4957,9 @@ class PharmacyProvider extends ChangeNotifier {
     final validation = await validateAndImportFile(filePath);
     if (!validation['success']) return validation;
 
+    DeltaSyncService.instance.stopPeriodicSync();
+    SupabaseRealtimeService.instance.pauseSubscriptions();
+    await SupabaseSyncService.instance.pauseSyncAndAwaitIdle(timeout: const Duration(seconds: 15));
     try {
       final rawRows = await ExcelWorkerService.parseExcelRawRowsInBackground(filePath);
       if (rawRows.length <= 1) {
@@ -4807,6 +4979,9 @@ class PharmacyProvider extends ChangeNotifier {
       return {'success': true, 'count': imported};
     } catch (e) {
       return {'success': false, 'message': e.toString()};
+    } finally {
+      SupabaseRealtimeService.instance.resumeSubscriptions();
+      SupabaseSyncService.instance.resumeSync();
     }
   }
 
@@ -4839,7 +5014,8 @@ class PharmacyProvider extends ChangeNotifier {
     if (_manufacturers.remove(name)) {
       if (!kIsWeb) {
         final db = await DbHelper.instance.database;
-        await db.delete('manufacturers', where: 'id = ?', whereArgs: [name]);
+        await DbHelper.instance.markDirtyAndUpdate('manufacturers', {'is_deleted': 1}, 'id = ?', [name]);
+        await DbHelper.instance.queueDeletion('manufacturers', name);
       }
       notifyListeners();
     }
@@ -5063,7 +5239,8 @@ class PharmacyProvider extends ChangeNotifier {
       _generics.removeAt(idx);
       if (!kIsWeb) {
         final db = await DbHelper.instance.database;
-        await db.delete('generics', where: 'id = ?', whereArgs: [genId]);
+        await DbHelper.instance.markDirtyAndUpdate('generics', {'is_deleted': 1}, 'id = ?', [genId]);
+        await DbHelper.instance.queueDeletion('generics', genId);
       }
       notifyListeners();
     }
@@ -5073,6 +5250,10 @@ class PharmacyProvider extends ChangeNotifier {
     final validation = await validateAndImportFile(filePath);
     if (!validation['success']) return validation;
 
+    SupabaseSyncService.instance.setBulkImportActive(true);
+    DeltaSyncService.instance.stopPeriodicSync();
+    SupabaseRealtimeService.instance.pauseSubscriptions();
+    await SupabaseSyncService.instance.pauseSyncAndAwaitIdle(timeout: const Duration(seconds: 15), keepPausedOnTimeout: true);
     try {
       final rawRows = await ExcelWorkerService.parseExcelRawRowsInBackground(filePath);
       if (rawRows.length <= 1) {
@@ -5080,6 +5261,11 @@ class PharmacyProvider extends ChangeNotifier {
       }
 
       final db = await DbHelper.instance.database;
+      try {
+        await db.execute('PRAGMA journal_mode = WAL;');
+        await db.execute('PRAGMA synchronous = NORMAL;');
+        await db.execute('PRAGMA busy_timeout = 30000;');
+      } catch (_) {}
 
       int imported = 0;
       int errors = 0;
@@ -5094,15 +5280,16 @@ class PharmacyProvider extends ChangeNotifier {
         for (var p in allExisting) p['id'].toString()
       };
 
-      final header = rawRows.first.map((e) => e.toLowerCase().trim()).toList();
+      int headerRowIdx = ExcelWorkerService.findExcelHeaderRowIndex(rawRows);
+      final header = rawRows[headerRowIdx].map((e) => e.toLowerCase().trim()).toList();
 
       int idxId = customMapping?['id'] ?? _findIdx(header, ['product id', 'id', 'pid']);
-      int idxName = customMapping?['name'] ?? _findIdx(header, ['product name', 'item name', 'particulars', 'item description', 'description', 'product', 'items', 'name']);
+      int idxName = customMapping?['name'] ?? _findIdx(header, ['product name', 'item name', 'particulars', 'item description', 'description', 'product', 'items', 'name', 'drug name', 'medicine', 'brand name', 'item desc', 'material description', 'desc']);
       int idxPack = customMapping?['packing'] ?? _findIdx(header, ['packing', 'pack', 'packsize', 'packng', 'packin', 'unit']);
       int idxRack = customMapping?['rack'] ?? _findIdx(header, ['rack', 'rackid', 'rack_id', 'location']);
       int idxHsn = customMapping?['hsncode'] ?? _findIdx(header, ['hsncode', 'hsn', 'hsn code', 'hcn', 'hcncode']);
-      int idxMRP = customMapping?['mrp'] ?? _findIdx(header, ['mrp', 'm.r.p', 'item mrp', 'item_mrp']);
-      int idxLCost = customMapping?['p_rate'] ?? _findIdx(header, ['p.rate', 'prate', 'p_rate', 'purchase rate', 'purchase_rate', 'l cost', 'lcost', 'cost price', 'landing cost']);
+      int idxMRP = customMapping?['mrp'] ?? _findIdx(header, ['mrp', 'm.r.p', 'item mrp', 'item_mrp', 'retail price', 'max retail price', 'price']);
+      int idxLCost = customMapping?['p_rate'] ?? _findIdx(header, ['p.rate', 'prate', 'p_rate', 'purchase rate', 'purchase_rate', 'l cost', 'lcost', 'cost price', 'landing cost', 'rate', 'cost']);
       int idxSPrice = customMapping?['s_price'] ?? _findIdx(header, ['s price', 's_price', 'sale price', 'sale rate', 's.price', 'srate', 'selling price', 'selling_price']);
       int idxCat = customMapping?['category'] ?? _findIdx(header, ['category', 'category_id', 'cat']);
       int idxSubCat = customMapping?['sub_category'] ?? _findIdx(header, ['subcategory', 'sub category', 'sub_category', 'subcatogory', 'sub cat']);
@@ -5114,16 +5301,23 @@ class PharmacyProvider extends ChangeNotifier {
       int idxSch = customMapping?['schedule'] ?? _findIdx(header, ['schedule', 'sch', 'shedule', 'drug class', 'drug type']);
       int idxReorder = customMapping?['reorder'] ?? _findIdx(header, ['reorder level', 'reorder', 'min stock', 'min level', 'reorder level']);
       int idxMax = customMapping?['max'] ?? _findIdx(header, ['max level', 'max', 'max level', 'max lev', 'max stock']);
-      int idxStock = customMapping?['stock'] ?? _findIdx(header, ['stock', 'qty', 'current stock', 'quantity']);
+      int idxStock = customMapping?['stock'] ?? _findIdx(header, ['stock', 'qty', 'quantity', 'current stock', 'physical stock', 'closing stock', 'balance qty', 'pcs', 'units']);
       int idxBatch = customMapping?['batch'] ?? _findIdx(header, ['batch', 'batch_number', 'batch no']);
       int idxExp = customMapping?['expiry'] ?? _findIdx(header, ['expiry', 'exp', 'exp date', 'expiry date']);
 
-      final dataRows = rawRows.sublist(1);
+      final dataRows = rawRows.sublist(headerRowIdx + 1);
       final int totalRows = dataRows.length;
-      const int chunkSize = 500; 
+      const int chunkSize = 2000; 
       final int totalParts = (totalRows / chunkSize).ceil();
 
       _cancelImport = false;
+
+      // Temporarily drop FTS index triggers to prevent SQLite virtual table lock contention
+      try {
+        await db.execute('DROP TRIGGER IF EXISTS ad_product_master_fts;');
+        await db.execute('DROP TRIGGER IF EXISTS au_product_master_fts;');
+        await db.execute('DROP TRIGGER IF EXISTS ai_product_master_fts;');
+      } catch (_) {}
 
       String valRow(List<String> row, int idx) {
         if (idx < 0 || idx >= row.length) return "";
@@ -5141,15 +5335,15 @@ class PharmacyProvider extends ChangeNotifier {
         final int end = (start + chunkSize > totalRows) ? totalRows : start + chunkSize;
         final chunk = dataRows.sublist(start, end);
 
+        if (onProgress != null) {
+          onProgress(start / totalRows, "Part ${part + 1}/$totalParts (${((start / totalRows) * 100).toInt()}%)");
+        }
+
         await db.transaction((txn) async {
           final batch = txn.batch();
           for (int i = 0; i < chunk.length; i++) {
             final row = chunk[i];
             if (row.isEmpty) continue;
-
-            if (onProgress != null && i % 50 == 0) {
-              onProgress((start + i) / totalRows, "Part ${part + 1}/$totalParts");
-            }
 
             String excelId = valRow(row, idxId);
             String name = valRow(row, idxName);
@@ -5294,7 +5488,7 @@ class PharmacyProvider extends ChangeNotifier {
         });
 
         if (onProgress != null) {
-          onProgress(1.0, "Part ${part + 1}/$totalParts");
+          onProgress(end / totalRows, "Part ${part + 1}/$totalParts (${((end / totalRows) * 100).toInt()}%)");
         }
         await Future.delayed(const Duration(milliseconds: 10));
       }
@@ -5303,6 +5497,44 @@ class PharmacyProvider extends ChangeNotifier {
       return {'success': true, 'imported': imported, 'errors': errors, 'logs': errorLogs};
     } catch (e) {
       return {'success': false, 'message': 'Import failed: $e'};
+    } finally {
+      final db = await DbHelper.instance.database;
+      try {
+        await db.execute('DROP TRIGGER IF EXISTS ai_product_master_fts;');
+        await db.execute('DROP TRIGGER IF EXISTS au_product_master_fts;');
+        await db.execute('DROP TRIGGER IF EXISTS ad_product_master_fts;');
+
+        await db.execute('''
+          CREATE TRIGGER IF NOT EXISTS ai_product_master_fts AFTER INSERT ON product_master BEGIN
+            INSERT INTO product_search_fts(id, name, generic_name, barcode, hsn_code, rack_id)
+            VALUES (new.id, new.name, IFNULL(new.generic_name, ''), IFNULL(new.barcode, ''), IFNULL(new.hsn_code, ''), IFNULL(new.rack_id, ''));
+          END;
+        ''');
+        await db.execute('''
+          CREATE TRIGGER IF NOT EXISTS au_product_master_fts AFTER UPDATE OF name, generic_name, barcode, hsn_code, rack_id ON product_master BEGIN
+            DELETE FROM product_search_fts WHERE id = old.id;
+            INSERT INTO product_search_fts(id, name, generic_name, barcode, hsn_code, rack_id)
+            VALUES (new.id, new.name, IFNULL(new.generic_name, ''), IFNULL(new.barcode, ''), IFNULL(new.hsn_code, ''), IFNULL(new.rack_id, ''));
+          END;
+        ''');
+        await db.execute('''
+          CREATE TRIGGER IF NOT EXISTS ad_product_master_fts AFTER DELETE ON product_master BEGIN
+            DELETE FROM product_search_fts WHERE id = old.id;
+          END;
+        ''');
+
+        await db.execute('''
+          INSERT INTO product_search_fts(id, name, generic_name, barcode, hsn_code, rack_id)
+          SELECT id, name, IFNULL(generic_name, ''), IFNULL(barcode, ''), IFNULL(hsn_code, ''), IFNULL(rack_id, '')
+          FROM product_master
+          WHERE id NOT IN (SELECT id FROM product_search_fts);
+        ''');
+      } catch (ftsErr) {
+        debugPrint("FTS trigger recreate error: $ftsErr");
+      }
+      SupabaseSyncService.instance.setBulkImportActive(false);
+      SupabaseRealtimeService.instance.resumeSubscriptions();
+      SupabaseSyncService.instance.resumeSync();
     }
   }
 
@@ -5311,6 +5543,10 @@ class PharmacyProvider extends ChangeNotifier {
     final validation = await validateAndImportFile(filePath);
     if (!validation['success']) return validation;
 
+    SupabaseSyncService.instance.setBulkImportActive(true);
+    DeltaSyncService.instance.stopPeriodicSync();
+    SupabaseRealtimeService.instance.pauseSubscriptions();
+    await SupabaseSyncService.instance.pauseSyncAndAwaitIdle(timeout: const Duration(seconds: 15), keepPausedOnTimeout: true);
     try {
       final rawRows = await ExcelWorkerService.parseExcelRawRowsInBackground(filePath);
       if (rawRows.length <= 1) {
@@ -5318,6 +5554,11 @@ class PharmacyProvider extends ChangeNotifier {
       }
 
       final db = await DbHelper.instance.database;
+      try {
+        await db.execute('PRAGMA journal_mode = WAL;');
+        await db.execute('PRAGMA synchronous = NORMAL;');
+        await db.execute('PRAGMA busy_timeout = 30000;');
+      } catch (_) {}
 
       int imported = 0;
       int errors = 0;
@@ -5330,14 +5571,15 @@ class PharmacyProvider extends ChangeNotifier {
         for (var p in allExisting) p['name'].toString().toLowerCase().trim(): p['id'].toString()
       };
 
-      final header = rawRows.first.map((e) => e.toLowerCase().trim()).toList();
+      int headerRowIdx = ExcelWorkerService.findExcelHeaderRowIndex(rawRows);
+      final header = rawRows[headerRowIdx].map((e) => e.toLowerCase().trim()).toList();
 
-      int idxName = customMapping?['name'] ?? _findIdx(header, ['product name', 'item name', 'particulars', 'item description', 'description', 'product', 'items', 'name']);
-      int idxStock = customMapping?['stock'] ?? _findIdx(header, ['stock', 'qty', 'current stock']);
+      int idxName = customMapping?['name'] ?? _findIdx(header, ['product name', 'item name', 'particulars', 'item description', 'description', 'product', 'items', 'name', 'drug name', 'medicine', 'brand name', 'item desc', 'material description', 'desc']);
+      int idxStock = customMapping?['stock'] ?? _findIdx(header, ['stock', 'qty', 'quantity', 'current stock', 'physical stock', 'closing stock', 'balance qty', 'pcs', 'units']);
       int idxBatch = customMapping?['batch'] ?? _findIdx(header, ['batch', 'batch_number', 'batch no']);
       int idxExp = customMapping?['expiry'] ?? _findIdx(header, ['expiry', 'exp', 'exp date', 'expiry date']);
-      int idxMRP = customMapping?['mrp'] ?? _findIdx(header, ['mrp', 'm.r.p']);
-      int idxLCost = customMapping?['l_cost'] ?? customMapping?['p_rate'] ?? _findIdx(header, ['p.rate', 'prate', 'purchase rate', 'l cost', 'lcost', 'landing cost']);
+      int idxMRP = customMapping?['mrp'] ?? _findIdx(header, ['mrp', 'm.r.p', 'item mrp', 'item_mrp', 'retail price', 'max retail price', 'price']);
+      int idxLCost = customMapping?['l_cost'] ?? customMapping?['p_rate'] ?? _findIdx(header, ['p.rate', 'prate', 'p_rate', 'purchase rate', 'purchase_rate', 'l cost', 'lcost', 'cost price', 'landing cost', 'rate', 'cost']);
       int idxPack = customMapping?['packing'] ?? _findIdx(header, ['packing', 'pack', 'packsize', 'packng']);
       int idxSupplier = customMapping?['supplier'] ?? _findIdx(header, ['supplier', 'supplier name']);
       int idxGst = customMapping?['gst'] ?? _findIdx(header, ['gst', 'gst%', 'tax']);
@@ -5347,7 +5589,7 @@ class PharmacyProvider extends ChangeNotifier {
       int idxMfr = customMapping?['manufacturer'] ?? _findIdx(header, ['manufacturer', 'company', 'mfr', 'mfg']);
       int idxContent = customMapping?['generic_name'] ?? _findIdx(header, ['generic name', 'generic', 'generic_name', 'content', 'composition', 'composition name', 'salt', 'formula', 'drug_name', 'molecule', 'active_ingredient', 'generic name / composition', 'generic_name_composition']);
 
-      final dataRows = rawRows.sublist(1);
+      final dataRows = rawRows.sublist(headerRowIdx + 1);
       final int totalRows = dataRows.length;
       const int chunkSize = 500;
       final int totalParts = (totalRows / chunkSize).ceil();
@@ -5368,15 +5610,15 @@ class PharmacyProvider extends ChangeNotifier {
         final int end = (start + chunkSize > totalRows) ? totalRows : start + chunkSize;
         final chunk = dataRows.sublist(start, end);
 
+        if (onProgress != null) {
+          onProgress(start / totalRows, "Part ${part + 1}/$totalParts (${((start / totalRows) * 100).toInt()}%)");
+        }
+
         await db.transaction((txn) async {
           final batch = txn.batch();
           for (int i = 0; i < chunk.length; i++) {
             final row = chunk[i];
             if (row.isEmpty) continue;
-
-            if (onProgress != null && i % 50 == 0) {
-              onProgress((start + i) / totalRows, "Part ${part + 1}/$totalParts");
-            }
 
             String name = valRow(row, idxName);
             if (!isValidProductName(name)) {
@@ -5477,7 +5719,7 @@ class PharmacyProvider extends ChangeNotifier {
         });
 
         if (onProgress != null) {
-          onProgress(1.0, "Part ${part + 1}/$totalParts");
+          onProgress(end / totalRows, "Part ${part + 1}/$totalParts (${((end / totalRows) * 100).toInt()}%)");
         }
         await Future.delayed(const Duration(milliseconds: 10));
       }
@@ -5493,6 +5735,10 @@ class PharmacyProvider extends ChangeNotifier {
       };
     } catch (e) {
       return {'success': false, 'message': 'Import failed: $e'};
+    } finally {
+      SupabaseSyncService.instance.setBulkImportActive(false);
+      SupabaseRealtimeService.instance.resumeSubscriptions();
+      SupabaseSyncService.instance.resumeSync();
     }
   }
 
@@ -5559,6 +5805,9 @@ class PharmacyProvider extends ChangeNotifier {
     final validation = await validateAndImportFile(filePath);
     if (!validation['success']) return validation;
 
+    DeltaSyncService.instance.stopPeriodicSync();
+    SupabaseRealtimeService.instance.pauseSubscriptions();
+    await SupabaseSyncService.instance.pauseSyncAndAwaitIdle(timeout: const Duration(seconds: 15));
     try {
       // 1. Parse entirely in background isolate (Zero UI stutter)
       final rawRows = await ExcelWorkerService.parseExcelFileInBackground(filePath);
@@ -5709,6 +5958,9 @@ class PharmacyProvider extends ChangeNotifier {
       };
     } catch (e) {
       return {'success': false, 'message': 'Bulk import failed: $e'};
+    } finally {
+      SupabaseRealtimeService.instance.resumeSubscriptions();
+      SupabaseSyncService.instance.resumeSync();
     }
   }
 
@@ -5717,6 +5969,9 @@ class PharmacyProvider extends ChangeNotifier {
     final validation = await validateAndImportFile(filePath);
     if (!validation['success']) return validation;
 
+    DeltaSyncService.instance.stopPeriodicSync();
+    SupabaseRealtimeService.instance.pauseSubscriptions();
+    await SupabaseSyncService.instance.pauseSyncAndAwaitIdle(timeout: const Duration(seconds: 15));
     try {
       final rawRows = await ExcelWorkerService.parseExcelRawRowsInBackground(filePath);
       if (rawRows.length <= 1) {
@@ -5835,6 +6090,9 @@ class PharmacyProvider extends ChangeNotifier {
       };
     } catch (e) {
       return {'success': false, 'message': 'Import failed: $e'};
+    } finally {
+      SupabaseRealtimeService.instance.resumeSubscriptions();
+      SupabaseSyncService.instance.resumeSync();
     }
   }
 
@@ -5858,6 +6116,9 @@ class PharmacyProvider extends ChangeNotifier {
     final validation = await validateAndImportFile(filePath);
     if (!validation['success']) return validation;
 
+    DeltaSyncService.instance.stopPeriodicSync();
+    SupabaseRealtimeService.instance.pauseSubscriptions();
+    await SupabaseSyncService.instance.pauseSyncAndAwaitIdle(timeout: const Duration(seconds: 15));
     try {
       onProgress?.call(0.05, "Reading file in background isolate...");
       
@@ -6221,6 +6482,9 @@ class PharmacyProvider extends ChangeNotifier {
     } catch (e) {
       debugPrint("Import Sales Error: $e");
       return {'success': false, 'message': 'Sales import failed: $e'};
+    } finally {
+      SupabaseRealtimeService.instance.resumeSubscriptions();
+      SupabaseSyncService.instance.resumeSync();
     }
   }
 
@@ -6233,6 +6497,9 @@ class PharmacyProvider extends ChangeNotifier {
     final validation = await validateAndImportFile(filePath);
     if (!validation['success']) return validation;
 
+    DeltaSyncService.instance.stopPeriodicSync();
+    SupabaseRealtimeService.instance.pauseSubscriptions();
+    await SupabaseSyncService.instance.pauseSyncAndAwaitIdle(timeout: const Duration(seconds: 15));
     try {
       onProgress?.call(0.05, "Reading file in background isolate...");
 
@@ -6463,148 +6730,156 @@ class PharmacyProvider extends ChangeNotifier {
         await db.delete('purchase_entries');
       }
 
-      await db.transaction((txn) async {
-        int totalPurchases = purchaseGroups.length;
-        int currentP = 0;
-        
-        for (var entry in purchaseGroups.entries) {
-          currentP++;
-          if (onProgress != null) {
-            onProgress(0.4 + (currentP / totalPurchases * 0.6), "Importing Purchase $currentP of $totalPurchases");
-          }
-          
-          String entryNo = entry.key;
-          var rows = entry.value;
-          if (rows.isEmpty) continue;
+      int totalPurchases = purchaseGroups.length;
+      int currentP = 0;
+      final purchaseEntriesList = purchaseGroups.entries.toList();
+      const int purchaseChunkSize = 200;
 
-          DateTime pDate = rows.first['date'];
-          String supplier = rows.first['supplier'];
-          String doneBy = rows.first['doneBy'];
-          String fy = _getCalculatedFY(pDate);
+      for (int bStart = 0; bStart < purchaseEntriesList.length; bStart += purchaseChunkSize) {
+        final bEnd = (bStart + purchaseChunkSize < purchaseEntriesList.length) ? bStart + purchaseChunkSize : purchaseEntriesList.length;
+        final chunk = purchaseEntriesList.sublist(bStart, bEnd);
 
-          // If entryNo is one of our generated GRP keys, replace it with a sequential numeric ID
-          if (entryNo.startsWith("GRP-") || entryNo.startsWith("UNIQUE-")) {
-            if (!fyNextNo.containsKey(fy)) {
-              final List<Map<String, dynamic>> result = await txn.rawQuery(
-                  'SELECT MAX(CAST(entry_no AS INTEGER)) as max_no FROM purchase_entries WHERE financial_year = ?', [fy]);
-              fyNextNo[fy] = ((result.first['max_no'] as int?) ?? 0) + 1;
-            }
-            entryNo = fyNextNo[fy].toString();
-            fyNextNo[fy] = fyNextNo[fy]! + 1;
-          }
-
-          double subTotal = 0.0;
-          double discount = 0.0;
-          double grandTotal = 0.0;
-          
-          for (var r in rows) {
-            final double pRate = (r['p_rate'] as num?)?.toDouble() ?? 0.0;
-            final int qty = (r['qty'] as num?)?.toInt() ?? 0;
-            final double discPerc = (r['disc_perc'] as num?)?.toDouble() ?? 0.0;
-            final double gstPerc = (r['gst_perc'] as num?)?.toDouble() ?? 0.0;
+        await DbHelper.instance.executeSerializedTransaction((txn) async {
+          for (var entry in chunk) {
+            currentP++;
             
-            double gross = pRate * qty;
-            double discAmt = (gross * discPerc) / 100;
-            double net = gross - discAmt;
-            double gstAmt = (net * gstPerc) / 100;
-            
-            subTotal += gross;
-            discount += discAmt;
-            grandTotal += (net + gstAmt);
-          }
+            String entryNo = entry.key;
+            var rows = entry.value;
+            if (rows.isEmpty) continue;
 
-          await txn.insert('purchase_entries', {
-            'entry_no': entryNo,
-            'date': pDate.toIso8601String(),
-            'supplier_name': supplier,
-            'done_by': doneBy,
-            'sup_inv_no': rows.first['invNo'],
-            'sup_inv_date': DateTime.tryParse(rows.first['invDate'] ?? "")?.toIso8601String() ?? pDate.toIso8601String(),
-            'sub_total': subTotal,
-            'discount': discount,
-            'grand_total': grandTotal,
-            'payment_status': 1,
-            'paid_amount': grandTotal,
-            'financial_year': _getCalculatedFY(pDate),
-          }, conflictAlgorithm: sql.ConflictAlgorithm.replace);
-          importedPurchases++;
+            DateTime pDate = rows.first['date'];
+            String supplier = rows.first['supplier'];
+            String doneBy = rows.first['doneBy'];
+            String fy = _getCalculatedFY(pDate);
 
-          await txn.delete('purchase_items', where: 'entry_no = ?', whereArgs: [entryNo]);
-
-          for (var r in rows) {
-            String prodName = r['product'].toString().trim();
-            if (prodName.isEmpty) continue;
-
-            var profile = nameToProfile[prodName.toLowerCase()];
-            String prodId = profile != null ? profile['id'].toString() : "";
-
-            if (prodId.isEmpty) {
-              prodId = generate10DigitId();
-              await txn.insert('product_master', {
-                'id': prodId,
-                'name': prodName,
-                'packing': r['packing'] ?? 1,
-                'is_active': 1,
-              }, conflictAlgorithm: sql.ConflictAlgorithm.ignore);
-              profile = {
-                'id': prodId,
-                'name': prodName,
-                'rack_id': '',
-                'hsn_code': '',
-                's_disc_percent': 0.0
-              };
-              nameToProfile[prodName.toLowerCase()] = profile;
+            // If entryNo is one of our generated GRP keys, replace it with a sequential numeric ID
+            if (entryNo.startsWith("GRP-") || entryNo.startsWith("UNIQUE-")) {
+              if (!fyNextNo.containsKey(fy)) {
+                final List<Map<String, dynamic>> result = await txn.rawQuery(
+                    'SELECT MAX(CAST(entry_no AS INTEGER)) as max_no FROM purchase_entries WHERE financial_year = ?', [fy]);
+                fyNextNo[fy] = ((result.first['max_no'] as int?) ?? 0) + 1;
+              }
+              entryNo = fyNextNo[fy].toString();
+              fyNextNo[fy] = fyNextNo[fy]! + 1;
             }
 
-            final double pRate = (r['p_rate'] as num?)?.toDouble() ?? 0.0;
-            final int qty = (r['qty'] as num?)?.toInt() ?? 0;
-            final int fQty = (r['f_qty'] as num?)?.toInt() ?? 0;
-            final int packing = (r['packing'] as num?)?.toInt() ?? 1;
-            final double discPerc = (r['disc_perc'] as num?)?.toDouble() ?? 0.0;
-            final double gross = pRate * qty;
-            final double discAmt = (gross * discPerc) / 100;
-            final double net = gross - discAmt;
-            final double gstPerc = (r['gst_perc'] as num?)?.toDouble() ?? 0.0;
-            final double gstAmt = (net * gstPerc) / 100;
-            final double total = net + gstAmt;
+            double subTotal = 0.0;
+            double discount = 0.0;
+            double grandTotal = 0.0;
             
-            double trueLandingCost = (qty + fQty) > 0 ? (total / (qty + fQty)) : pRate;
+            for (var r in rows) {
+              final double pRate = (r['p_rate'] as num?)?.toDouble() ?? 0.0;
+              final int qty = (r['qty'] as num?)?.toInt() ?? 0;
+              final double discPerc = (r['disc_perc'] as num?)?.toDouble() ?? 0.0;
+              final double gstPerc = (r['gst_perc'] as num?)?.toDouble() ?? 0.0;
+              
+              double gross = pRate * qty;
+              double discAmt = (gross * discPerc) / 100;
+              double net = gross - discAmt;
+              double gstAmt = (net * gstPerc) / 100;
+              
+              subTotal += gross;
+              discount += discAmt;
+              grandTotal += (net + gstAmt);
+            }
 
-            final double mrp = (r['mrp'] as num?)?.toDouble() ?? 0.0;
-            final double sDiscPercent = (profile?['s_disc_percent'] as num?)?.toDouble() ?? 0.0;
-            final double sRate = mrp - (mrp * sDiscPercent / 100);
-
-            // Update purchase_items with clean batch
-            await txn.insert('purchase_items', {
+            await txn.insert('purchase_entries', {
               'entry_no': entryNo,
-              'product_id': prodId,
-              'product_name': prodName,
-              'batch': r['batch'].toString().trim(),
-              'expiry': r['expiry'],
-              'qty': qty,
-              'f_qty': fQty,
-              'mrp': mrp,
-              'p_rate': pRate,
-              'gross': gross,
-              'disc_percent': discPerc,
-              'disc_amt': discAmt,
-              'net': net,
-              'gst_percent': gstPerc,
-              'gst_amt': gstAmt,
-              'total': total,
-              'packin': packing,
-              'l_cost': trueLandingCost,
-              'rack': profile?['rack_id'] ?? "",
-              'hsn_code': profile?['hsn_code'] ?? "",
-              's_disc_percent': sDiscPercent,
-              's_rate': sRate,
-            });
+              'date': pDate.toIso8601String(),
+              'supplier_name': supplier,
+              'done_by': doneBy,
+              'sup_inv_no': rows.first['invNo'],
+              'sup_inv_date': DateTime.tryParse(rows.first['invDate'] ?? "")?.toIso8601String() ?? pDate.toIso8601String(),
+              'sub_total': subTotal,
+              'discount': discount,
+              'grand_total': grandTotal,
+              'payment_status': 1,
+              'paid_amount': grandTotal,
+              'financial_year': _getCalculatedFY(pDate),
+            }, conflictAlgorithm: sql.ConflictAlgorithm.replace);
+            importedPurchases++;
 
-            importedItems++;
+            await txn.delete('purchase_items', where: 'entry_no = ?', whereArgs: [entryNo]);
+
+            for (var r in rows) {
+              String prodName = r['product'].toString().trim();
+              if (prodName.isEmpty) continue;
+
+              var profile = nameToProfile[prodName.toLowerCase()];
+              String prodId = profile != null ? profile['id'].toString() : "";
+
+              if (prodId.isEmpty) {
+                prodId = generate10DigitId();
+                await txn.insert('product_master', {
+                  'id': prodId,
+                  'name': prodName,
+                  'packing': r['packing'] ?? 1,
+                  'is_active': 1,
+                }, conflictAlgorithm: sql.ConflictAlgorithm.ignore);
+                profile = {
+                  'id': prodId,
+                  'name': prodName,
+                  'rack_id': '',
+                  'hsn_code': '',
+                  's_disc_percent': 0.0
+                };
+                nameToProfile[prodName.toLowerCase()] = profile;
+              }
+
+              final double pRate = (r['p_rate'] as num?)?.toDouble() ?? 0.0;
+              final int qty = (r['qty'] as num?)?.toInt() ?? 0;
+              final int fQty = (r['f_qty'] as num?)?.toInt() ?? 0;
+              final int packing = (r['packing'] as num?)?.toInt() ?? 1;
+              final double discPerc = (r['disc_perc'] as num?)?.toDouble() ?? 0.0;
+              final double gross = pRate * qty;
+              final double discAmt = (gross * discPerc) / 100;
+              final double net = gross - discAmt;
+              final double gstPerc = (r['gst_perc'] as num?)?.toDouble() ?? 0.0;
+              final double gstAmt = (net * gstPerc) / 100;
+              final double total = net + gstAmt;
+              
+              double trueLandingCost = (qty + fQty) > 0 ? (total / (qty + fQty)) : pRate;
+
+              final double mrp = (r['mrp'] as num?)?.toDouble() ?? 0.0;
+              final double sDiscPercent = (profile?['s_disc_percent'] as num?)?.toDouble() ?? 0.0;
+              final double sRate = mrp - (mrp * sDiscPercent / 100);
+
+              // Update purchase_items with clean batch
+              await txn.insert('purchase_items', {
+                'entry_no': entryNo,
+                'product_id': prodId,
+                'product_name': prodName,
+                'batch': r['batch'].toString().trim(),
+                'expiry': r['expiry'],
+                'qty': qty,
+                'f_qty': fQty,
+                'mrp': mrp,
+                'p_rate': pRate,
+                'gross': gross,
+                'disc_percent': discPerc,
+                'disc_amt': discAmt,
+                'net': net,
+                'gst_percent': gstPerc,
+                'gst_amt': gstAmt,
+                'total': total,
+                'packin': packing,
+                'l_cost': trueLandingCost,
+                'rack': profile?['rack_id'] ?? "",
+                'hsn_code': profile?['hsn_code'] ?? "",
+                's_disc_percent': sDiscPercent,
+                's_rate': sRate,
+              });
+
+              importedItems++;
+            }
           }
-          if (currentP % 50 == 0) await Future.delayed(const Duration(milliseconds: 10));
+        });
+
+        if (onProgress != null) {
+          onProgress(0.4 + (currentP / totalPurchases * 0.6), "Importing Purchase $currentP of $totalPurchases");
         }
-      });
+        await Future.delayed(const Duration(milliseconds: 10));
+      }
 
       await loadFromDatabase();
       await syncVoucherSequences();
@@ -6623,15 +6898,18 @@ class PharmacyProvider extends ChangeNotifier {
       };
     } catch (e) {
       return {'success': false, 'message': 'Purchase import failed: $e'};
+    } finally {
+      SupabaseRealtimeService.instance.resumeSubscriptions();
+      SupabaseSyncService.instance.resumeSync();
     }
   }
 
-  Future<Map<String, dynamic>> importSalesReturnsFromExcel(String filePath, {Function(double, String)? onProgress, Map<String, int>? customMapping}) async {
-    return importReturnsFromExcel(filePath, onProgress: onProgress, customMapping: customMapping, forceSales: true);
+  Future<Map<String, dynamic>> importSalesReturnsFromExcel(String filePath, {Function(double, String)? onProgress, Map<String, int>? customMapping, String? financialYear}) async {
+    return importReturnsFromExcel(filePath, onProgress: onProgress, customMapping: customMapping, forceSales: true, financialYear: financialYear);
   }
 
-  Future<Map<String, dynamic>> importPurchaseReturnsFromExcel(String filePath, {Function(double, String)? onProgress, Map<String, int>? customMapping}) async {
-    return importReturnsFromExcel(filePath, onProgress: onProgress, customMapping: customMapping, forcePurchase: true);
+  Future<Map<String, dynamic>> importPurchaseReturnsFromExcel(String filePath, {Function(double, String)? onProgress, Map<String, int>? customMapping, String? financialYear}) async {
+    return importReturnsFromExcel(filePath, onProgress: onProgress, customMapping: customMapping, forcePurchase: true, financialYear: financialYear);
   }
 
   Future<Map<String, dynamic>> importReturnsFromExcel(
@@ -6645,6 +6923,9 @@ class PharmacyProvider extends ChangeNotifier {
     final validation = await validateAndImportFile(filePath);
     if (!validation['success']) return validation;
 
+    DeltaSyncService.instance.stopPeriodicSync();
+    SupabaseRealtimeService.instance.pauseSubscriptions();
+    await SupabaseSyncService.instance.pauseSyncAndAwaitIdle(timeout: const Duration(seconds: 15));
     try {
       onProgress?.call(0.05, "Reading file in background isolate...");
 
@@ -6800,97 +7081,88 @@ class PharmacyProvider extends ChangeNotifier {
         }
       }
 
-      await db.transaction((txn) async {
-        int totalGroups = allGroups.length;
-        int currentG = 0;
-        for (var entry in allGroups.entries) {
-          currentG++;
-          if (onProgress != null) onProgress(0.4 + (currentG / totalGroups * 0.6), "Importing Return $currentG");
-          
-          String entryNo = entry.key;
-          var gRows = entry.value;
-          bool isSalesReturn = gRows.first['isSales'];
-          double grandTotal = gRows.fold(0.0, (sum, r) => sum + r['total']);
+      int totalGroups = allGroups.length;
+      int currentG = 0;
+      final returnEntriesList = allGroups.entries.toList();
+      const int returnChunkSize = 200;
 
-          if (isSalesReturn) {
-            double totalDiscAmt = gRows.fold(0.0, (sum, r) => sum + (r['disc_amt'] ?? 0.0));
-            double totalGstAmt = gRows.fold(0.0, (sum, r) => sum + (r['gst_amt'] ?? 0.0));
+      for (int bStart = 0; bStart < returnEntriesList.length; bStart += returnChunkSize) {
+        final bEnd = (bStart + returnChunkSize < returnEntriesList.length) ? bStart + returnChunkSize : returnEntriesList.length;
+        final chunk = returnEntriesList.sublist(bStart, bEnd);
 
-            // Ensure imported returns have original invoice linkage and are tagged:
-            await txn.insert('sales_return_invoices', {
-              'entry_no': entryNo,
-              'date': gRows.first['date'].toIso8601String(),
-              'customer_acc': gRows.first['acc'],
-              'patient': gRows.first['acc'],
-              'original_invoice_no': gRows.first['ref'],
-              'discount': totalDiscAmt,
-              'tax': totalGstAmt,
-              'grand_total': grandTotal,
-              'financial_year': _getCalculatedFY(gRows.first['date']),
-              'is_deleted': 0,
-              'is_imported': 1,
-            }, conflictAlgorithm: sql.ConflictAlgorithm.replace);
+        await DbHelper.instance.executeSerializedTransaction((txn) async {
+          for (var entry in chunk) {
+            currentG++;
             
-            await txn.delete('sales_return_items', where: 'return_no = ?', whereArgs: [entryNo]);
-            for (var r in gRows) {
-              String prodId = nameToId[r['product'].toString().toLowerCase()] ?? "";
-              await txn.insert('sales_return_items', {
-                'return_no': entryNo,
-                'product_id': prodId,
-                'product_name': r['product'],
-                'batch_number': r['batch'],
-                'quantity': r['qty'],
-                'total': r['total'],
-              });
+            String entryNo = entry.key;
+            var gRows = entry.value;
+            bool isSalesReturn = gRows.first['isSales'];
+            double grandTotal = gRows.fold(0.0, (sum, r) => sum + r['total']);
+
+            if (isSalesReturn) {
+              double totalDiscAmt = gRows.fold(0.0, (sum, r) => sum + (r['disc_amt'] ?? 0.0));
+              double totalGstAmt = gRows.fold(0.0, (sum, r) => sum + (r['gst_amt'] ?? 0.0));
+
+              // Ensure imported returns have original invoice linkage and are tagged:
+              await txn.insert('sales_return_invoices', {
+                'entry_no': entryNo,
+                'date': gRows.first['date'].toIso8601String(),
+                'customer_acc': gRows.first['acc'],
+                'patient': gRows.first['acc'],
+                'original_invoice_no': gRows.first['ref'],
+                'discount': totalDiscAmt,
+                'tax': totalGstAmt,
+                'grand_total': grandTotal,
+                'financial_year': _getCalculatedFY(gRows.first['date']),
+                'is_deleted': 0,
+                'is_imported': 1,
+              }, conflictAlgorithm: sql.ConflictAlgorithm.replace);
               
-              // DATA SYNC RULE: History imports do NOT affect live stock
-              /*
-              if (prodId.isNotEmpty) {
-                int packing = (r['packing'] as num?)?.toInt() ?? 1;
-                int totalQty = (r['qty'] as num).toInt() * packing;
-                await txn.rawUpdate('UPDATE stock_batches SET current_stock = current_stock + ? WHERE product_id = ? AND batch_number = ?', 
-                  [totalQty, prodId, r['batch']]);
+              await txn.delete('sales_return_items', where: 'return_no = ?', whereArgs: [entryNo]);
+              for (var r in gRows) {
+                String prodId = nameToId[r['product'].toString().toLowerCase()] ?? "";
+                await txn.insert('sales_return_items', {
+                  'return_no': entryNo,
+                  'product_id': prodId,
+                  'product_name': r['product'],
+                  'batch_number': r['batch'],
+                  'quantity': r['qty'],
+                  'total': r['total'],
+                });
+                
+                importedItems++;
               }
-              */
-              importedItems++;
-            }
-          } else {
-            await txn.insert('purchase_return_entries', {
-              'entry_no': entryNo,
-              'date': gRows.first['date'].toIso8601String(),
-              'supplier_name': gRows.first['acc'],
-              'original_purchase_no': gRows.first['ref'],
-              'grand_total': grandTotal,
-              'financial_year': _getCalculatedFY(gRows.first['date']),
-              'is_imported': 1,
-            }, conflictAlgorithm: sql.ConflictAlgorithm.replace);
-            
-            await txn.delete('purchase_return_items', where: 'entry_no = ?', whereArgs: [entryNo]);
-            for (var r in gRows) {
-              await txn.insert('purchase_return_items', {
-                'entry_no': entryNo, // Correct column name
-                'product_name': r['product'],
-                'batch': r['batch'],
-                'qty': r['qty'],
-                'total': r['total'],
-              });
+            } else {
+              await txn.insert('purchase_return_entries', {
+                'entry_no': entryNo,
+                'date': gRows.first['date'].toIso8601String(),
+                'supplier_name': gRows.first['acc'],
+                'original_purchase_no': gRows.first['ref'],
+                'grand_total': grandTotal,
+                'financial_year': _getCalculatedFY(gRows.first['date']),
+                'is_imported': 1,
+              }, conflictAlgorithm: sql.ConflictAlgorithm.replace);
+              
+              await txn.delete('purchase_return_items', where: 'entry_no = ?', whereArgs: [entryNo]);
+              for (var r in gRows) {
+                await txn.insert('purchase_return_items', {
+                  'entry_no': entryNo,
+                  'product_name': r['product'],
+                  'batch': r['batch'],
+                  'qty': r['qty'],
+                  'total': r['total'],
+                });
 
-              // DATA SYNC RULE: History imports do NOT affect live stock
-              /*
-              if (prodId.isNotEmpty) {
-                int packing = (r['packing'] as num?)?.toInt() ?? 1;
-                int totalQty = (r['qty'] as num).toInt() * packing;
-                await txn.rawUpdate('UPDATE stock_batches SET current_stock = current_stock - ? WHERE product_id = ? AND batch_number = ?', 
-                  [totalQty, prodId, r['batch']]);
+                importedItems++;
               }
-              */
-              importedItems++;
             }
+            importedReturns++;
           }
-          importedReturns++;
-          if (currentG % 50 == 0) await Future.delayed(const Duration(milliseconds: 10));
-        }
-      });
+        });
+
+        if (onProgress != null) onProgress(0.4 + (currentG / totalGroups * 0.6), "Importing Return $currentG of $totalGroups");
+        await Future.delayed(const Duration(milliseconds: 10));
+      }
 
       await loadFromDatabase();
       
@@ -6908,6 +7180,9 @@ class PharmacyProvider extends ChangeNotifier {
       };
     } catch (e) {
       return {'success': false, 'message': 'Returns import failed: $e'};
+    } finally {
+      SupabaseRealtimeService.instance.resumeSubscriptions();
+      SupabaseSyncService.instance.resumeSync();
     }
   }
 
@@ -6920,6 +7195,9 @@ class PharmacyProvider extends ChangeNotifier {
     final validation = await validateAndImportFile(filePath);
     if (!validation['success']) return validation;
 
+    DeltaSyncService.instance.stopPeriodicSync();
+    SupabaseRealtimeService.instance.pauseSubscriptions();
+    await SupabaseSyncService.instance.pauseSyncAndAwaitIdle(timeout: const Duration(seconds: 15));
     try {
       onProgress?.call(0.05, "Reading file in background isolate...");
 
@@ -6971,38 +7249,49 @@ class PharmacyProvider extends ChangeNotifier {
 
       final Set<String> importedYears = {};
 
-      await db.transaction((txn) async {
-        int totalRows = rawRows.length - (headerRowIdx + 1);
-        for (int i = headerRowIdx + 1; i < rawRows.length; i++) {
-          final row = rawRows[i];
-          if (row.isEmpty) continue;
-          if (onProgress != null && i % 100 == 0) {
-            onProgress(i / totalRows, "Importing Damage Log $i of $totalRows");
+      final dataRows = rawRows.sublist(headerRowIdx + 1);
+      final int totalRows = dataRows.length;
+      const int chunkSize = 500;
+      final int totalParts = (totalRows / chunkSize).ceil();
+
+      for (int part = 0; part < totalParts; part++) {
+        final int start = part * chunkSize;
+        final int end = (start + chunkSize > totalRows) ? totalRows : start + chunkSize;
+        final chunk = dataRows.sublist(start, end);
+
+        await DbHelper.instance.executeSerializedTransaction((txn) async {
+          for (int i = 0; i < chunk.length; i++) {
+            final row = chunk[i];
+            if (row.isEmpty) continue;
+
+            String prodName = valRow(row, idxProduct);
+            String prodId = nameToId[prodName.toLowerCase()] ?? "";
+            String batchNum = valRow(row, idxBatch);
+            int qty = _parse(valRow(row, idxQty)).toInt();
+            DateTime woDate = _parseExcelDate(valRow(row, idxDate));
+            String fy = _getCalculatedFY(woDate);
+            importedYears.add(fy);
+
+            await txn.insert('stock_write_offs', {
+              'id': valRow(row, idxId).isNotEmpty ? valRow(row, idxId) : "DMG_${DateTime.now().millisecondsSinceEpoch}_${start + i}",
+              'date': woDate.toIso8601String(),
+              'product_id': prodId,
+              'batch_number': batchNum,
+              'quantity': qty,
+              'reason': valRow(row, idxReason),
+              'loss_value': _parse(valRow(row, idxLoss)),
+              'financial_year': fy,
+            }, conflictAlgorithm: sql.ConflictAlgorithm.replace);
+
+            importedCount++;
           }
+        });
 
-          String prodName = valRow(row, idxProduct);
-          String prodId = nameToId[prodName.toLowerCase()] ?? "";
-          String batchNum = valRow(row, idxBatch);
-          int qty = _parse(valRow(row, idxQty)).toInt();
-          DateTime woDate = _parseExcelDate(valRow(row, idxDate));
-          String fy = _getCalculatedFY(woDate);
-          importedYears.add(fy);
-
-          await txn.insert('stock_write_offs', {
-            'id': valRow(row, idxId).isNotEmpty ? valRow(row, idxId) : "DMG_${DateTime.now().millisecondsSinceEpoch}_$i",
-            'date': woDate.toIso8601String(),
-            'product_id': prodId,
-            'batch_number': batchNum,
-            'quantity': qty,
-            'reason': valRow(row, idxReason),
-            'loss_value': _parse(valRow(row, idxLoss)),
-            'financial_year': fy,
-          }, conflictAlgorithm: sql.ConflictAlgorithm.replace);
-
-          importedCount++;
-          if (i % 100 == 0) await Future.delayed(const Duration(milliseconds: 10));
+        if (onProgress != null) {
+          onProgress(end / totalRows, "Importing Damage Log $end of $totalRows");
         }
-      });
+        await Future.delayed(const Duration(milliseconds: 10));
+      }
 
       await loadFromDatabase();
 
@@ -7014,6 +7303,9 @@ class PharmacyProvider extends ChangeNotifier {
       };
     } catch (e) {
       return {'success': false, 'message': 'Damage import failed: $e'};
+    } finally {
+      SupabaseRealtimeService.instance.resumeSubscriptions();
+      SupabaseSyncService.instance.resumeSync();
     }
   }
 
@@ -7493,6 +7785,9 @@ class PharmacyProvider extends ChangeNotifier {
 
     List<PurchaseItem> items = [];
 
+    DeltaSyncService.instance.stopPeriodicSync();
+    SupabaseRealtimeService.instance.pauseSubscriptions();
+    await SupabaseSyncService.instance.pauseSyncAndAwaitIdle(timeout: const Duration(seconds: 15));
     try {
       final file = File(filePath);
       List<List<dynamic>> rawRows = [];
@@ -7881,6 +8176,9 @@ class PharmacyProvider extends ChangeNotifier {
     } catch (e) {
       debugPrint("Import Error: $e");
       return [];
+    } finally {
+      SupabaseRealtimeService.instance.resumeSubscriptions();
+      SupabaseSyncService.instance.resumeSync();
     }
   }
 
@@ -8474,7 +8772,7 @@ class PharmacyProvider extends ChangeNotifier {
     return products;
   }
 
-  Future<String> saveSale(SaleInvoice sale) async {
+  Future<String> saveSale(SaleInvoice sale, {bool isEditMode = false}) async {
     if (kIsWeb) return "";
     if (sale.customerAcc.trim().isEmpty) {
       throw "Account Name is mandatory. Cannot save sales invoice with blank Account Name.";
@@ -8492,13 +8790,13 @@ class PharmacyProvider extends ChangeNotifier {
     List<Map<String, dynamic>> existingOldItems = [];
     double oldGrandTotal = 0.0;
     DateTime? oldSaleDate;
-    bool isEdit = false;
+    bool isEdit = isEditMode;
 
     try {
       List<Map<String, dynamic>> existingOldHeader = [];
 
       await executeSerializedTransaction((txn) async {
-        if (finalEntryNo.isEmpty || finalEntryNo == "AUTO") {
+        if (!isEdit || finalEntryNo.isEmpty || finalEntryNo == "AUTO") {
           finalEntryNo = await _generateNextNoWithFY(txn, 'sales_invoices', 'entry_no', fy);
         }
 
@@ -8554,7 +8852,7 @@ class PharmacyProvider extends ChangeNotifier {
             }
           }
 
-          // 4. Save Invoice Header
+          // 4. Save Invoice Header & Atomically Update Voucher Sequence Counter
           await txn.insert('sales_invoices', {
             'entry_no': finalEntryNo,
             'date': sale.date.toIso8601String(),
@@ -8585,7 +8883,27 @@ class PharmacyProvider extends ChangeNotifier {
             'days': sale.days,
             'financial_year': fy,
             'order_type': sale.orderType,
+            'is_synced': 0,
+            'terminal_id': ServerConfigService.instance.terminalId,
           }, conflictAlgorithm: sql.ConflictAlgorithm.replace);
+
+          int savedSaleSeq = parseSequenceNumber(finalEntryNo);
+          if (savedSaleSeq > 0) {
+            if (savedSaleSeq > _lastKnownSalesSeq) {
+              _lastKnownSalesSeq = savedSaleSeq;
+            }
+            final termPrefix = ServerConfigService.instance.terminalPrefix;
+            final vKey = termPrefix.isNotEmpty ? 'sales_invoices_$termPrefix' : 'sales_invoices';
+            final seqRow = await txn.query('voucher_sequences', where: 'voucher_type = ? AND financial_year = ?', whereArgs: [vKey, fy]);
+            if (seqRow.isNotEmpty) {
+              int lastS = (seqRow.first['last_sequence'] as int? ?? 0);
+              if (savedSaleSeq > lastS) {
+                await txn.update('voucher_sequences', {'last_sequence': savedSaleSeq}, where: 'voucher_type = ? AND financial_year = ?', whereArgs: [vKey, fy]);
+              }
+            } else {
+              await txn.insert('voucher_sequences', {'voucher_type': vKey, 'financial_year': fy, 'last_sequence': savedSaleSeq});
+            }
+          }
 
           // 5. Insert Items & Apply Atomic DB Stock Deduction
           for (var item in sale.items) {
@@ -8638,8 +8956,8 @@ class PharmacyProvider extends ChangeNotifier {
                   : availableInRow;
 
               final int affected = await txn.rawUpdate(
-                'UPDATE stock_batches SET current_stock = current_stock - ? WHERE rowid = ? AND current_stock >= ?',
-                [deductFromThisRow, rowid, deductFromThisRow]
+                'UPDATE stock_batches SET current_stock = current_stock - ?, is_synced = 0, updated_at = ? WHERE rowid = ? AND current_stock >= ?',
+                [deductFromThisRow, DateTime.now().toUtc().toIso8601String(), rowid, deductFromThisRow]
               );
 
               if (affected == 0) {
@@ -8768,9 +9086,101 @@ class PharmacyProvider extends ChangeNotifier {
       _sales.sort((a, b) => b.date.compareTo(a.date));
       if (_sales.length > 50) _sales.removeLast();
 
-      await syncInventoryFromDb();
-      await refreshSalesFrequency();
+      unawaited(syncInventoryFromDb());
+      unawaited(refreshSalesFrequency());
 
+      try {
+        final eventId = "EVT_${DateTime.now().microsecondsSinceEpoch}_${Random().nextInt(100000)}";
+        final invoiceMap = {
+          'entry_no': finalEntryNo,
+          'grand_total': updatedSale.grandTotal,
+          'patient': updatedSale.patient,
+          'date': updatedSale.date.toIso8601String(),
+          'event_id': eventId,
+        };
+        final deductions = sale.items.map((item) => {
+          'batch_id': item.product.batch,
+          'product_id': item.product.id,
+          'quantity_deducted': (item.qty + item.fQty) * item.packin,
+        }).toList();
+
+        LanSyncService.instance.broadcastEvent('SALE_SAVED', {
+          'event_id': eventId,
+          'entry_no': finalEntryNo,
+          'invoice': invoiceMap,
+          'batch_deductions': deductions,
+        });
+        LanSyncService.instance.broadcastEvent('SALE_COMPLETED', {
+          'event_id': eventId,
+          'entry_no': finalEntryNo,
+          'grand_total': updatedSale.grandTotal,
+          'invoice': invoiceMap,
+          'batch_deductions': deductions,
+        });
+      } catch (_) {}
+
+      // Trigger background atomic push to Supabase Cloud on sale save
+      unawaited(() async {
+        try {
+          final itemsPayload = sale.items.map((it) => {
+            'product_id': it.product.id,
+            'product_name': it.product.name,
+            'extra': it.extra,
+            'batch_number': it.product.batch,
+            'expiry_date': it.product.expiry,
+            'quantity': it.qty,
+            'qty': it.qty,
+            'f_qty': 0,
+            'packing': it.packin,
+            'packin': it.packin,
+            'mrp': it.product.mrp,
+            'purchase_rate': it.purchaseRate,
+            'landing_cost': it.landingCost,
+            'taxable_sp': it.taxableSP,
+            'unit_price': it.sRate,
+            's_rate': it.sRate,
+            'disc_percent': it.discPercent,
+            'disc_amt': it.discAmt,
+            'gst_percent': it.gstPercent,
+            'gst_amt': it.gstAmt,
+            'cgst_amt': it.cgstAmt,
+            'sgst_amt': it.sgstAmt,
+            'igst_amt': it.igstAmt,
+            'total_amount': it.total,
+            'profit': it.profit,
+            'supplier_name': it.supplier,
+            'rack': it.product.rack,
+            'terminal_id': ServerConfigService.instance.terminalId,
+          }).toList();
+
+          final saleMap = {
+            'entry_no': finalEntryNo,
+            'invoice_no': finalEntryNo,
+            'financial_year': fy,
+            'date': sale.date.toIso8601String(),
+            'customer_acc': sale.customerAcc,
+            'patient': sale.patient,
+            'mobile': sale.mobile,
+            'doctor': sale.doctor,
+            'doctor_reg_no': sale.doctorRegNo,
+            'sub_total': sale.subTotal,
+            'grand_total': sale.grandTotal,
+            'net_amount': sale.grandTotal,
+            'rcvd_amt': sale.rcvdAmt,
+            'agent': sale.agent,
+            'payment_mode': sale.customerAcc,
+            'is_paid': sale.isPaid ? 1 : 0,
+            'is_deleted': sale.isDeleted ? 1 : 0,
+            'terminal_id': ServerConfigService.instance.terminalId,
+          };
+
+          await SupabaseSyncService.instance.pushSalesInvoice(saleMap, itemsPayload);
+        } catch (e) {
+          debugPrint('Instant sale sync push error: $e');
+        }
+      }());
+
+      invalidateNavCache('sales_invoices');
       return finalEntryNo;
     } catch (e) {
       debugPrint("Save Sale Error: $e");
@@ -8778,7 +9188,7 @@ class PharmacyProvider extends ChangeNotifier {
     }
   }
 
-  Future<String> savePurchase(PurchaseEntry purchase) async {
+  Future<String> savePurchase(PurchaseEntry purchase, {bool isEditMode = false}) async {
     if (kIsWeb) return "";
     String finalEntryNo = purchase.entryNo;
     String fy = purchase.financialYear.isEmpty ? _selectedFinancialYear : purchase.financialYear;
@@ -8834,7 +9244,7 @@ class PharmacyProvider extends ChangeNotifier {
               String pId = entry.key.split('|')[0];
               String batch = entry.key.split('|')[1];
 
-              await txn.rawUpdate('UPDATE stock_batches SET current_stock = current_stock WHERE product_id = ? AND batch_number = ?', [pId, batch]);
+              await txn.rawUpdate('UPDATE stock_batches SET current_stock = current_stock, is_synced = 0, updated_at = ? WHERE product_id = ? AND batch_number = ?', [DateTime.now().toUtc().toIso8601String(), pId, batch]);
               final stockCheck = await txn.rawQuery('SELECT SUM(current_stock) as total_stock FROM stock_batches WHERE product_id = ? AND batch_number = ? COLLATE NOCASE', [pId, batch]);
               int liveStock = stockCheck.isNotEmpty ? (stockCheck.first['total_stock'] as num?)?.toInt() ?? 0 : 0;
 
@@ -8859,7 +9269,7 @@ class PharmacyProvider extends ChangeNotifier {
               }
               if (pId.isNotEmpty) {
                 int looseQty = ((old['qty'] as num).toInt() + (old['f_qty'] as num).toInt()) * ((old['packin'] as num).toInt());
-                await txn.rawUpdate('UPDATE stock_batches SET current_stock = current_stock - ? WHERE product_id = ? AND batch_number = ? COLLATE NOCASE', [looseQty, pId, old['batch']]);
+                await txn.rawUpdate('UPDATE stock_batches SET current_stock = current_stock - ?, is_synced = 0, updated_at = ? WHERE product_id = ? AND batch_number = ? COLLATE NOCASE', [looseQty, DateTime.now().toUtc().toIso8601String(), pId, old['batch']]);
               }
             }
             await txn.delete('purchase_items', where: 'entry_no = ?', whereArgs: [finalEntryNo]);
@@ -8896,6 +9306,24 @@ class PharmacyProvider extends ChangeNotifier {
             'days': purchase.days,
             'financial_year': fy,
           }, conflictAlgorithm: sql.ConflictAlgorithm.replace);
+
+          int savedPurSeq = parseSequenceNumber(finalEntryNo);
+          if (savedPurSeq > 0) {
+            if (savedPurSeq > _lastKnownPurchaseSeq) {
+              _lastKnownPurchaseSeq = savedPurSeq;
+            }
+            final termPrefix = ServerConfigService.instance.terminalPrefix;
+            final vKey = termPrefix.isNotEmpty ? 'purchase_entries_$termPrefix' : 'purchase_entries';
+            final seqRow = await txn.query('voucher_sequences', where: 'voucher_type = ? AND financial_year = ?', whereArgs: [vKey, fy]);
+            if (seqRow.isNotEmpty) {
+              int lastS = (seqRow.first['last_sequence'] as int? ?? 0);
+              if (savedPurSeq > lastS) {
+                await txn.update('voucher_sequences', {'last_sequence': savedPurSeq}, where: 'voucher_type = ? AND financial_year = ?', whereArgs: [vKey, fy]);
+              }
+            } else {
+              await txn.insert('voucher_sequences', {'voucher_type': vKey, 'financial_year': fy, 'last_sequence': savedPurSeq});
+            }
+          }
 
           // ================================================================
           // 4. INSERT NEW ITEMS & APPLY NEW LEDGER
@@ -8936,7 +9364,9 @@ class PharmacyProvider extends ChangeNotifier {
                     sale_rate = ?, 
                     expiry_date = ?, 
                     rack = ?, 
-                    is_active = 1 
+                    is_active = 1,
+                    is_synced = 0,
+                    updated_at = ? 
                 WHERE rowid = ?
               ''', [
                 looseQty,
@@ -8946,6 +9376,7 @@ class PharmacyProvider extends ChangeNotifier {
                 item.sRate,
                 item.expiry,
                 item.rack,
+                DateTime.now().toUtc().toIso8601String(),
                 targetRowId
               ]);
             } else {
@@ -9092,6 +9523,72 @@ class PharmacyProvider extends ChangeNotifier {
 
       await syncInventoryFromDb();
       await fetchAccounts();
+
+      // Trigger instant atomic push to Supabase Cloud when saving purchase
+      unawaited(() async {
+        try {
+          final headerMap = {
+            'entry_no': finalEntryNo,
+            'date': purchase.date.toIso8601String(),
+            'supplier_name': purchase.supplierName,
+            'sup_inv_no': cleanInvoiceNo(purchase.supInvNo),
+            'sup_inv_date': purchase.supInvDate.toIso8601String(),
+            'done_by': purchase.doneBy,
+            'inv_total': purchase.invTotal,
+            'remarks': purchase.remarks,
+            'sub_total': purchase.subTotal,
+            'discount': purchase.discount,
+            'other_charge': purchase.otherCharge,
+            'round_off': purchase.roundOff,
+            'grand_total': purchase.grandTotal,
+            'payment_status': purchase.paymentStatus,
+            'payment_mode': purchase.paymentMode,
+            'payment_remarks': purchase.paymentRemarks,
+            'payment_date': purchase.paymentDate?.toIso8601String(),
+            'paid_amount': purchase.paidAmount,
+            'days': purchase.days,
+            'financial_year': fy,
+            'terminal_id': ServerConfigService.instance.terminalId,
+          };
+
+          final itemsMap = purchase.items.map((it) => {
+            'entry_no': finalEntryNo,
+            'product_id': it.id,
+            'product_name': it.productName,
+            'batch': it.batch.trim(),
+            'expiry': it.expiry,
+            'packin': it.packin,
+            'qty': it.qty,
+            'f_qty': it.fQty,
+            'mrp': it.mrp,
+            'p_rate': it.pRate,
+            'gross': it.gross,
+            'disc_percent': it.discPercent,
+            'disc_amt': it.discAmt,
+            'net': it.net,
+            'gst_percent': it.gstPercent,
+            'gst_amt': it.gstAmt,
+            'total': it.total,
+            'rack': it.rack,
+            'hsn_code': it.hsnCode,
+            's_disc_percent': it.sDiscPercent,
+            's_rate': it.sRate,
+            'l_cost': it.lCost,
+          }).toList();
+
+          final ok = await SupabaseSyncService.instance.savePurchaseEntryAtomicRPC(
+            purchaseHeader: headerMap,
+            items: itemsMap,
+          );
+          if (!ok) {
+            await SupabaseSyncService.instance.pushPurchaseEntry(headerMap, itemsMap);
+          }
+        } catch (e) {
+          debugPrint('Instant purchase sync error: $e');
+        }
+      }());
+
+      invalidateNavCache('purchase_entries');
       return finalEntryNo;
     } catch (e) {
       debugPrint("Save Purchase Error: $e");
@@ -9126,8 +9623,8 @@ class PharmacyProvider extends ChangeNotifier {
 
         // ---> THE RACE CONDITION FIX: Acquire a write lock on the row immediately <---
         await txn.rawUpdate(
-            'UPDATE stock_batches SET current_stock = current_stock WHERE product_id = ? AND batch_number = ?',
-            [pId, batch]
+            'UPDATE stock_batches SET current_stock = current_stock, is_synced = 0, updated_at = ? WHERE product_id = ? AND batch_number = ?',
+            [DateTime.now().toUtc().toIso8601String(), pId, batch]
         );
 
         final stockCheck = await txn.rawQuery(
@@ -9149,27 +9646,42 @@ class PharmacyProvider extends ChangeNotifier {
     }
   }
 
-  Future<String> _generateNextNoWithFY(sql.Transaction txn, String table, String column, String fy) async {
-    String cleanColExpr = "CASE WHEN instr($column, '_') > 0 THEN substr($column, instr($column, '_') + 1) ELSE REPLACE(REPLACE(REPLACE($column, 'SRET-', ''), 'PRET-', ''), 'ADJ-', '') END";
-    final List<Map<String, dynamic>> maxRes = await txn.rawQuery(
-        "SELECT MAX(CAST($cleanColExpr AS INTEGER)) as max_no FROM $table WHERE financial_year = ? AND CAST($cleanColExpr AS INTEGER) < 100000000", [fy]);
-    int maxInDb = (maxRes.first['max_no'] as num?)?.toInt() ?? 0;
+  Future<String> _generateNextNoWithFY(sql.Transaction txn, String table, String column, String fy, {String? prefix}) async {
+    // Force terminal prefix for both sales invoices and purchases
+    final defaultPrefix = ServerConfigService.instance.terminalPrefix.isNotEmpty 
+        ? ServerConfigService.instance.terminalPrefix 
+        : '';
+        
+    final String effectivePrefix = prefix ?? defaultPrefix;
+    final String voucherKey = effectivePrefix.isNotEmpty ? '${table}_$effectivePrefix' : table;
 
+    int lastSeq = 0;
     final List<Map<String, dynamic>> res = await txn.query(
       'voucher_sequences',
       where: 'voucher_type = ? AND financial_year = ?',
-      whereArgs: [table, fy],
+      whereArgs: [voucherKey, fy],
     );
-
-    int lastSeq = 0;
     if (res.isNotEmpty) {
       lastSeq = (res.first['last_sequence'] as int? ?? 0);
     }
 
-    int effectiveLast = maxInDb;
-    if (res.isNotEmpty && maxInDb > 0) {
-      effectiveLast = maxInDb > lastSeq ? maxInDb : lastSeq;
+    int maxInDb = 0;
+    if (effectivePrefix.isNotEmpty) {
+      final List<Map<String, dynamic>> maxRes = await txn.rawQuery(
+        "SELECT MAX(CAST(REPLACE($column, '$effectivePrefix', '') AS INTEGER)) as max_no FROM $table WHERE financial_year = ? AND $column LIKE ? AND CAST(REPLACE($column, '$effectivePrefix', '') AS INTEGER) < 100000000",
+        [fy, '$effectivePrefix%'],
+      );
+      maxInDb = (maxRes.first['max_no'] as num?)?.toInt() ?? 0;
+    } else {
+      String cleanColExpr = "SUBSTR($column, INSTR($column, '_') + 1)";
+      final List<Map<String, dynamic>> maxRes = await txn.rawQuery(
+        "SELECT MAX(CAST($cleanColExpr AS INTEGER)) as max_no FROM $table WHERE financial_year = ? AND CAST($cleanColExpr AS INTEGER) < 100000000",
+        [fy],
+      );
+      maxInDb = (maxRes.first['max_no'] as num?)?.toInt() ?? 0;
     }
+
+    int effectiveLast = maxInDb > lastSeq ? maxInDb : lastSeq;
     int nextSeq = effectiveLast + 1;
 
     if (res.isNotEmpty) {
@@ -9177,17 +9689,17 @@ class PharmacyProvider extends ChangeNotifier {
         'voucher_sequences',
         {'last_sequence': nextSeq},
         where: 'voucher_type = ? AND financial_year = ?',
-        whereArgs: [table, fy],
+        whereArgs: [voucherKey, fy],
       );
     } else {
       await txn.insert('voucher_sequences', {
-        'voucher_type': table,
+        'voucher_type': voucherKey,
         'financial_year': fy,
         'last_sequence': nextSeq,
       });
     }
 
-    return nextSeq.toString();
+    return effectivePrefix.isNotEmpty ? "$effectivePrefix$nextSeq" : nextSeq.toString();
   }
 
 
@@ -9240,8 +9752,8 @@ class PharmacyProvider extends ChangeNotifier {
               int qtyToRevert = (old['qty'] as num).toInt();
               // Reverting an adjustment means subtracting the variance that was previously added
               await txn.rawUpdate(
-                  'UPDATE stock_batches SET current_stock = current_stock - ? WHERE product_id = ? AND batch_number = ?',
-                  [qtyToRevert, old['product_id'], old['batch_number']]
+                  'UPDATE stock_batches SET current_stock = current_stock - ?, is_synced = 0, updated_at = ? WHERE product_id = ? AND batch_number = ?',
+                  [qtyToRevert, DateTime.now().toUtc().toIso8601String(), old['product_id'], old['batch_number']]
               );
 
               final pIndex = _products.indexWhere((p) => p.id == old['product_id'] && p.batch == old['batch_number']);
@@ -9291,8 +9803,8 @@ class PharmacyProvider extends ChangeNotifier {
 
             if (item.qty < 0) {
               final int affected = await txn.rawUpdate(
-                  'UPDATE stock_batches SET current_stock = current_stock + ? WHERE product_id = ? AND batch_number = ? AND current_stock >= ? COLLATE NOCASE',
-                  [item.qty, item.product.id, item.product.batch, item.qty.abs()]
+                  'UPDATE stock_batches SET current_stock = current_stock + ?, is_synced = 0, updated_at = ? WHERE product_id = ? AND batch_number = ? AND current_stock >= ? COLLATE NOCASE',
+                  [item.qty, DateTime.now().toUtc().toIso8601String(), item.product.id, item.product.batch, item.qty.abs()]
               );
               if (affected == 0) {
                 throw "STOCK RACE CONDITION!\n\nUnits of '${item.product.name}' (Batch: ${item.product.batch}) were modified simultaneously.\n\nTransaction aborted.";
@@ -9300,8 +9812,8 @@ class PharmacyProvider extends ChangeNotifier {
             } else {
               // ATOMIC UPDATE OR INSERT FOR POSITIVE ADJUSTMENTS
               final int affected = await txn.rawUpdate(
-                  'UPDATE stock_batches SET current_stock = current_stock + ? WHERE product_id = ? AND batch_number = ? COLLATE NOCASE',
-                  [item.qty, item.product.id, item.product.batch]
+                  'UPDATE stock_batches SET current_stock = current_stock + ?, is_synced = 0, updated_at = ? WHERE product_id = ? AND batch_number = ? COLLATE NOCASE',
+                  [item.qty, DateTime.now().toUtc().toIso8601String(), item.product.id, item.product.batch]
               );
 
               // If the batch row was missing or previously deleted, re-insert it
@@ -9388,8 +9900,8 @@ class PharmacyProvider extends ChangeNotifier {
             final String batch = item['batch_number'];
 
             await txn.rawUpdate(
-              'UPDATE stock_batches SET current_stock = current_stock WHERE product_id = ? AND batch_number = ?',
-              [pId, batch]
+              'UPDATE stock_batches SET current_stock = current_stock, is_synced = 0, updated_at = ? WHERE product_id = ? AND batch_number = ?',
+              [DateTime.now().toUtc().toIso8601String(), pId, batch]
             );
 
             final stockCheck = await txn.rawQuery(
@@ -9416,8 +9928,8 @@ class PharmacyProvider extends ChangeNotifier {
           // If qty was positive (+10), subtract 10. If qty was negative (-10), add 10.
           if (qty > 0) {
             final int affected = await txn.rawUpdate(
-              'UPDATE stock_batches SET current_stock = current_stock - ? WHERE product_id = ? AND batch_number = ? AND current_stock >= ? COLLATE NOCASE',
-              [qty, pId, batch, qty]
+              'UPDATE stock_batches SET current_stock = current_stock - ?, is_synced = 0, updated_at = ? WHERE product_id = ? AND batch_number = ? AND current_stock >= ? COLLATE NOCASE',
+              [qty, DateTime.now().toUtc().toIso8601String(), pId, batch, qty]
             );
             if (affected == 0) throw "Stock race condition on adjustment deletion.";
           } else {
@@ -9480,8 +9992,8 @@ class PharmacyProvider extends ChangeNotifier {
 
           // 3. UPDATE DB STOCK (WITH MASTER LOCK)
           final int affected = await txn.rawUpdate(
-              'UPDATE stock_batches SET current_stock = current_stock - ? WHERE product_id = ? AND batch_number = ? AND current_stock >= ? COLLATE NOCASE',
-              [writeOff.quantity, writeOff.product.id, writeOff.product.batch, writeOff.quantity]
+              'UPDATE stock_batches SET current_stock = current_stock - ?, is_synced = 0, updated_at = ? WHERE product_id = ? AND batch_number = ? AND current_stock >= ? COLLATE NOCASE',
+              [writeOff.quantity, DateTime.now().toUtc().toIso8601String(), writeOff.product.id, writeOff.product.batch, writeOff.quantity]
           );
 
           if (affected == 0) {
@@ -9540,6 +10052,14 @@ class PharmacyProvider extends ChangeNotifier {
       debugPrint("Delete Write-Off Error: $e");
       rethrow;
     }
+  }
+
+  /// Triggers a one-time recovery to replace PC2's unsynced local draft for [entryNo] with PC1's cloud invoice
+  Future<InvoiceRecoveryResult> recoverCloudInvoice(String entryNo) async {
+    return await InvoiceRecoveryService.instance.recoverUnsyncedInvoice(
+      entryNo: entryNo,
+      pharmacy: this,
+    );
   }
 
   Future<void> deleteSale(String entryNo) async {
@@ -9622,6 +10142,10 @@ class PharmacyProvider extends ChangeNotifier {
         );
       }
       await syncInventoryFromDb();
+      invalidateNavCache('sales_invoices');
+      try {
+        LanSyncService.instance.broadcastEvent('SALE_DELETED', {'entry_no': entryNo});
+      } catch (_) {}
     } catch (e) {
       debugPrint("Delete Sale Error: $e");
       rethrow;
@@ -9714,8 +10238,8 @@ class PharmacyProvider extends ChangeNotifier {
 
             // Lock row and fetch live batch stock
             await txn.rawUpdate(
-              'UPDATE stock_batches SET current_stock = current_stock WHERE product_id = ? AND batch_number = ?',
-              [productId, batch]
+              'UPDATE stock_batches SET current_stock = current_stock, is_synced = 0, updated_at = ? WHERE product_id = ? AND batch_number = ?',
+              [DateTime.now().toUtc().toIso8601String(), productId, batch]
             );
 
             final stockCheck = await txn.rawQuery(
@@ -9745,8 +10269,8 @@ class PharmacyProvider extends ChangeNotifier {
             final String batch = item['batch']?.toString() ?? '';
 
             final int affected = await txn.rawUpdate(
-              'UPDATE stock_batches SET current_stock = current_stock - ? WHERE product_id = ? AND batch_number = ? AND current_stock >= ? COLLATE NOCASE',
-              [totalQty, productId, batch, totalQty]
+              'UPDATE stock_batches SET current_stock = current_stock - ?, is_synced = 0, updated_at = ? WHERE product_id = ? AND batch_number = ? AND current_stock >= ? COLLATE NOCASE',
+              [totalQty, DateTime.now().toUtc().toIso8601String(), productId, batch, totalQty]
             );
 
             if (affected == 0) {
@@ -9784,6 +10308,10 @@ class PharmacyProvider extends ChangeNotifier {
       _purchases.removeWhere((p) => p.entryNo == entryNo);
       await syncInventoryFromDb();
       await fetchAccounts();
+      invalidateNavCache('purchase_entries');
+      try {
+        LanSyncService.instance.broadcastEvent('PURCHASE_DELETED', {'entry_no': entryNo});
+      } catch (_) {}
     } catch (e) { 
       debugPrint("Delete Purchase Error: $e"); 
       rethrow;
@@ -9825,8 +10353,8 @@ class PharmacyProvider extends ChangeNotifier {
 
             if (productId.isNotEmpty && qty > 0) {
               await txn.rawUpdate(
-                'UPDATE stock_batches SET current_stock = current_stock WHERE product_id = ? AND batch_number = ?',
-                [productId, batch]
+                'UPDATE stock_batches SET current_stock = current_stock, is_synced = 0, updated_at = ? WHERE product_id = ? AND batch_number = ?',
+                [DateTime.now().toUtc().toIso8601String(), productId, batch]
               );
 
               final stockCheck = await txn.rawQuery(
@@ -9854,8 +10382,8 @@ class PharmacyProvider extends ChangeNotifier {
 
             if (productId.isNotEmpty && qty > 0) {
               final int affected = await txn.rawUpdate(
-                'UPDATE stock_batches SET current_stock = current_stock - ? WHERE product_id = ? AND batch_number = ? AND current_stock >= ? COLLATE NOCASE',
-                [qty, productId, batch, qty]
+                'UPDATE stock_batches SET current_stock = current_stock - ?, is_synced = 0, updated_at = ? WHERE product_id = ? AND batch_number = ? AND current_stock >= ? COLLATE NOCASE',
+                [qty, DateTime.now().toUtc().toIso8601String(), productId, batch, qty]
               );
 
               if (affected == 0) {
@@ -9884,6 +10412,7 @@ class PharmacyProvider extends ChangeNotifier {
       
       _saleReturns.removeWhere((s) => s.entryNo == entryNo);
       await syncInventoryFromDb();
+      invalidateNavCache('sales_return_invoices');
     } catch (e) {
       debugPrint("Delete Sale Return Error: $e");
       rethrow;
@@ -9961,6 +10490,7 @@ class PharmacyProvider extends ChangeNotifier {
       });
 
       await syncInventoryFromDb();
+      invalidateNavCache('purchase_return_entries');
       notifyListeners();
     } catch (e) {
       debugPrint("Delete Purchase Return Error: $e");
@@ -10096,7 +10626,7 @@ class PharmacyProvider extends ChangeNotifier {
           final List<Map<String, dynamic>> prod = await txn.query('product_master', columns: ['id'], where: 'name = ?', whereArgs: [item.productName]);
           if (prod.isNotEmpty) {
             int totalOldUnits = (item.qty + item.fQty) * (item.packin > 0 ? item.packin : 1);
-            await txn.rawUpdate('UPDATE stock_batches SET current_stock = current_stock - ? WHERE product_id = ? AND batch_number = ?', [totalOldUnits, prod[0]['id'], item.batch]);
+            await txn.rawUpdate('UPDATE stock_batches SET current_stock = current_stock - ?, is_synced = 0, updated_at = ? WHERE product_id = ? AND batch_number = ?', [totalOldUnits, DateTime.now().toUtc().toIso8601String(), prod[0]['id'], item.batch]);
           }
         }
         // 2. Delete old
@@ -10174,7 +10704,7 @@ class PharmacyProvider extends ChangeNotifier {
             // other fields...
           });
           int totalSaleUnits = item.qty;
-          await txn.rawUpdate('UPDATE stock_batches SET current_stock = current_stock - ? WHERE product_id = ? AND batch_number = ?', [totalSaleUnits, item.product.id, item.product.batch]);
+          await txn.rawUpdate('UPDATE stock_batches SET current_stock = current_stock - ?, is_synced = 0, updated_at = ? WHERE product_id = ? AND batch_number = ?', [totalSaleUnits, DateTime.now().toUtc().toIso8601String(), item.product.id, item.product.batch]);
         }
       });
       int idx = _sales.indexWhere((s) => s.entryNo == oldSale.entryNo);
@@ -10310,8 +10840,8 @@ class PharmacyProvider extends ChangeNotifier {
 
               if (pId.isNotEmpty && oldQty > 0) {
                 await txn.rawUpdate(
-                  'UPDATE stock_batches SET current_stock = current_stock - ? WHERE product_id = ? AND batch_number = ? AND current_stock >= ? COLLATE NOCASE',
-                  [oldQty, pId, bNo, oldQty]
+                  'UPDATE stock_batches SET current_stock = current_stock - ?, is_synced = 0, updated_at = ? WHERE product_id = ? AND batch_number = ? AND current_stock >= ? COLLATE NOCASE',
+                  [oldQty, DateTime.now().toUtc().toIso8601String(), pId, bNo, oldQty]
                 );
               }
             }
@@ -10498,6 +11028,7 @@ class PharmacyProvider extends ChangeNotifier {
       if (_saleReturns.length > 50) _saleReturns.removeLast();
 
       await syncInventoryFromDb();
+      invalidateNavCache('sales_return_invoices');
       return finalEntryNo;
     } catch (e) {
       debugPrint("Save Sale Return Error: $e");
@@ -10701,8 +11232,8 @@ class PharmacyProvider extends ChangeNotifier {
             });
 
             final int affected = await txn.rawUpdate(
-              'UPDATE stock_batches SET current_stock = current_stock - ? WHERE product_id = ? AND batch_number = ? AND current_stock >= ? COLLATE NOCASE',
-              [requestedLooseQty, productId, item.batch, requestedLooseQty]
+              'UPDATE stock_batches SET current_stock = current_stock - ?, is_synced = 0, updated_at = ? WHERE product_id = ? AND batch_number = ? AND current_stock >= ? COLLATE NOCASE',
+              [requestedLooseQty, DateTime.now().toUtc().toIso8601String(), productId, item.batch, requestedLooseQty]
             );
 
             if (affected == 0) {
@@ -10795,7 +11326,11 @@ class PharmacyProvider extends ChangeNotifier {
       }
     }
 
-    if (conditions.length == 1) return [];
+    if (conditions.length == 1) {
+      return await db.rawQuery(
+        "SELECT entry_no, date, patient, doctor, mobile, grand_total FROM sales_invoices WHERE (is_deleted IS NULL OR is_deleted = 0) ORDER BY rowid DESC LIMIT 25"
+      );
+    }
 
     String whereClause = conditions.join(" AND ");
     return await db.rawQuery(
@@ -10804,7 +11339,7 @@ class PharmacyProvider extends ChangeNotifier {
     );
   }
 
-  Future<Map<String, dynamic>?> navigateInvoice(String currentEntry, String direction, {bool isPurchase = false, bool isSaleReturn = false, bool isPurchaseReturn = false, bool isAdjustment = false}) async {
+  Future<Map<String, dynamic>?> navigateInvoice(String currentEntry, String direction, {bool isPurchase = false, bool isSaleReturn = false, bool isPurchaseReturn = false, bool isAdjustment = false, String? targetFinancialYear, bool? isExistingEntry}) async {
     final db = await DbHelper.instance.database;
     String table = 'sales_invoices';
     if (isPurchase) table = 'purchase_entries';
@@ -10822,207 +11357,290 @@ class PharmacyProvider extends ChangeNotifier {
       currentNo = currentNo.substring(currentNo.indexOf('_') + 1);
     }
 
-    String replaceStr = "CASE WHEN instr(entry_no, '_') > 0 THEN substr(entry_no, instr(entry_no, '_') + 1) ELSE ${prefix.isNotEmpty ? "REPLACE(entry_no, '$prefix', '')" : "entry_no"} END";
-    String fyFilter = "(financial_year = ? OR financial_year IS NULL OR financial_year = '')";
-    String isDelFilter = '';
-
     if (direction == 'find') {
       String search1 = currentEntry.trim();
       String search2 = (prefix.isNotEmpty && !search1.toUpperCase().startsWith(prefix)) ? "$prefix$search1" : search1;
+      final termPrefix = ServerConfigService.instance.terminalPrefix;
+      final searchTermPrefixed = (termPrefix.isNotEmpty && !search1.toUpperCase().startsWith(termPrefix)) ? "$termPrefix$search1" : search1;
 
-      // Step 1: Fast exact primary key or invoice_no match (O(1) indexed lookup)
+      // Fast exact primary key or invoice_no match (O(1) indexed lookup)
       List<Map<String, dynamic>> res = await db.rawQuery(
         table == 'sales_invoices'
-            ? "SELECT * FROM $table WHERE (entry_no = ? OR invoice_no = ? OR entry_no = ?) $isDelFilter LIMIT 1"
-            : "SELECT * FROM $table WHERE (entry_no = ? OR entry_no = ?) $isDelFilter LIMIT 1",
-        table == 'sales_invoices' ? [search1, search1, search2] : [search1, search2]
+            ? "SELECT * FROM $table WHERE (entry_no = ? OR invoice_no = ? OR entry_no = ? OR invoice_no = ? OR entry_no LIKE ?) LIMIT 1"
+            : "SELECT * FROM $table WHERE (entry_no = ? OR entry_no = ?) LIMIT 1",
+        table == 'sales_invoices' ? [searchTermPrefixed, searchTermPrefixed, search1, search1, "%-$search1"] : [search1, search2]
       );
       if (res.isNotEmpty) return res.first;
 
-      // Step 2: Fallback for entry numbers with financial year prefix (e.g. "2024-25_17876")
+      // Fallback for entry numbers with financial year prefix (e.g. "2024-25_17876")
       if (currentNo.isNotEmpty) {
         res = await db.rawQuery(
-          "SELECT * FROM $table WHERE (entry_no LIKE ? OR entry_no LIKE ?) $isDelFilter LIMIT 1",
-          ["%_$currentNo", "%_$search2"]
+          "SELECT * FROM $table WHERE (entry_no LIKE ? OR entry_no LIKE ? OR entry_no LIKE ?) LIMIT 1",
+          ["%_$searchTermPrefixed", "%_$currentNo", "%_$search2"]
         );
         if (res.isNotEmpty) return res.first;
       }
 
       if (isPurchase) {
-        res = await db.rawQuery("SELECT * FROM $table WHERE sup_inv_no = ? $isDelFilter LIMIT 1", [currentEntry]);
+        res = await db.rawQuery("SELECT * FROM $table WHERE sup_inv_no = ? LIMIT 1", [currentEntry]);
         if (res.isNotEmpty) return res.first;
       }
 
       return null;
     }
 
-    Map<String, dynamic>? currentRecord;
-    if (currentNo.isNotEmpty) {
-      String curWhere = table == 'sales_invoices'
-          ? "(entry_no = ? OR invoice_no = ? OR entry_no LIKE ?)"
-          : "(entry_no = ? OR entry_no LIKE ?)";
-      List<dynamic> curParams = table == 'sales_invoices'
-          ? [currentEntry, currentEntry, "%_$currentNo"]
-          : [currentEntry, "%_$currentNo"];
+    // =========================================================================
+    // ULTRA-FAST IN-MEMORY CACHED NAVIGATION (<2ms O(1) Primary Key Resolution)
+    // Avoids massive unindexed SQLite table scans and dynamic string parsing
+    // =========================================================================
+    final String activeFy = (targetFinancialYear != null && targetFinancialYear.isNotEmpty)
+        ? targetFinancialYear
+        : _selectedFinancialYear;
+    final String cacheKey = "$table|$activeFy";
 
-      final curList = await db.rawQuery(
-        "SELECT rowid, entry_no, date, financial_year FROM $table WHERE $curWhere $isDelFilter LIMIT 1",
-        curParams
-      );
-      if (curList.isNotEmpty) {
-        currentRecord = curList.first;
-      }
+    int extractNum(String entryStr) {
+      String clean = entryStr.trim();
+      if (clean.contains('_')) clean = clean.substring(clean.lastIndexOf('_') + 1);
+      final match = RegExp(r'(\d+)$').firstMatch(clean);
+      return match != null ? (int.tryParse(match.group(1)!) ?? 0) : 0;
     }
 
-    int? currentNum = int.tryParse(currentNo);
-    int currentDbRowId = currentRecord != null ? (currentRecord['rowid'] as int? ?? 0) : 0;
-    String currentDateStr = currentRecord != null ? (currentRecord['date']?.toString() ?? '') : '';
-
-    if (currentRecord == null && currentNum == null && direction == 'prev') {
-      final maxRes = await db.rawQuery("SELECT CAST($replaceStr AS INTEGER) as max_no FROM $table WHERE $fyFilter $isDelFilter ORDER BY max_no DESC LIMIT 1", [_selectedFinancialYear]);
-      if (maxRes.isNotEmpty && maxRes.first['max_no'] != null) {
-        currentNum = (maxRes.first['max_no'] as num).toInt() + 1;
+    List<String>? cachedKeys = _navEntryKeysCache[cacheKey];
+    if (cachedKeys == null) {
+      List<Map<String, dynamic>> rows;
+      if (activeFy.isNotEmpty) {
+        rows = await db.rawQuery(
+          "SELECT rowid, entry_no FROM $table WHERE (financial_year = ? OR financial_year IS NULL OR financial_year = '') AND (is_deleted = 0 OR is_deleted IS NULL) ORDER BY rowid ASC",
+          [activeFy]
+        );
       } else {
-        final maxResAll = await db.rawQuery("SELECT CAST($replaceStr AS INTEGER) as max_no FROM $table WHERE 1=1 $isDelFilter ORDER BY max_no DESC LIMIT 1");
-        if (maxResAll.isNotEmpty && maxResAll.first['max_no'] != null) {
-          currentNum = (maxResAll.first['max_no'] as num).toInt() + 1;
+        rows = await db.rawQuery(
+          "SELECT rowid, entry_no FROM $table WHERE (is_deleted = 0 OR is_deleted IS NULL) ORDER BY rowid ASC"
+        );
+      }
+
+      final sortedList = List<Map<String, dynamic>>.from(rows);
+      sortedList.sort((a, b) {
+        final aNo = a['entry_no']?.toString() ?? '';
+        final bNo = b['entry_no']?.toString() ?? '';
+        final numA = extractNum(aNo);
+        final numB = extractNum(bNo);
+        if (numA != numB) return numA.compareTo(numB);
+        final rowA = (a['rowid'] as num?)?.toInt() ?? 0;
+        final rowB = (b['rowid'] as num?)?.toInt() ?? 0;
+        return rowA.compareTo(rowB);
+      });
+
+      // Deduplicate so that multiple legacy/synced records with the same sequence number
+      // don't create deadlocks when navigating next/prev
+      final Map<dynamic, String> uniqueEntries = {};
+      final termPrefix = ServerConfigService.instance.terminalPrefix.toUpperCase();
+      for (var r in sortedList) {
+        final rawNo = r['entry_no']?.toString() ?? '';
+        final numVal = extractNum(rawNo);
+        final key = numVal > 0 ? numVal : cleanEntryNo(rawNo);
+
+        if (uniqueEntries.containsKey(key)) {
+          final existing = uniqueEntries[key]!.toUpperCase();
+          // Prefer current terminal format if available, otherwise prefer latest rowid
+          if (termPrefix.isNotEmpty && !existing.startsWith(termPrefix) && rawNo.toUpperCase().startsWith(termPrefix)) {
+            uniqueEntries[key] = rawNo;
+          } else if (!existing.startsWith(termPrefix) && !rawNo.toUpperCase().startsWith(termPrefix)) {
+            uniqueEntries[key] = rawNo;
+          }
+        } else {
+          uniqueEntries[key] = rawNo;
         }
       }
+
+      cachedKeys = uniqueEntries.values.toList();
+      cachedKeys.sort((a, b) {
+        final numA = extractNum(a);
+        final numB = extractNum(b);
+        if (numA != numB) return numA.compareTo(numB);
+        return a.compareTo(b);
+      });
+      _navEntryKeysCache[cacheKey] = cachedKeys;
     }
 
-    List<Map<String, dynamic>> result = [];
+    if (cachedKeys.isNotEmpty) {
+      final cleanCur = cleanEntryNo(currentEntry);
+      final int curNum = int.tryParse(cleanCur) ?? extractNum(currentEntry);
 
-    switch (direction) {
-      case 'first':
-        result = await db.rawQuery(
-          "SELECT * FROM $table WHERE $fyFilter $isDelFilter ORDER BY CAST($replaceStr AS INTEGER) ASC, rowid ASC LIMIT 1",
-          [_selectedFinancialYear]
-        );
-        if (result.isEmpty) {
-          result = await db.rawQuery("SELECT * FROM $table WHERE 1=1 $isDelFilter ORDER BY CAST($replaceStr AS INTEGER) ASC, rowid ASC LIMIT 1");
-        }
-        break;
+      // 1. Try exact primary key match first
+      int curIdx = cachedKeys.indexOf(currentEntry);
+      // 2. Fallback to clean match (e.g. 'T2-3' vs '2026-27_T2-3')
+      if (curIdx == -1) {
+        curIdx = cachedKeys.indexWhere((k) => cleanEntryNo(k) == cleanCur);
+      }
+      // 3. Fallback to numeric sequence match
+      if (curIdx == -1 && curNum > 0) {
+        curIdx = cachedKeys.indexWhere((k) => extractNum(k) == curNum);
+      }
 
-      case 'last':
-        result = await db.rawQuery(
-          "SELECT * FROM $table WHERE $fyFilter $isDelFilter ORDER BY CAST($replaceStr AS INTEGER) DESC, rowid DESC LIMIT 1",
-          [_selectedFinancialYear]
-        );
-        if (result.isEmpty) {
-          result = await db.rawQuery("SELECT * FROM $table WHERE 1=1 $isDelFilter ORDER BY CAST($replaceStr AS INTEGER) DESC, rowid DESC LIMIT 1");
-        }
-        break;
+      String? targetEntryNo;
+      switch (direction) {
+        case 'first':
+          targetEntryNo = cachedKeys.first;
+          break;
+        case 'last':
+          targetEntryNo = cachedKeys.last;
+          break;
+        case 'prev':
+          if (curIdx > 0) {
+            // Find an entry with a strictly lower sequence number to prevent stuck loops
+            if (curNum > 0) {
+              for (int i = curIdx - 1; i >= 0; i--) {
+                if (extractNum(cachedKeys[i]) < curNum) {
+                  targetEntryNo = cachedKeys[i];
+                  break;
+                }
+              }
+            }
+            targetEntryNo ??= cachedKeys[curIdx - 1];
+          } else if (curIdx == -1) {
+            // Unsaved/new entry: find highest entry number strictly less than current
+            if (curNum > 0) {
+              for (int i = cachedKeys.length - 1; i >= 0; i--) {
+                if (extractNum(cachedKeys[i]) < curNum) {
+                  targetEntryNo = cachedKeys[i];
+                  break;
+                }
+              }
+            }
+            targetEntryNo ??= cachedKeys.last;
+          }
+          break;
+        case 'next':
+          if (curIdx >= 0) {
+            // Find an entry with a strictly greater sequence number to prevent stuck loops
+            if (curNum > 0) {
+              for (int i = curIdx + 1; i < cachedKeys.length; i++) {
+                if (extractNum(cachedKeys[i]) > curNum) {
+                  targetEntryNo = cachedKeys[i];
+                  break;
+                }
+              }
+            }
+            // Fallback to next index
+            targetEntryNo ??= (curIdx < cachedKeys.length - 1 ? cachedKeys[curIdx + 1] : null);
+          } else if (curIdx == -1) {
+            // Unsaved/new entry: find lowest entry number strictly greater than current
+            if (curNum > 0) {
+              for (int i = 0; i < cachedKeys.length; i++) {
+                if (extractNum(cachedKeys[i]) > curNum) {
+                  targetEntryNo = cachedKeys[i];
+                  break;
+                }
+              }
+            }
+          }
+          break;
+      }
 
-      case 'prev':
-        if (currentNum != null && currentNum > 0) {
-          result = await db.rawQuery(
-            "SELECT * FROM $table WHERE $fyFilter AND (CAST($replaceStr AS INTEGER) < ? OR (CAST($replaceStr AS INTEGER) = ? AND rowid < ?)) $isDelFilter ORDER BY CAST($replaceStr AS INTEGER) DESC, rowid DESC LIMIT 1",
-            [_selectedFinancialYear, currentNum, currentNum, currentDbRowId]
-          );
-        } else if (currentDbRowId > 0) {
-          result = await db.rawQuery(
-            "SELECT * FROM $table WHERE $fyFilter AND rowid < ? $isDelFilter ORDER BY rowid DESC LIMIT 1",
-            [_selectedFinancialYear, currentDbRowId]
-          );
-        }
-
-        if (result.isEmpty) {
-          if (currentNum != null && currentNum > 0) {
-            result = await db.rawQuery(
-              "SELECT * FROM $table WHERE (CAST($replaceStr AS INTEGER) < ? OR (CAST($replaceStr AS INTEGER) = ? AND rowid < ?)) $isDelFilter ORDER BY date DESC, CAST($replaceStr AS INTEGER) DESC, rowid DESC LIMIT 1",
-              [currentNum, currentNum, currentDbRowId]
-            );
-          }
-          if (result.isEmpty && currentDbRowId > 0) {
-            result = await db.rawQuery(
-              "SELECT * FROM $table WHERE rowid < ? $isDelFilter ORDER BY rowid DESC LIMIT 1",
-              [currentDbRowId]
-            );
-          }
-          if (result.isEmpty && currentDateStr.isNotEmpty) {
-            result = await db.rawQuery(
-              "SELECT * FROM $table WHERE date < ? $isDelFilter ORDER BY date DESC, rowid DESC LIMIT 1",
-              [currentDateStr]
-            );
-          }
-        }
-        break;
-
-      case 'next':
-        if (currentNum != null && currentNum > 0) {
-          result = await db.rawQuery(
-            "SELECT * FROM $table WHERE $fyFilter AND (CAST($replaceStr AS INTEGER) > ? OR (CAST($replaceStr AS INTEGER) = ? AND rowid > ?)) $isDelFilter ORDER BY CAST($replaceStr AS INTEGER) ASC, rowid ASC LIMIT 1",
-            [_selectedFinancialYear, currentNum, currentNum, currentDbRowId]
-          );
-        } else if (currentDbRowId > 0) {
-          result = await db.rawQuery(
-            "SELECT * FROM $table WHERE $fyFilter AND rowid > ? $isDelFilter ORDER BY rowid ASC LIMIT 1",
-            [_selectedFinancialYear, currentDbRowId]
-          );
-        }
-
-        if (result.isEmpty) {
-          if (currentNum != null && currentNum > 0) {
-            result = await db.rawQuery(
-              "SELECT * FROM $table WHERE (CAST($replaceStr AS INTEGER) > ? OR (CAST($replaceStr AS INTEGER) = ? AND rowid > ?)) $isDelFilter ORDER BY date ASC, CAST($replaceStr AS INTEGER) ASC, rowid ASC LIMIT 1",
-              [currentNum, currentNum, currentDbRowId]
-            );
-          }
-          if (result.isEmpty && currentDbRowId > 0) {
-            result = await db.rawQuery(
-              "SELECT * FROM $table WHERE rowid > ? $isDelFilter ORDER BY rowid ASC LIMIT 1",
-              [currentDbRowId]
-            );
-          }
-          if (result.isEmpty && currentDateStr.isNotEmpty) {
-            result = await db.rawQuery(
-              "SELECT * FROM $table WHERE date > ? $isDelFilter ORDER BY date ASC, rowid ASC LIMIT 1",
-              [currentDateStr]
-            );
-          }
-        }
-        break;
+      if (targetEntryNo != null && targetEntryNo.isNotEmpty) {
+        final res = await db.query(table, where: 'entry_no = ?', whereArgs: [targetEntryNo], limit: 1);
+        if (res.isNotEmpty) return res.first;
+      }
+      return null;
     }
 
-    if (result.isNotEmpty) {
-      return result.first;
-    }
     return null;
   }
 
-  Future<List<Map<String, dynamic>>> getInvoiceItems(String invoiceNo, {bool isPurchase = false, bool isSaleReturn = false, bool isPurchaseReturn = false}) async {
+  Future<List<Map<String, dynamic>>> getInvoiceItems(String invoiceNo, {bool isPurchase = false, bool isSaleReturn = false, bool isPurchaseReturn = false, String? financialYear}) async {
     final db = await DbHelper.instance.database;
+    final rawNo = invoiceNo.trim();
+    final cleanNo = cleanEntryNo(rawNo);
+    final termPrefix = ServerConfigService.instance.terminalPrefix;
+    final prefixedNo = (termPrefix.isNotEmpty && !cleanNo.toUpperCase().startsWith(termPrefix.toUpperCase())) ? "$termPrefix$cleanNo" : cleanNo;
+
+    List<Map<String, dynamic>> rawRows = [];
 
     if (isPurchase) {
-      return await db.rawQuery('''
+      // 1. Try exact match first
+      rawRows = await db.rawQuery('''
         SELECT pi.*, p.rack_id as master_rack, p.hsn_code as master_hsn, p.s_disc_percent as master_s_disc
         FROM purchase_items pi
         LEFT JOIN product_master p ON pi.product_id = p.id
         WHERE pi.entry_no = ?
-      ''', [invoiceNo]);
-    }
+      ''', [rawNo]);
 
-    if (isPurchaseReturn) {
-      return await db.query('purchase_return_items', where: 'entry_no = ?', whereArgs: [invoiceNo]);
-    }
+      // 2. Fallback to clean / prefixed / wildcard matches only if exact match returned nothing
+      if (rawRows.isEmpty) {
+        rawRows = await db.rawQuery('''
+          SELECT pi.*, p.rack_id as master_rack, p.hsn_code as master_hsn, p.s_disc_percent as master_s_disc
+          FROM purchase_items pi
+          LEFT JOIN product_master p ON pi.product_id = p.id
+          WHERE pi.entry_no = ? OR pi.entry_no = ? OR pi.entry_no LIKE ? OR pi.entry_no LIKE ?
+        ''', [cleanNo, prefixedNo, "%_$cleanNo", "%_$prefixedNo"]);
+      }
+    } else if (isPurchaseReturn) {
+      rawRows = await db.rawQuery('''
+        SELECT pri.*
+        FROM purchase_return_items pri
+        WHERE pri.entry_no = ?
+      ''', [rawNo]);
 
-    if (isSaleReturn) {
-      return await db.rawQuery('''
+      if (rawRows.isEmpty) {
+        rawRows = await db.rawQuery('''
+          SELECT pri.*
+          FROM purchase_return_items pri
+          WHERE pri.entry_no = ? OR pri.entry_no = ? OR pri.entry_no LIKE ?
+        ''', [cleanNo, prefixedNo, "%_$cleanNo"]);
+      }
+    } else if (isSaleReturn) {
+      rawRows = await db.rawQuery('''
         SELECT ri.*, ri.quantity as qty, ri.expiry_date as expiry, p.name as master_product_name, p.hsn_code as master_hsn, p.gst_percent as master_gst, p.packing as master_packing,
                p.mrp as master_mrp, p.purchase_rate as master_prate, p.sale_rate as master_srate
         FROM sales_return_items ri
         LEFT JOIN product_master p ON ri.product_id = p.id
-        WHERE ri.return_no = ? OR ri.return_no = ?
-      ''', [invoiceNo, "SRET-$invoiceNo"]);
+        WHERE ri.return_no = ?
+      ''', [rawNo]);
+
+      if (rawRows.isEmpty) {
+        rawRows = await db.rawQuery('''
+          SELECT ri.*, ri.quantity as qty, ri.expiry_date as expiry, p.name as master_product_name, p.hsn_code as master_hsn, p.gst_percent as master_gst, p.packing as master_packing,
+                 p.mrp as master_mrp, p.purchase_rate as master_prate, p.sale_rate as master_srate
+          FROM sales_return_items ri
+          LEFT JOIN product_master p ON ri.product_id = p.id
+          WHERE ri.return_no = ? OR ri.return_no = ? OR ri.return_no LIKE ?
+        ''', ["SRET-$rawNo", cleanNo, "%_$cleanNo"]);
+      }
+    } else {
+      // Sales items: 1. Try exact match first
+      rawRows = await db.rawQuery('''
+        SELECT s.*, p.name as product_name 
+        FROM sales_items s
+        LEFT JOIN product_master p ON s.product_id = p.id
+        WHERE s.invoice_no = ?
+      ''', [rawNo]);
+
+      // 2. Fallback to clean / prefixed / wildcard matches only if exact match returned nothing
+      if (rawRows.isEmpty) {
+        rawRows = await db.rawQuery('''
+          SELECT s.*, p.name as product_name 
+          FROM sales_items s
+          LEFT JOIN product_master p ON s.product_id = p.id
+          WHERE s.invoice_no = ? OR s.invoice_no = ? OR s.invoice_no LIKE ? OR s.invoice_no LIKE ?
+        ''', [cleanNo, prefixedNo, "%_$cleanNo", "%_$prefixedNo"]);
+      }
     }
 
-    // Join sales_items with product_master to get the actual product names
-    return await db.rawQuery('''
-      SELECT s.*, p.name as product_name 
-      FROM sales_items s
-      LEFT JOIN product_master p ON s.product_id = p.id
-      WHERE s.invoice_no = ?
-    ''', [invoiceNo]);
+    // In-memory deduplication safety guard:
+    // Ensures that identical line items (same product, batch, qty) are never duplicated in the UI
+    final Set<String> seenSignatures = {};
+    final List<Map<String, dynamic>> deduped = [];
+    for (var row in rawRows) {
+      final pId = (row['product_id'] ?? row['product_name'] ?? '').toString().trim().toUpperCase();
+      final bNo = (row['batch_number'] ?? row['batch'] ?? '').toString().trim().toUpperCase();
+      final qty = (row['qty'] ?? row['quantity'] ?? 0).toString();
+      final sig = "$pId|$bNo|$qty";
+      if (seenSignatures.add(sig)) {
+        deduped.add(row);
+      }
+    }
+    return deduped;
   }
 
   Future<List<Map<String, dynamic>>> getProductPurchaseHistory(String productName, {String? productId}) async {
@@ -11049,7 +11667,7 @@ class PharmacyProvider extends ChangeNotifier {
       JOIN purchase_entries e ON i.entry_no = e.entry_no
       WHERE $whereClause
         AND IFNULL(e.is_deleted, 0) = 0
-      ORDER BY e.date DESC, e.entry_no DESC
+      ORDER BY e.date DESC, CAST(SUBSTR(SUBSTR(e.entry_no, INSTR(e.entry_no, '_') + 1), INSTR(SUBSTR(e.entry_no, INSTR(e.entry_no, '_') + 1), '-') + 1) AS INTEGER) DESC
       LIMIT 30
     ''', whereArgs);
   }
@@ -11095,13 +11713,15 @@ class PharmacyProvider extends ChangeNotifier {
 
   Future<List<PurchaseReturnEntry>> fetchPurchaseReturnsInDateRange(DateTime from, DateTime to, {bool loadItems = true, int? limit, int? offset}) async {
     final db = await DbHelper.instance.database;
-    final fromStr = DateTime(from.year, from.month, from.day, 0, 0, 0).toIso8601String();
-    final toStr = DateTime(to.year, to.month, to.day, 23, 59, 59).toIso8601String();
+    final fromDay = DateFormat('yyyy-MM-dd').format(from);
+    final toDay = DateFormat('yyyy-MM-dd').format(to);
+    final fromBound = fromDay;
+    final toBound = '$toDay\u007f';
 
     final List<Map<String, dynamic>> maps = await db.query(
         'purchase_return_entries',
         where: "date >= ? AND date <= ? AND (financial_year = ? OR financial_year IS NULL OR financial_year = '') AND IFNULL(is_deleted, 0) = 0",
-        whereArgs: [fromStr, toStr, _selectedFinancialYear],
+        whereArgs: [fromBound, toBound, _selectedFinancialYear],
         orderBy: 'date DESC',
         limit: limit,
         offset: offset
@@ -11110,29 +11730,32 @@ class PharmacyProvider extends ChangeNotifier {
     Map<String, List<PurchaseItem>> itemsMap = {};
     if (loadItems && maps.isNotEmpty) {
       final List<String> ids = maps.map((m) => m['entry_no'].toString()).toList();
-      final String inClause = ids.map((no) => "'$no'").join(',');
-      final List<Map<String, dynamic>> itemsData = await db.rawQuery('SELECT * FROM purchase_return_items WHERE entry_no IN ($inClause)');
+      for (int i = 0; i < ids.length; i += 500) {
+        final chunk = ids.sublist(i, min(i + 500, ids.length));
+        final String inClause = chunk.map((no) => "'$no'").join(',');
+        final List<Map<String, dynamic>> itemsData = await db.rawQuery('SELECT * FROM purchase_return_items WHERE entry_no IN ($inClause)');
 
-      for (var i in itemsData) {
-        final en = i['entry_no'].toString();
-        itemsMap.putIfAbsent(en, () => []).add(PurchaseItem(
-          id: i['product_id']?.toString() ?? "",
-          productName: i['product_name'] ?? "",
-          batch: i['batch'] ?? "",
-          expiry: i['expiry'] ?? "",
-          packin: (i['packin'] as num?)?.toInt() ?? 1,
-          qty: (i['qty'] as num?)?.toInt() ?? 0,
-          fQty: (i['f_qty'] as num?)?.toInt() ?? 0,
-          mrp: (i['mrp'] as num?)?.toDouble() ?? 0.0,
-          pRate: (i['p_rate'] as num?)?.toDouble() ?? 0.0,
-          total: (i['total'] as num?)?.toDouble() ?? 0.0,
-          sRate: (i['s_rate'] as num?)?.toDouble() ?? 0.0,
-          gstPercent: (i['gst_percent'] as num?)?.toDouble() ?? 0.0,
-          discPercent: (i['disc_percent'] as num?)?.toDouble() ?? 0.0,
-          reason: i['reason'] ?? "",
-          supplier: i['supplier'] ?? "",
-          hsnCode: i['hsn_code'] ?? "",
-        ));
+        for (var i in itemsData) {
+          final en = i['entry_no'].toString();
+          itemsMap.putIfAbsent(en, () => []).add(PurchaseItem(
+            id: i['product_id']?.toString() ?? "",
+            productName: i['product_name'] ?? "",
+            batch: i['batch'] ?? "",
+            expiry: i['expiry'] ?? "",
+            packin: (i['packin'] as num?)?.toInt() ?? 1,
+            qty: (i['qty'] as num?)?.toInt() ?? 0,
+            fQty: (i['f_qty'] as num?)?.toInt() ?? 0,
+            mrp: (i['mrp'] as num?)?.toDouble() ?? 0.0,
+            pRate: (i['p_rate'] as num?)?.toDouble() ?? 0.0,
+            total: (i['total'] as num?)?.toDouble() ?? 0.0,
+            sRate: (i['s_rate'] as num?)?.toDouble() ?? 0.0,
+            gstPercent: (i['gst_percent'] as num?)?.toDouble() ?? 0.0,
+            discPercent: (i['disc_percent'] as num?)?.toDouble() ?? 0.0,
+            reason: i['reason'] ?? "",
+            supplier: i['supplier'] ?? "",
+            hsnCode: i['hsn_code'] ?? "",
+          ));
+        }
       }
     }
 
@@ -11153,13 +11776,15 @@ class PharmacyProvider extends ChangeNotifier {
 
   Future<List<SaleReturnInvoice>> fetchSaleReturnsInDateRange(DateTime from, DateTime to, {bool loadItems = true, int? limit, int? offset}) async {
     final db = await DbHelper.instance.database;
-    final fromStr = DateTime(from.year, from.month, from.day, 0, 0, 0).toIso8601String();
-    final toStr = DateTime(to.year, to.month, to.day, 23, 59, 59).toIso8601String();
+    final fromDay = DateFormat('yyyy-MM-dd').format(from);
+    final toDay = DateFormat('yyyy-MM-dd').format(to);
+    final fromBound = fromDay;
+    final toBound = '$toDay\u007f';
 
     final List<Map<String, dynamic>> maps = await db.query(
         'sales_return_invoices',
         where: "date >= ? AND date <= ? AND (financial_year = ? OR financial_year IS NULL OR financial_year = '') AND IFNULL(is_deleted, 0) = 0",
-        whereArgs: [fromStr, toStr, _selectedFinancialYear],
+        whereArgs: [fromBound, toBound, _selectedFinancialYear],
         orderBy: 'date DESC',
         limit: limit,
         offset: offset
@@ -11168,49 +11793,50 @@ class PharmacyProvider extends ChangeNotifier {
     Map<String, List<SaleItem>> itemsMap = {};
     if (loadItems && maps.isNotEmpty) {
       final List<String> ids = maps.map((m) => m['entry_no'].toString()).toList();
-      final String inClause = ids.map((no) => "'$no'").join(',');
-      final List<Map<String, dynamic>> itemsData = await db.rawQuery('SELECT * FROM sales_return_items WHERE return_no IN ($inClause)');
+      for (int i = 0; i < ids.length; i += 500) {
+        final chunk = ids.sublist(i, min(i + 500, ids.length));
+        final String inClause = chunk.map((no) => "'$no'").join(',');
+        final List<Map<String, dynamic>> itemsData = await db.rawQuery('SELECT * FROM sales_return_items WHERE return_no IN ($inClause)');
 
-      for (var i in itemsData) {
-        final en = i['return_no'].toString();
-        final pId = i['product_id'] ?? "";
-        final pBatch = i['batch_number'] ?? "";
+        for (var i in itemsData) {
+          final en = i['return_no'].toString();
+          final pId = i['product_id'] ?? "";
+          final pBatch = i['batch_number'] ?? "";
 
-        int qVal = (i['qty'] as num?)?.toInt() ?? (i['quantity'] as num?)?.toInt() ?? 0;
-        int pVal = (i['packing'] as num?)?.toInt() ?? (i['packin'] as num?)?.toInt() ?? 1;
-        double mrpVal = (i['mrp'] as num?)?.toDouble() ?? 0.0;
-        double sRateVal = (i['sale_rate'] as num?)?.toDouble() ?? 0.0;
-        double discPctVal = (i['disc_percent'] as num?)?.toDouble() ?? 0.0;
-        double discAmtVal = (i['disc_amt'] as num?)?.toDouble() ?? 0.0;
-        double gstPctVal = (i['gst_percent'] as num?)?.toDouble() ?? 12.0;
+          int qVal = (i['qty'] as num?)?.toInt() ?? (i['quantity'] as num?)?.toInt() ?? 0;
+          int pVal = (i['packing'] as num?)?.toInt() ?? (i['packin'] as num?)?.toInt() ?? 1;
+          double mrpVal = (i['mrp'] as num?)?.toDouble() ?? 0.0;
+          double sRateVal = (i['sale_rate'] as num?)?.toDouble() ?? 0.0;
+          double discPctVal = (i['disc_percent'] as num?)?.toDouble() ?? 0.0;
+          double discAmtVal = (i['disc_amt'] as num?)?.toDouble() ?? 0.0;
+          double gstPctVal = (i['gst_percent'] as num?)?.toDouble() ?? 12.0;
 
-        itemsMap.putIfAbsent(en, () => []).add(SaleItem(
-          product: Product(
-            id: pId, 
-            name: i['product_name'] ?? "Unknown", 
-            batch: pBatch, 
-            expiry: i['expiry_date'] ?? "",
+          itemsMap.putIfAbsent(en, () => []).add(SaleItem(
+            product: Product(
+              id: pId, 
+              name: i['product_name'] ?? "Unknown", 
+              batch: pBatch, 
+              expiry: i['expiry_date'] ?? "",
+              mrp: mrpVal,
+              salePrice: sRateVal,
+              purchaseRate: (i['purchase_rate'] as num?)?.toDouble() ?? 0.0,
+              landingCost: (i['landing_cost'] as num?)?.toDouble() ?? 0.0,
+              gstPercent: gstPctVal,
+              packSize: pVal,
+              hsnCode: i['hsn_code']?.toString() ?? "",
+            ),
+            qty: qVal,
+            packin: pVal,
             mrp: mrpVal,
-            salePrice: sRateVal,
-            purchaseRate: (i['purchase_rate'] as num?)?.toDouble() ?? 0.0,
-            landingCost: (i['landing_cost'] as num?)?.toDouble() ?? 0.0,
+            sRate: sRateVal,
+            taxableSP: sRateVal,
+            discPercent: discPctVal,
+            discAmt: discAmtVal,
             gstPercent: gstPctVal,
-            packSize: pVal,
-            hsnCode: i['hsn_code']?.toString() ?? "",
-          ),
-          qty: qVal,
-          packin: pVal,
-          mrp: mrpVal,
-          sRate: sRateVal,
-          taxableSP: sRateVal,
-          discPercent: discPctVal,
-          discAmt: discAmtVal,
-          gstPercent: gstPctVal,
-          total: (i['total'] as num?)?.toDouble() ?? 0.0,
-          purchaseRate: (i['purchase_rate'] as num?)?.toDouble() ?? 0.0,
-          landingCost: (i['landing_cost'] as num?)?.toDouble() ?? 0.0,
-          supplier: i['supplier_name']?.toString() ?? "",
-        ));
+            gstAmt: (i['gst_amt'] as num?)?.toDouble() ?? 0.0,
+            total: (i['total'] as num?)?.toDouble() ?? 0.0,
+          ));
+        }
       }
     }
 
@@ -11235,15 +11861,17 @@ class PharmacyProvider extends ChangeNotifier {
     }).toList();
   }
 
-  Future<List<PurchaseEntry>> fetchPurchasesInDateRange(DateTime from, DateTime to, {bool loadItems = true, int? limit, int? offset}) async {
+  Future<List<PurchaseEntry>> fetchPurchasesInDateRange(DateTime from, DateTime to, {bool loadItems = true, int? limit, int? offset, bool tryOnlineFirst = false}) async {
     final db = await DbHelper.instance.database;
-    final fromStr = DateTime(from.year, from.month, from.day, 0, 0, 0).toIso8601String();
-    final toStr = DateTime(to.year, to.month, to.day, 23, 59, 59).toIso8601String();
+    final fromDay = DateFormat('yyyy-MM-dd').format(from);
+    final toDay = DateFormat('yyyy-MM-dd').format(to);
+    final fromBound = fromDay;
+    final toBound = '$toDay\u007f';
 
     final List<Map<String, dynamic>> maps = await db.query(
         'purchase_entries',
         where: "date >= ? AND date <= ? AND (financial_year = ? OR financial_year IS NULL OR financial_year = '') AND IFNULL(is_deleted, 0) = 0",
-        whereArgs: [fromStr, toStr, _selectedFinancialYear],
+        whereArgs: [fromBound, toBound, _selectedFinancialYear],
         orderBy: 'date DESC',
         limit: limit,
         offset: offset
@@ -11252,32 +11880,35 @@ class PharmacyProvider extends ChangeNotifier {
     Map<String, List<PurchaseItem>> itemsMap = {};
     if (loadItems && maps.isNotEmpty) {
       final List<String> ids = maps.map((m) => m['entry_no'].toString()).toList();
-      final String inClause = ids.map((no) => "'$no'").join(',');
-      final List<Map<String, dynamic>> itemsData = await db.rawQuery('SELECT * FROM purchase_items WHERE entry_no IN ($inClause)');
+      for (int i = 0; i < ids.length; i += 500) {
+        final chunk = ids.sublist(i, min(i + 500, ids.length));
+        final String inClause = chunk.map((no) => "'$no'").join(',');
+        final List<Map<String, dynamic>> itemsData = await db.rawQuery('SELECT * FROM purchase_items WHERE entry_no IN ($inClause)');
 
-      for (var i in itemsData) {
-        final en = i['entry_no'].toString();
-        itemsMap.putIfAbsent(en, () => []).add(PurchaseItem(
-          id: i['product_id']?.toString() ?? "",
-          productName: i['product_name'] ?? "",
-          extra: i['extra'] ?? "",
-          batch: i['batch'] ?? "",
-          expiry: i['expiry'] ?? "",
-          packin: (i['packin'] as num?)?.toInt() ?? 1,
-          qty: (i['qty'] as num?)?.toInt() ?? 0,
-          fQty: (i['f_qty'] as num?)?.toInt() ?? 0,
-          mrp: (i['mrp'] as num?)?.toDouble() ?? 0.0,
-          pRate: (i['p_rate'] as num?)?.toDouble() ?? 0.0,
-          gross: (i['gross'] as num?)?.toDouble() ?? 0.0,
-          discPercent: (i['disc_percent'] as num?)?.toDouble() ?? 0.0,
-          discAmt: (i['disc_amt'] as num?)?.toDouble() ?? 0.0,
-          net: (i['net'] as num?)?.toDouble() ?? 0.0,
-          gstPercent: (i['gst_percent'] as num?)?.toDouble() ?? 0.0,
-          gstAmt: (i['gst_amt'] as num?)?.toDouble() ?? 0.0,
-          total: (i['total'] as num?)?.toDouble() ?? 0.0,
-          sRate: (i['s_rate'] as num?)?.toDouble() ?? 0.0,
-          lCost: (i['l_cost'] as num?)?.toDouble() ?? 0.0,
-        ));
+        for (var i in itemsData) {
+          final en = i['entry_no'].toString();
+          itemsMap.putIfAbsent(en, () => []).add(PurchaseItem(
+            id: i['product_id']?.toString() ?? "",
+            productName: i['product_name'] ?? "",
+            extra: i['extra'] ?? "",
+            batch: i['batch'] ?? "",
+            expiry: i['expiry'] ?? "",
+            packin: (i['packin'] as num?)?.toInt() ?? 1,
+            qty: (i['qty'] as num?)?.toInt() ?? 0,
+            fQty: (i['f_qty'] as num?)?.toInt() ?? 0,
+            mrp: (i['mrp'] as num?)?.toDouble() ?? 0.0,
+            pRate: (i['p_rate'] as num?)?.toDouble() ?? 0.0,
+            gross: (i['gross'] as num?)?.toDouble() ?? 0.0,
+            discPercent: (i['disc_percent'] as num?)?.toDouble() ?? 0.0,
+            discAmt: (i['disc_amt'] as num?)?.toDouble() ?? 0.0,
+            net: (i['net'] as num?)?.toDouble() ?? 0.0,
+            gstPercent: (i['gst_percent'] as num?)?.toDouble() ?? 0.0,
+            gstAmt: (i['gst_amt'] as num?)?.toDouble() ?? 0.0,
+            total: (i['total'] as num?)?.toDouble() ?? 0.0,
+            sRate: (i['s_rate'] as num?)?.toDouble() ?? 0.0,
+            lCost: (i['l_cost'] as num?)?.toDouble() ?? 0.0,
+          ));
+        }
       }
     }
 
@@ -11309,73 +11940,69 @@ class PharmacyProvider extends ChangeNotifier {
     }).toList();
   }
 
-  Future<List<SaleInvoice>> fetchSalesInDateRange(DateTime from, DateTime to, {bool loadItems = true, int? limit, int? offset, bool includeDeleted = false}) async {
+  Future<List<SaleInvoice>> fetchSalesInDateRange(DateTime from, DateTime to, {bool loadItems = true, int? limit, int? offset, bool includeDeleted = false, bool tryOnlineFirst = false}) async {
     final db = await DbHelper.instance.database;
-    final fromStr = DateTime(from.year, from.month, from.day, 0, 0, 0).toIso8601String();
-    final toStr = DateTime(to.year, to.month, to.day, 23, 59, 59).toIso8601String();
     final fromDay = DateFormat('yyyy-MM-dd').format(from);
     final toDay = DateFormat('yyyy-MM-dd').format(to);
+    final fromBound = fromDay;
+    final toBound = '$toDay\u007f';
 
     final String deletedClause = includeDeleted ? '' : 'AND (is_deleted = 0 OR is_deleted IS NULL)';
 
-    // Handles both ISO strings ('2026-08-15...') and slash formats ('15/08/2026')
+    // Pure B-Tree index range scan on idx_sales_inv_date_clean(date, is_deleted, customer_acc)
     final List<Map<String, dynamic>> maps = await db.rawQuery('''
       SELECT * FROM sales_invoices
       WHERE (customer_acc != 'Special Order')
         $deletedClause
-        AND (
-          (date BETWEEN ? AND ?)
-          OR (
-            date LIKE '%/%' 
-            AND (substr(date, 7, 4) || '-' || substr(date, 4, 2) || '-' || substr(date, 1, 2)) BETWEEN ? AND ?
-          )
-          OR (date(date) BETWEEN ? AND ?)
-        )
-      ORDER BY date DESC, CAST(entry_no AS INTEGER) DESC
+        AND (date >= ? AND date <= ?)
+      ORDER BY date DESC, entry_no DESC
       ${limit != null ? 'LIMIT $limit' : ''}
       ${offset != null ? 'OFFSET $offset' : ''}
-    ''', [fromStr, toStr, fromDay, toDay, fromDay, toDay]);
+    ''', [fromBound, toBound]);
 
     Map<String, List<SaleItem>> itemsMap = {};
     if (loadItems && maps.isNotEmpty) {
       final List<String> ids = maps.map((m) => m['entry_no'].toString()).toList();
-      final String inClause = ids.map((no) => "'$no'").join(',');
-      final List<Map<String, dynamic>> itemsData = await db.rawQuery('''
-        SELECT si.*, p.name as master_prod_name 
-        FROM sales_items si
-        LEFT JOIN product_master p ON si.product_id = p.id
-        WHERE si.invoice_no IN ($inClause)
-      ''');
-      
-      for (var m in itemsData) {
-        final en = m['invoice_no'].toString();
-        final pName = (m['product_name'] ?? m['master_prod_name'] ?? 'Unknown').toString();
-        final pId = m['product_id']?.toString() ?? '';
-        final bNo = m['batch_number']?.toString() ?? '';
-        final expVal = m['expiry_date']?.toString() ?? '';
-        final packVal = (m['packin'] as num?)?.toInt() ?? 1;
-        final sRateVal = (m['s_rate'] as num?)?.toDouble() ?? (m['sale_rate'] as num?)?.toDouble() ?? 0.0;
-        final taxSpVal = (m['taxable_sp'] as num?)?.toDouble() ?? sRateVal;
+      for (int i = 0; i < ids.length; i += 500) {
+        final chunk = ids.sublist(i, min(i + 500, ids.length));
+        final String inClause = chunk.map((no) => "'$no'").join(',');
+        final List<Map<String, dynamic>> itemsData = await db.rawQuery('''
+          SELECT si.*, p.name as master_prod_name 
+          FROM sales_items si
+          LEFT JOIN product_master p ON si.product_id = p.id
+          WHERE si.invoice_no IN ($inClause)
+        ''');
+        
+        for (var m in itemsData) {
+          final en = m['invoice_no'].toString();
+          final pName = (m['product_name'] ?? m['master_prod_name'] ?? 'Unknown').toString();
+          final pId = m['product_id']?.toString() ?? '';
+          final bNo = m['batch_number']?.toString() ?? '';
+          final expVal = m['expiry_date']?.toString() ?? '';
+          final packVal = (m['packin'] as num?)?.toInt() ?? 1;
+          final sRateVal = (m['s_rate'] as num?)?.toDouble() ?? (m['sale_rate'] as num?)?.toDouble() ?? 0.0;
+          final taxSpVal = (m['taxable_sp'] as num?)?.toDouble() ?? sRateVal;
 
-        itemsMap.putIfAbsent(en, () => []).add(SaleItem(
-          product: Product(id: pId, name: pName, batch: bNo, expiry: expVal, packSize: packVal, salePrice: sRateVal),
-          qty: (m['qty'] as num?)?.toInt() ?? 0,
-          packin: packVal,
-          mrp: (m['mrp'] as num?)?.toDouble() ?? 0.0,
-          sRate: sRateVal,
-          taxableSP: taxSpVal,
-          discPercent: (m['disc_percent'] as num?)?.toDouble() ?? 0.0,
-          discAmt: (m['disc_amt'] as num?)?.toDouble() ?? 0.0,
-          gstPercent: (m['gst_percent'] as num?)?.toDouble() ?? 0.0,
-          gstAmt: (m['gst_amt'] as num?)?.toDouble() ?? 0.0,
-          cgstAmt: (m['cgst_amt'] as num?)?.toDouble() ?? 0.0,
-          sgstAmt: (m['sgst_amt'] as num?)?.toDouble() ?? 0.0,
-          igstAmt: (m['igst_amt'] as num?)?.toDouble() ?? 0.0,
-          total: (m['total'] as num?)?.toDouble() ?? 0.0,
-          purchaseRate: (m['purchase_rate'] as num?)?.toDouble() ?? 0.0,
-          landingCost: (m['landing_cost'] as num?)?.toDouble() ?? 0.0,
-          supplier: m['supplier_name']?.toString() ?? "",
-        ));
+          itemsMap.putIfAbsent(en, () => []).add(SaleItem(
+            product: Product(id: pId, name: pName, batch: bNo, expiry: expVal, packSize: packVal, salePrice: sRateVal),
+            qty: (m['qty'] as num?)?.toInt() ?? 0,
+            packin: packVal,
+            mrp: (m['mrp'] as num?)?.toDouble() ?? 0.0,
+            sRate: sRateVal,
+            taxableSP: taxSpVal,
+            discPercent: (m['disc_percent'] as num?)?.toDouble() ?? 0.0,
+            discAmt: (m['disc_amt'] as num?)?.toDouble() ?? 0.0,
+            gstPercent: (m['gst_percent'] as num?)?.toDouble() ?? 0.0,
+            gstAmt: (m['gst_amt'] as num?)?.toDouble() ?? 0.0,
+            cgstAmt: (m['cgst_amt'] as num?)?.toDouble() ?? 0.0,
+            sgstAmt: (m['sgst_amt'] as num?)?.toDouble() ?? 0.0,
+            igstAmt: (m['igst_amt'] as num?)?.toDouble() ?? 0.0,
+            total: (m['total'] as num?)?.toDouble() ?? 0.0,
+            purchaseRate: (m['purchase_rate'] as num?)?.toDouble() ?? 0.0,
+            landingCost: (m['landing_cost'] as num?)?.toDouble() ?? 0.0,
+            supplier: m['supplier_name']?.toString() ?? "",
+          ));
+        }
       }
     }
 
@@ -11418,6 +12045,168 @@ class PharmacyProvider extends ChangeNotifier {
         isDeleted: (s['is_deleted'] as int?) == 1,
         isPaid: (s['is_paid'] as int?) == 1,
       );
+    }).toList();
+  }
+
+  // Database-Engine Direct Aggregation for Instant Loading (< 15ms)
+  Future<List<Map<String, dynamic>>> fetchDailySalesSummary(DateTime from, DateTime to, {bool includeDeleted = false}) async {
+    final db = await DbHelper.instance.database;
+    final fromDay = DateFormat('yyyy-MM-dd').format(from);
+    final toDay = DateFormat('yyyy-MM-dd').format(to);
+    final fromBound = fromDay;
+    final toBound = '$toDay\u007f';
+
+    final String deletedClause = includeDeleted ? '' : 'AND (si.is_deleted = 0 OR si.is_deleted IS NULL)';
+
+    final rawRows = await db.rawQuery('''
+      SELECT 
+        substr(si.date, 1, 10) AS date_str,
+        CASE WHEN (si.is_deleted = 1) THEN 'DELETED ENTRY' ELSE 'Active' END AS status,
+        SUM(COALESCE(item_aggs.taxable_base, si.sub_total)) AS net,
+        SUM(COALESCE(item_aggs.total_gst, si.tax)) AS gst,
+        SUM(COALESCE(item_aggs.taxable_base, si.sub_total) + COALESCE(item_aggs.total_gst, si.tax)) AS total,
+        SUM(si.discount) AS other_discount,
+        SUM(si.sales_return_amt) AS other_charges,
+        SUM(si.round_off) AS round_off,
+        SUM(si.grand_total) AS grand_total,
+        SUM(COALESCE(item_aggs.profit, 0.0)) AS profit
+      FROM sales_invoices si
+      LEFT JOIN (
+        SELECT 
+          invoice_no,
+          SUM(CASE WHEN (total - gst_amt) > 0 THEN (total - gst_amt) ELSE 0.0 END) AS taxable_base,
+          SUM(gst_amt) AS total_gst,
+          SUM(profit) AS profit
+        FROM sales_items
+        GROUP BY invoice_no
+      ) item_aggs ON si.entry_no = item_aggs.invoice_no
+      WHERE si.customer_acc != 'Special Order'
+        $deletedClause
+        AND (si.date >= ? AND si.date <= ?)
+      GROUP BY substr(si.date, 1, 10), CASE WHEN (si.is_deleted = 1) THEN 'DELETED ENTRY' ELSE 'Active' END
+      ORDER BY date_str DESC
+    ''', [fromBound, toBound]);
+
+    return rawRows.map((row) {
+      final dateStr = row['date_str']?.toString() ?? '';
+      DateTime? parsedDate = DateTime.tryParse(dateStr);
+      final displayDate = parsedDate != null ? DateFormat('dd/MM/yyyy').format(parsedDate) : dateStr;
+
+      return {
+        'date': displayDate,
+        'raw_date': parsedDate,
+        'net': (row['net'] as num?)?.toDouble() ?? 0.0,
+        'gst': (row['gst'] as num?)?.toDouble() ?? 0.0,
+        'total': (row['total'] as num?)?.toDouble() ?? 0.0,
+        'other_discount': (row['other_discount'] as num?)?.toDouble() ?? 0.0,
+        'other_charges': (row['other_charges'] as num?)?.toDouble() ?? 0.0,
+        'round_off': (row['round_off'] as num?)?.toDouble() ?? 0.0,
+        'grand_total': (row['grand_total'] as num?)?.toDouble() ?? 0.0,
+        'profit': (row['profit'] as num?)?.toDouble() ?? 0.0,
+        'status': row['status']?.toString() ?? 'Active',
+        'from_date': DateFormat('dd/MM/yyyy').format(from),
+        'to_date': DateFormat('dd/MM/yyyy').format(to),
+      };
+    }).toList();
+  }
+
+  Future<List<Map<String, dynamic>>> fetchAccountsSalesSummary(DateTime from, DateTime to, {bool includeDeleted = false}) async {
+    final db = await DbHelper.instance.database;
+    final fromDay = DateFormat('yyyy-MM-dd').format(from);
+    final toDay = DateFormat('yyyy-MM-dd').format(to);
+    final fromBound = fromDay;
+    final toBound = '$toDay\u007f';
+
+    final String deletedClause = includeDeleted ? '' : 'AND (si.is_deleted = 0 OR si.is_deleted IS NULL)';
+
+    final rawRows = await db.rawQuery('''
+      SELECT 
+        si.customer_acc AS account,
+        CASE WHEN (si.is_deleted = 1) THEN 'DELETED ENTRY' ELSE 'Active' END AS status,
+        SUM(COALESCE(item_aggs.taxable_base, si.sub_total)) AS net,
+        SUM(COALESCE(item_aggs.total_gst, si.tax)) AS gst,
+        SUM(COALESCE(item_aggs.taxable_base, si.sub_total) + COALESCE(item_aggs.total_gst, si.tax)) AS total,
+        SUM(si.discount) AS other_discount,
+        SUM(si.sales_return_amt) AS other_charges,
+        SUM(si.round_off) AS round_off,
+        SUM(si.grand_total) AS grand_total,
+        SUM(COALESCE(item_aggs.profit, 0.0)) AS profit
+      FROM sales_invoices si
+      LEFT JOIN (
+        SELECT 
+          invoice_no,
+          SUM(CASE WHEN (total - gst_amt) > 0 THEN (total - gst_amt) ELSE 0.0 END) AS taxable_base,
+          SUM(gst_amt) AS total_gst,
+          SUM(profit) AS profit
+        FROM sales_items
+        GROUP BY invoice_no
+      ) item_aggs ON si.entry_no = item_aggs.invoice_no
+      WHERE si.customer_acc != 'Special Order'
+        $deletedClause
+        AND (si.date >= ? AND si.date <= ?)
+      GROUP BY si.customer_acc, CASE WHEN (si.is_deleted = 1) THEN 'DELETED ENTRY' ELSE 'Active' END
+      ORDER BY grand_total DESC
+    ''', [fromBound, toBound]);
+
+    return rawRows.map((row) {
+      return {
+        'account': row['account']?.toString() ?? 'Cash',
+        'net': (row['net'] as num?)?.toDouble() ?? 0.0,
+        'gst': (row['gst'] as num?)?.toDouble() ?? 0.0,
+        'total': (row['total'] as num?)?.toDouble() ?? 0.0,
+        'other_discount': (row['other_discount'] as num?)?.toDouble() ?? 0.0,
+        'other_charges': (row['other_charges'] as num?)?.toDouble() ?? 0.0,
+        'round_off': (row['round_off'] as num?)?.toDouble() ?? 0.0,
+        'grand_total': (row['grand_total'] as num?)?.toDouble() ?? 0.0,
+        'profit': (row['profit'] as num?)?.toDouble() ?? 0.0,
+        'status': row['status']?.toString() ?? 'Active',
+      };
+    }).toList();
+  }
+
+  Future<List<Map<String, dynamic>>> fetchProductSalesSummary(DateTime from, DateTime to, {bool includeDeleted = false}) async {
+    final db = await DbHelper.instance.database;
+    final fromDay = DateFormat('yyyy-MM-dd').format(from);
+    final toDay = DateFormat('yyyy-MM-dd').format(to);
+    final fromBound = fromDay;
+    final toBound = '$toDay\u007f';
+
+    final String deletedClause = includeDeleted ? '' : 'AND (inv.is_deleted = 0 OR inv.is_deleted IS NULL)';
+
+    final rawRows = await db.rawQuery('''
+      SELECT 
+        si.product_name AS product,
+        CASE WHEN (inv.is_deleted = 1) THEN 'DELETED ENTRY' ELSE 'Active' END AS status,
+        SUM(si.qty) AS qty,
+        MAX(si.mrp) AS mrp,
+        SUM(si.mrp * si.qty) AS mrp_value,
+        CASE WHEN SUM(si.qty) > 0 THEN SUM(si.disc_amt) / SUM(si.qty) ELSE 0.0 END AS disc_amt_piece,
+        SUM(si.disc_amt) AS disc_amt,
+        SUM((si.total + si.gst_amt) - si.profit) AS lcwt,
+        SUM(si.total) AS total,
+        SUM(si.profit) AS profit
+      FROM sales_items si
+      JOIN sales_invoices inv ON si.invoice_no = inv.entry_no
+      WHERE inv.customer_acc != 'Special Order'
+        $deletedClause
+        AND (inv.date >= ? AND inv.date <= ?)
+      GROUP BY si.product_name, CASE WHEN (inv.is_deleted = 1) THEN 'DELETED ENTRY' ELSE 'Active' END
+      ORDER BY total DESC
+    ''', [fromBound, toBound]);
+
+    return rawRows.map((row) {
+      return {
+        'product': row['product']?.toString() ?? '',
+        'qty': (row['qty'] as num?)?.toDouble() ?? 0.0,
+        'mrp': (row['mrp'] as num?)?.toDouble() ?? 0.0,
+        'mrp_value': (row['mrp_value'] as num?)?.toDouble() ?? 0.0,
+        'disc_amt_piece': (row['disc_amt_piece'] as num?)?.toDouble() ?? 0.0,
+        'disc_amt': (row['disc_amt'] as num?)?.toDouble() ?? 0.0,
+        'lcwt': (row['lcwt'] as num?)?.toDouble() ?? 0.0,
+        'total': (row['total'] as num?)?.toDouble() ?? 0.0,
+        'profit': (row['profit'] as num?)?.toDouble() ?? 0.0,
+        'status': row['status']?.toString() ?? 'Active',
+      };
     }).toList();
   }
 
@@ -11723,7 +12512,7 @@ class PharmacyProvider extends ChangeNotifier {
         JOIN sales_invoices e ON i.invoice_no = e.entry_no
         LEFT JOIN product_master p ON i.product_id = p.id
         $whereClause
-        ORDER BY e.date DESC, e.entry_no DESC
+        ORDER BY e.date DESC, CAST(SUBSTR(SUBSTR(e.entry_no, INSTR(e.entry_no, '_') + 1), INSTR(SUBSTR(e.entry_no, INSTR(e.entry_no, '_') + 1), '-') + 1) AS INTEGER) DESC
         LIMIT 30
       ''', whereArgs);
       return result;
@@ -11896,7 +12685,7 @@ class PharmacyProvider extends ChangeNotifier {
       JOIN sales_items si ON s.entry_no = si.invoice_no
       JOIN product_master pm ON si.product_id = pm.id
       WHERE $whereClause
-      ORDER BY s.date DESC, s.entry_no DESC
+      ORDER BY s.date DESC, CAST(SUBSTR(SUBSTR(s.entry_no, INSTR(s.entry_no, '_') + 1), INSTR(SUBSTR(s.entry_no, INSTR(s.entry_no, '_') + 1), '-') + 1) AS INTEGER) DESC
     ''';
 
     return await db.rawQuery(sql, args);
@@ -13295,7 +14084,7 @@ class PharmacyProvider extends ChangeNotifier {
       if (pr.name.isNotEmpty) rankPositionMap[pr.name.toUpperCase().trim()] = i + 1;
     }
 
-    final String query = '''
+    const String query = '''
       SELECT 
         p.id as product_id,
         p.name as product_name,
@@ -13743,13 +14532,13 @@ class PharmacyProvider extends ChangeNotifier {
       final pid = r['product_id']?.toString() ?? '';
       if (pid.isEmpty) continue;
 
-      String wholesaleName = r['wholesale_name']?.toString()?.trim() ?? 'Unassigned';
+      String wholesaleName = r['wholesale_name']?.toString().trim() ?? 'Unassigned';
       if (wholesaleName.isEmpty) wholesaleName = 'Unassigned';
 
-      String mfg = r['company_name']?.toString()?.trim() ?? '';
+      String mfg = r['company_name']?.toString().trim() ?? '';
       if (mfg.isEmpty) mfg = 'Unassigned';
 
-      String cat = r['category_name']?.toString()?.trim() ?? '';
+      String cat = r['category_name']?.toString().trim() ?? '';
       if (cat.isEmpty) cat = 'General';
 
       int stock = (r['current_stock'] as num?)?.toInt() ?? 0;
@@ -13757,13 +14546,13 @@ class PharmacyProvider extends ChangeNotifier {
       double mrp = (r['mrp'] as num?)?.toDouble() ?? 0.0;
       double srate = (r['sale_rate'] as num?)?.toDouble() ?? 0.0;
 
-      String rack = r['rack']?.toString()?.trim() ?? '-';
+      String rack = r['rack']?.toString().trim() ?? '-';
       if (rack.isEmpty) rack = '-';
 
-      String batch = r['batch_number']?.toString()?.trim() ?? '';
-      String exp = r['expiry_date']?.toString()?.trim() ?? '';
-      String pDate = r['last_purchase_date']?.toString()?.trim() ?? '-';
-      String pInv = r['last_inv_no']?.toString()?.trim() ?? '-';
+      String batch = r['batch_number']?.toString().trim() ?? '';
+      String exp = r['expiry_date']?.toString().trim() ?? '';
+      String pDate = r['last_purchase_date']?.toString().trim() ?? '-';
+      String pInv = r['last_inv_no']?.toString().trim() ?? '-';
       int purQty = (r['total_purchased_qty'] as num?)?.toInt() ?? 0;
 
       String key = "$pid|$wholesaleName";
@@ -14705,7 +15494,13 @@ class PharmacyProvider extends ChangeNotifier {
 
   bool verifyMasterPin(String inputPin) {
     if (masterPassword.isEmpty) return false;
-    return SecurityCrypto.verifyPin(inputPin, masterPassword);
+    if (!SecurityCrypto.verifyPin(inputPin, masterPassword)) return false;
+
+    // Upgrade a legacy hash after successful verification without blocking the PIN check.
+    if (!masterPassword.startsWith('pbkdf2_sha256:')) {
+      setMasterPassword(inputPin);
+    }
+    return true;
   }
 
   bool isAdminSessionActive() => _adminSessionActive;
@@ -15713,6 +16508,1061 @@ class PharmacyProvider extends ChangeNotifier {
     }
     return false;
   }
+
+  // --- ORDER BOOK & DOCK STATE ---
+  bool _isDockVisible = true;
+  bool get isDockVisible => _isDockVisible;
+
+  bool _isOrderPanelOpen = false;
+  bool get isOrderPanelOpen => _isOrderPanelOpen;
+
+  bool _isOrderPanelMinimized = false;
+  bool get isOrderPanelMinimized => _isOrderPanelMinimized;
+
+  int _orderPanelActiveTab = 0;
+  int get orderPanelActiveTab => _orderPanelActiveTab;
+
+  final List<Map<String, dynamic>> _customExtraOrderItems = [];
+  List<Map<String, dynamic>> get customExtraOrderItems => _customExtraOrderItems;
+
+  final Map<String, int> _orderOverrideQtys = {};
+  Map<String, int> get orderOverrideQtys => _orderOverrideQtys;
+
+  void toggleOrderPanel() {
+    if (_isOrderPanelOpen) {
+      minimizeOrderPanel();
+    } else {
+      openOrderPanel();
+    }
+  }
+
+  void openOrderPanel() {
+    _isOrderPanelOpen = true;
+    _isOrderPanelMinimized = false;
+    _isDockVisible = true;
+    notifyListeners();
+  }
+
+  void minimizeOrderPanel() {
+    _isOrderPanelOpen = false;
+    _isOrderPanelMinimized = true;
+    _isDockVisible = true;
+    notifyListeners();
+  }
+
+  void closeOrderPanelCompletely() {
+    _isOrderPanelOpen = false;
+    _isOrderPanelMinimized = false;
+    _isDockVisible = false;
+    notifyListeners();
+  }
+
+  void setOrderPanelActiveTab(int tab) {
+    _orderPanelActiveTab = tab;
+    notifyListeners();
+  }
+
+  void addCustomExtraOrderItem(dynamic product, int qty) {
+    String pId = "";
+    String pName = "";
+    String pSupplier = "";
+    int pPackSize = 1;
+
+    if (product is Product) {
+      pId = product.id;
+      pName = product.name;
+      pSupplier = product.supplier.isNotEmpty ? product.supplier : product.manufacturer;
+      pPackSize = product.packSize > 0 ? product.packSize : 1;
+    } else if (product is Map<String, dynamic>) {
+      pId = product['id']?.toString() ?? "";
+      pName = product['name']?.toString() ?? product['productName']?.toString() ?? "";
+      pSupplier = product['supplier']?.toString() ?? product['company']?.toString() ?? "";
+      pPackSize = int.tryParse(product['packSize']?.toString() ?? "1") ?? 1;
+    } else {
+      pName = product.toString();
+    }
+
+    _customExtraOrderItems.add({
+      'key': "EXTRA_${DateTime.now().millisecondsSinceEpoch}_$pId",
+      'productName': pName,
+      'company': pSupplier,
+      'packSize': pPackSize,
+      'qty': qty > 0 ? qty : 1,
+    });
+    notifyListeners();
+  }
+
+  void setOrderOverrideQty(String key, int qty) {
+    if (qty <= 0) {
+      _orderOverrideQtys.remove(key);
+    } else {
+      _orderOverrideQtys[key] = qty;
+    }
+    notifyListeners();
+  }
+
+  // --- REALTIME & DEBOUNCED SYNC ---
+  Timer? _inventorySyncDebounceTimer;
+
+  void scheduleDebouncedInventorySync() {
+    _inventorySyncDebounceTimer?.cancel();
+    _inventorySyncDebounceTimer = Timer(const Duration(milliseconds: 600), () async {
+      await loadFromDatabase();
+      notifyListeners();
+    });
+  }
+
+  void refreshInventoryOnPageMovement() {
+    scheduleDebouncedInventorySync();
+  }
+
+  Future<Map<String, dynamic>> getDayClosingData(DateTime date) async {
+    final db = await DbHelper.instance.database;
+    final dateStr = DateFormat('yyyy-MM-dd').format(date);
+
+    final res = await db.rawQuery('''
+      SELECT 
+        COUNT(*) as total_invoices,
+        SUM(grand_total) as total_sales,
+        SUM(CASE WHEN LOWER(payment_mode) = 'cash' THEN grand_total ELSE 0 END) as cash_sales,
+        SUM(CASE WHEN LOWER(payment_mode) = 'upi' OR LOWER(payment_mode) = 'online' THEN grand_total ELSE 0 END) as upi_sales,
+        SUM(CASE WHEN LOWER(payment_mode) = 'card' THEN grand_total ELSE 0 END) as card_sales,
+        SUM(CASE WHEN LOWER(payment_mode) = 'credit' THEN grand_total ELSE 0 END) as credit_sales
+      FROM sales_invoices
+      WHERE date(date) = ? AND (is_deleted = 0 OR is_deleted IS NULL)
+    ''', [dateStr]);
+
+    if (res.isNotEmpty) {
+      final row = res.first;
+      return {
+        'total_invoices': (row['total_invoices'] as num?)?.toInt() ?? 0,
+        'total_sales': (row['total_sales'] as num?)?.toDouble() ?? 0.0,
+        'cash_sales': (row['cash_sales'] as num?)?.toDouble() ?? 0.0,
+        'upi_sales': (row['upi_sales'] as num?)?.toDouble() ?? 0.0,
+        'card_sales': (row['card_sales'] as num?)?.toDouble() ?? 0.0,
+        'credit_sales': (row['credit_sales'] as num?)?.toDouble() ?? 0.0,
+      };
+    }
+
+    return {
+      'total_invoices': 0,
+      'total_sales': 0.0,
+      'cash_sales': 0.0,
+      'upi_sales': 0.0,
+      'card_sales': 0.0,
+      'credit_sales': 0.0,
+    };
+  }
+
+  double _d(dynamic v, [double def = 0.0]) {
+    if (v == null) return def;
+    if (v is num) return v.toDouble();
+    return double.tryParse(v.toString()) ?? def;
+  }
+
+  int _i(dynamic v, [int def = 0]) {
+    if (v == null) return def;
+    if (v is num) return v.toInt();
+    return int.tryParse(v.toString()) ?? def;
+  }
+
+  Map<String, dynamic>? sanitizeRealtimeRowForSqlite(String tableName, Map<String, dynamic> item) {
+    switch (tableName) {
+      case 'sales_invoices':
+        final entryNo = (item['entry_no'] ?? item['invoice_no'] ?? '').toString().trim();
+        if (entryNo.isEmpty) return null;
+        return {
+          'entry_no': entryNo,
+          'invoice_no': item['invoice_no']?.toString() ?? entryNo,
+          'date': item['date']?.toString() ?? DateTime.now().toIso8601String(),
+          'customer_acc': item['customer_acc']?.toString() ?? item['payment_mode']?.toString() ?? 'Cash',
+          'customer_name': item['customer_name']?.toString() ?? item['patient']?.toString() ?? '',
+          'patient': item['patient']?.toString() ?? item['customer_name']?.toString() ?? '',
+          'mobile': item['customer_phone']?.toString() ?? item['mobile']?.toString() ?? '',
+          'doctor': item['doctor']?.toString() ?? 'D1',
+          'doctor_reg_no': item['doctor_reg_no']?.toString() ?? '',
+          'sub_total': _d(item['sub_total'] ?? item['subtotal']),
+          'total_amount': _d(item['grand_total'] ?? item['net_amount'] ?? item['total_amount']),
+          'grand_total': _d(item['grand_total'] ?? item['net_amount'] ?? item['total_amount']),
+          'discount_percent': _d(item['discount_percent'] ?? item['disc_percent']),
+          'discount': _d(item['discount'] ?? item['disc_amt']),
+          'additional_discount': _d(item['additional_discount']),
+          'other_charge': _d(item['other_charge']),
+          'tax': _d(item['tax'] ?? item['tax_amount']),
+          'round_off': _d(item['round_off']),
+          'rcvd_amt': _d(item['rcvd_amt']),
+          'payment_mode': item['payment_mode']?.toString() ?? 'CASH',
+          'payment_remarks': item['payment_remarks']?.toString() ?? '',
+          'secondary_acc': item['secondary_acc']?.toString() ?? '',
+          'secondary_amt': _d(item['secondary_amt']),
+          'is_deleted': _i(item['is_deleted'], 0),
+          'is_paid': _i(item['is_paid'], 1),
+          'tax_type': item['tax_type']?.toString() ?? 'Non Gst',
+          'agent': item['agent']?.toString() ?? item['done_by']?.toString() ?? 'Admin',
+          'financial_year': item['financial_year']?.toString() ?? '',
+          'sales_return_amt': _d(item['sales_return_amt']),
+          'order_type': _i(item['order_type'], 0),
+          'is_synced': 1,
+        };
+
+      case 'sales_items':
+        final invNo = (item['invoice_no'] ?? item['entry_no'] ?? '').toString().trim();
+        final prodId = (item['product_id'] ?? '').toString().trim();
+        if (invNo.isEmpty) return null;
+        final qty = _i(item['qty'] ?? item['quantity'], 1);
+        final sRate = _d(item['s_rate'] ?? item['sale_rate'] ?? item['unit_price']);
+        final mrp = _d(item['mrp']);
+        final packing = _i(item['packin'] ?? item['packing'], 1);
+        final gstAmt = _d(item['gst_amt']);
+        final totalAmt = _d(item['total_amount'] ?? item['total']);
+
+        return {
+          'invoice_no': invNo,
+          'product_id': prodId,
+          'product_name': item['product_name']?.toString() ?? '',
+          'extra': item['extra']?.toString() ?? '',
+          'batch_number': (item['batch_number'] ?? item['batch'] ?? '').toString().trim(),
+          'expiry_date': (item['expiry_date'] ?? item['expiry'] ?? '').toString().trim(),
+          'qty': qty,
+          'quantity': qty,
+          'packin': packing,
+          'packing': packing,
+          'mrp': mrp,
+          'purchase_rate': _d(item['purchase_rate']),
+          'landing_cost': _d(item['landing_cost']),
+          'taxable_sp': _d(item['taxable_sp'] ?? (sRate > 0 ? sRate : (mrp / (packing > 0 ? packing : 1)))),
+          's_rate': sRate,
+          'sale_rate': sRate,
+          'disc_percent': _d(item['disc_percent'] ?? item['discount_percent']),
+          'disc_amt': _d(item['disc_amt'] ?? item['discount_amount']),
+          'gst_percent': _d(item['gst_percent']),
+          'tax_percent': _d(item['gst_percent']),
+          'gst_amt': gstAmt,
+          'cgst_amt': _d(item['cgst_amt'] ?? (gstAmt / 2)),
+          'sgst_amt': _d(item['sgst_amt'] ?? (gstAmt / 2)),
+          'igst_amt': _d(item['igst_amt']),
+          'total': totalAmt,
+          'total_amount': totalAmt,
+          'profit': _d(item['profit']),
+          'supplier_name': item['supplier_name']?.toString() ?? '',
+        };
+
+      case 'purchase_entries':
+        final entryNo = (item['entry_no'] ?? item['purchase_no'] ?? '').toString().trim();
+        if (entryNo.isEmpty) return null;
+        return {
+          'entry_no': entryNo,
+          'date': item['date']?.toString() ?? DateTime.now().toIso8601String(),
+          'supplier_name': item['supplier_name']?.toString() ?? '',
+          'sup_inv_no': item['sup_inv_no']?.toString() ?? entryNo,
+          'sup_inv_date': item['sup_inv_date']?.toString() ?? item['date']?.toString() ?? '',
+          'sub_total': _d(item['sub_total'] ?? item['subtotal']),
+          'discount': _d(item['discount'] ?? item['discount_amount']),
+          'other_charge': _d(item['other_charge']),
+          'round_off': _d(item['round_off']),
+          'grand_total': _d(item['grand_total'] ?? item['net_amount'] ?? item['inv_total'] ?? item['total_amount']),
+          'paid_amt': _d(item['paid_amt'] ?? item['rcvd_amt']),
+          'remarks': item['remarks']?.toString() ?? '',
+          'days': _i(item['days'], 0),
+          'tax_type': item['tax_type']?.toString() ?? 'Gst',
+          'financial_year': item['financial_year']?.toString() ?? '',
+          'is_deleted': _i(item['is_deleted'], 0),
+          'is_synced': 1,
+        };
+
+      case 'purchase_items':
+        final entryNo = (item['entry_no'] ?? item['purchase_no'] ?? '').toString().trim();
+        if (entryNo.isEmpty) return null;
+        return {
+          'entry_no': entryNo,
+          'product_id': item['product_id']?.toString() ?? '',
+          'product_name': item['product_name']?.toString() ?? '',
+          'extra': item['extra']?.toString() ?? '',
+          'batch': (item['batch_number'] ?? item['batch'] ?? '').toString().trim(),
+          'expiry': (item['expiry_date'] ?? item['expiry'] ?? '').toString().trim(),
+          'packin': _i(item['packin'] ?? item['packing'], 1),
+          'qty': _i(item['qty'] ?? item['quantity'], 1),
+          'f_qty': _i(item['f_qty'] ?? item['free_qty'], 0),
+          'mrp': _d(item['mrp']),
+          'p_rate': _d(item['p_rate'] ?? item['purchase_rate'] ?? item['unit_price']),
+          'gross': _d(item['gross']),
+          'disc_percent': _d(item['disc_percent']),
+          'disc_amt': _d(item['disc_amt']),
+          'net': _d(item['net']),
+          'gst_percent': _d(item['gst_percent']),
+          'gst_amt': _d(item['gst_amt']),
+          'total': _d(item['total'] ?? item['total_amount']),
+          'rack': item['rack']?.toString() ?? '',
+          'hsn_code': item['hsn_code']?.toString() ?? '',
+          's_disc_percent': _d(item['s_disc_percent']),
+          's_rate': _d(item['s_rate'] ?? item['sale_rate'] ?? item['selling_rate']),
+          'l_cost': _d(item['l_cost'] ?? item['landing_cost']),
+        };
+
+      case 'stock_batches':
+        final prodId = (item['product_id'] ?? '').toString().trim();
+        final batchNo = (item['batch_number'] ?? item['batch'] ?? '').toString().trim();
+        if (prodId.isEmpty || batchNo.isEmpty) return null;
+        return {
+          'product_id': prodId,
+          'batch_number': batchNo,
+          'expiry_date': item['expiry_date']?.toString() ?? item['expiry']?.toString() ?? '',
+          'mfg_date': item['mfg_date']?.toString() ?? '',
+          'current_stock': _i(item['current_stock'] ?? item['current_quantity'] ?? item['stock'], 0),
+          'purchase_rate': _d(item['purchase_rate'] ?? item['p_rate']),
+          'landing_cost': _d(item['landing_cost'] ?? item['l_cost'] ?? item['purchase_rate'] ?? item['p_rate']),
+          'mrp': _d(item['mrp']),
+          'sale_rate': _d(item['sale_rate'] ?? item['selling_rate'] ?? item['s_rate']),
+          's_disc_percent': _d(item['s_disc_percent']),
+          'gst_percent': _d(item['gst_percent'], 12.0),
+          'rack': item['rack']?.toString() ?? '',
+          'supplier_name': item['supplier_name']?.toString() ?? '',
+          'packing': _i(item['packing'] ?? item['packin'], 1),
+          'is_active': _i(item['is_active'], 1),
+          'financial_year': item['financial_year']?.toString() ?? '',
+          'is_synced': 1,
+        };
+
+      case 'product_master':
+        final prodId = (item['id'] ?? '').toString().trim();
+        final name = (item['product_name'] ?? item['name'] ?? '').toString().trim();
+        if (prodId.isEmpty || name.isEmpty) return null;
+        return {
+          'id': prodId,
+          'name': name,
+          'generic_name': item['generic_name']?.toString() ?? '',
+          'category_id': item['category_id']?.toString() ?? '',
+          'sub_category_id': item['sub_category_id']?.toString() ?? '',
+          'manufacturer_id': item['manufacturer_id']?.toString() ?? '',
+          'rack_id': item['rack_id']?.toString() ?? '',
+          'hsn_code': item['hsn_code']?.toString() ?? '',
+          'gst_percent': _d(item['gst_percent'] ?? item['gst_rate'], 12.0),
+          's_disc_percent': _d(item['s_disc_percent']),
+          'schedule': item['schedule']?.toString() ?? 'H',
+          'reorder_level': _i(item['reorder_level'], 10),
+          'max_level': _i(item['max_level'], 100),
+          'unit': item['unit']?.toString() ?? 'Strip',
+          'packing': _i(item['packing'], 10),
+          'mrp': _d(item['mrp']),
+          'purchase_rate': _d(item['purchase_rate']),
+          'sale_rate': _d(item['sale_rate'] ?? item['selling_price']),
+          'patent': item['patent']?.toString() ?? '',
+          'barcode': item['barcode']?.toString() ?? '',
+          'is_controlled': _i(item['is_controlled'], 0),
+          'is_banned': _i(item['is_banned'], 0),
+          'is_nrx': _i(item['is_nrx'], 0),
+          'is_active': _i(item['is_active'], 1),
+          'is_disc_locked': _i(item['is_disc_locked'], 0),
+          'preferred_wholesale': item['preferred_wholesale']?.toString() ?? '',
+          'lead_time': _i(item['lead_time'], 2),
+          'is_synced': 1,
+          'updated_at': item['updated_at']?.toString() ?? DateTime.now().toIso8601String(),
+        };
+
+      case 'patients':
+        final patName = (item['name'] ?? item['patient'] ?? '').toString().trim();
+        if (patName.isEmpty) return null;
+        return {
+          'id': item['id']?.toString() ?? "PAT_${DateTime.now().millisecondsSinceEpoch}",
+          'name': patName,
+          'mobile': item['mobile']?.toString() ?? item['customer_phone']?.toString() ?? '',
+          'current_balance': _d(item['current_balance']),
+          'address': item['address']?.toString() ?? '',
+        };
+
+      default:
+        return Map<String, dynamic>.from(item);
+    }
+  }
+
+  Map<String, dynamic> sanitizePurchaseEntryForSqlite(Map<String, dynamic> cloudRow) {
+    final map = Map<String, dynamic>.from(cloudRow);
+    
+    // Remove non-existent SQLite columns
+    map.remove('invoice_no');
+    
+    // Ensure all local SQLite purchase_entries schema attributes are populated
+    if (map.containsKey('paid_amt')) {
+      map['paid_amount'] = map.remove('paid_amt');
+    }
+    if (map.containsKey('subtotal') && !map.containsKey('sub_total')) {
+      map['sub_total'] = map['subtotal'];
+    }
+    if (map.containsKey('net_amount') && !map.containsKey('inv_total')) {
+      map['inv_total'] = map['net_amount'];
+    }
+    if (map.containsKey('inv_total') && !map.containsKey('grand_total')) {
+      map['grand_total'] = map['inv_total'];
+    }
+    if (map.containsKey('discount_amount') && !map.containsKey('discount')) {
+      map['discount'] = map['discount_amount'];
+    }
+    return map;
+  }
+
+  Future<void> applyRemoteRealtimeUpdate(
+    String tableName,
+    String eventType,
+    List<dynamic> rows,
+  ) async {
+    if (rows.isEmpty) return;
+    final sw = Stopwatch()..start();
+    final db = await DbHelper.instance.database;
+    final isDeleteEvent = eventType.toUpperCase() == 'DELETE';
+
+    final List<Map<String, dynamic>> upsertRows = [];
+
+    for (final row in rows) {
+      if (row is Map<String, dynamic>) {
+        final rawSanitized = sanitizeRealtimeRowForSqlite(tableName, row);
+        if (rawSanitized != null && rawSanitized.isNotEmpty) {
+          final Map<String, dynamic> sanitized = (tableName == 'purchase_entries')
+              ? sanitizePurchaseEntryForSqlite(rawSanitized)
+              : rawSanitized;
+          try {
+            final bool isRowSoftDeleted = _i(sanitized['is_deleted']) == 1;
+
+            if (isDeleteEvent || isRowSoftDeleted) {
+              // Handle DELETE / Soft-DELETE events
+              if (tableName == 'sales_invoices') {
+                final key = sanitized['entry_no'] ?? sanitized['invoice_no'];
+                if (key != null) {
+                  await db.delete('sales_invoices', where: 'entry_no = ?', whereArgs: [key]);
+                  await db.delete('sales_items', where: 'invoice_no = ?', whereArgs: [key]);
+                }
+              } else if (tableName == 'purchase_entries') {
+                final key = sanitized['entry_no'];
+                if (key != null) {
+                  await db.delete('purchase_entries', where: 'entry_no = ?', whereArgs: [key]);
+                  await db.delete('purchase_items', where: 'entry_no = ?', whereArgs: [key]);
+                }
+              } else if (tableName == 'sales_return_invoices') {
+                final key = sanitized['entry_no'];
+                if (key != null) {
+                  await db.delete('sales_return_invoices', where: 'entry_no = ?', whereArgs: [key]);
+                  await db.delete('sales_return_items', where: 'return_no = ?', whereArgs: [key]);
+                }
+              } else if (tableName == 'purchase_return_entries') {
+                final key = sanitized['entry_no'];
+                if (key != null) {
+                  await db.delete('purchase_return_entries', where: 'entry_no = ?', whereArgs: [key]);
+                  await db.delete('purchase_return_items', where: 'entry_no = ?', whereArgs: [key]);
+                }
+              } else if (tableName == 'sales_items') {
+                final key = sanitized['invoice_no'];
+                final pId = sanitized['product_id'];
+                final bNo = sanitized['batch_number'];
+                if (key != null && pId != null) {
+                  await db.delete('sales_items', where: 'invoice_no = ? AND product_id = ? AND batch_number = ?', whereArgs: [key, pId, bNo]);
+                }
+              } else if (tableName == 'purchase_items') {
+                final key = sanitized['entry_no'];
+                final pId = sanitized['product_id'];
+                final bNo = sanitized['batch_number'];
+                if (key != null && pId != null) {
+                  await db.delete('purchase_items', where: 'entry_no = ? AND product_id = ? AND batch_number = ?', whereArgs: [key, pId, bNo]);
+                }
+              } else if (tableName == 'product_master') {
+                final key = sanitized['id'];
+                if (key != null) {
+                  await db.delete('product_master', where: 'id = ?', whereArgs: [key]);
+                }
+              } else {
+                final pk = sanitized.containsKey('id') ? 'id' : (sanitized.containsKey('entry_no') ? 'entry_no' : '');
+                if (pk.isNotEmpty && sanitized[pk] != null) {
+                  await db.delete(tableName, where: '$pk = ?', whereArgs: [sanitized[pk]]);
+                }
+              }
+            } else {
+              upsertRows.add(sanitized);
+            }
+          } catch (e) {
+            debugPrint("Error processing realtime row for $tableName: $e");
+          }
+        }
+      }
+    }
+
+    if (upsertRows.isNotEmpty) {
+      try {
+        await db.transaction((txn) async {
+          final batch = txn.batch();
+          for (final item in upsertRows) {
+            if (tableName == 'sales_items') {
+              final invNo = item['invoice_no']?.toString() ?? '';
+              final pId = item['product_id']?.toString() ?? '';
+              final bNo = (item['batch_number'] ?? '').toString().trim();
+              if (invNo.isNotEmpty && pId.isNotEmpty) {
+                final cleanInv = cleanEntryNo(invNo);
+                batch.delete(
+                  'sales_items',
+                  where: '(invoice_no = ? OR invoice_no = ? OR invoice_no LIKE ?) AND product_id = ? AND IFNULL(TRIM(batch_number), "") = ?',
+                  whereArgs: [invNo, cleanInv, "%_$cleanInv", pId, bNo],
+                );
+              }
+            } else if (tableName == 'purchase_items') {
+              final entryNo = item['entry_no']?.toString() ?? '';
+              final pId = item['product_id']?.toString() ?? '';
+              final bNo = (item['batch'] ?? item['batch_number'] ?? '').toString().trim();
+              if (entryNo.isNotEmpty && pId.isNotEmpty) {
+                final cleanEnt = cleanEntryNo(entryNo);
+                batch.delete(
+                  'purchase_items',
+                  where: '(entry_no = ? OR entry_no = ? OR entry_no LIKE ?) AND product_id = ? AND IFNULL(TRIM(batch), "") = ?',
+                  whereArgs: [entryNo, cleanEnt, "%_$cleanEnt", pId, bNo],
+                );
+              }
+            }
+            batch.insert(tableName, item, conflictAlgorithm: sql.ConflictAlgorithm.replace);
+          }
+          await batch.commit(noResult: true);
+        });
+        debugPrint('⏱️ [PERF TIMING] Fast SQLite batch transaction completed for $tableName (${upsertRows.length} rows) in ${sw.elapsedMilliseconds}ms');
+      } catch (e) {
+        debugPrint("Error applying batch remote realtime update to $tableName: $e");
+      }
+    }
+
+    if (tableName == 'stock_batches' || tableName == 'purchase_items' || tableName == 'sales_items') {
+      _debounceRealtimeInventoryRefresh();
+    } else {
+      await syncInventoryFromDb();
+      await _recalculateTodayStatsFromDb();
+      notifyListeners();
+      SyncEventBus.instance.notifyTableChanged(tableName);
+    }
+    debugPrint('⏱️ [PERF TIMING] Screen refresh notified via PharmacyProvider for $tableName in ${sw.elapsedMilliseconds}ms');
+  }
+
+  Timer? _realtimeInventoryTimer;
+
+  void _debounceRealtimeInventoryRefresh() {
+    _realtimeInventoryTimer?.cancel();
+    _realtimeInventoryTimer = Timer(const Duration(milliseconds: 100), () async {
+      await syncInventoryFromDb();
+      await _recalculateTodayStatsFromDb();
+      notifyListeners();
+      SyncEventBus.instance.notifyTableChanged('stock_batches');
+      debugPrint('⏱️ [PERF TIMING] Debounced Realtime Inventory Refresh Completed.');
+    });
+  }
+
+  Future<void> applyRealtimeSalesInvoiceUpdate(List<dynamic> rows) async {
+    await applyRemoteRealtimeUpdate('sales_invoices', 'UPDATE', rows);
+  }
+
+  Future<void> applyRealtimePurchaseEntryUpdate(List<dynamic> rows) async {
+    await applyRemoteRealtimeUpdate('purchase_entries', 'UPDATE', rows);
+  }
+
+  Future<void> recalculateTodayStatsFromDb() async {
+    await _recalculateTodayStatsFromDb();
+  }
+
+  Future<void> recalculateAllStockFromLedgerInternal(sql.Database db) async {
+    await SupabaseSyncService.recalculateStockFromLedgerDirect(db);
+  }
+
+  Future<String> recalculateAllStockFromLedger() async {
+    final db = await DbHelper.instance.database;
+    await recalculateAllStockFromLedgerInternal(db);
+    await loadFromDatabase();
+    notifyListeners();
+    return "Live stock successfully recalculated from ledger transaction logs.";
+  }
+
+  // --- STAFF ORDERING & AGENTS ---
+  List<String> getOrderedStaffNames() {
+    final names = staffNames;
+    final named = names.where((n) => !n.toLowerCase().startsWith('staff')).toList();
+    final generic = names.where((n) => n.toLowerCase().startsWith('staff')).toList();
+    return [...named, ...generic];
+  }
+
+  void cycleStaffAgent({bool forward = true}) {
+    final list = getOrderedStaffNames();
+    if (list.isEmpty) return;
+
+    String currentAgent = _salesSessions[_activeSessionIdx]['agent']?.toString().trim() ?? "";
+    int idx = list.indexOf(currentAgent);
+    if (idx == -1) {
+      idx = 0;
+    } else {
+      if (forward) {
+        idx = (idx + 1) % list.length;
+      } else {
+        idx = (idx - 1 + list.length) % list.length;
+      }
+    }
+    _salesSessions[_activeSessionIdx]['agent'] = list[idx];
+    notifyListeners();
+  }
+
+  // --- VALIDATION RULES ENGINE ---
+  final List<ValidationRule> _validationRules = [];
+  bool _validationRulesLoaded = false;
+
+  void _initDefaultValidationRulesSync() {
+    if (_validationRules.isNotEmpty) return;
+    const entryTypes = ["PURCHASE", "SALES", "PURCHASE_RETURN", "SALES_RETURN", "DAMAGE", "STOCK_ADJUSTMENT", "ORDER_BOOK"];
+    for (var et in entryTypes) {
+      _validationRules.addAll(ValidationRule.getDefaultRules(et));
+    }
+  }
+
+  Future<void> _ensureValidationRulesLoaded() async {
+    if (_validationRulesLoaded) return;
+    _validationRulesLoaded = true;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      String? jsonStr = prefs.getString('app_validation_rules_v3');
+      if (jsonStr == null || jsonStr.isEmpty) {
+        // Migration from v2 if available
+        jsonStr = prefs.getString('app_validation_rules_v2');
+      }
+      if (jsonStr != null && jsonStr.isNotEmpty) {
+        final decoded = ValidationRule.decodeMap(jsonStr);
+        _validationRules.clear();
+        decoded.forEach((_, list) => _validationRules.addAll(list));
+      } else {
+        _initDefaultValidationRulesSync();
+      }
+      await _saveValidationRulesToPrefs();
+    } catch (e) {
+      debugPrint("Error loading validation rules from prefs: $e");
+    }
+  }
+
+  Future<void> _saveValidationRulesToPrefs() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      Map<String, List<ValidationRule>> map = {};
+      for (var r in _validationRules) {
+        map.putIfAbsent(r.entryType.toUpperCase(), () => []).add(r);
+      }
+      await prefs.setString('app_validation_rules_v3', ValidationRule.encodeMap(map));
+    } catch (e) {
+      debugPrint("Error saving validation rules to prefs: $e");
+    }
+  }
+
+  List<ValidationRule> getValidationRules(String entryType) {
+    if (_validationRules.isEmpty) {
+      _initDefaultValidationRulesSync();
+    }
+    if (!_validationRulesLoaded) {
+      _ensureValidationRulesLoaded();
+    }
+    final rules = _validationRules.where((r) => r.entryType.toUpperCase() == entryType.toUpperCase()).toList();
+    if (rules.isEmpty) {
+      final defaults = _getDefaultValidationRules(entryType);
+      _validationRules.addAll(defaults);
+      _saveValidationRulesToPrefs();
+      return defaults;
+    }
+    return rules;
+  }
+
+  List<ValidationRule> _getDefaultValidationRules(String entryType) {
+    return ValidationRule.getDefaultRules(entryType);
+  }
+
+  void addValidationRule(ValidationRule rule) {
+    _validationRules.add(rule);
+    _saveValidationRulesToPrefs();
+    notifyListeners();
+  }
+
+  void deleteValidationRule(String entryTypeOrId, [String? ruleId]) {
+    final String targetId = ruleId ?? entryTypeOrId;
+    _validationRules.removeWhere((r) => r.id == targetId);
+    _saveValidationRulesToPrefs();
+    notifyListeners();
+  }
+
+  void updateValidationRule(ValidationRule rule) {
+    int idx = _validationRules.indexWhere((r) => r.id == rule.id);
+    if (idx != -1) {
+      _validationRules[idx] = rule;
+    } else {
+      _validationRules.add(rule);
+    }
+    _saveValidationRulesToPrefs();
+    notifyListeners();
+  }
+
+  void resetValidationRulesToDefaults(String entryType) {
+    _validationRules.removeWhere((r) => r.entryType.toUpperCase() == entryType.toUpperCase());
+    _validationRules.addAll(_getDefaultValidationRules(entryType));
+    _saveValidationRulesToPrefs();
+    notifyListeners();
+  }
+
+  void reorderValidationRules(String entryType, int oldIndex, int newIndex) {
+    final rules = getValidationRules(entryType);
+    if (oldIndex < 0 || oldIndex >= rules.length) return;
+    if (newIndex < 0 || newIndex > rules.length) return;
+    if (newIndex > oldIndex) newIndex -= 1;
+    final item = rules.removeAt(oldIndex);
+    rules.insert(newIndex, item);
+    _saveValidationRulesToPrefs();
+    notifyListeners();
+  }
+
+  void moveValidationRule(String entryType, int oldIndex, int newIndex) {
+    reorderValidationRules(entryType, oldIndex, newIndex);
+  }
+
+  // --- ENTRY SEQUENCES & RESERVATION ---
+  final Set<String> _reservedEntryNumbers = {};
+  int _lastKnownSalesSeq = 0;
+  int _lastKnownPurchaseSeq = 0;
+
+  String getNextSaleEntryNoSync() {
+    final prefix = ServerConfigService.instance.terminalPrefix;
+    int maxSeq = _lastKnownSalesSeq;
+    for (var inv in sales) {
+      String entryNo = inv.entryNo;
+      if (prefix.isNotEmpty) {
+        if (entryNo.startsWith(prefix)) {
+          int seq = parseSequenceNumber(entryNo.substring(prefix.length));
+          if (seq > maxSeq) maxSeq = seq;
+        }
+      } else {
+        int seq = parseSequenceNumber(inv.invoiceNo);
+        if (seq > maxSeq) maxSeq = seq;
+      }
+    }
+    int next = maxSeq + 1;
+    while (_reservedEntryNumbers.contains("$prefix$next") || _reservedEntryNumbers.contains("SALES_$prefix$next")) {
+      next++;
+    }
+    return "$prefix$next";
+  }
+
+  String getNextPurchaseEntryNoSync() {
+    final prefix = ServerConfigService.instance.terminalPrefix;
+    int maxSeq = _lastKnownPurchaseSeq;
+    for (var pur in purchases) {
+      String entryNo = pur.entryNo;
+      if (prefix.isNotEmpty) {
+        if (entryNo.startsWith(prefix)) {
+          int seq = parseSequenceNumber(entryNo.substring(prefix.length));
+          if (seq > maxSeq) maxSeq = seq;
+        }
+      } else {
+        int seq = parseSequenceNumber(pur.entryNo);
+        if (seq > maxSeq) maxSeq = seq;
+      }
+    }
+    int next = maxSeq + 1;
+    while (_reservedEntryNumbers.contains("$prefix$next") || _reservedEntryNumbers.contains("PUR_$prefix$next") || _reservedEntryNumbers.contains("PUR_$next")) {
+      next++;
+    }
+    return "$prefix$next";
+  }
+
+  void reserveEntryNo(String entryNo) {
+    if (entryNo.trim().isNotEmpty) {
+      _reservedEntryNumbers.add(entryNo.trim());
+    }
+  }
+
+  void releaseEntryNo(String entryNo) {
+    _reservedEntryNumbers.remove(entryNo.trim());
+  }
+
+  void clearReservedEntryNumbers() {
+    _reservedEntryNumbers.clear();
+  }
+
+  int parseSequenceNumber(String entryNo) {
+    if (entryNo.trim().isEmpty) return 0;
+    String clean = entryNo.trim();
+    if (clean.contains('_')) {
+      clean = clean.substring(clean.lastIndexOf('_') + 1);
+    }
+    // Remove terminal prefixes like T1-, T2-, POS-01-, SO-, SALE-
+    clean = clean.replaceAll(RegExp(r'^(T\d+|POS[-_]?\d+|SALE|SO)[-_]', caseSensitive: false), '');
+    final match = RegExp(r'(\d+)$').firstMatch(clean);
+    if (match != null) {
+      return int.tryParse(match.group(1)!) ?? 0;
+    }
+    return 0;
+  }
+
+  Future<bool> isEntryTaken(String tableName, String entryNo) async {
+    final cleanNo = entryNo.trim();
+    if (cleanNo.isEmpty) return false;
+    final db = await DbHelper.instance.database;
+    String col = 'entry_no';
+    if (tableName == 'sales_invoices' || tableName == 'sales_return_invoices') {
+      col = 'invoice_no';
+    }
+    
+    // Check local SQLite DB for exact invoice_no or entry_no match
+    final res = await db.query(
+      tableName,
+      columns: [col],
+      where: '$col = ? OR $col = ? OR $col LIKE ?',
+      whereArgs: [cleanNo, cleanNo.toLowerCase(), '%_$cleanNo'],
+      limit: 1,
+    );
+    if (res.isNotEmpty) return true;
+
+    return false;
+  }
+
+  Future<String> resolveGuaranteedNextEntryNo(String tableName, String requestedEntryNo, {String? excludePrefix}) async {
+    String candidate = requestedEntryNo.trim();
+    if (candidate.isEmpty) return await getNextSaleEntryNo();
+
+    // Check if entry is already taken in local SQLite or reserved
+    bool taken = await isEntryTaken(tableName, candidate);
+    if (!taken) {
+      return candidate;
+    }
+
+    // If candidate is already taken (saved by another terminal), calculate next sequence preserving prefix
+    int seq = parseSequenceNumber(candidate);
+    if (seq == 0) seq = 1;
+
+    String prefix = "";
+    final match = RegExp(r'^(.*?)(\d+)$').firstMatch(candidate);
+    if (match != null) {
+      prefix = match.group(1)!;
+    } else {
+      prefix = candidate.replaceAll(RegExp(r'[0-9]'), '');
+    }
+
+    while (await isEntryTaken(tableName, "$prefix$seq")) {
+      seq++;
+    }
+    return "$prefix$seq";
+  }
+
+  // --- CACHED PRODUCT LOOKUP MAPS & BALANCE ---
+  Map<String, Product> get masterNameMap {
+    final Map<String, Product> map = {};
+    for (var p in productMaster) {
+      map[p.name.trim().toLowerCase()] = p;
+    }
+    return map;
+  }
+
+  Map<String, Product> get masterIdMap {
+    final Map<String, Product> map = {};
+    for (var p in productMaster) {
+      map[p.id] = p;
+    }
+    return map;
+  }
+
+  Map<String, Product> get productBatchMap {
+    final Map<String, Product> map = {};
+    for (var p in productMaster) {
+      map[p.id] = p;
+      map["${p.name.trim().toLowerCase()}|${p.batch.trim().toLowerCase()}"] = p;
+    }
+    return map;
+  }
+
+  bool canEditCrossTerminalEntry(String? entryNo) => true;
+
+  Future<OnlineStockCheckResult> verifyStockOnlineFirst({
+    required String productId,
+    required String batchNumber,
+    required int requestedQty,
+  }) async {
+    final config = ServerConfigService.instance;
+    if (!config.isServerModeEnabled || !config.isConnected) {
+      return OnlineStockCheckResult(isAvailable: true, serverStock: 9999.0);
+    }
+
+    try {
+      final cleanBatch = batchNumber.trim().toLowerCase();
+      final cleanProd = productId.trim();
+
+      var query = Supabase.instance.client
+          .from('stock_batches')
+          .select('current_quantity, current_stock, batch_number');
+
+      if (cleanProd.isNotEmpty) {
+        query = query.eq('product_id', cleanProd);
+      }
+      if (cleanBatch.isNotEmpty) {
+        query = query.ilike('batch_number', cleanBatch);
+      }
+
+      final resList = await query.limit(1);
+
+      if (resList.isNotEmpty) {
+        final res = resList.first;
+        final serverStock = (res['current_quantity'] as num?)?.toDouble() ??
+                            (res['current_stock'] as num?)?.toDouble() ?? 0.0;
+        final isAvail = serverStock >= requestedQty;
+        return OnlineStockCheckResult(isAvailable: isAvail, serverStock: serverStock);
+      }
+    } catch (e) {
+      debugPrint('verifyStockOnlineFirst error: $e');
+    }
+
+    return OnlineStockCheckResult(isAvailable: true, serverStock: 9999.0);
+  }
+
+  Future<bool> checkConcurrentInvoiceEditConflict({
+    required String entryNo,
+    required String loadedUpdatedAt,
+  }) async {
+    final config = ServerConfigService.instance;
+    if (!config.isServerModeEnabled || !config.isConnected) return false;
+
+    try {
+      final cleanNo = entryNo.trim();
+      if (cleanNo.isEmpty || loadedUpdatedAt.isEmpty) return false;
+
+      final res = await Supabase.instance.client
+          .from('sales_invoices')
+          .select('updated_at, terminal_id')
+          .or('entry_no.eq.$cleanNo,invoice_no.eq.$cleanNo')
+          .limit(1)
+          .maybeSingle();
+
+      if (res != null && res['updated_at'] != null) {
+        final String serverUpdatedAtStr = res['updated_at'].toString();
+        final DateTime? serverUpdatedAt = DateTime.tryParse(serverUpdatedAtStr);
+        final DateTime? loadedUpdatedAtDt = DateTime.tryParse(loadedUpdatedAt);
+
+        if (serverUpdatedAt != null && loadedUpdatedAtDt != null) {
+          if (serverUpdatedAt.difference(loadedUpdatedAtDt).inSeconds > 1) {
+            debugPrint('⚡ Concurrent Edit Conflict detected for invoice $cleanNo: Server updated_at ($serverUpdatedAtStr) > Loaded ($loadedUpdatedAt)');
+            return true;
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('checkConcurrentInvoiceEditConflict error: $e');
+    }
+    return false;
+  }
+
+  Future<String> saveSaleOnlineFirst(SaleInvoice sale, {bool isEditMode = false}) async {
+    final sw = Stopwatch()..start();
+
+    // 1. Persist sale locally in SQLite first for instant responsiveness (< 50ms)
+    // 2. saveSale asynchronously triggers unawaited background push to Supabase Cloud without UI latency
+    final entryNo = await saveSale(sale, isEditMode: isEditMode);
+    debugPrint('⏱️ [PERF TIMING] Invoice $entryNo saved locally and background cloud sync queued in ${sw.elapsedMilliseconds}ms');
+
+    return entryNo;
+  }
+
+  Future<double> getPatientNetBalance(dynamic patientNameOrId) async {
+    if (patientNameOrId == null || patientNameOrId.toString().trim().isEmpty) return 0.0;
+    final db = await DbHelper.instance.database;
+    final String queryName = patientNameOrId.toString().trim();
+    final res = await db.rawQuery('''
+      SELECT SUM(grand_total) as total_bought
+      FROM sales_invoices
+      WHERE (customer_name = ? OR customer_id = ?) AND (is_deleted = 0 OR is_deleted IS NULL)
+    ''', [queryName, queryName]);
+
+    final double totalBought = (res.first['total_bought'] as num?)?.toDouble() ?? 0.0;
+    return totalBought;
+  }
+
+  Future<Map<String, double>> getAdjustmentRates({
+    required String productId,
+    required String batchNumber,
+    required double defaultMrp,
+    required double defaultSaleRate,
+  }) async {
+    final db = await DbHelper.instance.database;
+    final res = await db.query(
+      'purchase_items',
+      columns: ['purchase_rate', 'mrp', 'sale_rate', 'landing_cost'],
+      where: 'product_id = ? AND LOWER(batch_number) = ?',
+      whereArgs: [productId, batchNumber.trim().toLowerCase()],
+      orderBy: 'id DESC',
+      limit: 1,
+    );
+
+    if (res.isNotEmpty) {
+      final row = res.first;
+      final double landing = (row['landing_cost'] as num?)?.toDouble() ?? 0.0;
+      final double prate = (row['purchase_rate'] as num?)?.toDouble() ?? 0.0;
+      final double mrp = (row['mrp'] as num?)?.toDouble() ?? defaultMrp;
+      final double srate = (row['sale_rate'] as num?)?.toDouble() ?? defaultSaleRate;
+      return {
+        'landingCost': landing > 0 ? landing : (prate > 0 ? prate : mrp),
+        'purchaseRate': prate,
+        'mrp': mrp,
+        'saleRate': srate,
+      };
+    }
+
+    return {
+      'landingCost': defaultMrp,
+      'purchaseRate': defaultSaleRate,
+      'mrp': defaultMrp,
+      'saleRate': defaultSaleRate,
+    };
+  }
+
+  // --- REPORTING UTILITIES ---
+  // Note: Date & Financial Year standardizations are permanently handled at database startup in DbHelper.
+
+  Future<Map<String, dynamic>> performFullSystemWipe({
+    Set<String>? selectedCategories,
+    Function(double, String)? onProgress,
+  }) async {
+    onProgress?.call(0.05, "Initiating system reset...");
+
+    final result = await SupabaseSyncService.instance.wipeAllCloudAndLocalData(
+      selectedCategoryIds: selectedCategories,
+      onProgress: onProgress,
+    );
+
+    onProgress?.call(0.95, "Reloading database state...");
+    await loadFromDatabase();
+    notifyListeners();
+    onProgress?.call(1.0, "Reset complete.");
+
+    return result;
+  }
+
+  Future<List<Product>> getNonMovedProducts({required DateTime fromDate, required DateTime toDate}) async {
+    final db = await DbHelper.instance.database;
+    final fromStr = DateFormat('yyyy-MM-dd').format(fromDate);
+    final toStr = DateFormat('yyyy-MM-dd').format(toDate);
+
+    final List<Map<String, dynamic>> res = await db.rawQuery('''
+      SELECT p.* 
+      FROM product_master p
+      WHERE p.stock > 0 
+        AND p.id NOT IN (
+          SELECT DISTINCT product_id 
+          FROM sales_items si
+          JOIN sales_invoices s ON si.invoice_no = s.invoice_no
+          WHERE date(s.date) BETWEEN ? AND ?
+        )
+      ORDER BY p.name ASC
+    ''', [fromStr, toStr]);
+
+    return res.map((m) => Product.fromMap(m)).toList();
+  }
+
+  Future<List<String>> getWholesalersSortedByBillCount() async {
+    final db = await DbHelper.instance.database;
+    final res = await db.rawQuery('''
+      SELECT supplier, COUNT(*) as bill_count
+      FROM purchase_entries
+      WHERE supplier IS NOT NULL AND TRIM(supplier) != ''
+      GROUP BY supplier
+      ORDER BY bill_count DESC
+    ''');
+    return res.map((r) => r['supplier']?.toString() ?? '').where((s) => s.isNotEmpty).toList();
+  }
 }
 
 class _WholesaleStockItemBuilder {
@@ -15811,6 +17661,7 @@ class SyncTask {
   final String id;
   final String title;
   final String type; // 'Import', 'Export', 'Delete'
+  String? cachedFilePath;
   double progress; // 0.0 to 1.0
   String status; // 'Pending', 'In Progress', 'Completed', 'Failed'
   String statusMessage;
@@ -15820,11 +17671,18 @@ class SyncTask {
     required this.id,
     required this.title,
     required this.type,
+    this.cachedFilePath,
     this.progress = 0.0,
     this.status = 'Pending',
     this.statusMessage = 'Queued...',
     this.resultMessage,
   });
+}
+
+class OnlineStockCheckResult {
+  final bool isAvailable;
+  final double serverStock;
+  OnlineStockCheckResult({required this.isAvailable, required this.serverStock});
 }
 
 // PURE TOP-LEVEL FUNCTION FOR BACKGROUND ISOLATE

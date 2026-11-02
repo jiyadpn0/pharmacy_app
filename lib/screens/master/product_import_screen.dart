@@ -8,6 +8,7 @@ import '../../utils/app_dialogs.dart';
 import '../../widgets/pin_unlock_dialog.dart';
 import '../../widgets/import_widgets.dart';
 import '../../utils/theme_constants.dart';
+import '../../services/product_import_service.dart';
 
 class StockManagementScreen extends StatefulWidget {
   const StockManagementScreen({super.key});
@@ -163,14 +164,41 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
       _confirmWipe("PRODUCT MASTER", () async {
         setState(() => _isImporting = true);
         await Provider.of<PharmacyProvider>(context, listen: false).clearProductMaster();
+        if (!mounted) return;
         setState(() => _isImporting = false);
       });
     } else if (option == 4) {
       _confirmWipe("INVENTORY / BATCHES", () async {
         setState(() => _isImporting = true);
         await Provider.of<PharmacyProvider>(context, listen: false).clearInventoryOnly();
+        if (!mounted) return;
         setState(() => _isImporting = false);
       });
+    } else if (option == 5) {
+      setState(() {
+        _isImporting = true;
+        _importProgress = 0.0;
+        _importStatus = "Starting 57k Product Catalog Import...";
+      });
+
+      final importRes = await ProductImportService.instance.import57kCatalog(
+        onProgress: (processed, total) {
+          if (mounted) {
+            setState(() {
+              _importProgress = total > 0 ? (processed / total) : 0.0;
+              _importStatus = "Imported $processed of $total products...";
+            });
+          }
+        },
+      );
+
+      if (mounted) {
+        await Provider.of<PharmacyProvider>(context, listen: false).loadFromDatabase();
+        setState(() {
+          _isImporting = false;
+          _result = importRes;
+        });
+      }
     }
   }
 
@@ -320,6 +348,7 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
                       _optionCard(2, "Clean Junk/Numeric Names", "Remove auto-created number names ('115', '120', '7S') from bad imports.", Icons.cleaning_services_rounded, Colors.purple),
                       _optionCard(3, "Remove Stock Names", "Delete all medicine names and history.", Icons.delete_sweep, Colors.orange),
                       _optionCard(4, "Clear Inventory", "Clear shop stock levels and batches only.", Icons.layers_clear, Colors.red),
+                      _optionCard(5, "Import 57k Old DB Catalog", "Pre-load 57,059 medicines with generic salts, brands & GST rates.", Icons.cloud_download_rounded, Colors.teal),
                     ],
                   ),
                 ),

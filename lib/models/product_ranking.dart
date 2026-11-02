@@ -149,12 +149,12 @@ class ProductRankingCalculator {
     required String rankFormula,
     List<Map<String, dynamic>> rankRules = const [],
     required String reOrderFormula,
-    required List<Map<String, dynamic>> reOrderRules,
+    List<Map<String, dynamic>> reOrderRules = const [],
     required String warningFormula,
     List<Map<String, dynamic>> warningRules = const [],
     required String maxOrderFormula,
-    required List<Map<String, dynamic>> maxOrderRules,
-    required List<Map<String, dynamic>> customMetricColumns,
+    List<Map<String, dynamic>> maxOrderRules = const [],
+    List<Map<String, dynamic>> customMetricColumns = const [],
     int mavgInterval = 0,
     int specialInterval = 0,
   }) {
@@ -439,8 +439,11 @@ class ProductRankingCalculator {
     StringBuffer sb = StringBuffer();
     for (int i = 0; i < s.length; i++) {
       String char = s[i];
-      if (char == '(') depth++;
-      else if (char == ')') depth--;
+      if (char == '(') {
+        depth++;
+      } else if (char == ')') {
+        depth--;
+      }
       if (char == ',' && depth == 0) {
         res.add(sb.toString().trim());
         sb.clear();
@@ -463,12 +466,19 @@ class ProductRankingCalculator {
         double left = _evaluateBasicMath(leftPart) ?? 0.0;
         double right = _evaluateBasicMath(rightPart) ?? 0.0;
         bool res = false;
-        if (op == ">") res = left > (right + eps);
-        else if (op == "<") res = left < (right - eps);
-        else if (op == ">=") res = left >= (right - eps);
-        else if (op == "<=") res = left <= (right + eps);
-        else if (op == "=") res = (left - right).abs() < eps;
-        else if (op == "!=") res = (left - right).abs() >= eps;
+        if (op == ">") {
+          res = left > (right + eps);
+        } else if (op == "<") {
+          res = left < (right - eps);
+        } else if (op == ">=") {
+          res = left >= (right - eps);
+        } else if (op == "<=") {
+          res = left <= (right + eps);
+        } else if (op == "=") {
+          res = (left - right).abs() < eps;
+        } else if (op == "!=") {
+          res = (left - right).abs() >= eps;
+        }
         return res ? 1.0 : 0.0;
       }
     }

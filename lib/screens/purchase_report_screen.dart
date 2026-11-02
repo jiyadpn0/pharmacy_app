@@ -1,10 +1,13 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:excel/excel.dart' as ex;
 import '../providers/pharmacy_provider.dart';
 import '../providers/app_provider.dart';
+import '../services/app_notification_service.dart';
 import '../widgets/app_date_picker.dart';
 import 'package:intl/intl.dart';
 import '../widgets/erp_tooltip.dart';
@@ -12,8 +15,11 @@ import '../utils/report_pdf_generator.dart';
 import '../utils/printer_service.dart';
 import '../utils/app_formatters.dart';
 import '../utils/theme_constants.dart';
+import '../utils/pack_unit_converter.dart';
+import '../widgets/server_discrepancy_dialog.dart';
 
 enum PurchaseReportType { detailed, summary, supplierWise, categoryWise }
+enum AggregationType { sum, min, max, count, average, none }
 
 class PurchaseReportScreen extends StatefulWidget {
   const PurchaseReportScreen({super.key});
@@ -23,11 +29,16 @@ class PurchaseReportScreen extends StatefulWidget {
 }
 
 class _PurchaseReportScreenState extends State<PurchaseReportScreen> {
-  DateTime _from = DateTime.now().subtract(const Duration(days: 30));
+  DateTime _from = DateTime.now();
   DateTime _to = DateTime.now();
   PurchaseReportType _reportType = PurchaseReportType.detailed;
   final Map<String, Map<String, dynamic>> _activeFilters = {};
+  final Map<String, AggregationType> _columnAggregations = {};
   double _headerHeight = 52.0;
+
+  // Column header sorting
+  String? _sortColumnKey;
+  bool _isAscending = true;
 
   // CODE MASTER FIX: RAM Cache variables to stop the UI freeze
   List<Map<String, dynamic>> _masterData = [];
@@ -38,15 +49,18 @@ class _PurchaseReportScreenState extends State<PurchaseReportScreen> {
   int _offset = 0;
   final int _pageSize = 50;
   bool _hasMore = true;
+  int _selectedIndex = 0;
+  int _lastTapIndex = -1;
+  DateTime? _lastTapTime;
   final ScrollController _scrollController = ScrollController();
   final ScrollController _horizontalScrollController = ScrollController();
 
   final Map<String, double> _colWidths = {
     'entry_no': 80, 'date': 90, 'supplier': 150, 'supplier_acc': 120, 'inv_no': 100, 'po_no': 80,
-    'gross': 80, 'disc': 80, 's_disc': 80, 'net': 80, 'gst': 80, 'cgst': 70, 'sgst': 70, 'igst': 70,
+    'gross': 80, 'disc': 80, 'net': 80, 'gst': 80, 'cgst': 70, 'sgst': 70, 'igst': 70,
     'subtotal': 100, 'other_disc': 90, 'other_charge': 90, 'credit_note': 90, 'total': 110, 'status': 70, 'tax_type': 80,
     'name': 180, 'rack': 70, 'category': 100, 'sub_category': 100, 'hsn': 80, 'batch': 90, 'expiry': 80,
-    'qty': 60, 'packing': 70, 'f_qty': 60, 'p_rate': 80, 'gst_amt': 80, 'l_cost': 80, 's_rate': 80, 'mrp': 80, 'mrp_total': 100,
+    'qty': 60, 'packing': 70, 'f_qty': 60, 'total_loose': 90, 'p_rate': 80, 'gst_amt': 80, 'l_cost': 80, 's_rate': 80, 'mrp': 80, 'mrp_total': 100,
     'inv_count': 100, 'strip_qty': 80, 'loose_qty': 80
   };
 
@@ -57,7 +71,7 @@ class _PurchaseReportScreenState extends State<PurchaseReportScreen> {
           {'key': 'entry_no', 'title': 'Entry No'}, {'key': 'date', 'title': 'Date'}, {'key': 'supplier', 'title': 'Supplier'},
           {'key': 'supplier_acc', 'title': 'Supplier Acc'}, {'key': 'inv_no', 'title': 'Sup Inv No'}, {'key': 'po_no', 'title': 'Po.No'},
           {'key': 'gross', 'title': 'Gross', 'type': 'numeric'}, {'key': 'disc', 'title': 'Disc', 'type': 'numeric'},
-          {'key': 's_disc', 'title': 'SDisc', 'type': 'numeric'}, {'key': 'net', 'title': 'Net', 'type': 'numeric'},
+          {'key': 'net', 'title': 'Net', 'type': 'numeric'},
           {'key': 'gst', 'title': 'gst', 'type': 'numeric'}, {'key': 'cgst', 'title': 'cgst', 'type': 'numeric'},
           {'key': 'sgst', 'title': 'sgst', 'type': 'numeric'}, {'key': 'igst', 'title': 'igst', 'type': 'numeric'},
           {'key': 'subtotal', 'title': 'Sub Total', 'type': 'numeric'}, {'key': 'other_disc', 'title': 'Other Disc', 'type': 'numeric'},
@@ -70,9 +84,9 @@ class _PurchaseReportScreenState extends State<PurchaseReportScreen> {
           {'key': 'name', 'title': 'Name'}, {'key': 'rack', 'title': 'Rack'}, {'key': 'category', 'title': 'Category'},
           {'key': 'sub_category', 'title': 'Sub Ca...'}, {'key': 'hsn', 'title': 'hsncode'}, {'key': 'batch', 'title': 'Batch'},
           {'key': 'expiry', 'title': 'Expiry'}, {'key': 'qty', 'title': 'Qty', 'type': 'numeric'}, {'key': 'packing', 'title': 'packing', 'type': 'numeric'},
-          {'key': 'f_qty', 'title': 'F.Qty', 'type': 'numeric'}, {'key': 'p_rate', 'title': 'P.Rate', 'type': 'numeric'},
+          {'key': 'f_qty', 'title': 'F.Qty', 'type': 'numeric'}, {'key': 'total_loose', 'title': 'Total Loose Qty', 'type': 'numeric'}, {'key': 'p_rate', 'title': 'P.Rate', 'type': 'numeric'},
           {'key': 'gross', 'title': 'Gross', 'type': 'numeric'}, {'key': 'disc', 'title': 'Disc', 'type': 'numeric'},
-          {'key': 's_disc', 'title': 'SDisc', 'type': 'numeric'}, {'key': 'net', 'title': 'Net', 'type': 'numeric'},
+          {'key': 'net', 'title': 'Net', 'type': 'numeric'},
           {'key': 'cgst', 'title': 'cgst', 'type': 'numeric'}, {'key': 'igst', 'title': 'igst', 'type': 'numeric'},
           {'key': 'sgst', 'title': 'sgst', 'type': 'numeric'}, {'key': 'gst_amt', 'title': 'gst_amt', 'type': 'numeric'},
           {'key': 'total', 'title': 'Total', 'type': 'numeric'}, {'key': 'l_cost', 'title': 'L.Cost', 'type': 'numeric'},
@@ -89,15 +103,31 @@ class _PurchaseReportScreenState extends State<PurchaseReportScreen> {
     }
   }
 
+  StreamSubscription<AppNotification>? _watchdogSub;
+  Timer? _watchdogDebounceTimer;
+
   @override
   void initState() {
     super.initState();
     _scrollController.addListener(_onScroll);
     WidgetsBinding.instance.addPostFrameCallback((_) => _search());
+
+    _watchdogSub = AppNotificationService.instance.watchdogStream.listen((notif) {
+      if (!mounted) return;
+      final cat = notif.detectedCategory;
+      if (cat == 'PURCHASES') {
+        _watchdogDebounceTimer?.cancel();
+        _watchdogDebounceTimer = Timer(const Duration(milliseconds: 500), () {
+          if (mounted) _search();
+        });
+      }
+    });
   }
 
   @override
   void dispose() {
+    _watchdogDebounceTimer?.cancel();
+    _watchdogSub?.cancel();
     _scrollController.dispose();
     _horizontalScrollController.dispose();
     super.dispose();
@@ -123,6 +153,7 @@ class _PurchaseReportScreenState extends State<PurchaseReportScreen> {
     final provider = Provider.of<PharmacyProvider>(context, listen: false);
     final dateFiltered = await provider.fetchPurchasesInDateRange(_from, _to, loadItems: true, limit: _pageSize, offset: 0);
 
+    if (!mounted) return;
     setState(() {
       _masterData = _processRawData(dateFiltered, provider);
       _displayData = List.from(_masterData);
@@ -140,6 +171,7 @@ class _PurchaseReportScreenState extends State<PurchaseReportScreen> {
     final provider = Provider.of<PharmacyProvider>(context, listen: false);
     final nextPurchases = await provider.fetchPurchasesInDateRange(_from, _to, loadItems: true, limit: _pageSize, offset: _offset);
 
+    if (!mounted) return;
     setState(() {
       final processed = _processRawData(nextPurchases, provider);
       _masterData.addAll(processed);
@@ -193,30 +225,83 @@ class _PurchaseReportScreenState extends State<PurchaseReportScreen> {
     }
   }
 
-  bool checkIfDuplicate(PurchaseEntry current, List<PurchaseEntry> allPurchases) {
-    return allPurchases.any((other) =>
-      other.entryNo != current.entryNo && // ensure it's not comparing against itself
-      other.supplierName.trim().toLowerCase() == current.supplierName.trim().toLowerCase() &&
-      other.supInvNo.trim().isNotEmpty &&
-      other.supInvNo.trim().toLowerCase() == current.supInvNo.trim().toLowerCase() &&
-      other.financialYear == current.financialYear
-    );
+  bool checkIfDuplicate(PurchaseEntry current, List<PurchaseEntry> allPurchases, PharmacyProvider provider) {
+    final currentCleanNo = cleanEntryNo(current.entryNo);
+    final currentSupplier = current.supplierName.trim().toLowerCase();
+    final currentInvNo = cleanInvoiceNo(current.supInvNo).trim().toLowerCase();
+
+    final currentFY = current.financialYear.isNotEmpty
+        ? current.financialYear
+        : provider.getCalculatedFY(current.date);
+
+    return allPurchases.any((other) {
+      if (identical(other, current)) {
+        return false;
+      }
+
+      final otherCleanNo = cleanEntryNo(other.entryNo);
+      final otherSupplier = other.supplierName.trim().toLowerCase();
+      final otherInvNo = cleanInvoiceNo(other.supInvNo).trim().toLowerCase();
+
+      final otherFY = other.financialYear.isNotEmpty
+          ? other.financialYear
+          : provider.getCalculatedFY(other.date);
+
+      if (otherFY != currentFY) {
+        return false;
+      }
+
+      // If clean entry number matches and supplier matches (or is blank),
+      // it's the exact same entry instance (RAM copy "1" vs SQLite copy "2026-27_1"), NOT a duplicate entry!
+      if ((other.entryNo == current.entryNo || (currentCleanNo.isNotEmpty && otherCleanNo == currentCleanNo)) &&
+          (otherSupplier == currentSupplier || currentSupplier.isEmpty || otherSupplier.isEmpty)) {
+        return false;
+      }
+
+      bool sameCleanEntry = currentCleanNo.isNotEmpty && otherCleanNo == currentCleanNo;
+      bool sameSupplierInv = currentSupplier.isNotEmpty && currentInvNo.isNotEmpty &&
+          otherSupplier == currentSupplier && otherInvNo == currentInvNo;
+
+      return sameCleanEntry || sameSupplierInv;
+    });
   }
 
-  List<Map<String, dynamic>> _processRawData(List<PurchaseEntry> dateFiltered, PharmacyProvider provider) {
+  List<Map<String, dynamic>> _processRawData(List<PurchaseEntry> rawFiltered, PharmacyProvider provider) {
     List<Map<String, dynamic>> reportData = [];
+
+    // Deduplicate dateFiltered entries so SQLite DB copy + RAM copy don't duplicate rows in report grid
+    final Map<String, PurchaseEntry> uniqueFilteredMap = {};
+    for (var p in rawFiltered) {
+      final key = "${cleanEntryNo(p.entryNo)}_${p.supplierName.trim().toLowerCase()}_${cleanInvoiceNo(p.supInvNo).trim().toLowerCase()}";
+      uniqueFilteredMap[key] = p;
+    }
+    final dateFiltered = uniqueFilteredMap.values.toList();
+
+    // Build deduplicated comparison list
+    final Map<String, PurchaseEntry> uniqueCompareMap = Map.from(uniqueFilteredMap);
+    for (var p in provider.purchases) {
+      final key = "${cleanEntryNo(p.entryNo)}_${p.supplierName.trim().toLowerCase()}_${cleanInvoiceNo(p.supInvNo).trim().toLowerCase()}";
+      uniqueCompareMap.putIfAbsent(key, () => p);
+    }
+    final allPurchasesToCompare = uniqueCompareMap.values.toList();
+
     switch (_reportType) {
       case PurchaseReportType.summary:
         reportData = dateFiltered.map((p) {
           double totalGst = p.items.fold(0.0, (sum, item) => sum + item.gstAmt);
-          bool isDup = checkIfDuplicate(p, provider.purchases);
+          bool isDup = checkIfDuplicate(p, allPurchasesToCompare, provider);
+          bool isInterstate = p.taxType == 'Interstate';
           return {
             'entry_no': cleanEntryNo(p.entryNo), 'date': DateFormat('dd/MM/yyyy').format(p.date),
             'supplier': p.supplierName, 'supplier_acc': p.supplierName, 'inv_no': cleanInvoiceNo(p.supInvNo),
-            'po_no': "", 'gross': p.subTotal, 'disc': p.discount, 's_disc': 0.0,
-            'net': p.subTotal - p.discount, 'gst': totalGst, 'cgst': totalGst / 2, 'sgst': totalGst / 2,
-            'igst': 0.0, 'subtotal': p.subTotal, 'other_disc': 0.0, 'other_charge': p.otherCharge,
-            'credit_note': 0.0, 'total': p.grandTotal, 'status': p.paymentStatus == 1 ? "Paid" : "Saved", 'tax_type': "Normal",
+            'po_no': "", 'gross': p.subTotal, 'disc': p.discount,
+            'net': p.subTotal - p.discount, 'gst': totalGst,
+            'cgst': isInterstate ? 0.0 : totalGst / 2,
+            'sgst': isInterstate ? 0.0 : totalGst / 2,
+            'igst': isInterstate ? totalGst : 0.0,
+            'subtotal': p.subTotal, 'other_disc': 0.0, 'other_charge': p.otherCharge,
+            'credit_note': 0.0, 'total': p.grandTotal, 'status': p.paymentStatus == 1 ? "Paid" : "Saved",
+            'tax_type': p.taxType,
             'is_duplicate': isDup,
           };
         }).toList();
@@ -224,16 +309,28 @@ class _PurchaseReportScreenState extends State<PurchaseReportScreen> {
 
       case PurchaseReportType.detailed:
         for (var p in dateFiltered) {
-          bool isDup = checkIfDuplicate(p, provider.purchases);
+          bool isDup = checkIfDuplicate(p, allPurchasesToCompare, provider);
+          bool isInterstate = p.taxType == 'Interstate';
           for (var item in p.items) {
             final prod = provider.productMaster.firstWhere((element) => element.id == item.id || element.name == item.productName, orElse: () => Product(id: "", name: item.productName));
+            final int packSize = item.packin > 0 ? item.packin : 1;
+            final int totalLoose = PackUnitConverter.toTotalLooseUnits(
+              fullPacks: item.qty,
+              looseUnits: item.looseQty,
+              freePacks: item.fQty,
+              packing: packSize,
+            );
             reportData.add({
               'entry_no': cleanEntryNo(p.entryNo), 'date': DateFormat('dd/MM/yyyy').format(p.date), 'supplier': p.supplierName,
               'name': item.productName, 'rack': item.rack.isNotEmpty ? item.rack : prod.rack,
               'category': prod.category, 'sub_category': prod.subCategory, 'hsn': item.hsnCode.isNotEmpty ? item.hsnCode : prod.hsnCode,
               'batch': item.batch, 'expiry': item.expiry, 'qty': item.qty, 'packing': item.packin, 'f_qty': item.fQty,
-              'p_rate': item.pRate, 'gross': item.gross, 'disc': item.discAmt, 's_disc': item.sDiscAmt, 'net': item.net,
-              'cgst': item.gstAmt / 2, 'igst': 0.0, 'sgst': item.gstAmt / 2, 'gst_amt': item.gstAmt, 'total': item.total,
+              'total_loose': totalLoose,
+              'p_rate': item.pRate, 'gross': item.gross, 'disc': item.discAmt, 'net': item.net,
+              'cgst': isInterstate ? 0.0 : item.gstAmt / 2,
+              'igst': isInterstate ? item.gstAmt : 0.0,
+              'sgst': isInterstate ? 0.0 : item.gstAmt / 2,
+              'gst_amt': item.gstAmt, 'total': item.total,
               'l_cost': item.lCost, 's_rate': item.sRate, 'mrp': item.mrp, 'mrp_total': item.mrp * (item.qty + item.fQty),
               'is_duplicate': isDup,
             });
@@ -260,8 +357,15 @@ class _PurchaseReportScreenState extends State<PurchaseReportScreen> {
             if (!catGrouped.containsKey(item.productName)) {
               catGrouped[item.productName] = {'name': item.productName, 'strip_qty': 0, 'loose_qty': 0};
             }
-            catGrouped[item.productName]!['loose_qty'] += item.qty;
-            catGrouped[item.productName]!['strip_qty'] += item.qty ~/ (item.packin > 0 ? item.packin : 1);
+            final int packSize = item.packin > 0 ? item.packin : 1;
+            final int totalLoose = PackUnitConverter.toTotalLooseUnits(
+              fullPacks: item.qty,
+              looseUnits: item.looseQty,
+              freePacks: item.fQty,
+              packing: packSize,
+            );
+            catGrouped[item.productName]!['loose_qty'] += totalLoose;
+            catGrouped[item.productName]!['strip_qty'] += (item.qty + item.fQty);
           }
         }
         reportData = catGrouped.values.toList();
@@ -272,14 +376,54 @@ class _PurchaseReportScreenState extends State<PurchaseReportScreen> {
 
   void _applyFilters() {
     setState(() {
-      _displayData = _masterData.where((data) {
+      var filtered = _masterData.where((data) {
         bool matches = true;
         _activeFilters.forEach((key, filter) {
           if (!_matchesFilter(data[key], key)) matches = false;
         });
         return matches;
       }).toList();
+
+      if (_sortColumnKey != null) {
+        filtered.sort((a, b) {
+          dynamic valA = a[_sortColumnKey];
+          dynamic valB = b[_sortColumnKey];
+
+          int comp = 0;
+          if (valA is num && valB is num) {
+            comp = valA.compareTo(valB);
+          } else if (valA is num || valB is num) {
+            double numA = double.tryParse(valA?.toString() ?? '') ?? 0.0;
+            double numB = double.tryParse(valB?.toString() ?? '') ?? 0.0;
+            comp = numA.compareTo(numB);
+          } else {
+            String strA = valA?.toString().toLowerCase() ?? '';
+            String strB = valB?.toString().toLowerCase() ?? '';
+            comp = strA.compareTo(strB);
+          }
+          return _isAscending ? comp : -comp;
+        });
+      }
+
+      _displayData = filtered;
       _isLoading = false;
+    });
+  }
+
+  void _onColumnHeaderTap(String key) {
+    setState(() {
+      if (_sortColumnKey == key) {
+        if (_isAscending) {
+          _isAscending = false;
+        } else {
+          _sortColumnKey = null;
+          _isAscending = true;
+        }
+      } else {
+        _sortColumnKey = key;
+        _isAscending = true;
+      }
+      _applyFilters();
     });
   }
 
@@ -428,17 +572,27 @@ class _PurchaseReportScreenState extends State<PurchaseReportScreen> {
                                                 }
                                                 final row = _displayData[i];
                                                 final bool isDuplicate = row['is_duplicate'] == true;
+                                                final bool isSelected = i == _selectedIndex;
 
                                                 return InkWell(
                                                   onTap: () {
-                                                    if (row.containsKey('entry_no')) {
-                                                      Provider.of<AppProvider>(context, listen: false).openPurchase(entryNo: row['entry_no']);
+                                                    final now = DateTime.now();
+                                                    if (_lastTapIndex == i && _lastTapTime != null && now.difference(_lastTapTime!) < const Duration(milliseconds: 350)) {
+                                                      _lastTapTime = null;
+                                                      _lastTapIndex = -1;
+                                                      if (row.containsKey('entry_no') && row['entry_no'] != null && row['entry_no'].toString().isNotEmpty) {
+                                                        Provider.of<AppProvider>(context, listen: false).openPurchase(entryNo: row['entry_no'].toString());
+                                                      }
+                                                    } else {
+                                                      _lastTapIndex = i;
+                                                      _lastTapTime = now;
+                                                      setState(() => _selectedIndex = i);
                                                     }
                                                   },
                                                   child: Container(
                                                     height: 25, 
                                                     decoration: BoxDecoration(
-                                                      color: isDuplicate ? Colors.red.shade50 : (i % 2 == 0 ? Colors.white : const Color(0xFFF9F9F9)),
+                                                      color: isSelected ? const Color(0xFFBAE6FD) : (isDuplicate ? Colors.red.shade50 : (i % 2 == 0 ? Colors.white : const Color(0xFFF9F9F9))),
                                                       border: const Border(bottom: BorderSide(color: Colors.grey, width: 0.1))
                                                     ),
                                                     child: Row(children: [
@@ -573,8 +727,12 @@ class _PurchaseReportScreenState extends State<PurchaseReportScreen> {
           Row(
             children: [
               Expanded(child: _sideActionBtn("Export", Icons.exit_to_app, onPressed: _exportExcel)),
-              const SizedBox(width: 8),
+              const SizedBox(width: 4),
               Expanded(child: _sideActionBtn("Print", Icons.print, onPressed: _printReport)),
+              const SizedBox(width: 4),
+              Expanded(child: _sideActionBtn("Audit", Icons.youtube_searched_for_rounded, onPressed: () {
+                ServerDiscrepancyDialog.show(context, initialCategoryKey: 'purchase_entries');
+              })),
             ],
           )
         ],
@@ -624,16 +782,18 @@ class _PurchaseReportScreenState extends State<PurchaseReportScreen> {
   Widget _reportTypeRadio(PurchaseReportType type, String label) {
     return SizedBox(
       height: 30,
-      child: Row(
-        children: [
-          Radio<PurchaseReportType>(
-            value: type,
-            groupValue: _reportType,
-            onChanged: (v) { setState(() => _reportType = v!); _processData(); },
-            visualDensity: VisualDensity.compact,
-          ),
-          Text(label, style: const TextStyle(fontSize: 11)),
-        ],
+      child: RadioGroup<PurchaseReportType>(
+        groupValue: _reportType,
+        onChanged: (v) { if (v != null) { setState(() => _reportType = v); _processData(); } },
+        child: Row(
+          children: [
+            Radio<PurchaseReportType>(
+              value: type,
+              visualDensity: VisualDensity.compact,
+            ),
+            Text(label, style: const TextStyle(fontSize: 11)),
+          ],
+        ),
       ),
     );
   }
@@ -691,11 +851,35 @@ class _PurchaseReportScreenState extends State<PurchaseReportScreen> {
     return Container(
       width: double.infinity,
       color: const Color(0xFFD1D9E1),
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Text(
-        "$title From: ${DateFormat('dd/MM/yyyy').format(_from)} To: ${DateFormat('dd/MM/yyyy').format(_to)}",
-        textAlign: TextAlign.center,
-        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF2C3E50)),
+      padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 12),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              "$title From: ${DateFormat('dd/MM/yyyy').format(_from)} To: ${DateFormat('dd/MM/yyyy').format(_to)}",
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF2C3E50)),
+            ),
+          ),
+          InkWell(
+            onTap: () => ServerDiscrepancyDialog.show(context, initialCategoryKey: 'purchase_entries'),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: Colors.red.shade700,
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.youtube_searched_for_rounded, size: 14, color: Colors.white),
+                  SizedBox(width: 4),
+                  Text('Cloud Audit', style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold)),
+                ],
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -705,6 +889,9 @@ class _PurchaseReportScreenState extends State<PurchaseReportScreen> {
        title: title, 
        width: _colWidths[key] ?? 100, 
        columnType: columnType,
+       isSorted: _sortColumnKey == key,
+       isAscending: _isAscending,
+       onSortTap: () => _onColumnHeaderTap(key),
        onQuickFilter: (c, v) => _applyQuickFilter(key, c, v),
        onAdvancedTap: (pos) => _openAdvancedFilter(key, title, pos),
        onResize: (v) => setState(() => _colWidths[key] = v.clamp(40, 500)),
@@ -712,19 +899,162 @@ class _PurchaseReportScreenState extends State<PurchaseReportScreen> {
      );
   }
 
-  Widget _buildFooter(List<Map<String, dynamic>> data) {
-    double total = data.fold(0.0, (sum, p) => sum + (p['total'] ?? 0.0));
-    return Container(
-      height: 30, 
-      color: Colors.grey.shade300, 
-      padding: const EdgeInsets.symmetric(horizontal: 20), 
+  String _calculateAggregation(String colKey, AggregationType type, List<Map<String, dynamic>> data) {
+    if (type == AggregationType.none || data.isEmpty) return "";
+    if (type == AggregationType.count) return "${data.length}";
+
+    List<double> values = [];
+    for (var row in data) {
+      if (row['status'] == 'DELETED ENTRY') continue;
+      final val = row[colKey];
+      if (val is num) {
+        values.add(val.toDouble());
+      } else if (val is String) {
+        final parsed = double.tryParse(val);
+        if (parsed != null) values.add(parsed);
+      }
+    }
+
+    if (values.isEmpty) return "";
+
+    switch (type) {
+      case AggregationType.sum:
+        return values.fold(0.0, (s, v) => s + v).toStringAsFixed(2);
+      case AggregationType.min:
+        return values.reduce((a, b) => a < b ? a : b).toStringAsFixed(2);
+      case AggregationType.max:
+        return values.reduce((a, b) => a > b ? a : b).toStringAsFixed(2);
+      case AggregationType.average:
+        return (values.fold(0.0, (s, v) => s + v) / values.length).toStringAsFixed(2);
+      default:
+        return "";
+    }
+  }
+
+  void _showAggregationMenu(Offset position, String colKey, List<Map<String, dynamic>> data) {
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
+    final currentAgg = _columnAggregations[colKey] ?? AggregationType.none;
+    final resultStr = _calculateAggregation(colKey, currentAgg, data);
+
+    final List<PopupMenuEntry<dynamic>> items = [
+      _buildPopupItem(AggregationType.sum, "Sum", Icons.functions),
+      _buildPopupItem(AggregationType.min, "Min", Icons.bar_chart),
+      _buildPopupItem(AggregationType.max, "Max", Icons.bar_chart),
+      _buildPopupItem(AggregationType.count, "Count", Icons.numbers),
+      _buildPopupItem(AggregationType.average, "Average", Icons.abc),
+      const PopupMenuDivider(),
+      _buildPopupItem(AggregationType.none, "None", Icons.check),
+    ];
+
+    if (resultStr.isNotEmpty) {
+      items.addAll([
+        const PopupMenuDivider(),
+        PopupMenuItem<String>(
+          value: "COPY_VALUE",
+          height: 32,
+          child: Row(
+            children: [
+              const Icon(Icons.copy, size: 14, color: Colors.blue),
+              const SizedBox(width: 8),
+              Text("Copy ($resultStr)", style: const TextStyle(fontSize: 11)),
+            ],
+          ),
+        ),
+      ]);
+    }
+
+    showMenu<dynamic>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(position.dx, position.dy, 0, 0),
+        Offset.zero & overlay.size,
+      ),
+      items: items,
+    ).then((selected) {
+      if (selected is AggregationType) {
+        setState(() => _columnAggregations[colKey] = selected);
+      } else if (selected == "COPY_VALUE") {
+        Clipboard.setData(ClipboardData(text: resultStr));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Copied $resultStr to clipboard"), duration: const Duration(seconds: 1)),
+          );
+        }
+      }
+    });
+  }
+
+  PopupMenuItem<AggregationType> _buildPopupItem(AggregationType type, String label, IconData icon) {
+    return PopupMenuItem<AggregationType>(
+      value: type,
+      height: 32,
       child: Row(
-        mainAxisAlignment: MainAxisAlignment.end, 
         children: [
-          const Text("TOTAL: ", style: TextStyle(fontWeight: FontWeight.bold)), 
-          Text("₹${total.toStringAsFixed(2)}", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16))
-        ]
-      )
+          Icon(icon, size: 14, color: Colors.blueGrey),
+          const SizedBox(width: 8),
+          Text(label, style: const TextStyle(fontSize: 11)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFooter(List<Map<String, dynamic>> data) {
+    final columns = _getColumns();
+    double totalSum = 0.0;
+    for (var p in data) {
+      if (p['status'] == 'DELETED ENTRY') continue;
+      final t = p['total'];
+      if (t is num) totalSum += t.toDouble();
+    }
+
+    return Container(
+      height: 30,
+      decoration: BoxDecoration(
+        color: const Color(0xFFE8EAF6),
+        border: Border(top: BorderSide(color: Colors.grey.shade400, width: 1)),
+      ),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        physics: const NeverScrollableScrollPhysics(),
+        child: Row(
+          children: columns.map((col) {
+            final key = col['key'] as String;
+            final colW = _colWidths[key] ?? 100.0;
+            final selectedAgg = _columnAggregations[key];
+
+            String valStr = '';
+            if (selectedAgg != null && selectedAgg != AggregationType.none) {
+              valStr = _calculateAggregation(key, selectedAgg, data);
+            } else if (key == 'date') {
+              valStr = 'TOTAL';
+            } else if (key == 'total') {
+              valStr = '₹${totalSum.toStringAsFixed(2)}';
+            }
+
+            return GestureDetector(
+              onTapDown: (details) => _showAggregationMenu(details.globalPosition, key, data),
+              onSecondaryTapDown: (details) => _showAggregationMenu(details.globalPosition, key, data),
+              child: ERPTooltip(
+                message: valStr,
+                child: Container(
+                  width: colW,
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  alignment: col['type'] == 'numeric' ? Alignment.centerRight : Alignment.centerLeft,
+                  decoration: BoxDecoration(
+                    border: Border(right: BorderSide(color: Colors.grey.shade300, width: 0.5)),
+                  ),
+                  child: Text(
+                    valStr,
+                    style: const TextStyle(color: Colors.blue, fontSize: 10, fontWeight: FontWeight.bold),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ),
+            );
+          }).toList(),
+        ),
+      ),
     );
   }
 }
@@ -733,12 +1063,26 @@ class _Hdr extends StatefulWidget {
   final String title;
   final double width;
   final String columnType;
+  final bool isSorted;
+  final bool isAscending;
+  final VoidCallback? onSortTap;
   final Function(String condition, String value) onQuickFilter;
   final Function(Offset position)? onAdvancedTap;
   final Function(double) onResize;
   final Function(double) onHeightResize;
 
-  const _Hdr({required this.title, required this.width, this.columnType = 'text', required this.onQuickFilter, this.onAdvancedTap, required this.onResize, required this.onHeightResize});
+  const _Hdr({
+    required this.title,
+    required this.width,
+    this.columnType = 'text',
+    this.isSorted = false,
+    this.isAscending = true,
+    this.onSortTap,
+    required this.onQuickFilter,
+    this.onAdvancedTap,
+    required this.onResize,
+    required this.onHeightResize,
+  });
 
   @override
   State<_Hdr> createState() => _HdrState();
@@ -807,7 +1151,38 @@ class _HdrState extends State<_Hdr> {
               children: [
                 Row(
                   children: [
-                    Expanded(child: Padding(padding: const EdgeInsets.only(left: 6, top: 4), child: Text(widget.title, style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey.shade800), overflow: TextOverflow.ellipsis))),
+                    Expanded(
+                      child: InkWell(
+                        onTap: widget.onSortTap,
+                        child: Padding(
+                          padding: const EdgeInsets.only(left: 6, top: 4),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Flexible(
+                                child: Text(
+                                  widget.title,
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.bold,
+                                    color: widget.isSorted ? Colors.blue.shade900 : Colors.grey.shade800,
+                                  ),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              if (widget.isSorted) ...[
+                                const SizedBox(width: 2),
+                                Icon(
+                                  widget.isAscending ? Icons.arrow_upward : Icons.arrow_downward,
+                                  size: 11,
+                                  color: Colors.blue.shade900,
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
                     Opacity(
                       opacity: showFilter ? 1.0 : 0.0,
                       child: GestureDetector(

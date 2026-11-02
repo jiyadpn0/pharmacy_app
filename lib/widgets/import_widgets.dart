@@ -1,9 +1,8 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/scheduler.dart';
 import 'package:provider/provider.dart';
 import '../providers/pharmacy_provider.dart';
+import '../providers/mdi_controller.dart';
 import '../screens/master/product_registration_screen.dart';
-import '../database/db_helper.dart';
 
 class ImportFormatSelectionDialog extends StatelessWidget {
   final PharmacyProvider provider;
@@ -11,6 +10,7 @@ class ImportFormatSelectionDialog extends StatelessWidget {
   final Function(ImportMapping, int) onEdit;
   final Function(bool) onAddNew;
   final Function(ImportMapping?)? closeWindow;
+  final bool isGmailSelector;
 
   const ImportFormatSelectionDialog({
     super.key,
@@ -19,6 +19,7 @@ class ImportFormatSelectionDialog extends StatelessWidget {
     required this.onEdit,
     required this.onAddNew,
     this.closeWindow,
+    this.isGmailSelector = false,
   });
 
   @override
@@ -35,20 +36,31 @@ class ImportFormatSelectionDialog extends StatelessWidget {
             child: Row(
               children: [
                 const Text("Format Manager", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-                const Spacer(),
-                ElevatedButton.icon(
-                  icon: const Icon(Icons.table_chart, size: 14),
-                  label: const Text("Excel", style: TextStyle(fontSize: 11)),
-                  style: ElevatedButton.styleFrom(backgroundColor: Colors.green.shade600, foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(horizontal: 10)),
-                  onPressed: () => onAddNew(false),
-                ),
-                const SizedBox(width: 8),
-                ElevatedButton.icon(
-                  icon: const Icon(Icons.picture_as_pdf, size: 14),
-                  label: const Text("PDF", style: TextStyle(fontSize: 11)),
-                  style: ElevatedButton.styleFrom(backgroundColor: Colors.green.shade600, foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(horizontal: 10)),
-                  onPressed: () => onAddNew(true),
-                ),
+                if (!isGmailSelector) ...[
+                  const Spacer(),
+                  const Text(
+                    "CREATE NEW : ",
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.blueGrey,
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  ElevatedButton.icon(
+                    icon: const Icon(Icons.table_chart, size: 14),
+                    label: const Text("Excel", style: TextStyle(fontSize: 11)),
+                    style: ElevatedButton.styleFrom(backgroundColor: Colors.green.shade600, foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(horizontal: 10)),
+                    onPressed: () => onAddNew(false),
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton.icon(
+                    icon: const Icon(Icons.picture_as_pdf, size: 14),
+                    label: const Text("PDF", style: TextStyle(fontSize: 11)),
+                    style: ElevatedButton.styleFrom(backgroundColor: Colors.green.shade600, foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(horizontal: 10)),
+                    onPressed: () => onAddNew(true),
+                  ),
+                ],
               ],
             ),
           ),
@@ -70,7 +82,7 @@ class ImportFormatSelectionDialog extends StatelessWidget {
                           padding: const EdgeInsets.all(20),
                           alignment: Alignment.center,
                           decoration: BoxDecoration(color: Colors.grey.shade100, borderRadius: BorderRadius.circular(8)),
-                          child: const Text("No saved formats yet. Click a green button above to create one.", style: TextStyle(fontStyle: FontStyle.italic, color: Colors.grey)),
+                          child: const Text("No saved formats yet. Click a format button above or import an invoice to create one.", style: TextStyle(fontStyle: FontStyle.italic, color: Colors.grey)),
                         );
                       }
 
@@ -141,7 +153,17 @@ class ImportFormatSelectionDialog extends StatelessWidget {
                       if (closeWindow != null) {
                         closeWindow!(null);
                       } else {
-                        Navigator.pop(context);
+                        try {
+                          final mdi = Provider.of<MdiController>(context, listen: false);
+                          if (mdi.windows.any((w) => w.id == "format_manager_import" || w.id == "format_manager")) {
+                            mdi.closeWindow("format_manager_import");
+                            mdi.closeWindow("format_manager");
+                            return;
+                          }
+                        } catch (_) {}
+                        if (Navigator.canPop(context)) {
+                          Navigator.pop(context);
+                        }
                       }
                     },
                     child: const Text("CLOSE")
@@ -159,42 +181,53 @@ class ImportFormatSelectionDialog extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.05),
+        color: color.withValues(alpha: 0.08),
         borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: color.withValues(alpha: 0.2)),
+        border: Border.all(color: color.withValues(alpha: 0.3)),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
+          // Select Format for Immediate Import
           InkWell(
             onTap: () => onFormatSelected(m),
             child: Row(
               children: [
-                Icon(icon, color: color, size: 18),
+                Icon(icon, color: color, size: 16),
                 const SizedBox(width: 4),
-                Text(label, style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 10)),
+                Text(label, style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 11)),
               ],
             ),
           ),
-          const SizedBox(width: 8),
-          Container(width: 1, height: 16, color: color.withValues(alpha: 0.2)),
-          const SizedBox(width: 4),
-          IconButton(
-            icon: Icon(Icons.edit, color: Colors.blueGrey.shade700, size: 14),
-            onPressed: () => onEdit(m, actualIndex),
-            padding: EdgeInsets.zero,
-            constraints: const BoxConstraints(),
-            visualDensity: VisualDensity.compact,
-            tooltip: "Edit $label Format",
-          ),
           const SizedBox(width: 6),
-          IconButton(
-            icon: const Icon(Icons.delete, color: Colors.red, size: 14),
-            onPressed: () => prov.deleteImportMapping(actualIndex),
-            padding: EdgeInsets.zero,
-            constraints: const BoxConstraints(),
-            visualDensity: VisualDensity.compact,
-            tooltip: "Delete $label Format",
+          Container(width: 1, height: 14, color: color.withValues(alpha: 0.3)),
+          const SizedBox(width: 4),
+
+          // Edit Format
+          Tooltip(
+            message: "Edit $label Format Settings",
+            child: InkWell(
+              onTap: () => onEdit(m, actualIndex),
+              child: const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 2.0),
+                child: Icon(Icons.edit_note_rounded, color: Colors.blue, size: 18),
+              ),
+            ),
+          ),
+          const SizedBox(width: 4),
+          Container(width: 1, height: 14, color: color.withValues(alpha: 0.3)),
+          const SizedBox(width: 4),
+
+          // Delete Format
+          Tooltip(
+            message: "Delete $label Format",
+            child: InkWell(
+              onTap: () => prov.deleteImportMapping(actualIndex),
+              child: const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 2.0),
+                child: Icon(Icons.delete_forever_rounded, color: Colors.red, size: 16),
+              ),
+            ),
           ),
         ],
       ),
@@ -221,715 +254,543 @@ class ProductMappingDialog extends StatefulWidget {
 }
 
 class _ProductMappingDialogState extends State<ProductMappingDialog> {
-  final Map<int, Product?> _selectedMatches = {};
-  final Map<int, bool> _skipItems = {};
-  late List<FocusNode> _focusNodes;
-  late List<TextEditingController> _controllers;
-  Map<String, int> _productSalesMap = {};
+  final Map<int, Product?> _selectedMappings = {};
+  final Map<int, String> _customProductNames = {};
+  final Map<int, TextEditingController> _searchControllers = {};
+  final Map<int, FocusNode> _focusNodes = {};
+  final FocusNode _saveButtonFocusNode = FocusNode();
+  bool _isLoading = true;
 
   @override
   void initState() {
     super.initState();
-    _focusNodes = List.generate(widget.unknownItems.length, (index) => FocusNode());
-    _controllers = List.generate(widget.unknownItems.length, (index) => TextEditingController());
-    _initializeMappings();
-    _loadSalesVolume();
+    _loadProducts();
   }
 
-  void _initializeMappings() {
-    for (int i = 0; i < widget.unknownItems.length; i++) {
-      final item = widget.unknownItems[i];
-      String extName = (item.externalName.isNotEmpty ? item.externalName : item.productName).trim();
-      String extCode = item.externalCode.trim();
-
-      // 1. Check if there's an existing saved mapping rule
-      final mappedName = widget.provider.getMappedProduct(widget.wholesalerName, extName, extCode);
-      Product? match;
-      if (mappedName != null && mappedName.isNotEmpty) {
-        String cleanMapped = mappedName.trim().toLowerCase();
-        match = widget.provider.productMaster.cast<Product?>().firstWhere(
-          (p) => p != null && p.name.trim().toLowerCase() == cleanMapped,
-          orElse: () => null,
-        );
-      }
-
-      // 2. Fallback: Check if there's an exact match in Product Master by name or code
-      if (match == null) {
-        String cleanExt = extName.toLowerCase();
-        match = widget.provider.productMaster.cast<Product?>().firstWhere(
-          (p) => p != null && (p.name.trim().toLowerCase() == cleanExt || (extCode.isNotEmpty && p.hsnCode.trim() == extCode)),
-          orElse: () => null,
-        );
-      }
-
-      if (match != null) {
-        _selectedMatches[i] = match;
-        _controllers[i].text = match.name;
-      }
-    }
+  FocusNode _getFocusNode(int index) {
+    return _focusNodes.putIfAbsent(index, () => FocusNode());
   }
 
-  Product? _getValidMatch(int index) {
-    if (index < 0 || index >= widget.unknownItems.length) return null;
-    final text = _controllers[index].text.trim().toLowerCase();
-    if (text.isEmpty) return null;
-
-    final selected = _selectedMatches[index];
-    if (selected != null && selected.name.trim().toLowerCase() == text) {
-      return selected;
-    }
-
-    final exactMatch = widget.provider.productMaster.cast<Product?>().firstWhere(
-      (p) => p != null && p.name.trim().toLowerCase() == text,
-      orElse: () => null,
-    );
-
-    return exactMatch;
+  TextEditingController _getSearchController(int index) {
+    return _searchControllers.putIfAbsent(index, () => TextEditingController());
   }
 
-  Future<void> _loadSalesVolume() async {
-    try {
-      final db = await DbHelper.instance.database;
-      final res = await db.rawQuery('''
-        SELECT product_id, SUM(qty) as total_sold 
-        FROM sales_items 
-        GROUP BY product_id
-      ''');
-      if (mounted) {
-        setState(() {
-          _productSalesMap = {
-            for (var r in res)
-              (r['product_id']?.toString() ?? ''): ((r['total_sold'] as num?)?.toInt() ?? 0)
-          };
-        });
-      }
-    } catch (e) {
-      debugPrint("Error loading sales volume: $e");
+  void _moveToNextBox(int currentIndex) {
+    if (currentIndex < widget.unknownItems.length - 1) {
+      _getFocusNode(currentIndex + 1).requestFocus();
+    } else {
+      _saveButtonFocusNode.requestFocus();
     }
   }
 
   @override
   void dispose() {
-    for (var node in _focusNodes) {
-      node.dispose();
-    }
-    for (var ctrl in _controllers) {
+    for (var ctrl in _searchControllers.values) {
       ctrl.dispose();
     }
+    for (var node in _focusNodes.values) {
+      node.dispose();
+    }
+    _saveButtonFocusNode.dispose();
     super.dispose();
   }
 
-  void _moveToNext(int currentIndex) {
-    if (currentIndex == -1) return;
-    int nextIndex = currentIndex + 1;
-    while (nextIndex < widget.unknownItems.length) {
-      if (_skipItems[nextIndex] != true) {
-        _focusNodes[nextIndex].requestFocus();
-        break;
-      }
-      nextIndex++;
+  Future<void> _loadProducts() async {
+    final prods = widget.provider.productMaster;
+    if (mounted) {
+      setState(() {
+        _isLoading = false;
+        for (int i = 0; i < widget.unknownItems.length; i++) {
+          final extName = widget.unknownItems[i].externalName.trim().toLowerCase();
+          final extCode = widget.unknownItems[i].externalCode.trim().toLowerCase();
+
+          Product? exact;
+          if (extCode.isNotEmpty) {
+            try {
+              exact = prods.firstWhere(
+                (p) => p.id.trim().toLowerCase() == extCode,
+              );
+            } catch (_) {}
+          }
+          if (exact == null) {
+            try {
+              exact = prods.firstWhere(
+                (p) => p.name.trim().toLowerCase() == extName,
+              );
+            } catch (_) {}
+          }
+
+          if (exact != null) {
+            _selectedMappings[i] = exact;
+            _getSearchController(i).text = exact.name;
+          } else {
+            _getSearchController(i).text = "";
+          }
+        }
+      });
     }
   }
 
-  Future<void> _openRegistrationAndAdd(int index, String initialName) async {
-    final Product? newProd = await showDialog<Product>(
+  void _createNewProduct(int index) async {
+    final extName = widget.unknownItems[index].externalName;
+
+    final result = await showDialog<dynamic>(
       context: context,
+      barrierDismissible: true,
       builder: (ctx) => Dialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
         clipBehavior: Clip.antiAlias,
         child: SizedBox(
           width: 600,
-          height: 680,
+          height: 580,
           child: ProductRegistrationScreen(
-            initialName: initialName,
+            initialName: extName,
             isCompact: true,
           ),
         ),
       ),
     );
 
-    if (newProd != null) {
-      if (index != -1) {
-        setState(() {
-          _selectedMatches[index] = newProd;
-          _controllers[index].text = newProd.name;
-        });
-        _moveToNext(index);
-      } else {
-        // Auto-link new product to any unmapped items matching name
-        for (int i = 0; i < widget.unknownItems.length; i++) {
-          if (_selectedMatches[i] == null) {
-            final unkName = (widget.unknownItems[i].productName.isNotEmpty
-                    ? widget.unknownItems[i].productName
-                    : widget.unknownItems[i].externalName)
-                .trim()
-                .toLowerCase();
-            final newName = newProd.name.trim().toLowerCase();
-            if (unkName == newName || unkName.contains(newName) || newName.contains(unkName)) {
-              setState(() {
-                _selectedMatches[i] = newProd;
-                _controllers[i].text = newProd.name;
-              });
-              break;
-            }
-          }
+    final updatedProds = widget.provider.productMaster;
+    if (mounted) {
+      setState(() {
+        Product? newProd;
+        if (result is Product) {
+          newProd = result;
+        } else {
+          try {
+            newProd = updatedProds.firstWhere(
+              (p) => p.name.trim().toLowerCase() == extName.trim().toLowerCase(),
+            );
+          } catch (_) {}
+        }
+
+        if (newProd != null) {
+          _selectedMappings[index] = newProd;
+          _customProductNames.remove(index);
+          _getSearchController(index).text = newProd.name;
+        }
+      });
+    }
+  }
+
+  void _saveMappingsAndImport() async {
+    for (int i = 0; i < widget.unknownItems.length; i++) {
+      if (_selectedMappings[i] == null) {
+        final text = _getSearchController(i).text.trim();
+        if (text.isNotEmpty) {
+          try {
+            final match = widget.provider.productMaster.firstWhere(
+              (p) => p.name.trim().toLowerCase() == text.toLowerCase(),
+            );
+            _selectedMappings[i] = match;
+          } catch (_) {}
         }
       }
+
+      final extName = widget.unknownItems[i].externalName;
+      final extCode = widget.unknownItems[i].externalCode;
+      final mappedProd = _selectedMappings[i];
+
+      if (mappedProd != null) {
+        await widget.provider.saveProductMapping(
+          ProductMapping(
+            wholesalerName: widget.wholesalerName,
+            externalCode: extCode,
+            externalName: extName,
+            internalName: mappedProd.name,
+            productId: mappedProd.id,
+          ),
+        );
+      }
     }
+
+    List<PurchaseItem> result = [];
+    for (int i = 0; i < widget.unknownItems.length; i++) {
+      final base = widget.unknownItems[i];
+      final mappedProd = _selectedMappings[i];
+
+      if (mappedProd != null) {
+        result.add(PurchaseItem(
+          id: mappedProd.id,
+          productName: mappedProd.name,
+          externalName: base.externalName,
+          externalCode: base.externalCode,
+          batch: base.batch,
+          expiry: base.expiry,
+          packin: base.packin > 0 ? base.packin : mappedProd.packSize,
+          qty: base.qty,
+          fQty: base.fQty,
+          mrp: base.mrp > 0 ? base.mrp : mappedProd.mrp,
+          pRate: base.pRate > 0 ? base.pRate : mappedProd.purchaseRate,
+          sRate: base.sRate > 0 ? base.sRate : mappedProd.salePrice,
+          discPercent: base.discPercent,
+          gstPercent: base.gstPercent > 0 ? base.gstPercent : 12.0,
+          hsnCode: base.hsnCode.isNotEmpty ? base.hsnCode : mappedProd.hsnCode,
+        ));
+      } else {
+        String finalName = _customProductNames[i] ?? base.externalName;
+        result.add(PurchaseItem(
+          id: base.externalCode.isNotEmpty ? base.externalCode : "UNMAPPED_${i + 1}",
+          productName: finalName,
+          externalName: base.externalName,
+          externalCode: base.externalCode,
+          batch: base.batch,
+          expiry: base.expiry,
+          packin: base.packin,
+          qty: base.qty,
+          fQty: base.fQty,
+          mrp: base.mrp,
+          pRate: base.pRate,
+          sRate: base.sRate,
+          discPercent: base.discPercent,
+          gstPercent: base.gstPercent,
+          hsnCode: base.hsnCode,
+        ));
+      }
+    }
+
+    widget.onImportRequested(result);
   }
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      width: 950,
-      height: 650,
-      child: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(24, 16, 24, 8),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
+    if (_isLoading) {
+      return const SizedBox(
+        height: 250,
+        child: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    return Column(
+      children: [
+        Container(
+          padding: const EdgeInsets.all(12),
+          color: Colors.blue.shade50,
+          child: Row(
+            children: [
+              const Icon(Icons.info_outline, color: Colors.blue),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  "Map unknown products from '${widget.wholesalerName}' to internal inventory. Mappings are remembered for future imports.",
+                  style: TextStyle(fontSize: 12, color: Colors.blue.shade900),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: ListView.separated(
+            padding: const EdgeInsets.all(12),
+            itemCount: widget.unknownItems.length,
+            separatorBuilder: (ctx, i) => const Divider(),
+            itemBuilder: (ctx, index) {
+              final item = widget.unknownItems[index];
+              final bool isMapped = _selectedMappings[index] != null;
+
+              return Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Row(
                   children: [
                     Expanded(
-                      child: Text("Link Unknown Products (${widget.wholesalerName})",
-                          style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF1E293B))),
-                    ),
-                    const SizedBox(width: 10),
-                    ElevatedButton.icon(
-                      icon: const Icon(Icons.add_circle_outline_rounded, size: 16),
-                      label: const Text("CREATE PRODUCT", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.blue.shade700,
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                      ),
-                      onPressed: () => _openRegistrationAndAdd(-1, ""),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                const Text(
-                  "The following items from Excel don't match your Product Master. Link them to existing products to import them. This will be remembered permanently.",
-                  style: TextStyle(fontSize: 14, color: Colors.blueGrey),
-                ),
-              ],
-            ),
-          ),
-          Expanded(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 24.0),
-              child: ListView.builder(
-                itemCount: widget.unknownItems.length,
-                itemBuilder: (ctx, i) {
-                  final item = widget.unknownItems[i];
-                  final isSkipped = _skipItems[i] ?? false;
-
-                  // --- CORRECTED DISPLAY NAME PRIORITY ---
-                  // Force it to use productName first (extracted from your 'itemname' column), 
-                  // falling back to externalName only if empty. Never default to code numbers!
-                  String displayName = item.productName.trim();
-                  if (displayName.isEmpty || RegExp(r'^\d+$').hasMatch(displayName)) {
-                    if (item.externalName.trim().isNotEmpty && !RegExp(r'^\d+$').hasMatch(item.externalName.trim())) {
-                      displayName = item.externalName.trim();
-                    }
-                  }
-
-                  String itemCode = item.externalCode.trim();
-                  if (itemCode.isEmpty && RegExp(r'^\d+$').hasMatch(item.productName)) {
-                    itemCode = item.productName.trim();
-                  }
-
-                  return Container(
-                    padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 10),
-                    margin: const EdgeInsets.only(bottom: 4),
-                    decoration: BoxDecoration(
-                      color: isSkipped ? Colors.grey.shade100 : Colors.white,
-                      border: Border.all(color: Colors.grey.shade300),
-                      borderRadius: BorderRadius.circular(6),
-                    ),
-                    child: Row(
-                      children: [
-                        // 1. MOST LEFT SIDE: Item Code
-                        if (itemCode.isNotEmpty) ...[
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                            decoration: BoxDecoration(
-                              color: Colors.blue.shade50,
-                              borderRadius: BorderRadius.circular(4),
-                              border: Border.all(color: Colors.blue.shade200),
-                            ),
-                            child: Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              crossAxisAlignment: CrossAxisAlignment.center,
-                              children: [
-                                Text("CODE", style: TextStyle(fontSize: 8, fontWeight: FontWeight.bold, color: Colors.blue.shade700)),
-                                Text(
-                                  itemCode,
-                                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.blue.shade900),
-                                ),
-                              ],
+                      flex: 3,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            item.externalName,
+                            style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 13.5,
+                              color: Colors.black87,
                             ),
                           ),
-                          const SizedBox(width: 10),
+                          if (item.externalCode.isNotEmpty)
+                            Text("Code: ${item.externalCode}", style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                          Text("Batch: ${item.batch} | Exp: ${item.expiry} | Qty: ${item.qty} | MRP: ₹${item.mrp}", style: const TextStyle(fontSize: 11, color: Colors.blueGrey)),
                         ],
-
-                        // 2. MIDDLE: Item Name (Wholesaler Print)
-                        Expanded(
-                          flex: 3,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                displayName,
-                                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF1E293B)),
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                              const SizedBox(height: 2),
-                              Builder(
-                                builder: (_) {
-                                  double displayMrp = item.mrp;
-                                  String displayGen = "";
-                                  if (_selectedMatches[i] != null) {
-                                    if (displayMrp <= 0) displayMrp = _selectedMatches[i]!.mrp;
-                                    displayGen = _selectedMatches[i]!.genericName.trim();
-                                  }
-                                  String mrpText = displayMrp > 0 ? displayMrp.toStringAsFixed(2) : "0.00";
-                                  String genSuffix = displayGen.isNotEmpty ? " | Generic: $displayGen" : "";
-                                  return Text(
-                                    "MRP: $mrpText | Batch: ${item.batch.isNotEmpty ? item.batch : '-'}$genSuffix",
-                                    style: const TextStyle(fontSize: 10, color: Colors.grey),
-                                    overflow: TextOverflow.ellipsis,
-                                  );
-                                },
-                              ),
-                            ],
-                          ),
-                        ),
-
-                        const Icon(Icons.arrow_right_alt_rounded, color: Colors.grey, size: 20),
-                        const SizedBox(width: 10),
-
-                        // 3. RIGHT SIDE: Our Software Name (Dropdown, editable Autocomplete)
-                        Expanded(
-                          flex: 4,
-                          child: isSkipped
-                              ? const Text("SKIPPED", style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold))
-                              : Autocomplete<Product>(
-                            focusNode: _focusNodes[i],
-                            textEditingController: _controllers[i],
-                            displayStringForOption: (p) => p.name,
-                            optionsBuilder: (TextEditingValue v) {
-                              final q = v.text.trim().toLowerCase();
-                              if (q.isEmpty) {
-                                return const Iterable<Product>.empty();
+                      ),
+                    ),
+                    const Icon(Icons.arrow_forward, color: Colors.grey, size: 16),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      flex: 4,
+                      child: RawAutocomplete<Product>(
+                        focusNode: _getFocusNode(index),
+                        textEditingController: _getSearchController(index),
+                        displayStringForOption: (Product p) => p.name,
+                        optionsBuilder: (TextEditingValue textEditingValue) {
+                          final query = textEditingValue.text.trim();
+                          if (query.isEmpty) {
+                            return const Iterable<Product>.empty();
+                          }
+                          return widget.provider.searchProducts(query, includeGenerics: true);
+                        },
+                        onSelected: (Product selection) {
+                          setState(() {
+                            _selectedMappings[index] = selection;
+                            _customProductNames.remove(index);
+                            _getSearchController(index).text = selection.name;
+                          });
+                          _moveToNextBox(index);
+                        },
+                        fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) {
+                          focusNode.addListener(() {
+                            if (!focusNode.hasFocus) {
+                              final selected = _selectedMappings[index];
+                              if (selected == null || controller.text.trim() != selected.name.trim()) {
+                                if (selected != null) {
+                                  controller.text = selected.name;
+                                } else {
+                                  controller.clear();
+                                }
                               }
+                            }
+                          });
 
-                              final matches = widget.provider.searchProducts(q, includeGenerics: false);
+                          if (_selectedMappings[index] != null && controller.text.isEmpty) {
+                            controller.text = _selectedMappings[index]!.name;
+                          }
 
-                              if (matches.isEmpty) {
-                                return [Product(id: "CREATE_NEW", name: v.text.trim())];
-                              }
-
-                              return matches.take(30);
-                            },
-                            onSelected: (p) {
-                              if (p.id == "CREATE_NEW") {
-                                _openRegistrationAndAdd(i, p.name);
+                          return TextField(
+                            controller: controller,
+                            focusNode: focusNode,
+                            style: TextStyle(
+                              color: isMapped ? Colors.green.shade900 : Colors.black87,
+                              fontWeight: isMapped ? FontWeight.w600 : FontWeight.normal,
+                            ),
+                            decoration: InputDecoration(
+                              isDense: true,
+                              hintText: "Search internal product...",
+                              contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                              border: const OutlineInputBorder(),
+                              enabledBorder: OutlineInputBorder(
+                                borderSide: BorderSide(
+                                  color: isMapped ? Colors.green.shade600 : Colors.grey.shade400,
+                                  width: isMapped ? 1.5 : 1.0,
+                                ),
+                              ),
+                              focusedBorder: OutlineInputBorder(
+                                borderSide: BorderSide(
+                                  color: isMapped ? Colors.green.shade700 : Colors.blue,
+                                  width: 2.0,
+                                ),
+                              ),
+                              suffixIcon: isMapped
+                                  ? IconButton(
+                                      icon: const Icon(Icons.check_circle, color: Colors.green, size: 18),
+                                      onPressed: () {
+                                        controller.clear();
+                                        setState(() {
+                                          _selectedMappings.remove(index);
+                                          _customProductNames.remove(index);
+                                        });
+                                      },
+                                    )
+                                  : (controller.text.isNotEmpty
+                                      ? IconButton(
+                                          icon: const Icon(Icons.clear, size: 16),
+                                          onPressed: () {
+                                            controller.clear();
+                                            setState(() {
+                                              _selectedMappings.remove(index);
+                                              _customProductNames.remove(index);
+                                            });
+                                          },
+                                        )
+                                      : null),
+                            ),
+                            onSubmitted: (value) {
+                              onFieldSubmitted();
+                              if (_selectedMappings[index] != null) {
+                                _getSearchController(index).text = _selectedMappings[index]!.name;
+                                _moveToNextBox(index);
                                 return;
                               }
-                              setState(() => _selectedMatches[i] = p);
-                              _moveToNext(i);
-                            },
-                            fieldViewBuilder: (ctx, ctrl, fn, onFieldSubmitted) {
-                              final Product? validMatch = _getValidMatch(i);
-                              final bool hasText = ctrl.text.trim().isNotEmpty;
-                              final bool isValid = validMatch != null;
-                              final bool isFocused = fn.hasFocus;
-                              final bool isInvalid = hasText && !isValid && !isFocused && !isSkipped;
-
-                              Color fillColor = Colors.white;
-                              Color borderColor = Colors.grey.shade400;
-                              Widget? suffixIcon;
-
-                              if (isSkipped) {
-                                fillColor = Colors.grey.shade100;
-                              } else if (isValid) {
-                                fillColor = Colors.green.shade50;
-                                borderColor = Colors.green.shade600;
-                                suffixIcon = const Icon(Icons.check_circle_rounded, color: Colors.green, size: 18);
-                              } else if (isFocused) {
-                                fillColor = Colors.amber.shade50;
-                                borderColor = Colors.blue.shade700;
-                                suffixIcon = const Icon(Icons.search_rounded, color: Colors.blue, size: 18);
-                              } else if (isInvalid) {
-                                fillColor = Colors.red.shade50;
-                                borderColor = Colors.red.shade500;
-                                suffixIcon = const Tooltip(
-                                  message: "Invalid product name! Must select from dropdown.",
-                                  child: Icon(Icons.cancel_rounded, color: Colors.red, size: 18),
-                                );
-                              } else {
-                                fillColor = Colors.amber.shade50;
-                                borderColor = Colors.amber.shade600;
-                                suffixIcon = const Icon(Icons.search_rounded, color: Colors.amber, size: 18);
+                              final query = value.trim();
+                              if (query.isNotEmpty) {
+                                final matches = widget.provider.searchProducts(query, includeGenerics: true);
+                                if (matches.isNotEmpty) {
+                                  final topMatch = matches.first;
+                                  setState(() {
+                                    _selectedMappings[index] = topMatch;
+                                    _customProductNames.remove(index);
+                                    _getSearchController(index).text = topMatch.name;
+                                  });
+                                  _moveToNextBox(index);
+                                  return;
+                                }
                               }
-
-                              return Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  TextField(
-                                    controller: ctrl,
-                                    focusNode: fn,
-                                    onChanged: (v) {
-                                      setState(() {
-                                        _selectedMatches[i] = _getValidMatch(i);
-                                      });
-                                    },
-                                    decoration: InputDecoration(
-                                      hintText: "Search Product...",
-                                      border: const OutlineInputBorder(),
-                                      enabledBorder: OutlineInputBorder(
-                                        borderSide: BorderSide(color: borderColor, width: (isInvalid || isValid) ? 1.5 : 1.0),
-                                      ),
-                                      focusedBorder: OutlineInputBorder(
-                                        borderSide: BorderSide(color: Colors.blue.shade700, width: 2.0),
-                                      ),
-                                      filled: true,
-                                      fillColor: fillColor,
-                                      isDense: true,
-                                      contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-                                      suffixIcon: suffixIcon,
-                                    ),
-                                    onSubmitted: (val) {
-                                      onFieldSubmitted();
-                                      _moveToNext(i);
-                                    },
-                                  ),
-                                  if (isInvalid && !isSkipped)
-                                    Padding(
-                                      padding: const EdgeInsets.only(top: 2, left: 2),
-                                      child: Text(
-                                        "NOT IN DROPDOWN - Select valid product from list",
-                                        style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Colors.red.shade700),
-                                      ),
-                                    ),
-                                ],
-                              );
+                              _moveToNextBox(index);
                             },
-                            optionsViewBuilder: (context, onSelected, options) {
-                              final String typedText = _controllers[i].text;
-                              final bool isCreateNew = options.length == 1 && options.first.id == "CREATE_NEW";
+                          );
+                        },
+                        optionsViewBuilder: (context, onSelected, options) {
+                          return Align(
+                            alignment: Alignment.topLeft,
+                            child: Material(
+                              elevation: 6,
+                              borderRadius: BorderRadius.circular(4),
+                              color: Colors.white,
+                              child: ConstrainedBox(
+                                constraints: const BoxConstraints(maxHeight: 250, maxWidth: 450),
+                                child: ListView.builder(
+                                  padding: EdgeInsets.zero,
+                                  shrinkWrap: true,
+                                  itemCount: options.length,
+                                  itemBuilder: (BuildContext context, int optionIndex) {
+                                    final Product option = options.elementAt(optionIndex);
+                                    final bool hasStock = option.stock > 0;
 
-                              return Align(
-                                alignment: Alignment.topLeft,
-                                child: Material(
-                                  elevation: 8,
-                                  borderRadius: BorderRadius.circular(4),
-                                  child: ConstrainedBox(
-                                    constraints: const BoxConstraints(maxHeight: 300, maxWidth: 650),
-                                    child: Column(
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        if (isCreateNew)
-                                          InkWell(
-                                            onTap: () {
-                                              _openRegistrationAndAdd(i, typedText);
-                                            },
-                                            child: Container(
-                                              width: double.infinity,
-                                              padding: const EdgeInsets.all(12),
-                                              color: Colors.orange.shade50,
-                                              child: Row(
-                                                children: [
-                                                  const Icon(Icons.add_circle, color: Colors.orange),
-                                                  const SizedBox(width: 10),
-                                                  Expanded(
-                                                    child: Text("PRODUCT NOT FOUND. CREATE NEW: '$typedText'?",
-                                                      style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.orange),
-                                                    ),
-                                                  ),
-                                                  const Icon(Icons.arrow_forward_ios, size: 14, color: Colors.orange),
-                                                ],
-                                              ),
+                                    return Builder(
+                                      builder: (BuildContext context) {
+                                        final bool highlight = AutocompleteHighlightedOption.of(context) == optionIndex;
+
+                                        return InkWell(
+                                          onTap: () => onSelected(option),
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                            decoration: BoxDecoration(
+                                              color: highlight
+                                                  ? (hasStock ? Colors.blue.shade50 : Colors.red.shade50)
+                                                  : (hasStock ? Colors.white : Colors.red.shade50.withAlpha(20)),
+                                              border: Border(bottom: BorderSide(color: Colors.grey.shade200)),
                                             ),
-                                          ),
-                                        if (!isCreateNew) ...[
-                                          Container(
-                                            height: 24,
-                                            color: Colors.blue.shade900,
-                                            child: const Row(
+                                            child: Column(
+                                              crossAxisAlignment: CrossAxisAlignment.start,
                                               children: [
-                                                SizedBox(width: 8),
-                                                Expanded(flex: 6, child: Text("Product Name", style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold))),
-                                                Expanded(flex: 2, child: Text("Generic / Salt", style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold))),
-                                                Expanded(flex: 1, child: Text("Stock", style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold), textAlign: TextAlign.right)),
-                                                Expanded(flex: 1, child: Text("MRP", style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold), textAlign: TextAlign.right)),
-                                                SizedBox(width: 8),
+                                                Row(
+                                                  children: [
+                                                    Expanded(
+                                                      child: Text(
+                                                        option.name,
+                                                        style: TextStyle(
+                                                          fontSize: 13,
+                                                          fontWeight: FontWeight.bold,
+                                                          color: highlight ? Colors.blue.shade900 : Colors.black87,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                    const SizedBox(width: 8),
+                                                    Container(
+                                                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                                      decoration: BoxDecoration(
+                                                        color: hasStock ? Colors.green.shade50 : Colors.red.shade50,
+                                                        borderRadius: BorderRadius.circular(4),
+                                                        border: Border.all(
+                                                          color: hasStock ? Colors.green.shade300 : Colors.red.shade300,
+                                                        ),
+                                                      ),
+                                                      child: Text(
+                                                        "Stock: ${option.stock}",
+                                                        style: TextStyle(
+                                                          fontSize: 10.5,
+                                                          fontWeight: FontWeight.bold,
+                                                          color: hasStock ? Colors.green.shade800 : Colors.red.shade900,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                                const SizedBox(height: 3),
+                                                Row(
+                                                  children: [
+                                                    Expanded(
+                                                      child: Text(
+                                                        [
+                                                          if (option.manufacturer.isNotEmpty) option.manufacturer,
+                                                          if (option.genericName.isNotEmpty) option.genericName,
+                                                        ].join(" • "),
+                                                        maxLines: 1,
+                                                        overflow: TextOverflow.ellipsis,
+                                                        style: TextStyle(
+                                                          fontSize: 10.5,
+                                                          color: Colors.grey.shade600,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                    const SizedBox(width: 8),
+                                                    Text(
+                                                      "MRP: ₹${option.mrp.toStringAsFixed(2)}",
+                                                      style: const TextStyle(
+                                                        fontSize: 11,
+                                                        fontWeight: FontWeight.bold,
+                                                        color: Colors.black87,
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
                                               ],
                                             ),
                                           ),
-                                          Flexible(
-                                            child: ListView.builder(
-                                              padding: EdgeInsets.zero,
-                                              shrinkWrap: true,
-                                              itemCount: options.length,
-                                              itemBuilder: (BuildContext context, int index) {
-                                                final Product option = options.elementAt(index);
-                                                return InkWell(
-                                                  onTap: () => onSelected(option),
-                                                  child: Builder(
-                                                      builder: (context) {
-                                                        final bool highlight = AutocompleteHighlightedOption.of(context) == index;
-                                                        if (highlight) {
-                                                          SchedulerBinding.instance.addPostFrameCallback((Duration timeStamp) {
-                                                            Scrollable.ensureVisible(context, alignment: 0.5);
-                                                          });
-                                                        }
-                                                        return Container(
-                                                          color: highlight ? Colors.blue.shade50 : Colors.white,
-                                                          padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
-                                                          child: Row(
-                                                            children: [
-                                                              Expanded(
-                                                                flex: 6,
-                                                                child: Tooltip(
-                                                                  message: option.name,
-                                                                  child: Text(
-                                                                    option.name,
-                                                                    style: TextStyle(
-                                                                      fontSize: 12,
-                                                                      fontWeight: highlight ? FontWeight.bold : FontWeight.normal,
-                                                                    ),
-                                                                    overflow: TextOverflow.ellipsis,
-                                                                  ),
-                                                                ),
-                                                              ),
-                                                              Expanded(
-                                                                flex: 2,
-                                                                child: Tooltip(
-                                                                  message: option.genericName,
-                                                                  child: Text(
-                                                                    option.genericName,
-                                                                    style: const TextStyle(fontSize: 10, color: Colors.blueGrey),
-                                                                    overflow: TextOverflow.ellipsis,
-                                                                  ),
-                                                                ),
-                                                              ),
-                                                              Expanded(
-                                                                flex: 1,
-                                                                child: Text(
-                                                                  option.stock.toString(),
-                                                                  style: const TextStyle(fontSize: 11, color: Colors.blue),
-                                                                  textAlign: TextAlign.right,
-                                                                ),
-                                                              ),
-                                                              Expanded(
-                                                                flex: 1,
-                                                                child: Text(
-                                                                  option.mrp.toStringAsFixed(2),
-                                                                  style: const TextStyle(fontSize: 11, color: Colors.green),
-                                                                  textAlign: TextAlign.right,
-                                                                ),
-                                                              ),
-                                                            ],
-                                                          ),
-                                                        );
-                                                      }
-                                                  ),
-                                                );
-                                              },
-                                            ),
-                                          ),
-                                        ],
-                                      ],
-                                    ),
-                                  ),
+                                        );
+                                      },
+                                    );
+                                  },
                                 ),
-                              );
-                            },
-                          ),
-                        ),
-                        IconButton(
-                          icon: Icon(isSkipped ? Icons.add_circle_outline : Icons.remove_circle_outline, color: isSkipped ? Colors.green : Colors.red),
-                          onPressed: () => setState(() => _skipItems[i] = !isSkipped),
-                          tooltip: isSkipped ? "Include" : "Skip",
-                        ),
-                      ],
+                              ),
+                            ),
+                          );
+                        },
+                      ),
                     ),
-                  );
-                },
+                    const SizedBox(width: 8),
+                    IconButton(
+                      icon: const Icon(Icons.add_circle, color: Colors.green),
+                      tooltip: "Register New Product in Inventory",
+                      onPressed: () => _createNewProduct(index),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          decoration: BoxDecoration(
+            color: Colors.blue.shade50,
+            border: Border(top: BorderSide(color: Colors.blue.shade200, width: 1.5)),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                "${widget.unknownItems.length} Products to Link",
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.blue.shade900),
               ),
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.all(24.0),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
-                TextButton(
-                  onPressed: () => widget.onImportRequested(null),
-                  child: const Text("CANCEL", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blueGrey)),
-                ),
-                const SizedBox(width: 16),
-                ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.blue.shade50,
-                    foregroundColor: Colors.blue.shade900,
-                    padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+              Row(
+                children: [
+                  OutlinedButton(
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.grey.shade800,
+                      side: BorderSide(color: Colors.grey.shade400),
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                    ),
+                    onPressed: () => widget.onImportRequested(null),
+                    child: const Text("CANCEL", style: TextStyle(fontWeight: FontWeight.bold)),
                   ),
-                  onPressed: () async {
-                    final nav = Navigator.of(context);
-                    int mappedCount = 0;
-                    int unmappedCount = 0;
-
-                    for (int i = 0; i < widget.unknownItems.length; i++) {
-                      if (_skipItems[i] == true) continue;
-                      if (_getValidMatch(i) != null) {
-                        mappedCount++;
-                      } else {
-                        unmappedCount++;
-                      }
-                    }
-
-                    // 1. If unmapped items exist, show confirmation dialog
-                    if (unmappedCount > 0) {
-                      final bool? proceed = await showDialog<bool>(
-                        context: context,
-                        builder: (ctx) => AlertDialog(
-                          backgroundColor: const Color(0xFF1E293B),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                          title: const Row(
-                            children: [
-                              Icon(Icons.warning_amber_rounded, color: Colors.amberAccent, size: 26),
-                              SizedBox(width: 10),
-                              Text("Unmapped Items Found", style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
-                            ],
-                          ),
-                          content: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                "You haven't mapped all stocks ($unmappedCount unmapped item(s) out of ${mappedCount + unmappedCount}).",
-                                style: const TextStyle(color: Color(0xFFCBD5E1), fontSize: 13),
-                              ),
-                              const SizedBox(height: 10),
-                              const Text(
-                                "Do you want to continue importing? Unmapped items will be imported with blank product names so you can fill them in the purchase table.",
-                                style: TextStyle(color: Colors.white70, fontSize: 12),
-                              ),
-                            ],
-                          ),
-                          actions: [
-                            TextButton(
-                              onPressed: () => Navigator.of(ctx).pop(false),
-                              child: const Text("Map Items Now", style: TextStyle(color: Colors.amberAccent, fontWeight: FontWeight.bold)),
-                            ),
-                            ElevatedButton.icon(
-                              onPressed: () => Navigator.of(ctx).pop(true),
-                              style: ElevatedButton.styleFrom(backgroundColor: Colors.blue.shade700, foregroundColor: Colors.white),
-                              icon: const Icon(Icons.arrow_forward_rounded, size: 16),
-                              label: const Text("Continue Import"),
-                            ),
-                          ],
-                        ),
-                      );
-
-                      if (!mounted) return;
-                      if (proceed != true) {
-                        return; // User chose to stay and map items
-                      }
-                    }
-
-                    final List<PurchaseItem> mappedItems = [];
-                    String cleanWholesaler = widget.wholesalerName.replaceAll(' - PDF', '').replaceAll(' - EXCEL', '').trim().toUpperCase();
-
-                    for (int i = 0; i < widget.unknownItems.length; i++) {
-                      if (_skipItems[i] == true) continue;
-
-                      final match = _getValidMatch(i);
-                      final original = widget.unknownItems[i];
-
-                      if (match != null) {
-                        // Mapped item: Save DB mapping rule permanently
-                        await widget.provider.saveProductMapping(ProductMapping(
-                          wholesalerName: cleanWholesaler,
-                          externalCode: original.externalCode.trim(),
-                          externalName: (original.externalName.isNotEmpty ? original.externalName : original.productName).trim(),
-                          internalName: match.name,
-                          productId: match.id,
-                        ));
-                        if (!mounted) return;
-
-                        mappedItems.add(PurchaseItem(
-                          id: match.id,
-                          productName: match.name,
-                          externalName: original.externalName,
-                          externalCode: original.externalCode,
-                          batch: original.batch,
-                          expiry: original.expiry,
-                          qty: original.qty,
-                          fQty: original.fQty,
-                          pRate: original.pRate,
-                          mrp: original.mrp == 0 ? match.mrp : original.mrp,
-                          gstPercent: original.gstPercent == 0 ? match.gstPercent : original.gstPercent,
-                          sRate: original.sRate,
-                          packin: original.packin == 0 ? match.packSize : original.packin,
-                          rack: original.rack.isEmpty ? match.rack : original.rack,
-                          hsnCode: original.hsnCode.isEmpty ? match.hsnCode : original.hsnCode,
-                          gross: original.gross,
-                          discPercent: original.discPercent,
-                          discAmt: 0, net: 0, gstAmt: 0, total: 0,
-                          sDiscPercent: match.sDiscPercent,
-                        ));
-                      } else {
-                        // Unmapped item: Keep productName blank, import all other details
-                        mappedItems.add(PurchaseItem(
-                          id: "UNKNOWN",
-                          productName: "", // KEEP BLANK ON PRODUCT NAME AS REQUESTED
-                          externalName: original.externalName,
-                          externalCode: original.externalCode,
-                          batch: original.batch,
-                          expiry: original.expiry,
-                          qty: original.qty,
-                          fQty: original.fQty,
-                          pRate: original.pRate,
-                          mrp: original.mrp,
-                          gstPercent: original.gstPercent,
-                          sRate: original.sRate,
-                          packin: original.packin,
-                          rack: original.rack,
-                          hsnCode: original.hsnCode,
-                          gross: original.gross,
-                          discPercent: original.discPercent,
-                          discAmt: 0, net: 0, gstAmt: 0, total: 0,
-                          sDiscPercent: original.sDiscPercent,
-                        ));
-                      }
-                    }
-
-                    _finishImport(mappedItems);
-                  },
-                  child: const Text("IMPORT MAPPED ITEMS", style: TextStyle(fontWeight: FontWeight.bold)),
-                ),
-              ],
-            ),
+                  const SizedBox(width: 12),
+                  ElevatedButton.icon(
+                    focusNode: _saveButtonFocusNode,
+                    icon: const Icon(Icons.check_circle_rounded, size: 18),
+                    label: const Text("SAVE MAPPINGS & IMPORT", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.green.shade700,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                      elevation: 2,
+                    ),
+                    onPressed: _saveMappingsAndImport,
+                  ),
+                ],
+              ),
+            ],
           ),
-        ],
-      ),
+        ),
+      ],
     );
-  }
-
-  void _finishImport(List<PurchaseItem> mappedItems) {
-    if (!mounted) return;
-    widget.onImportRequested(mappedItems);
-    if (Navigator.of(context).canPop()) {
-      Navigator.of(context).pop(true);
-    }
   }
 }

@@ -5,6 +5,7 @@ import 'package:intl/intl.dart';
 import '../providers/pharmacy_provider.dart';
 import '../providers/app_provider.dart';
 import '../utils/theme_constants.dart';
+import '../utils/app_formatters.dart';
 import '../widgets/pin_unlock_dialog.dart';
 import '../widgets/edit_history_dialog.dart';
 import '../widgets/app_date_picker.dart';
@@ -21,13 +22,16 @@ class EditedInvoicesScreen extends StatefulWidget {
 
 class _EditedInvoicesScreenState extends State<EditedInvoicesScreen> {
   final TextEditingController _searchCtrl = TextEditingController();
-  DateTime _fromDate = DateTime.now().subtract(const Duration(days: 180)); // 6 Months
+  DateTime _fromDate = DateTime.now();
   DateTime _toDate = DateTime.now();
   String _selectedType = 'Sales';
   bool _editedOnly = true;
 
   List<Map<String, dynamic>> _editedData = [];
   bool _isLoading = false;
+  int? _selectedIndex;
+  int? _lastTapIndex;
+  DateTime? _lastTapTime;
 
   @override
   void initState() {
@@ -241,7 +245,7 @@ class _EditedInvoicesScreenState extends State<EditedInvoicesScreen> {
             const SizedBox(width: 16),
             ElevatedButton.icon(
               onPressed: () {
-                _fromDate = DateTime.now().subtract(const Duration(days: 180));
+                _fromDate = DateTime.now();
                 _toDate = DateTime.now();
                 _searchCtrl.clear();
                 _fetchData();
@@ -350,20 +354,31 @@ class _EditedInvoicesScreenState extends State<EditedInvoicesScreen> {
                 itemBuilder: (context, i) {
                   final item = data[i];
                   DateTime dt = DateTime.tryParse(item['date']?.toString() ?? "") ?? DateTime.now();
-                  final entryNo = item['entry_no']?.toString() ?? "";
                   final party = (item['patient'] ?? item['supplier_name'] ?? "").toString();
                   final editSummary = item['_edit_summary']?.toString() ?? "N/A";
                   final oldTotal = (item['previous_grand_total'] as num?)?.toDouble() ?? 0.0;
                   final newTotal = (item['grand_total'] as num?)?.toDouble() ?? 0.0;
                   final entryLabel = _getEntryLabel(item);
+                  final bool isSelected = (i == _selectedIndex);
 
                   return InkWell(
-                    onTap: () => _openInvoiceInEditor(item),
+                    onTap: () {
+                      final now = DateTime.now();
+                      setState(() => _selectedIndex = i);
+                      if (_lastTapIndex == i && _lastTapTime != null && now.difference(_lastTapTime!) < const Duration(milliseconds: 350)) {
+                        _lastTapTime = null;
+                        _lastTapIndex = null;
+                        _openInvoiceInEditor(item);
+                      } else {
+                        _lastTapIndex = i;
+                        _lastTapTime = now;
+                      }
+                    },
                     child: Container(
                       height: 45,
                       decoration: BoxDecoration(
-                        color: i % 2 == 0 ? Colors.white : Colors.grey.shade50,
-                        border: Border(bottom: BorderSide(color: Colors.grey.shade100)),
+                        color: isSelected ? const Color(0xFFBAE6FD) : (i % 2 == 0 ? Colors.white : Colors.grey.shade50),
+                        border: Border(bottom: BorderSide(color: isSelected ? Colors.blue.shade300 : Colors.grey.shade100)),
                       ),
                       child: Row(
                         children: [
@@ -421,7 +436,7 @@ class _EditedInvoicesScreenState extends State<EditedInvoicesScreen> {
           context,
           provider,
           title: "Locked Entry",
-          message: "Enter Master Password to modify Entry $entryNo."
+          message: "Enter Master Password to modify Entry ${formatSaleDisplayNo(entryNo)}."
       );
 
       if (!mounted) return;
@@ -445,7 +460,7 @@ class _EditedInvoicesScreenState extends State<EditedInvoicesScreen> {
     }
 
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text("Editing $entryLabel #$entryNo"),
+      content: Text("Editing $entryLabel #${formatSaleDisplayNo(entryNo)}"),
       backgroundColor: Colors.orange,
       duration: const Duration(seconds: 2),
     ));

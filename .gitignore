@@ -14,6 +14,12 @@ migrate_working_dir/
 .artifacts/
 debug_lines.txt
 unnamed.patch
+*.zip
+*.ZIP
+analyze_output.txt
+analyze_results.txt
+supabase_analysis_results.json
+supabase_schema_dump.json
 
 # IntelliJ related
 *.iml

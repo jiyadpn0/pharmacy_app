@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
@@ -10,7 +11,9 @@ import '../providers/mdi_controller.dart';
 import '../utils/theme_constants.dart';
 import '../widgets/pin_unlock_dialog.dart';
 import '../widgets/app_date_picker.dart';
+import '../widgets/erp_grid_text_field.dart';
 import '../utils/search_debouncer.dart';
+import '../utils/unsaved_handler.dart';
 
 enum StockViewMode { pendingOnly, discrepancies, twoSide }
 
@@ -21,7 +24,30 @@ class StockCheckingScreen extends StatefulWidget {
   State<StockCheckingScreen> createState() => _StockCheckingScreenState();
 }
 
-class _StockCheckingScreenState extends State<StockCheckingScreen> {
+class _StockCheckingScreenState extends State<StockCheckingScreen> implements UnsavedHandler {
+  @override
+  bool hasUnsavedChanges() {
+    int totalEntries = 0;
+    for (var map in _agentPhysicalQtys.values) {
+      totalEntries += map.length;
+    }
+    if (totalEntries <= 0) return false;
+    return _agentPhysicalQtys.values.any((map) => map.isNotEmpty);
+  }
+
+  @override
+  void showDifferences() {}
+
+  Future<bool?> _promptDiscardChanges() async {
+    if (!hasUnsavedChanges()) return true;
+
+    final result = await showUnsavedChangesDialog(context);
+    if (result == UnsavedDialogResult.discard) {
+      return true;
+    } else {
+      return false;
+    }
+  }
   // UI State
   bool _batchMode = true;
   int _activeAgentIdx = 0;
@@ -87,6 +113,12 @@ class _StockCheckingScreenState extends State<StockCheckingScreen> {
   final ScrollController _leftScrollCtrl = ScrollController();
   final ScrollController _rightScrollCtrl = ScrollController();
 
+  // Audit Scanner State
+  bool _isAuditScannerActive = false;
+  String _auditBarcodeBuffer = "";
+  DateTime _lastAuditKeyPress = DateTime.now();
+  final FocusNode _auditFocusNode = FocusNode();
+
   // Debounce for refresh and save
   final SearchDebouncer _refreshDebouncer = SearchDebouncer(milliseconds: 300);
   final SearchDebouncer _saveDebouncer = SearchDebouncer(milliseconds: 1000);
@@ -94,15 +126,18 @@ class _StockCheckingScreenState extends State<StockCheckingScreen> {
   @override
   void initState() {
     super.initState();
+    UnsavedChangesRegistry.register("STOCK CHECKING", this);
     _loadState();
   }
 
   @override
   void dispose() {
+    UnsavedChangesRegistry.unregister("STOCK CHECKING");
     _refreshDebouncer.dispose();
     _saveDebouncer.dispose();
     _leftScrollCtrl.dispose();
     _rightScrollCtrl.dispose();
+    _auditFocusNode.dispose();
     for (var map in [_itemFocusNodesLeft, _itemFocusNodesRight]) {
       for (var agentNodes in map.values) {
         for (var node in agentNodes.values) {
@@ -360,16 +395,21 @@ class _StockCheckingScreenState extends State<StockCheckingScreen> {
             String filterStr = (filter['value1']?.toString() ?? "").toLowerCase();
             if (condition == 'Equals' && cellStr != filterStr) {
               return false;
-            } else if (condition == 'Contains' && !cellStr.contains(filterStr)) return false;
-            else if (condition == 'Begins With' && !cellStr.startsWith(filterStr)) return false;
+            } else if (condition == 'Contains' && !cellStr.contains(filterStr)) {
+              return false;
+            } else if (condition == 'Begins With' && !cellStr.startsWith(filterStr)) {
+              return false;
+            }
           } else if (filter['type'] == ColumnType.numeric) {
             double cellNum = double.tryParse(val?.toString() ?? "0") ?? 0.0;
             double v1 = double.tryParse(filter['value1']?.toString() ?? "0") ?? 0.0;
             if (condition == 'Equals' && cellNum != v1) {
               return false;
-            } else if (condition == 'Greater Than' && cellNum <= v1) return false;
-            else if (condition == 'Less Than' && cellNum >= v1) return false;
-            else if (condition == 'Between') {
+            } else if (condition == 'Greater Than' && cellNum <= v1) {
+              return false;
+            } else if (condition == 'Less Than' && cellNum >= v1) {
+              return false;
+            } else if (condition == 'Between') {
               double v2 = double.tryParse(filter['value2']?.toString() ?? "0") ?? 0.0;
               if (cellNum < v1 || cellNum > v2) return false;
             }
@@ -440,7 +480,7 @@ class _StockCheckingScreenState extends State<StockCheckingScreen> {
           }
         }
 
-        if (missingChecks) {
+        if (hasChanges || missingChecks) {
           bool? exit = await showDialog<bool>(
               context: context,
               builder: (ctx) => AlertDialog(
@@ -461,28 +501,102 @@ class _StockCheckingScreenState extends State<StockCheckingScreen> {
           Navigator.of(context).pop();
         }
       },
-      child: Scaffold(
-        backgroundColor: AppColors.of(context).background,
-        body: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _buildToolbar(),
-            Expanded(
-              child: Row(
-                children: [
-                  Expanded(child: _buildListArea(isPending: true)),
-                  if (_viewMode != StockViewMode.pendingOnly) ...[
-                    const VerticalDivider(width: 1, thickness: 1),
-                    Expanded(child: _buildListArea(isPending: false)),
+      child: Focus(
+        focusNode: _auditFocusNode,
+        autofocus: true,
+        onKeyEvent: (node, event) {
+          if (!_isAuditScannerActive) return KeyEventResult.ignored;
+
+          if (event is KeyDownEvent) {
+            final now = DateTime.now();
+            if (now.difference(_lastAuditKeyPress).inMilliseconds > 80) {
+              _auditBarcodeBuffer = "";
+            }
+            _lastAuditKeyPress = now;
+
+            if (event.logicalKey == LogicalKeyboardKey.enter && _auditBarcodeBuffer.length >= 2) {
+              final code = _auditBarcodeBuffer;
+              _auditBarcodeBuffer = "";
+              _processAuditBarcode(code);
+              return KeyEventResult.handled;
+            }
+
+            if (event.character != null && event.character!.isNotEmpty) {
+              _auditBarcodeBuffer += event.character!;
+            }
+          }
+          return KeyEventResult.ignored;
+        },
+        child: Scaffold(
+          backgroundColor: AppColors.of(context).background,
+          body: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _buildToolbar(),
+              Expanded(
+                child: Row(
+                  children: [
+                    Expanded(child: _buildListArea(isPending: true)),
+                    if (_viewMode != StockViewMode.pendingOnly) ...[
+                      const VerticalDivider(width: 1, thickness: 1),
+                      Expanded(child: _buildListArea(isPending: false)),
+                    ],
                   ],
-                ],
+                ),
               ),
-            ),
-            _buildFooter(),
-          ],
+              _buildFooter(),
+            ],
+          ),
         ),
       ),
     );
+  }
+
+  void _processAuditBarcode(String code) {
+    final clean = code.trim().toLowerCase();
+    if (clean.isEmpty) return;
+
+    final pharma = Provider.of<PharmacyProvider>(context, listen: false);
+    Product? match;
+
+    for (var p in pharma.products) {
+      if (p.batch.trim().toLowerCase() == clean ||
+          p.id.trim().toLowerCase() == clean ||
+          p.alias.trim().toLowerCase() == clean ||
+          p.name.trim().toLowerCase() == clean) {
+        match = p;
+        break;
+      }
+    }
+
+    if (match != null) {
+      String key = _batchMode ? "${match.id}|${match.batch}" : match.id;
+      int currentQty = _agentPhysicalQtys[_activeAgentIdx]?[key] ?? 0;
+      int nextQty = currentQty + 1;
+
+      setState(() {
+        _agentPhysicalQtys.putIfAbsent(_activeAgentIdx, () => {});
+        _agentPhysicalQtys[_activeAgentIdx]![key] = nextQty;
+        _agentCheckedIds[_activeAgentIdx]!.add(key);
+      });
+
+      ScaffoldMessenger.of(context).clearSnackBars();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text("Audit Count +1: ${match.name} (${match.batch}) -> Total: $nextQty"),
+          backgroundColor: Colors.green.shade800,
+          duration: const Duration(milliseconds: 900),
+        ),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text("No item found for barcode: '$code'"),
+          backgroundColor: Colors.red.shade800,
+          duration: const Duration(seconds: 1),
+        ),
+      );
+    }
   }
 
   void _addAgent() async {
@@ -733,6 +847,38 @@ class _StockCheckingScreenState extends State<StockCheckingScreen> {
                         const SizedBox(width: 6),
                         Text("ADJUSTMENT (ADMIN)",
                             style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Colors.red.shade900)),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                GestureDetector(
+                  onTap: () {
+                    setState(() {
+                      _isAuditScannerActive = !_isAuditScannerActive;
+                    });
+                    if (_isAuditScannerActive) {
+                      _auditFocusNode.requestFocus();
+                    }
+                  },
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: _isAuditScannerActive ? Colors.green.shade600 : Colors.grey.shade200,
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(Icons.qr_code_scanner, size: 12, color: _isAuditScannerActive ? Colors.white : Colors.black87),
+                        const SizedBox(width: 6),
+                        Text(
+                          _isAuditScannerActive ? "AUDIT SCANNER ON" : "AUDIT SCANNER OFF",
+                          style: TextStyle(
+                            fontSize: 9,
+                            fontWeight: FontWeight.bold,
+                            color: _isAuditScannerActive ? Colors.white : Colors.black87,
+                          ),
+                        ),
                       ],
                     ),
                   ),
@@ -1210,7 +1356,11 @@ class _StockItemRowState extends State<_StockItemRow> {
                                       final bool isH1 = widget.p.schedule.toUpperCase() == "H1";
                                       return GestureDetector(
                                         behavior: HitTestBehavior.opaque,
-                                        onTap: () => widget.focusNode?.requestFocus(),
+                                        onTap: () {
+                                          if (widget.focusNode != null) {
+                                            FocusScope.of(context).requestFocus(widget.focusNode);
+                                          }
+                                        },
                                         child: Container(
                                           height: 64,
                                           padding: const EdgeInsets.symmetric(horizontal: 0),
@@ -1260,19 +1410,18 @@ class _StockItemRowState extends State<_StockItemRow> {
                                                 alignment: Alignment.center,
                                                 child: SizedBox(
                                                   height: 42,
-                                                  child: TextField(
+                                                  child: ErpGridTextField(
                                                     controller: _controller,
                                                     focusNode: widget.focusNode,
                                                     keyboardType: TextInputType.number,
                                                     textAlign: TextAlign.center,
-                                                    textAlignVertical: TextAlignVertical.center,
                                                     style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: isH1 ? Colors.red.shade900 : Colors.black),
                                                     decoration: InputDecoration(
                                                       contentPadding: const EdgeInsets.only(bottom: 2),
                                                       isDense: true,
                                                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: isH1 ? BorderSide(color: Colors.red.shade300) : const BorderSide(color: Colors.grey)),
                                                       focusedBorder: isH1 ? OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: const BorderSide(color: Colors.red, width: 2)) : null,
-                                                      fillColor: isH1 ? Colors.red.shade50 : Colors.white,
+                                                      fillColor: isH1 ? Colors.red.shade50 : (diff != 0 ? const Color(0xFFFEF3C7) : Colors.white),
                                                       filled: true,
                                                       hintText: "-",
                                                     ),
@@ -1294,7 +1443,7 @@ class _StockItemRowState extends State<_StockItemRow> {
                                               Container(
                                                   width: widget.colWidths["expiry"] ?? 80,
                                                   alignment: Alignment.center,
-                                                  child: Text(widget.expiryStr ?? "-",
+                                                  child: Text(widget.expiryStr,
                                                       style: TextStyle(
                                                           fontSize: 11,
                                                           color: widget.isNearExpiry ? Colors.red : (isH1 ? Colors.red.shade700 : Colors.blueGrey),
@@ -1384,7 +1533,6 @@ class _AdminAdjustmentPanelState extends State<AdminAdjustmentPanel> {
   bool _allCheckableSelected = false;
   bool _showCheckedListOnly = false;
   final Map<String, FocusNode> _focusNodes = {};
-  int _focusedIndex = -1;
   final ScrollController _adminScrollCtrl = ScrollController();
 
   @override
@@ -1427,9 +1575,9 @@ class _AdminAdjustmentPanelState extends State<AdminAdjustmentPanel> {
     
     List<dynamic> source;
     if (widget.batchMode) {
-      source = pharma.products ?? [];
+      source = pharma.products;
     } else {
-      source = pharma.productMaster ?? [];
+      source = pharma.productMaster;
     }
     List<dynamic> allProducts = List.from(source);
 
@@ -1555,21 +1703,6 @@ class _AdminAdjustmentPanelState extends State<AdminAdjustmentPanel> {
 
       _isLoading = false;
     });
-  }
-
-  int? _getAgreedValue(String key) {
-    if (_verificationAgents.isEmpty) return null;
-    int? firstVal;
-    for (int idx in _verificationAgents) {
-      int? val = widget.agentPhysicalQtys[idx]?[key];
-      if (val == null) return null; // Missing count from one agent
-      if (firstVal == null) {
-        firstVal = val;
-      } else if (firstVal != val) {
-        return null; // Mismatch between agents
-      }
-    }
-    return firstVal;
   }
 
   dynamic _getAdminColValue(dynamic p, String key, List<dynamic> source) {
@@ -1743,7 +1876,7 @@ class _AdminAdjustmentPanelState extends State<AdminAdjustmentPanel> {
                                         },
                                         onReset: () => widget.onResetItem(key),
                                         focusNode: _getFocusNode(key),
-                                        onFocus: () => _focusedIndex = index,
+                                        onFocus: () {},
                                         onSubmitted: () => _moveFocus(index, 1),
                                         getItemVerificationStatus: _getItemVerificationStatus,
                                         showCheckedListOnly: _showCheckedListOnly,
@@ -1763,7 +1896,7 @@ class _AdminAdjustmentPanelState extends State<AdminAdjustmentPanel> {
               _buildFinancialSummary(),
               const SizedBox(width: 12),
               ElevatedButton.icon(
-                onPressed: _selectedKeys.isEmpty ? null : _confirmAndSync,
+                onPressed: (_selectedKeys.isEmpty || _isSyncing || _isLoading) ? null : _confirmAndSync,
                 icon: const Icon(Icons.sync_rounded, color: Colors.white),
                 label: const Text("ADJUST & MOVE TO CHECKED", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
                 style: ElevatedButton.styleFrom(
@@ -1776,28 +1909,38 @@ class _AdminAdjustmentPanelState extends State<AdminAdjustmentPanel> {
     );
   }
 
+  bool _isSyncing = false;
+
   Future<void> _confirmAndSync() async {
-    bool? confirm = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text("Finalize & Adjust Stock"),
-        content: Text("This will update the inventory and move the ${_selectedKeys.length} selected items to the checked list. Do you want to proceed?"),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text("CANCEL")),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.green.shade700),
-            child: const Text("FINALIZE & ADJUST", style: TextStyle(color: Colors.white)),
-          ),
-        ],
-      ),
-    );
-    if (confirm == true) {
-      _performFinalSync();
+    if (_isSyncing || _isLoading) return;
+    _isSyncing = true;
+    try {
+      bool? confirm = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text("Finalize & Adjust Stock"),
+          content: Text("This will update the inventory and move the ${_selectedKeys.length} selected items to the checked list. Do you want to proceed?"),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text("CANCEL")),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.green.shade700),
+              child: const Text("FINALIZE & ADJUST", style: TextStyle(color: Colors.white)),
+            ),
+          ],
+        ),
+      );
+      if (confirm == true) {
+        await _performFinalSync();
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isSyncing = false);
+      }
     }
   }
 
-  void _performFinalSync() async {
+  Future<void> _performFinalSync() async {
     setState(() => _isLoading = true);
     try {
       final pharma = Provider.of<PharmacyProvider>(context, listen: false);
@@ -1837,6 +1980,39 @@ class _AdminAdjustmentPanelState extends State<AdminAdjustmentPanel> {
       }
 
       if (adjustmentItems.isNotEmpty) {
+        final bool? confirmSave = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+            title: const Row(
+              children: [
+                Icon(Icons.save_rounded, color: Colors.blue, size: 28),
+                SizedBox(width: 10),
+                Text("Save Stock Audit & Adjustment", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+              ],
+            ),
+            content: Text(
+              "Are you sure you want to commit stock adjustments for ${adjustmentItems.length} audited items?\nYour inventory stock levels will be updated accordingly.",
+              style: const TextStyle(fontSize: 14, height: 1.4),
+            ),
+            actions: [
+              OutlinedButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text("Cancel"),
+              ),
+              ElevatedButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.blue.shade800,
+                  foregroundColor: Colors.white,
+                ),
+                child: const Text("Commit Adjustments", style: TextStyle(fontWeight: FontWeight.bold)),
+              ),
+            ],
+          ),
+        );
+        if (confirmSave != true) return;
+
         final adj = StockAdjustment(
           entryNo: "AUTO",
           date: DateTime.now(),
@@ -1972,7 +2148,7 @@ class _AdminAdjustmentPanelState extends State<AdminAdjustmentPanel> {
                       const Icon(Icons.check_rounded, color: Colors.white, size: 16),
                       const SizedBox(width: 8),
                     ],
-                    Text(name ?? "Agent",
+                    Text(name,
                       style: TextStyle(
                         fontSize: 11,
                         fontWeight: FontWeight.bold,
@@ -2536,12 +2712,6 @@ class _AdminTableRowState extends State<_AdminTableRow> {
     return const Text("CHECKED",
         style: TextStyle(fontSize: 9, fontWeight: FontWeight.w900, color: Color(0xFF4CAF50)));
   }
-
-  Widget _buildDiffIndicatorStatic(int diff) {
-    if (diff == 0) return const Text("TALLY", style: TextStyle(fontSize: 9, color: Colors.blue, fontWeight: FontWeight.bold));
-    return Text("${diff > 0 ? '+' : ''}$diff",
-        style: TextStyle(fontSize: 11, color: diff > 0 ? Colors.green : Colors.red, fontWeight: FontWeight.bold));
-  }
 }
 
 enum ColumnType { text, numeric, date }
@@ -2578,7 +2748,6 @@ class _GridHeaderCell extends StatefulWidget {
 class _GridHeaderCellState extends State<_GridHeaderCell> {
   late String _quickCondition;
   final TextEditingController _quickCtrl = TextEditingController();
-  bool _isHovered = false;
 
   @override
   void initState() {
@@ -2646,10 +2815,7 @@ class _GridHeaderCellState extends State<_GridHeaderCell> {
 
   @override
   Widget build(BuildContext context) {
-    return MouseRegion(
-      onEnter: (_) => setState(() => _isHovered = true),
-      onExit: (_) => setState(() => _isHovered = false),
-      child: Container(
+    return Container(
         width: widget.width,
         decoration: BoxDecoration(border: Border(right: BorderSide(color: Colors.grey.shade300))),
         child: Stack(
@@ -2728,8 +2894,7 @@ class _GridHeaderCellState extends State<_GridHeaderCell> {
               ),
           ],
         ),
-      ),
-    );
+      );
   }
 }
 

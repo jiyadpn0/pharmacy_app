@@ -6,9 +6,11 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import '../providers/pharmacy_provider.dart';
 import '../providers/app_provider.dart';
+import '../services/server_config_service.dart';
 import '../services/whatsapp_service.dart';
 import '../utils/app_dialogs.dart';
 import '../utils/theme_constants.dart';
+import '../utils/unsaved_handler.dart';
 
 // --- 1. DATA MODEL (Advanced Enterprise Logic) ---
 class AdvancedProductMovement {
@@ -94,7 +96,22 @@ class OrderScreen extends StatefulWidget {
   State<OrderScreen> createState() => _OrderScreenState();
 }
 
-class _OrderScreenState extends State<OrderScreen> with SingleTickerProviderStateMixin {
+class _OrderScreenState extends State<OrderScreen> with SingleTickerProviderStateMixin implements UnsavedHandler {
+  @override
+  bool hasUnsavedChanges() {
+    int totalQty = 0;
+    for (var item in _fullList) {
+      if (item.displayOrderQty > 0) {
+        totalQty += item.displayOrderQty;
+      }
+    }
+    if (totalQty <= 0) return false;
+    return _fullList.any((i) => i.manualOverrideQty != -1 || i.displayOrderQty > 0);
+  }
+
+  @override
+  void showDifferences() {}
+
   late TabController _tabController;
   final ScrollController _horizontalCtrl = ScrollController();
   final ScrollController _verticalCtrl = ScrollController();
@@ -118,12 +135,14 @@ class _OrderScreenState extends State<OrderScreen> with SingleTickerProviderStat
   @override
   void initState() {
     super.initState();
+    UnsavedChangesRegistry.register("STOCK ADJUSTMENT / ORDERS", this);
     _tabController = TabController(length: 3, vsync: this);
     _fetchAndRankData();
   }
 
   @override
   void dispose() {
+    UnsavedChangesRegistry.unregister("STOCK ADJUSTMENT / ORDERS");
     _tabController.dispose();
     _horizontalCtrl.dispose();
     _verticalCtrl.dispose();
@@ -170,42 +189,49 @@ class _OrderScreenState extends State<OrderScreen> with SingleTickerProviderStat
   @override
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
-    return Scaffold(
-      backgroundColor: c.background,
-      appBar: PreferredSize(
-        preferredSize: const Size.fromHeight(100),
-        child: Container(
-          color: c.cardBg,
-          child: Column(
+    return PopScope(
+      canPop: false,
+      child: DefaultTabController(
+        length: 3,
+        child: Scaffold(
+          backgroundColor: c.background,
+          body: Column(
             children: [
-              _buildTopToolbar(),
-              TabBar(
-                controller: _tabController,
-                labelColor: Colors.blue.shade900,
-                unselectedLabelColor: Colors.grey,
-                indicatorColor: Colors.blue.shade900,
-                indicatorWeight: 3,
-                tabs: const [
-                  Tab(text: "AUTO-DRAFTS (THE BRAIN)"),
-                  Tab(text: "SHORT / EXCESS STOCK"),
-                  Tab(text: "SPECIAL / MANUAL ORDERS"),
-                ],
+              Container(
+                color: c.cardBg,
+                child: Column(
+                  children: [
+                    _buildTopToolbar(),
+                    const TabBar(
+                      labelColor: Color(0xFF0F172A),
+                      unselectedLabelColor: Colors.grey,
+                      indicatorColor: Color(0xFF0F172A),
+                      indicatorWeight: 3,
+                      tabs: [
+                        Tab(text: "AUTO-DRAFTS (THE BRAIN)"),
+                        Tab(text: "SHORT / EXCESS STOCK"),
+                        Tab(text: "SPECIAL / MANUAL ORDERS"),
+                      ],
+                    ),
+                  ],
+                ),
               ),
+              Expanded(
+                child: _isLoading
+                    ? const Center(child: CircularProgressIndicator())
+                    : TabBarView(
+                        children: [
+                          _buildDraftsTab(),
+                          _buildInventoryHealthTab(),
+                          _buildManualOrdersTab(),
+                        ],
+                      ),
+              ),
+              _buildFooter(),
             ],
           ),
         ),
       ),
-      body: _isLoading
-          ? const Center(child: CircularProgressIndicator())
-          : TabBarView(
-        controller: _tabController,
-        children: [
-          _buildDraftsTab(),
-          _buildInventoryHealthTab(),
-          _buildManualOrdersTab(),
-        ],
-      ),
-      bottomNavigationBar: _buildFooter(),
     );
   }
 
@@ -219,19 +245,31 @@ class _OrderScreenState extends State<OrderScreen> with SingleTickerProviderStat
           const SizedBox(width: 12),
           const Text("SMART PROCUREMENT ENGINE", style: TextStyle(fontWeight: FontWeight.w900, fontSize: 18, letterSpacing: 0.5)),
           const Spacer(),
-          _actionBtn(Icons.refresh, "Recalculate", Colors.blueGrey, _fetchAndRankData),
+          _actionBtn(Icons.refresh, "Recalculate", Colors.blueGrey, () => _fetchAndRankData()),
           const SizedBox(width: 8),
-          _actionBtn(Icons.save_rounded, "SAVE ORDER CONFIRMATION", const Color(0xFF1E3A8A), _saveToOrderConfirmation),
+          _actionBtn(Icons.save_rounded, "SAVE ORDER CONFIRMATION", const Color(0xFF1E3A8A), () => _saveToOrderConfirmation()),
           const SizedBox(width: 8),
-          _actionBtn(Icons.picture_as_pdf, "GENERATE POs", Colors.red.shade700, _generateAllPDFs),
+          _actionBtn(Icons.picture_as_pdf, "GENERATE POs", Colors.red, () => _generateAllPDFs()),
           const SizedBox(width: 8),
-          _actionBtn(Icons.send_rounded, "DISPATCH TO WHATSAPP", Colors.green.shade700, _dispatchToWhatsApp),
+          _actionBtn(Icons.send_rounded, "DISPATCH TO WHATSAPP", Colors.green, () => _dispatchToWhatsApp()),
         ],
       ),
     );
   }
 
   void _saveToOrderConfirmation() async {
+    final provider = Provider.of<PharmacyProvider>(context, listen: false);
+    final appProvider = Provider.of<AppProvider>(context, listen: false);
+
+    if (ServerConfigService.instance.isPureCloud && !ServerConfigService.instance.isConnected) {
+      AppDialogs.showFastDialog(
+        context: context,
+        title: "Pure Cloud Live Disconnected",
+        content: "Cannot save order confirmation while disconnected from Supabase Cloud Server.\n\nPlease check your internet connection.",
+      );
+      return;
+    }
+
     final drafts = _fullList.where((i) => i.displayOrderQty > 0).toList();
     if (drafts.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -246,8 +284,39 @@ class _OrderScreenState extends State<OrderScreen> with SingleTickerProviderStat
       grouped.putIfAbsent(supplier, () => []).add(item);
     }
 
-    final provider = Provider.of<PharmacyProvider>(context, listen: false);
-    final appProvider = Provider.of<AppProvider>(context, listen: false);
+    final bool? confirmSave = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        title: const Row(
+          children: [
+            Icon(Icons.save_rounded, color: Colors.blue, size: 28),
+            SizedBox(width: 10),
+            Text("Save Order Confirmation", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+          ],
+        ),
+        content: Text(
+          "Save order confirmation(s) for ${drafts.length} item(s) across ${grouped.length} supplier(s)?",
+          style: const TextStyle(fontSize: 14, height: 1.4),
+        ),
+        actions: [
+          OutlinedButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text("Cancel"),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.blue.shade800,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text("Save Confirmation", style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+    if (confirmSave != true) return;
+
     final now = DateTime.now();
     int count = 0;
 
@@ -325,33 +394,34 @@ class _OrderScreenState extends State<OrderScreen> with SingleTickerProviderStat
 
   Widget _buildGrid(List<AdvancedProductMovement> items, {bool isHealthTab = false}) {
     double totalWidth = _colWidths.values.fold(0, (sum, w) => sum + w);
-    return Scrollbar(
-      controller: _horizontalCtrl,
-      thumbVisibility: true,
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        controller: _horizontalCtrl,
-        child: SizedBox(
-          width: totalWidth,
-          child: Column(
-            children: [
-              _buildGridHeader(),
-              Expanded(
-                child: Scrollbar(
-                  controller: _verticalCtrl,
-                  thumbVisibility: true,
-                  child: ListView.builder(
-                    cacheExtent: 300.0, controller: _verticalCtrl,
-                    itemExtent: 35.0,
-                    itemCount: items.length,
-                    itemBuilder: (ctx, i) => _buildGridRow(items[i], isHealthTab),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        return Scrollbar(
+          controller: _horizontalCtrl,
+          thumbVisibility: true,
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            controller: _horizontalCtrl,
+            child: SizedBox(
+              width: totalWidth,
+              height: constraints.maxHeight,
+              child: Column(
+                children: [
+                  _buildGridHeader(),
+                  Expanded(
+                    child: ListView.builder(
+                      controller: _verticalCtrl,
+                      itemExtent: 35.0,
+                      itemCount: items.length,
+                      itemBuilder: (ctx, i) => _buildGridRow(items[i], isHealthTab),
+                    ),
                   ),
-                ),
+                ],
               ),
-            ],
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 
@@ -397,14 +467,22 @@ class _OrderScreenState extends State<OrderScreen> with SingleTickerProviderStat
           Container(
             width: _colWidths[9],
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            decoration: const BoxDecoration(color: Color(0xFFFFFDE7), border: Border(right: BorderSide(color: Colors.black12))),
-            child: TextField(
-              controller: TextEditingController(text: item.displayOrderQty.toString()),
+            decoration: BoxDecoration(
+              color: item.displayOrderQty > 0 ? const Color(0xFFFEF3C7) : Colors.white,
+              border: const Border(right: BorderSide(color: Colors.black12)),
+            ),
+            child: TextFormField(
+              key: ValueKey("ord_qty_${item.productName}_${item.rank}"),
+              initialValue: item.displayOrderQty.toString(),
               textAlign: TextAlign.center,
               keyboardType: TextInputType.number,
               style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.blue),
               decoration: const InputDecoration(border: InputBorder.none, isDense: true),
-              onChanged: (val) => item.manualOverrideQty = int.tryParse(val) ?? item.finalOrderStrips,
+              onChanged: (val) {
+                setState(() {
+                  item.manualOverrideQty = int.tryParse(val) ?? item.finalOrderStrips;
+                });
+              },
             ),
           ),
         ],

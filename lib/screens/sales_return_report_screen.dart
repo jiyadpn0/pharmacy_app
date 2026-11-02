@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'dart:math' as math;
 import 'package:provider/provider.dart';
 import 'package:file_picker/file_picker.dart';
@@ -12,6 +13,8 @@ import '../widgets/erp_tooltip.dart';
 import '../utils/report_pdf_generator.dart';
 import '../utils/printer_service.dart';
 import '../utils/theme_constants.dart';
+import '../utils/pack_unit_converter.dart';
+import '../widgets/server_discrepancy_dialog.dart';
 
 class SalesReturnReportScreen extends StatefulWidget {
   const SalesReturnReportScreen({super.key});
@@ -36,13 +39,20 @@ class _ColInfo {
 }
 
 class _SalesReturnReportScreenState extends State<SalesReturnReportScreen> {
-  DateTime _from = DateTime.now().subtract(const Duration(days: 30));
+  DateTime _from = DateTime.now();
   DateTime _to = DateTime.now();
   ReportType _reportType = ReportType.detailed;
   double _headerHeight = 52.0;
 
+  // Column header sorting
+  String? _sortColumnKey;
+  bool _isAscending = true;
+
   final Map<String, Map<String, dynamic>> _activeFilters = {};
   final Map<String, AggregationType> _columnAggregations = {};
+  int? _selectedIndex;
+  int? _lastTapIndex;
+  DateTime? _lastTapTime;
 
   List<dynamic> _masterData = [];
   List<dynamic> _displayData = [];
@@ -90,6 +100,7 @@ class _SalesReturnReportScreenState extends State<SalesReturnReportScreen> {
     final provider = Provider.of<PharmacyProvider>(context, listen: false);
     final filteredReturns = await provider.fetchSaleReturnsInDateRange(_from, _to, loadItems: true, limit: _pageSize, offset: 0);
 
+    if (!mounted) return;
     setState(() {
       _masterData = _processData(filteredReturns);
       _displayData = List.from(_masterData);
@@ -107,6 +118,7 @@ class _SalesReturnReportScreenState extends State<SalesReturnReportScreen> {
     final provider = Provider.of<PharmacyProvider>(context, listen: false);
     final nextReturns = await provider.fetchSaleReturnsInDateRange(_from, _to, loadItems: true, limit: _pageSize, offset: _offset);
 
+    if (!mounted) return;
     setState(() {
       final processed = _processData(nextReturns);
       _masterData.addAll(processed);
@@ -119,52 +131,87 @@ class _SalesReturnReportScreenState extends State<SalesReturnReportScreen> {
   }
 
   void _applyFilters() {
-    if (_activeFilters.isEmpty) {
-      setState(() => _displayData = List.from(_masterData));
-      return;
+    List<dynamic> filtered = _masterData.where((row) {
+      if (_activeFilters.isEmpty) return true;
+      bool match = true;
+      _activeFilters.forEach((colKey, filter) {
+        if (!match) return;
+        if (filter['mode'] == 'values') {
+          List<String> allowed = List<String>.from(filter['selected_values']);
+          String cellVal = row[colKey]?.toString() ?? "";
+          if (!allowed.contains(cellVal)) match = false;
+          return;
+        }
+        String condition = filter['condition'];
+        if (condition == 'Clear' || condition == 'None') return;
+        final val = row[colKey];
+        if (filter['type'] == ColumnType.text) {
+          String cellStr = val?.toString().toLowerCase() ?? "";
+          String filterStr = filter['value1']?.toString().toLowerCase() ?? "";
+          if (condition == 'Equals' && cellStr != filterStr) {
+            match = false;
+          } else if (condition == 'Does Not Equal' && cellStr == filterStr) match = false;
+          else if (condition == 'Contains' && !cellStr.contains(filterStr)) match = false;
+          else if (condition == 'Does Not Contain' && cellStr.contains(filterStr)) match = false;
+          else if (condition == 'Begins With' && !cellStr.startsWith(filterStr)) match = false;
+          else if (condition == 'Ends With' && !cellStr.endsWith(filterStr)) match = false;
+        } else if (filter['type'] == ColumnType.numeric) {
+          double cellNum = double.tryParse(val?.toString() ?? "0") ?? 0.0;
+          double v1 = double.tryParse(filter['value1']?.toString() ?? "0") ?? 0.0;
+          if (condition == 'Between') {
+            double v2 = double.tryParse(filter['value2']?.toString() ?? "0") ?? 0.0;
+            if (cellNum < v1 || cellNum > v2) match = false;
+          } else {
+            if (condition == 'Equals' && cellNum != v1) {
+              match = false;
+            } else if (condition == 'Does Not Equal' && cellNum == v1) match = false;
+            else if (condition == 'Greater Than' && cellNum <= v1) match = false;
+            else if (condition == 'Less Than' && cellNum >= v1) match = false;
+          }
+        }
+      });
+      return match;
+    }).toList();
+
+    if (_sortColumnKey != null) {
+      final colDef = _getColumns().firstWhere((c) => c.key == _sortColumnKey, orElse: () => _getColumns().first);
+      final isNum = colDef.type == ColumnType.numeric;
+
+      filtered.sort((a, b) {
+        dynamic valA = a[_sortColumnKey];
+        dynamic valB = b[_sortColumnKey];
+
+        int comp = 0;
+        if (isNum) {
+          double numA = (valA is num) ? valA.toDouble() : (double.tryParse(valA?.toString() ?? '') ?? 0.0);
+          double numB = (valB is num) ? valB.toDouble() : (double.tryParse(valB?.toString() ?? '') ?? 0.0);
+          comp = numA.compareTo(numB);
+        } else {
+          String strA = valA?.toString().toLowerCase() ?? '';
+          String strB = valB?.toString().toLowerCase() ?? '';
+          comp = strA.compareTo(strB);
+        }
+        return _isAscending ? comp : -comp;
+      });
     }
 
+    setState(() => _displayData = filtered);
+  }
+
+  void _onColumnHeaderTap(String key) {
     setState(() {
-      _displayData = _masterData.where((row) {
-        bool match = true;
-        _activeFilters.forEach((colKey, filter) {
-          if (!match) return;
-          if (filter['mode'] == 'values') {
-            List<String> allowed = List<String>.from(filter['selected_values']);
-            String cellVal = row[colKey]?.toString() ?? "";
-            if (!allowed.contains(cellVal)) match = false;
-            return;
-          }
-          String condition = filter['condition'];
-          if (condition == 'Clear' || condition == 'None') return;
-          final val = row[colKey];
-          if (filter['type'] == ColumnType.text) {
-            String cellStr = val?.toString().toLowerCase() ?? "";
-            String filterStr = filter['value1']?.toString().toLowerCase() ?? "";
-            if (condition == 'Equals' && cellStr != filterStr) {
-              match = false;
-            } else if (condition == 'Does Not Equal' && cellStr == filterStr) match = false;
-            else if (condition == 'Contains' && !cellStr.contains(filterStr)) match = false;
-            else if (condition == 'Does Not Contain' && cellStr.contains(filterStr)) match = false;
-            else if (condition == 'Begins With' && !cellStr.startsWith(filterStr)) match = false;
-            else if (condition == 'Ends With' && !cellStr.endsWith(filterStr)) match = false;
-          } else if (filter['type'] == ColumnType.numeric) {
-            double cellNum = double.tryParse(val?.toString() ?? "0") ?? 0.0;
-            double v1 = double.tryParse(filter['value1']?.toString() ?? "0") ?? 0.0;
-            if (condition == 'Between') {
-              double v2 = double.tryParse(filter['value2']?.toString() ?? "0") ?? 0.0;
-              if (cellNum < v1 || cellNum > v2) match = false;
-            } else {
-              if (condition == 'Equals' && cellNum != v1) {
-                match = false;
-              } else if (condition == 'Does Not Equal' && cellNum == v1) match = false;
-              else if (condition == 'Greater Than' && cellNum <= v1) match = false;
-              else if (condition == 'Less Than' && cellNum >= v1) match = false;
-            }
-          }
-        });
-        return match;
-      }).toList();
+      if (_sortColumnKey == key) {
+        if (_isAscending) {
+          _isAscending = false;
+        } else {
+          _sortColumnKey = null;
+          _isAscending = true;
+        }
+      } else {
+        _sortColumnKey = key;
+        _isAscending = true;
+      }
+      _applyFilters();
     });
   }
 
@@ -210,7 +257,14 @@ class _SalesReturnReportScreenState extends State<SalesReturnReportScreen> {
           for (var item in s.items) {
             String pName = item.product.name;
             prodSum.putIfAbsent(pName, () => {'product': pName, 'qty': 0, 'total': 0.0});
-            prodSum[pName]!['qty'] += item.qty;
+            final int packSize = item.packin > 0 ? item.packin : 1;
+            final int totalLoose = PackUnitConverter.toTotalLooseUnits(
+              fullPacks: item.qty,
+              looseUnits: item.looseQty,
+              freePacks: 0,
+              packing: packSize,
+            );
+            prodSum[pName]!['qty'] += totalLoose;
             prodSum[pName]!['total'] += item.total;
           }
         }
@@ -424,17 +478,20 @@ class _SalesReturnReportScreenState extends State<SalesReturnReportScreen> {
   Widget _reportTypeRadio(ReportType type, String label) {
     return SizedBox(
       height: 28,
-      child: InkWell(
-        onTap: () { setState(() => _reportType = type); _search(); },
-        child: Row(
-          children: [
-            Radio<ReportType>(
-              value: type, groupValue: _reportType,
-              onChanged: (v) { setState(() => _reportType = v!); _search(); },
-              visualDensity: VisualDensity.compact,
-            ),
-            Expanded(child: Text(label, style: const TextStyle(fontSize: 11), overflow: TextOverflow.ellipsis)),
-          ],
+      child: RadioGroup<ReportType>(
+        groupValue: _reportType,
+        onChanged: (v) { if (v != null) { setState(() => _reportType = v); _search(); } },
+        child: InkWell(
+          onTap: () { setState(() => _reportType = type); _search(); },
+          child: Row(
+            children: [
+              Radio<ReportType>(
+                value: type,
+                visualDensity: VisualDensity.compact,
+              ),
+              Expanded(child: Text(label, style: const TextStyle(fontSize: 11), overflow: TextOverflow.ellipsis)),
+            ],
+          ),
         ),
       ),
     );
@@ -471,10 +528,37 @@ class _SalesReturnReportScreenState extends State<SalesReturnReportScreen> {
 
   Widget _buildReportHeader() {
     return Container(
-      width: double.infinity, color: const Color(0xFFD1D9E1), padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Text(
-        "Sales Return Report From: ${DateFormat('dd/MM/yyyy').format(_from)} To: ${DateFormat('dd/MM/yyyy').format(_to)}",
-        textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF2C3E50)),
+      width: double.infinity,
+      color: const Color(0xFFD1D9E1),
+      padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 12),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              "Sales Return Report From: ${DateFormat('dd/MM/yyyy').format(_from)} To: ${DateFormat('dd/MM/yyyy').format(_to)}",
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF2C3E50)),
+            ),
+          ),
+          InkWell(
+            onTap: () => ServerDiscrepancyDialog.show(context, initialCategoryKey: 'sales_return_invoices'),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: Colors.red.shade700,
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.youtube_searched_for_rounded, size: 14, color: Colors.white),
+                  SizedBox(width: 4),
+                  Text('Cloud Audit', style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold)),
+                ],
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -522,6 +606,9 @@ class _SalesReturnReportScreenState extends State<SalesReturnReportScreen> {
                           (idx) => _GridHeaderCell(
                             col: columns[idx],
                             width: scaledWidths[idx],
+                            isSorted: _sortColumnKey == columns[idx].key,
+                            isAscending: _isAscending,
+                            onSortTap: () => _onColumnHeaderTap(columns[idx].key),
                             onAdvancedTap: (pos) => _openAdvancedFilterDialog(columns[idx], pos),
                             onResize: (newWidth) => setState(() => columns[idx].width = newWidth.clamp(40, 500)),
                             onHeightResize: (newHeight) => setState(() => _headerHeight = newHeight.clamp(40, 150)),
@@ -632,15 +719,26 @@ class _SalesReturnReportScreenState extends State<SalesReturnReportScreen> {
   }
 
   Widget _buildGridRow(Map<String, dynamic> row, List<_ColInfo> columns, List<double> scaledWidths, int index) {
+    bool isSelected = (index == _selectedIndex);
     return InkWell(
       onTap: () {
-        if (_reportType == ReportType.detailed || _reportType == ReportType.productVs) {
-           Provider.of<AppProvider>(context, listen: false).openSalesReturn(entryNo: row['entry_no']);
+        final now = DateTime.now();
+        setState(() => _selectedIndex = index);
+        if (_lastTapIndex == index && _lastTapTime != null && now.difference(_lastTapTime!) < const Duration(milliseconds: 350)) {
+          _lastTapTime = null;
+          _lastTapIndex = null;
+          final entryNo = row['entry_no']?.toString();
+          if (entryNo != null && entryNo.isNotEmpty) {
+            Provider.of<AppProvider>(context, listen: false).openSalesReturn(entryNo: entryNo);
+          }
+        } else {
+          _lastTapIndex = index;
+          _lastTapTime = now;
         }
       },
       child: Container(
         height: 25,
-        color: index % 2 == 0 ? Colors.white : const Color(0xFFF9F9F9),
+        color: isSelected ? const Color(0xFFBAE6FD) : (index % 2 == 0 ? Colors.white : const Color(0xFFF9F9F9)),
         child: ClipRect(
           child: Row(
             children: List.generate(columns.length, (colIdx) {
@@ -680,6 +778,7 @@ class _SalesReturnReportScreenState extends State<SalesReturnReportScreen> {
           final result = _calculateAggregation(col.key, agg);
 
           return GestureDetector(
+            onTapDown: (details) => _showAggregationMenu(details.globalPosition, col.key),
             onSecondaryTapDown: (details) => _showAggregationMenu(details.globalPosition, col.key),
             child: ERPTooltip(
               message: result,
@@ -733,21 +832,55 @@ class _SalesReturnReportScreenState extends State<SalesReturnReportScreen> {
   }
 
   void _showAggregationMenu(Offset position, String colKey) {
-    showMenu<AggregationType>(
-      context: context,
-      position: RelativeRect.fromLTRB(position.dx, position.dy, position.dx, position.dy),
-      items: [
-        _buildPopupItem(AggregationType.sum, "Sum", Icons.functions),
-        _buildPopupItem(AggregationType.min, "Min", Icons.bar_chart),
-        _buildPopupItem(AggregationType.max, "Max", Icons.bar_chart),
-        _buildPopupItem(AggregationType.count, "Count", Icons.numbers),
-        _buildPopupItem(AggregationType.average, "Average", Icons.abc),
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
+    final currentAgg = _columnAggregations[colKey] ?? AggregationType.none;
+    final resultStr = _calculateAggregation(colKey, currentAgg);
+
+    final List<PopupMenuEntry<dynamic>> items = [
+      _buildPopupItem(AggregationType.sum, "Sum", Icons.functions),
+      _buildPopupItem(AggregationType.min, "Min", Icons.bar_chart),
+      _buildPopupItem(AggregationType.max, "Max", Icons.bar_chart),
+      _buildPopupItem(AggregationType.count, "Count", Icons.numbers),
+      _buildPopupItem(AggregationType.average, "Average", Icons.abc),
+      const PopupMenuDivider(),
+      _buildPopupItem(AggregationType.none, "None", Icons.check),
+    ];
+
+    if (resultStr.isNotEmpty) {
+      items.addAll([
         const PopupMenuDivider(),
-        _buildPopupItem(AggregationType.none, "None", Icons.check),
-      ],
+        PopupMenuItem<String>(
+          value: "COPY_VALUE",
+          height: 32,
+          child: Row(
+            children: [
+              const Icon(Icons.copy, size: 14, color: Colors.blue),
+              const SizedBox(width: 8),
+              Text("Copy ($resultStr)", style: const TextStyle(fontSize: 11)),
+            ],
+          ),
+        ),
+      ]);
+    }
+
+    showMenu<dynamic>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(position.dx, position.dy, 0, 0),
+        Offset.zero & overlay.size,
+      ),
+      items: items,
     ).then((selected) {
-      if (selected != null) {
+      if (selected is AggregationType) {
         setState(() => _columnAggregations[colKey] = selected);
+      } else if (selected == "COPY_VALUE") {
+        Clipboard.setData(ClipboardData(text: resultStr));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Copied $resultStr to clipboard"), duration: const Duration(seconds: 1)),
+          );
+        }
       }
     });
   }
@@ -768,10 +901,28 @@ class _SalesReturnReportScreenState extends State<SalesReturnReportScreen> {
 }
 
 class _GridHeaderCell extends StatefulWidget {
-  final _ColInfo col; final double width; final Function(Offset) onAdvancedTap;
+  final _ColInfo col;
+  final double width;
+  final bool isSorted;
+  final bool isAscending;
+  final VoidCallback? onSortTap;
+  final Function(Offset) onAdvancedTap;
   final Function(String condition, String value) onQuickFilter;
-  final Function(double) onResize; final Function(double) onHeightResize;
-  const _GridHeaderCell({required this.col, required this.width, required this.onAdvancedTap, required this.onQuickFilter, required this.onResize, required this.onHeightResize});
+  final Function(double) onResize;
+  final Function(double) onHeightResize;
+
+  const _GridHeaderCell({
+    required this.col,
+    required this.width,
+    this.isSorted = false,
+    this.isAscending = true,
+    this.onSortTap,
+    required this.onAdvancedTap,
+    required this.onQuickFilter,
+    required this.onResize,
+    required this.onHeightResize,
+  });
+
   @override State<_GridHeaderCell> createState() => _GridHeaderCellState();
 }
 
@@ -811,9 +962,14 @@ class _GridHeaderCellState extends State<_GridHeaderCell> {
     List<String> items = widget.col.type == ColumnType.text 
       ? ['Equals', 'Does Not Equal', 'Contains', 'Does Not Contain', 'Begins With', 'Ends With']
       : ['Equals', 'Does Not Equal', 'Greater Than', 'Less Than', 'Between'];
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
     final result = await showMenu<String>(
       context: context,
-      position: RelativeRect.fromLTRB(details.globalPosition.dx, details.globalPosition.dy + 10, details.globalPosition.dx, 0),
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(details.globalPosition.dx, details.globalPosition.dy + 10, 0, 0),
+        Offset.zero & overlay.size,
+      ),
       items: items.map((e) => PopupMenuItem(value: e, height: 30, child: Text(e, style: const TextStyle(fontSize: 11)))).toList(),
     );
     if (result != null) {
@@ -833,7 +989,38 @@ class _GridHeaderCellState extends State<_GridHeaderCell> {
         child: Stack(children: [
           Column(mainAxisSize: MainAxisSize.min, children: [
             Row(children: [
-              Expanded(child: Padding(padding: const EdgeInsets.only(left: 6, top: 4, bottom: 2), child: Text(widget.col.label, style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey.shade800), overflow: TextOverflow.ellipsis))),
+              Expanded(
+                child: InkWell(
+                  onTap: widget.onSortTap,
+                  child: Padding(
+                    padding: const EdgeInsets.only(left: 6, top: 4, bottom: 2),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Flexible(
+                          child: Text(
+                            widget.col.label,
+                            style: TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.bold,
+                              color: widget.isSorted ? Colors.blue.shade900 : Colors.grey.shade800,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        if (widget.isSorted) ...[
+                          const SizedBox(width: 2),
+                          Icon(
+                            widget.isAscending ? Icons.arrow_upward : Icons.arrow_downward,
+                            size: 11,
+                            color: Colors.blue.shade900,
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+              ),
               Opacity(opacity: showFilter ? 1.0 : 0.0, child: GestureDetector(onTapDown: (details) => widget.onAdvancedTap(details.globalPosition), child: Padding(padding: const EdgeInsets.only(right: 4, top: 4, bottom: 2), child: Icon(Icons.filter_alt_outlined, size: 14, color: Colors.blueGrey.shade600)))),
             ]),
             Container(

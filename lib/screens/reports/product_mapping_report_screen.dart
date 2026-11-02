@@ -17,12 +17,17 @@ class _ProductMappingReportScreenState extends State<ProductMappingReportScreen>
   final Map<String, Map<String, dynamic>> _activeFilters = {};
   List<ProductMapping> _displayData = [];
 
+  // Sorting state
+  String? _sortColumnKey;
+  bool _isAscending = true;
+
   // Edit state variables
   String? _editingKey;
   final TextEditingController _editInternalNameCtrl = TextEditingController();
   final FocusNode _editInternalNameFocus = FocusNode();
   String _editingProductId = "";
   Product? _selectedProduct;
+  Product? get selectedProduct => _selectedProduct;
 
   @override
   void initState() {
@@ -288,8 +293,40 @@ class _ProductMappingReportScreenState extends State<ProductMappingReportScreen>
       }).toList();
     }
 
+    if (_sortColumnKey != null) {
+      filtered.sort((a, b) {
+        String valA = '';
+        String valB = '';
+        if (_sortColumnKey == 'wholesaler') { valA = a.wholesalerName; valB = b.wholesalerName; }
+        else if (_sortColumnKey == 'external_code') { valA = a.externalCode; valB = b.externalCode; }
+        else if (_sortColumnKey == 'external_name') { valA = a.externalName; valB = b.externalName; }
+        else if (_sortColumnKey == 'internal_name') { valA = a.internalName; valB = b.internalName; }
+        else if (_sortColumnKey == 'product_id') { valA = a.productId; valB = b.productId; }
+
+        int comp = valA.toLowerCase().compareTo(valB.toLowerCase());
+        return _isAscending ? comp : -comp;
+      });
+    }
+
     setState(() {
       _displayData = filtered;
+    });
+  }
+
+  void _onColumnHeaderTap(String key) {
+    setState(() {
+      if (_sortColumnKey == key) {
+        if (_isAscending) {
+          _isAscending = false;
+        } else {
+          _sortColumnKey = null;
+          _isAscending = true;
+        }
+      } else {
+        _sortColumnKey = key;
+        _isAscending = true;
+      }
+      _applyFilters();
     });
   }
 
@@ -329,9 +366,11 @@ class _ProductMappingReportScreenState extends State<ProductMappingReportScreen>
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("CANCEL")),
           ElevatedButton(
             onPressed: () async {
+              final nav = Navigator.of(ctx);
               final provider = Provider.of<PharmacyProvider>(context, listen: false);
               await provider.deleteProductMapping(mapping.id, mapping.wholesalerName, mapping.externalName, mapping.externalCode);
-              if (mounted) Navigator.pop(ctx);
+              if (!mounted) return;
+              nav.pop();
               _refreshData();
             },
             style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
@@ -422,11 +461,11 @@ class _ProductMappingReportScreenState extends State<ProductMappingReportScreen>
           color: const Color(0xFFF5F5F5), // Standardized ERP Header Background
           child: Row(
             children: [
-              _Hdr(title: "Wholesaler", flex: 2, onQuickFilter: (c, v) => _applyQuickFilter('wholesaler', c, v), onAdvancedTap: (pos) => _openAdvancedFilter('wholesaler', "Wholesaler", pos)),
-              _Hdr(title: "Wholesaler Stock Number", flex: 1.5, onQuickFilter: (c, v) => _applyQuickFilter('external_code', c, v), onAdvancedTap: (pos) => _openAdvancedFilter('external_code', "Wholesaler Stock Number", pos)),
-              _Hdr(title: "Wholesaler Stock Name", flex: 3, onQuickFilter: (c, v) => _applyQuickFilter('external_name', c, v), onAdvancedTap: (pos) => _openAdvancedFilter('external_name', "Wholesaler Stock Name", pos)),
-              _Hdr(title: "(Mapped) My Stock Name", flex: 3, onQuickFilter: (c, v) => _applyQuickFilter('internal_name', c, v), onAdvancedTap: (pos) => _openAdvancedFilter('internal_name', "Mapped My Stock Name", pos)),
-              _Hdr(title: "Product ID", flex: 1.5, onQuickFilter: (c, v) => _applyQuickFilter('product_id', c, v), onAdvancedTap: (pos) => _openAdvancedFilter('product_id', "Product ID", pos)),
+              _Hdr(title: "Wholesaler", flex: 2, isSorted: _sortColumnKey == 'wholesaler', isAscending: _isAscending, onSortTap: () => _onColumnHeaderTap('wholesaler'), onQuickFilter: (c, v) => _applyQuickFilter('wholesaler', c, v), onAdvancedTap: (pos) => _openAdvancedFilter('wholesaler', "Wholesaler", pos)),
+              _Hdr(title: "Wholesaler Stock Number", flex: 1.5, isSorted: _sortColumnKey == 'external_code', isAscending: _isAscending, onSortTap: () => _onColumnHeaderTap('external_code'), onQuickFilter: (c, v) => _applyQuickFilter('external_code', c, v), onAdvancedTap: (pos) => _openAdvancedFilter('external_code', "Wholesaler Stock Number", pos)),
+              _Hdr(title: "Wholesaler Stock Name", flex: 3, isSorted: _sortColumnKey == 'external_name', isAscending: _isAscending, onSortTap: () => _onColumnHeaderTap('external_name'), onQuickFilter: (c, v) => _applyQuickFilter('external_name', c, v), onAdvancedTap: (pos) => _openAdvancedFilter('external_name', "Wholesaler Stock Name", pos)),
+              _Hdr(title: "(Mapped) My Stock Name", flex: 3, isSorted: _sortColumnKey == 'internal_name', isAscending: _isAscending, onSortTap: () => _onColumnHeaderTap('internal_name'), onQuickFilter: (c, v) => _applyQuickFilter('internal_name', c, v), onAdvancedTap: (pos) => _openAdvancedFilter('internal_name', "Mapped My Stock Name", pos)),
+              _Hdr(title: "Product ID", flex: 1.5, isSorted: _sortColumnKey == 'product_id', isAscending: _isAscending, onSortTap: () => _onColumnHeaderTap('product_id'), onQuickFilter: (c, v) => _applyQuickFilter('product_id', c, v), onAdvancedTap: (pos) => _openAdvancedFilter('product_id', "Product ID", pos)),
               const Expanded(flex: 10, child: Center(child: Text("Actions", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.blueGrey)))),
             ],
           ),
@@ -716,20 +755,19 @@ class _ProductMappingReportScreenState extends State<ProductMappingReportScreen>
 
 class _Hdr extends StatefulWidget {
   final String title;
-  final double? width;
   final num? flex;
-  final TextAlign align;
-  final String columnType;
+  final bool isSorted;
+  final bool isAscending;
+  final VoidCallback? onSortTap;
   final Function(String condition, String value)? onQuickFilter;
   final Function(Offset position)? onAdvancedTap;
 
   const _Hdr({
-    super.key,
     required this.title,
-    this.width,
     this.flex,
-    this.align = TextAlign.left,
-    this.columnType = 'text',
+    this.isSorted = false,
+    this.isAscending = true,
+    this.onSortTap,
     this.onQuickFilter,
     this.onAdvancedTap,
   });
@@ -746,7 +784,7 @@ class _HdrState extends State<_Hdr> {
   @override
   void initState() {
     super.initState();
-    _quickCondition = widget.columnType == 'text' ? 'Contains' : 'Equals';
+    _quickCondition = 'Contains';
   }
 
   @override
@@ -787,7 +825,6 @@ class _HdrState extends State<_Hdr> {
       onEnter: (_) => setState(() => _isHovered = true),
       onExit: (_) => setState(() => _isHovered = false),
       child: Container(
-        width: widget.width,
         decoration: BoxDecoration(
           border: Border(
             right: BorderSide(color: Colors.grey.shade300, width: 1),
@@ -799,7 +836,38 @@ class _HdrState extends State<_Hdr> {
           children: [
             Row(
               children: [
-                Expanded(child: Padding(padding: const EdgeInsets.only(left: 8, top: 4), child: Text(widget.title, style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey.shade800), overflow: TextOverflow.ellipsis))),
+                Expanded(
+                  child: InkWell(
+                    onTap: widget.onSortTap,
+                    child: Padding(
+                      padding: const EdgeInsets.only(left: 8, top: 4),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Flexible(
+                            child: Text(
+                              widget.title,
+                              style: TextStyle(
+                                fontSize: 10,
+                                fontWeight: FontWeight.bold,
+                                color: widget.isSorted ? Colors.blue.shade900 : Colors.grey.shade800,
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          if (widget.isSorted) ...[
+                            const SizedBox(width: 2),
+                            Icon(
+                              widget.isAscending ? Icons.arrow_upward : Icons.arrow_downward,
+                              size: 11,
+                              color: Colors.blue.shade900,
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
                 Opacity(
                   opacity: showFilter ? 1.0 : 0.0,
                   child: GestureDetector(

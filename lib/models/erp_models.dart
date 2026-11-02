@@ -8,6 +8,35 @@ extension NumPrecisionExtension on num {
   double get asCurrency => double.parse(toStringAsFixed(2));
 }
 
+/// Helper to safely extract double from JSON map across single/multiple keys
+double _dbl(Map<String, dynamic> m, List<String> keys, [double def = 0.0]) {
+  for (final k in keys) {
+    final v = m[k];
+    if (v == null) continue;
+    if (v is num) return v.toDouble();
+    if (v is String) {
+      final parsed = double.tryParse(v);
+      if (parsed != null) return parsed;
+    }
+  }
+  return def;
+}
+
+/// Helper to safely extract int from JSON map across single/multiple keys
+int _integer(Map<String, dynamic> m, List<String> keys, [int def = 0]) {
+  for (final k in keys) {
+    final v = m[k];
+    if (v == null) continue;
+    if (v is int) return v;
+    if (v is num) return v.toInt();
+    if (v is String) {
+      final parsed = int.tryParse(v);
+      if (parsed != null) return parsed;
+    }
+  }
+  return def;
+}
+
 class CompanyProfile {
   String name;
   String address;
@@ -16,6 +45,8 @@ class CompanyProfile {
   String gstIn;
   String dlNumber;
   String tagline;
+  String upiVpaId;
+  String upiPayeeName;
 
   CompanyProfile({
     this.name = "SAHAKAR MEDICALS & SURGICALS",
@@ -25,6 +56,8 @@ class CompanyProfile {
     this.gstIn = "32AAAAA0000A1Z5",
     this.dlNumber = "DL/123/2024",
     this.tagline = "Professional Pharmacy Care",
+    this.upiVpaId = "sahakarmedicals@upi",
+    this.upiPayeeName = "Sahakar Medicals",
   });
 }
 
@@ -72,6 +105,60 @@ class ProductMaster {
     this.preferredWholesale = "",
     this.leadTime = 2,
   });
+
+  Map<String, dynamic> toMap() {
+    return {
+      'id': id,
+      'name': name,
+      'generic_name': genericName,
+      'manufacturer_id': manufacturerId,
+      'category_id': categoryId,
+      'rack_id': rackId,
+      'hsn_code': hsnCode,
+      'gst_percent': gstPercent,
+      'schedule': schedule,
+      'reorder_level': reorderLevel,
+      'max_level': maxLevel,
+      'unit': unit,
+      'packing': packing,
+      'barcode': barcode,
+      'is_controlled': isControlled ? 1 : 0,
+      'is_banned': isBanned ? 1 : 0,
+      'is_nrx': isNrx ? 1 : 0,
+      'is_active': isActive ? 1 : 0,
+      'preferred_wholesale': preferredWholesale,
+      'lead_time': leadTime,
+    };
+  }
+
+  Map<String, dynamic> toJson() => toMap();
+
+  factory ProductMaster.fromMap(Map<String, dynamic> map) {
+    return ProductMaster(
+      id: map['id']?.toString() ?? '',
+      name: map['name']?.toString() ?? map['product_name']?.toString() ?? '',
+      genericName: map['generic_name']?.toString() ?? map['genericName']?.toString() ?? '',
+      manufacturerId: map['manufacturer_id']?.toString() ?? map['manufacturerId']?.toString() ?? '',
+      categoryId: map['category_id']?.toString() ?? map['categoryId']?.toString() ?? '',
+      rackId: map['rack_id']?.toString() ?? map['rackId']?.toString() ?? '',
+      hsnCode: map['hsn_code']?.toString() ?? map['hsnCode']?.toString() ?? '',
+      gstPercent: _dbl(map, ['gst_percent', 'gstPercent'], 12.0),
+      schedule: map['schedule']?.toString() ?? 'H',
+      reorderLevel: _integer(map, ['reorder_level', 'reorderLevel'], 10),
+      maxLevel: _integer(map, ['max_level', 'maxLevel'], 100),
+      unit: map['unit']?.toString() ?? 'Strip',
+      packing: _integer(map, ['packing', 'packSize'], 10),
+      barcode: map['barcode']?.toString() ?? '',
+      isControlled: map['is_controlled'] == 1 || map['is_controlled'] == true || map['isControlled'] == true,
+      isBanned: map['is_banned'] == 1 || map['is_banned'] == true || map['isBanned'] == true,
+      isNrx: map['is_nrx'] == 1 || map['is_nrx'] == true || map['isNrx'] == true,
+      isActive: map['is_active'] == null || map['is_active'] == 1 || map['is_active'] == true || map['isActive'] == true,
+      preferredWholesale: map['preferred_wholesale']?.toString() ?? map['preferredWholesale']?.toString() ?? '',
+      leadTime: _integer(map, ['lead_time', 'leadTime'], 2),
+    );
+  }
+
+  factory ProductMaster.fromJson(Map<String, dynamic> json) => ProductMaster.fromMap(json);
 }
 
 class StockBatch {
@@ -111,6 +198,46 @@ class StockBatch {
   int get landingCostPaise => (landingCost * 100).round();
 
   String get compositeKey => "$productId|$batchNumber|${expiryDate.month}/${expiryDate.year}|$mrp|$packing";
+
+  Map<String, dynamic> toMap() {
+    return {
+      'product_id': productId,
+      'batch_number': batchNumber,
+      'expiry_date': expiryDate.toIso8601String(),
+      'mfg_date': mfgDate.toIso8601String(),
+      'current_stock': currentStock,
+      'purchase_rate': purchaseRate,
+      'landing_cost': landingCost,
+      'mrp': mrp,
+      'sale_rate': saleRate,
+      'wholesale_rate': wholesaleRate,
+      'packing': packing,
+      'supplier_name': supplierName,
+      'gst_percent': gstPercent,
+    };
+  }
+
+  Map<String, dynamic> toJson() => toMap();
+
+  factory StockBatch.fromMap(Map<String, dynamic> map) {
+    return StockBatch(
+      productId: map['product_id']?.toString() ?? map['productId']?.toString() ?? '',
+      batchNumber: map['batch_number']?.toString() ?? map['batchNumber']?.toString() ?? map['batch']?.toString() ?? '',
+      expiryDate: DateTime.tryParse(map['expiry_date']?.toString() ?? map['expiryDate']?.toString() ?? map['expiry']?.toString() ?? '') ?? DateTime.now(),
+      mfgDate: DateTime.tryParse(map['mfg_date']?.toString() ?? map['mfgDate']?.toString() ?? '') ?? DateTime.now(),
+      currentStock: _integer(map, ['current_stock', 'currentStock', 'current_quantity', 'stock']),
+      purchaseRate: _dbl(map, ['purchase_rate', 'purchaseRate']),
+      landingCost: _dbl(map, ['landing_cost', 'landingCost']),
+      mrp: _dbl(map, ['mrp']),
+      saleRate: _dbl(map, ['sale_rate', 'saleRate', 'selling_rate']),
+      wholesaleRate: _dbl(map, ['wholesale_rate', 'wholesaleRate']),
+      packing: _integer(map, ['packing'], 1),
+      supplierName: map['supplier_name']?.toString() ?? map['supplierName']?.toString() ?? '',
+      gstPercent: _dbl(map, ['gst_percent', 'gstPercent'], 12.0),
+    );
+  }
+
+  factory StockBatch.fromJson(Map<String, dynamic> json) => StockBatch.fromMap(json);
 }
 
 class Product {
@@ -139,6 +266,12 @@ class Product {
   int get purchaseRatePaise => (purchaseRate * 100).round();
   int get landingCostPaise => (landingCost * 100).round();
   int get taxableSPPaise => (taxableSP * 100).round();
+
+  double get pRate => purchaseRate;
+  set pRate(double val) => purchaseRate = val;
+  double get sRate => salePrice;
+  set sRate(double val) => salePrice = val;
+
   String schedule;
   String genericName;
   String use;
@@ -153,6 +286,13 @@ class Product {
   String preferredWholesale;
   int leadTime;
   String alias;
+  String? lastMovedDate;
+
+  late final String nameLower = name.trim().toLowerCase();
+  late final String aliasLower = alias.trim().toLowerCase();
+  late final String idLower = id.trim().toLowerCase();
+  late final String hsnLower = hsnCode.trim().toLowerCase();
+  late final String genericLower = genericName.trim().toLowerCase();
 
   static String cleanProductName(String input) {
     if (input.isEmpty) return "";
@@ -182,8 +322,10 @@ class Product {
     this.expiry = "",
     this.packSize = 1,
     this.mrp = 0.0,
-    this.salePrice = 0.0,
-    this.purchaseRate = 0.0,
+    double salePrice = 0.0,
+    double purchaseRate = 0.0,
+    double? pRate,
+    double? sRate,
     this.landingCost = 0.0,
     this.taxableSP = 0.0,
     this.stock = 0,
@@ -207,7 +349,10 @@ class Product {
     this.preferredWholesale = "",
     this.leadTime = 2,
     this.alias = "",
-  })  : name = cleanProductName(name),
+    this.lastMovedDate,
+  })  : salePrice = sRate ?? salePrice,
+        purchaseRate = pRate ?? purchaseRate,
+        name = cleanProductName(name),
         genericName = cleanProductName(genericName);
 
   Product clone() {
@@ -245,6 +390,81 @@ class Product {
       preferredWholesale: preferredWholesale,
       leadTime: leadTime,
       alias: alias,
+      lastMovedDate: lastMovedDate,
+    );
+  }
+
+  Product copyWith({
+    String? id,
+    String? name,
+    String? batch,
+    String? rack,
+    String? hsnCode,
+    String? expiry,
+    int? packSize,
+    double? mrp,
+    double? salePrice,
+    double? purchaseRate,
+    double? landingCost,
+    double? taxableSP,
+    int? stock,
+    double? gstPercent,
+    String? category,
+    String? subCategory,
+    String? manufacturer,
+    String? supplier,
+    String? patent,
+    String? schedule,
+    String? genericName,
+    String? use,
+    double? sDiscPercent,
+    int? reorderLevel,
+    int? maxLevel,
+    bool? isControlled,
+    bool? isBanned,
+    bool? isNrx,
+    bool? isActive,
+    bool? isDiscLocked,
+    String? preferredWholesale,
+    int? leadTime,
+    String? alias,
+    String? lastMovedDate,
+  }) {
+    return Product(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      batch: batch ?? this.batch,
+      rack: rack ?? this.rack,
+      hsnCode: hsnCode ?? this.hsnCode,
+      expiry: expiry ?? this.expiry,
+      packSize: packSize ?? this.packSize,
+      mrp: mrp ?? this.mrp,
+      salePrice: salePrice ?? this.salePrice,
+      purchaseRate: purchaseRate ?? this.purchaseRate,
+      landingCost: landingCost ?? this.landingCost,
+      taxableSP: taxableSP ?? this.taxableSP,
+      stock: stock ?? this.stock,
+      gstPercent: gstPercent ?? this.gstPercent,
+      category: category ?? this.category,
+      subCategory: subCategory ?? this.subCategory,
+      manufacturer: manufacturer ?? this.manufacturer,
+      supplier: supplier ?? this.supplier,
+      patent: patent ?? this.patent,
+      schedule: schedule ?? this.schedule,
+      genericName: genericName ?? this.genericName,
+      use: use ?? this.use,
+      sDiscPercent: sDiscPercent ?? this.sDiscPercent,
+      reorderLevel: reorderLevel ?? this.reorderLevel,
+      maxLevel: maxLevel ?? this.maxLevel,
+      isControlled: isControlled ?? this.isControlled,
+      isBanned: isBanned ?? this.isBanned,
+      isNrx: isNrx ?? this.isNrx,
+      isActive: isActive ?? this.isActive,
+      isDiscLocked: isDiscLocked ?? this.isDiscLocked,
+      preferredWholesale: preferredWholesale ?? this.preferredWholesale,
+      leadTime: leadTime ?? this.leadTime,
+      alias: alias ?? this.alias,
+      lastMovedDate: lastMovedDate ?? this.lastMovedDate,
     );
   }
 
@@ -273,18 +493,22 @@ class Product {
 
   factory Product.fromMap(Map<String, dynamic> map) {
     return Product(
-      id: map['id']?.toString() ?? "",
-      name: map['name']?.toString() ?? "",
+      id: map['id']?.toString() ?? map['product_id']?.toString() ?? "",
+      name: map['name']?.toString() ?? map['product_name']?.toString() ?? map['item_name']?.toString() ?? "",
       batch: map['batch']?.toString() ?? map['batch_number']?.toString() ?? "",
       expiry: map['expiry']?.toString() ?? map['expiry_date']?.toString() ?? "",
-      packSize: map['packing'] is int ? map['packing'] : (map['packing'] != null ? int.tryParse(map['packing'].toString()) ?? 1 : 1),
-      mrp: (map['mrp'] ?? 0.0).toDouble(),
-      salePrice: (map['sale_price'] ?? map['sale_rate'] ?? 0.0).toDouble(),
-      purchaseRate: (map['purchase_rate'] ?? 0.0).toDouble(),
-      landingCost: (map['landing_cost'] ?? 0.0).toDouble(),
-      taxableSP: (map['taxable_sp'] ?? 0.0).toDouble(),
+      packSize: map['packing'] is int
+          ? map['packing']
+          : (map['packing'] != null
+              ? int.tryParse(map['packing'].toString()) ?? (map['packin'] is int ? map['packin'] : 1)
+              : (map['packin'] is int ? map['packin'] : (int.tryParse(map['packin']?.toString() ?? '') ?? 1))),
+      mrp: _dbl(map, ['mrp']),
+      salePrice: _dbl(map, ['sale_price', 'sale_rate', 's_rate', 'sRate']),
+      purchaseRate: _dbl(map, ['purchase_rate', 'purchaseRate', 'p_rate']),
+      landingCost: _dbl(map, ['landing_cost', 'landingCost']),
+      taxableSP: _dbl(map, ['taxable_sp', 'taxableSP']),
       stock: map['stock'] is int ? map['stock'] : (map['current_stock'] is int ? map['current_stock'] : (map['stock'] ?? map['current_stock'] ?? 0)),
-      gstPercent: (map['gst_percent'] ?? 12.0).toDouble(),
+      gstPercent: _dbl(map, ['gst_percent', 'gstPercent', 'tax_percent'], 12.0),
       rack: map['rack_id']?.toString() ?? map['rack']?.toString() ?? "",
       category: map['category_id']?.toString() ?? map['category']?.toString() ?? "General",
       subCategory: map['sub_category_id']?.toString() ?? map['sub_category']?.toString() ?? "",
@@ -294,7 +518,7 @@ class Product {
       schedule: map['schedule']?.toString() ?? "",
       genericName: map['generic_name']?.toString() ?? "",
       use: map['use']?.toString() ?? "",
-      sDiscPercent: (map['s_disc_percent'] ?? 0.0).toDouble(),
+      sDiscPercent: _dbl(map, ['s_disc_percent', 'disc_percent']),
       reorderLevel: map['reorder_level'] is int ? map['reorder_level'] : 10,
       maxLevel: map['max_level'] is int ? map['max_level'] : 100,
       isControlled: map['is_controlled'] == 1 || map['is_controlled'] == true,
@@ -336,6 +560,8 @@ class Product {
       'preferred_wholesale': preferredWholesale,
       'lead_time': leadTime,
       'alias': alias,
+      'is_synced': 0,
+      'updated_at': DateTime.now().toIso8601String(),
     };
   }
 }
@@ -461,35 +687,86 @@ class SaleItem {
     };
   }
 
+  Map<String, dynamic> toSqlMap() {
+    return {
+      'product_id': product.id,
+      'product_name': product.name,
+      'extra': extra,
+      'batch_number': product.batch,
+      'expiry_date': product.expiry,
+      'qty': qty,
+      'quantity': qty,
+      'packin': packin > 0 ? packin : product.packSize,
+      'packing': packin > 0 ? packin : product.packSize,
+      'mrp': mrp,
+      'purchase_rate': purchaseRate,
+      'landing_cost': landingCost > 0 ? landingCost : purchaseRate,
+      's_rate': sRate,
+      'sale_rate': sRate,
+      'disc_percent': discPercent,
+      'disc_amt': discAmt,
+      'gst_percent': gstPercent,
+      'gst_amt': gstAmt,
+      'cgst_amt': cgstAmt,
+      'sgst_amt': sgstAmt,
+      'igst_amt': igstAmt,
+      'total': total,
+      'profit': profit,
+      'supplier_name': supplier,
+      'rack': product.rack,
+    };
+  }
+
   factory SaleItem.fromMap(Map<String, dynamic> map) {
+    Product resolvedProduct;
+    if (map['product'] is Map) {
+      resolvedProduct = Product.fromMap(Map<String, dynamic>.from(map['product'] as Map));
+    } else {
+      resolvedProduct = Product(
+        id: map['product_id']?.toString() ?? '',
+        name: map['product_name']?.toString() ?? 'Unknown',
+        batch: map['batch_number']?.toString() ?? map['batch']?.toString() ?? '',
+        expiry: map['expiry_date']?.toString() ?? map['expiry']?.toString() ?? '',
+        packSize: _integer(map, ['packing', 'packin'], 1),
+        mrp: _dbl(map, ['mrp']),
+        salePrice: _dbl(map, ['s_rate', 'unit_price']),
+        purchaseRate: _dbl(map, ['purchase_rate', 'p_rate']),
+        landingCost: _dbl(map, ['landing_cost', 'l_cost']),
+        gstPercent: _dbl(map, ['gst_percent', 'tax_percent'], 12.0),
+        supplier: map['supplier_name']?.toString() ?? map['supplier']?.toString() ?? '',
+        rack: map['rack']?.toString() ?? '',
+      );
+    }
+
     return SaleItem(
-      uuid: map['uuid'],
-      product: Product.fromMap(map['product']),
-      extra: map['extra'] ?? "",
-      qty: map['qty'] ?? 0,
-      looseQty: map['looseQty'] ?? 0,
-      fQty: map['fQty'] ?? 0,
-      packin: map['packin'] ?? 1,
-      mrp: (map['mrp'] ?? 0.0).toDouble(),
-      taxableSP: (map['taxableSP'] ?? 0.0).toDouble(),
-      sRate: (map['sRate'] ?? 0.0).toDouble(),
-      discPercent: (map['discPercent'] ?? 0.0).toDouble(),
-      discAmt: (map['discAmt'] ?? 0.0).toDouble(),
-      gstPercent: (map['gstPercent'] ?? 0.0).toDouble(),
-      gstAmt: (map['gstAmt'] ?? 0.0).toDouble(),
-      cgstAmt: (map['cgstAmt'] ?? 0.0).toDouble(),
-      sgstAmt: (map['sgstAmt'] ?? 0.0).toDouble(),
-      total: (map['total'] ?? 0.0).toDouble(),
-      profit: (map['profit'] ?? 0.0).toDouble(),
-      purchaseRate: (map['purchaseRate'] ?? 0.0).toDouble(),
-      landingCost: (map['landingCost'] ?? 0.0).toDouble(),
-      supplier: map['supplier'] ?? "",
+      uuid: map['uuid']?.toString(),
+      product: resolvedProduct,
+      extra: map['extra']?.toString() ?? "",
+      qty: _integer(map, ['qty', 'quantity']),
+      looseQty: _integer(map, ['looseQty']),
+      fQty: _integer(map, ['fQty', 'f_qty']),
+      packin: _integer(map, ['packin', 'packing'], 1),
+      mrp: _dbl(map, ['mrp']),
+      taxableSP: _dbl(map, ['taxableSP', 'taxable_sp']),
+      sRate: _dbl(map, ['sRate', 's_rate', 'unit_price']),
+      discPercent: _dbl(map, ['discPercent', 'disc_percent']),
+      discAmt: _dbl(map, ['discAmt', 'disc_amt']),
+      gstPercent: _dbl(map, ['gstPercent', 'gst_percent', 'tax_percent']),
+      gstAmt: _dbl(map, ['gstAmt', 'gst_amt']),
+      cgstAmt: _dbl(map, ['cgstAmt', 'cgst_amt']),
+      sgstAmt: _dbl(map, ['sgstAmt', 'sgst_amt']),
+      igstAmt: _dbl(map, ['igstAmt', 'igst_amt']),
+      total: _dbl(map, ['total', 'total_amount']),
+      profit: _dbl(map, ['profit']),
+      purchaseRate: _dbl(map, ['purchaseRate', 'purchase_rate']),
+      landingCost: _dbl(map, ['landingCost', 'landing_cost']),
+      supplier: map['supplier']?.toString() ?? map['supplier_name']?.toString() ?? "",
     );
   }
 }
 
 class SaleInvoice {
-  final String entryNo;
+  String entryNo;
   final DateTime date;
   final String customerAcc;
   final String patient;
@@ -520,6 +797,44 @@ class SaleInvoice {
   final bool isPaid;
   final bool isDeleted;
   final int orderType; // 0 = NORMAL, 1 = SPECIAL ORDER, 2 = ONE TIME ORDER
+
+  String get invoiceNo => entryNo;
+  set invoiceNo(String v) => entryNo = v;
+
+  Map<String, dynamic> toMap() {
+    return {
+      'entry_no': entryNo,
+      'date': date.toIso8601String(),
+      'customer_acc': customerAcc,
+      'patient': patient,
+      'mobile': mobile,
+      'doctor': doctor,
+      'doctor_reg_no': doctorRegNo,
+      'special_order_json': specialOrderJson,
+      'tax_type': taxType,
+      'days': days,
+      'sub_total': subTotal,
+      'discount_percent': discountPercent,
+      'discount': discount,
+      'additional_discount': additionalDiscount,
+      'other_charge': otherCharge,
+      'rcvd_amt': rcvdAmt,
+      'round_off': roundOff,
+      'grand_total': grandTotal,
+      'agent': agent,
+      'expecting_date': expectingDate,
+      'special_customer_name': specialCustomerName,
+      'special_customer_phone': specialCustomerPhone,
+      'payment_remarks': paymentRemarks,
+      'secondary_acc': secondaryAcc,
+      'secondary_amt': secondaryAmt,
+      'financial_year': financialYear,
+      'sales_return_amt': salesReturn,
+      'is_paid': isPaid ? 1 : 0,
+      'is_deleted': isDeleted ? 1 : 0,
+      'order_type': orderType,
+    };
+  }
 
   int get subTotalPaise => (subTotal * 100).round();
   int get discountPaise => (discount * 100).round();
@@ -563,6 +878,58 @@ class SaleInvoice {
     this.isDeleted = false,
     this.orderType = 0,
   });
+
+  factory SaleInvoice.fromMap(Map<String, dynamic> map) {
+    List<SaleItem> itemsList = [];
+    if (map['items'] != null && map['items'] is List) {
+      itemsList = (map['items'] as List).map((i) {
+        if (i is SaleItem) return i;
+        if (i is Map) return SaleItem.fromMap(Map<String, dynamic>.from(i));
+        return null;
+      }).whereType<SaleItem>().toList();
+    }
+
+    DateTime parsedDate;
+    if (map['date'] != null) {
+      parsedDate = DateTime.tryParse(map['date'].toString()) ?? DateTime.now();
+    } else {
+      parsedDate = DateTime.now();
+    }
+
+    return SaleInvoice(
+      entryNo: (map['entry_no'] ?? map['entryNo'] ?? '').toString(),
+      date: parsedDate,
+      customerAcc: (map['customer_acc'] ?? map['customerAcc'] ?? '').toString(),
+      patient: (map['patient'] ?? '').toString(),
+      mobile: (map['mobile'] ?? '').toString(),
+      doctor: (map['doctor'] ?? '').toString(),
+      doctorRegNo: (map['doctor_reg_no'] ?? map['doctorRegNo'] ?? '').toString(),
+      specialOrderJson: (map['special_order_json'] ?? map['specialOrderJson'] ?? '[]').toString(),
+      taxType: (map['tax_type'] ?? map['taxType'] ?? 'Non Gst').toString(),
+      days: int.tryParse((map['days'] ?? 0).toString()) ?? 0,
+      items: itemsList,
+      subTotal: double.tryParse((map['sub_total'] ?? map['subTotal'] ?? 0).toString()) ?? 0.0,
+      discountPercent: double.tryParse((map['discount_percent'] ?? map['discountPercent'] ?? 0).toString()) ?? 0.0,
+      discount: double.tryParse((map['discount'] ?? 0).toString()) ?? 0.0,
+      additionalDiscount: double.tryParse((map['additional_discount'] ?? map['additionalDiscount'] ?? 0).toString()) ?? 0.0,
+      otherCharge: double.tryParse((map['other_charge'] ?? map['otherCharge'] ?? 0).toString()) ?? 0.0,
+      rcvdAmt: double.tryParse((map['rcvd_amt'] ?? map['rcvdAmt'] ?? 0).toString()) ?? 0.0,
+      roundOff: double.tryParse((map['round_off'] ?? map['roundOff'] ?? 0).toString()) ?? 0.0,
+      grandTotal: double.tryParse((map['grand_total'] ?? map['grandTotal'] ?? 0).toString()) ?? 0.0,
+      agent: (map['agent'] ?? 'Admin').toString(),
+      expectingDate: (map['expecting_date'] ?? map['expectingDate'] ?? '').toString(),
+      specialCustomerName: (map['special_customer_name'] ?? map['specialCustomerName'] ?? '').toString(),
+      specialCustomerPhone: (map['special_customer_phone'] ?? map['specialCustomerPhone'] ?? '').toString(),
+      paymentRemarks: (map['payment_remarks'] ?? map['paymentRemarks'] ?? '').toString(),
+      secondaryAcc: (map['secondary_acc'] ?? map['secondaryAcc'] ?? '').toString(),
+      secondaryAmt: double.tryParse((map['secondary_amt'] ?? map['secondaryAmt'] ?? 0).toString()) ?? 0.0,
+      financialYear: (map['financial_year'] ?? map['financialYear'] ?? '').toString(),
+      salesReturn: double.tryParse((map['sales_return_amt'] ?? map['salesReturn'] ?? 0).toString()) ?? 0.0,
+      isPaid: (map['is_paid'] == 1 || map['is_paid'] == true || map['isPaid'] == true),
+      isDeleted: (map['is_deleted'] == 1 || map['is_deleted'] == true || map['isDeleted'] == true),
+      orderType: int.tryParse((map['order_type'] ?? map['orderType'] ?? 0).toString()) ?? 0,
+    );
+  }
 }
 
 class PurchaseItem {
@@ -604,12 +971,19 @@ class PurchaseItem {
   String subCategory;
   String manufacturer;
 
+  double cgstAmt;
+  double sgstAmt;
+  double igstAmt;
+
   int get mrpPaise => (mrp * 100).round();
   int get pRatePaise => (pRate * 100).round();
   int get grossPaise => (gross * 100).round();
   int get discAmtPaise => (discAmt * 100).round();
   int get netPaise => (net * 100).round();
   int get gstAmtPaise => (gstAmt * 100).round();
+  int get cgstAmtPaise => (cgstAmt * 100).round();
+  int get sgstAmtPaise => (sgstAmt * 100).round();
+  int get igstAmtPaise => (igstAmt * 100).round();
   int get totalPaise => (total * 100).round();
   int get sDiscAmtPaise => (sDiscAmt * 100).round();
   int get cdAmtPaise => (cdAmt * 100).round();
@@ -638,6 +1012,9 @@ class PurchaseItem {
     this.net = 0.0,
     this.gstPercent = 0.0,
     this.gstAmt = 0.0,
+    this.cgstAmt = 0.0,
+    this.sgstAmt = 0.0,
+    this.igstAmt = 0.0,
     this.total = 0.0,
     this.sDiscPercent = 0.0,
     this.sDiscAmt = 0.0,
@@ -655,10 +1032,37 @@ class PurchaseItem {
     this.subCategory = "",
     this.manufacturer = "",
   });
+
+  Map<String, dynamic> toMap() {
+    return {
+      'product_id': id,
+      'product_name': productName,
+      'extra': extra,
+      'batch': batch,
+      'expiry': expiry,
+      'packin': packin,
+      'qty': qty,
+      'f_qty': fQty,
+      'mrp': mrp,
+      'p_rate': pRate,
+      'gross': gross,
+      'disc_percent': discPercent,
+      'disc_amt': discAmt,
+      'net': net,
+      'gst_percent': gstPercent,
+      'gst_amt': gstAmt,
+      'total': total,
+      'rack': rack,
+      'hsn_code': hsnCode,
+      's_disc_percent': sDiscPercent,
+      's_rate': sRate,
+      'l_cost': lCost,
+    };
+  }
 }
 
 class PurchaseEntry {
-  final String entryNo;
+  String entryNo;
   final DateTime date;
   final String supplierName;
   final String supInvNo;
@@ -673,13 +1077,41 @@ class PurchaseEntry {
   final double otherCharge;
   final double roundOff;
   final double grandTotal;
-  final String financialYear;
+  String financialYear;
   final bool isDeleted;
+  final String taxType;
   int paymentStatus;
   String? paymentMode;
   String? paymentRemarks;
   DateTime? paymentDate;
   double paidAmount;
+
+  Map<String, dynamic> toMap() {
+    return {
+      'entry_no': entryNo,
+      'date': date.toIso8601String(),
+      'supplier_name': supplierName,
+      'sup_inv_no': supInvNo,
+      'sup_inv_date': supInvDate.toIso8601String(),
+      'done_by': doneBy,
+      'inv_total': invTotal,
+      'remarks': remarks,
+      'sub_total': subTotal,
+      'discount': discount,
+      'other_charge': otherCharge,
+      'round_off': roundOff,
+      'grand_total': grandTotal,
+      'payment_status': paymentStatus,
+      'payment_mode': paymentMode,
+      'payment_remarks': paymentRemarks,
+      'payment_date': paymentDate?.toIso8601String(),
+      'paid_amount': paidAmount,
+      'days': days,
+      'financial_year': financialYear,
+      'tax_type': taxType,
+      'is_deleted': isDeleted ? 1 : 0,
+    };
+  }
 
   int get invTotalPaise => (invTotal * 100).round();
   int get subTotalPaise => (subTotal * 100).round();
@@ -707,6 +1139,7 @@ class PurchaseEntry {
     this.grandTotal = 0.0,
     this.financialYear = "",
     this.isDeleted = false,
+    this.taxType = "Gst",
     this.paymentStatus = 0,
     this.paymentMode,
     this.paymentRemarks,
@@ -824,6 +1257,42 @@ class SaleReturnInvoice {
     this.financialYear = "",
     this.isDeleted = false,
   });
+
+  factory SaleReturnInvoice.fromMap(Map<String, dynamic> map) {
+    List<SaleItem> itemsList = [];
+    if (map['items'] != null && map['items'] is List) {
+      itemsList = (map['items'] as List).map((i) {
+        if (i is SaleItem) return i;
+        if (i is Map) return SaleItem.fromMap(Map<String, dynamic>.from(i));
+        return null;
+      }).whereType<SaleItem>().toList();
+    }
+
+    DateTime parsedDate;
+    if (map['date'] != null) {
+      parsedDate = DateTime.tryParse(map['date'].toString()) ?? DateTime.now();
+    } else {
+      parsedDate = DateTime.now();
+    }
+
+    return SaleReturnInvoice(
+      entryNo: (map['return_no'] ?? map['entry_no'] ?? map['entryNo'] ?? '').toString(),
+      date: parsedDate,
+      customerAcc: (map['customer_acc'] ?? map['customerAcc'] ?? '').toString(),
+      patient: (map['patient'] ?? '').toString(),
+      doctor: (map['doctor'] ?? '').toString(),
+      originalInvoiceNo: (map['original_invoice_no'] ?? map['originalInvoiceNo'] ?? '').toString(),
+      items: itemsList,
+      subTotal: double.tryParse((map['sub_total'] ?? map['subTotal'] ?? 0).toString()) ?? 0.0,
+      discount: double.tryParse((map['discount'] ?? 0).toString()) ?? 0.0,
+      roundOff: double.tryParse((map['round_off'] ?? map['roundOff'] ?? 0).toString()) ?? 0.0,
+      grandTotal: double.tryParse((map['grand_total'] ?? map['grandTotal'] ?? 0).toString()) ?? 0.0,
+      narration: (map['narration'] ?? '').toString(),
+      gstMode: int.tryParse((map['gst_mode'] ?? map['gstMode'] ?? 1).toString()) ?? 1,
+      financialYear: (map['financial_year'] ?? map['financialYear'] ?? '').toString(),
+      isDeleted: (map['is_deleted'] == 1 || map['is_deleted'] == true || map['isDeleted'] == true),
+    );
+  }
 }
 
 class PurchaseReturnEntry {
@@ -889,7 +1358,7 @@ class Supplier {
       phone: map['phone']?.toString() ?? '',
       gstIn: map['gst_in']?.toString() ?? '',
       dlNumber: map['dl_number']?.toString() ?? '',
-      currentBalance: (map['current_balance'] as num?)?.toDouble() ?? 0.0,
+      currentBalance: _dbl(map, ['current_balance']),
     );
   }
 }
@@ -1142,8 +1611,14 @@ class WholesaleStockItem {
     this.rank = 0,
   });
 
-  double get purchaseValuation => currentStock * purchaseRate;
-  double get mrpValuation => currentStock * mrp;
+  double get purchaseValuation {
+    double ps = packing > 0 ? packing.toDouble() : 1.0;
+    return currentStock * (purchaseRate / ps);
+  }
+  double get mrpValuation {
+    double ps = packing > 0 ? packing.toDouble() : 1.0;
+    return currentStock * (mrp / ps);
+  }
 }
 
 class Prescription {
@@ -1193,6 +1668,7 @@ class StockAdjustment {
   final List<StockAdjustmentItem> items;
   final double grandTotal;
   final String financialYear;
+  final bool isDeleted;
 
   StockAdjustment({
     required this.entryNo,
@@ -1202,6 +1678,7 @@ class StockAdjustment {
     required this.items,
     this.grandTotal = 0.0,
     this.financialYear = "",
+    this.isDeleted = false,
   });
 }
 
@@ -1282,12 +1759,12 @@ class StockLedgerItem {
   });
 
   double get mrpValue {
-    double ps = packin == 0 ? 1 : packin.toDouble();
+    double ps = packin > 0 ? packin.toDouble() : 1.0;
     return closingStock * (mrp / ps);
   }
 
   double get lCostValue {
-    double ps = packin == 0 ? 1 : packin.toDouble();
+    double ps = packin > 0 ? packin.toDouble() : 1.0;
     return closingStock * (lCost / ps);
   }
 }
@@ -1416,10 +1893,10 @@ class OrderConfirmationItem {
     productId: map['product_id'] ?? "",
     productName: map['product_name'] ?? "",
     company: map['company'] ?? "",
-    orderQty: (map['order_qty'] as num?)?.toInt() ?? 0,
-    receivedQty: (map['received_qty'] as num?)?.toInt() ?? 0,
-    unitPrice: (map['unit_price'] as num?)?.toDouble() ?? 0.0,
-    packSize: (map['pack_size'] as num?)?.toInt() ?? 1,
+    orderQty: _integer(map, ['order_qty']),
+    receivedQty: _integer(map, ['received_qty']),
+    unitPrice: _dbl(map, ['unit_price']),
+    packSize: _integer(map, ['pack_size'], 1),
     status: map['status'] ?? 'PENDING',
     receivedDate: map['received_date'],
   );
@@ -1470,8 +1947,8 @@ class OrderConfirmation {
       orderId: map['order_id'] ?? "",
       orderDate: DateTime.tryParse(map['order_date'] ?? "") ?? DateTime.now(),
       supplierName: map['supplier_name'] ?? "",
-      totalItems: (map['total_items'] as num?)?.toInt() ?? 0,
-      totalAmount: (map['total_amount'] as num?)?.toDouble() ?? 0.0,
+      totalItems: _integer(map, ['total_items']),
+      totalAmount: _dbl(map, ['total_amount']),
       status: map['status'] ?? 'PENDING',
       expectedDeliveryDate: map['expected_delivery_date'],
       receivedDate: map['received_date'],
@@ -1544,3 +2021,159 @@ class WholesalerAvailabilityResult {
     this.purchaseCount = 0,
   });
 }
+
+class BatchMaster {
+  final String batchId;
+  final String productId;
+  final String batchNumber;
+  final String expiryDate;
+  final String mfgDate;
+  final String supplierId;
+  final String supplierName;
+  final int packing;
+  final double purchaseRate;
+  final double landingCost;
+  final double mrp;
+  final double saleRate;
+  final double gstPercent;
+  final String rack;
+  final String createdAt;
+  final bool isActive;
+  final int currentLooseStock;
+
+  BatchMaster({
+    required this.batchId,
+    required this.productId,
+    required this.batchNumber,
+    required this.expiryDate,
+    this.mfgDate = '',
+    this.supplierId = '',
+    this.supplierName = '',
+    this.packing = 1,
+    this.purchaseRate = 0.0,
+    this.landingCost = 0.0,
+    this.mrp = 0.0,
+    this.saleRate = 0.0,
+    this.gstPercent = 12.0,
+    this.rack = '',
+    String? createdAt,
+    this.isActive = true,
+    this.currentLooseStock = 0,
+  }) : createdAt = createdAt ?? DateTime.now().toIso8601String();
+
+  Map<String, dynamic> toMap() {
+    return {
+      'batch_id': batchId,
+      'product_id': productId,
+      'batch_number': batchNumber,
+      'expiry_date': expiryDate,
+      'mfg_date': mfgDate,
+      'supplier_id': supplierId,
+      'supplier_name': supplierName,
+      'packing': packing > 0 ? packing : 1,
+      'purchase_rate': purchaseRate,
+      'landing_cost': landingCost,
+      'mrp': mrp,
+      'sale_rate': saleRate,
+      'gst_percent': gstPercent,
+      'rack': rack,
+      'created_at': createdAt,
+      'is_active': isActive ? 1 : 0,
+    };
+  }
+
+  factory BatchMaster.fromMap(Map<String, dynamic> map, {int currentLooseStock = 0}) {
+    return BatchMaster(
+      batchId: map['batch_id']?.toString() ?? '',
+      productId: map['product_id']?.toString() ?? '',
+      batchNumber: map['batch_number']?.toString() ?? '',
+      expiryDate: map['expiry_date']?.toString() ?? '',
+      mfgDate: map['mfg_date']?.toString() ?? '',
+      supplierId: map['supplier_id']?.toString() ?? '',
+      supplierName: map['supplier_name']?.toString() ?? '',
+      packing: _integer(map, ['packing'], 1),
+      purchaseRate: _dbl(map, ['purchase_rate']),
+      landingCost: _dbl(map, ['landing_cost']),
+      mrp: _dbl(map, ['mrp']),
+      saleRate: _dbl(map, ['sale_rate']),
+      gstPercent: _dbl(map, ['gst_percent'], 12.0),
+      rack: map['rack']?.toString() ?? '',
+      createdAt: map['created_at']?.toString(),
+      isActive: map['is_active'] == null ? true : map['is_active'] == 1,
+      currentLooseStock: currentLooseStock,
+    );
+  }
+}
+
+class StockLedgerEntry {
+  final int? ledgerId;
+  final String timestamp;
+  final String batchId;
+  final String productId;
+  final String voucherType; // 'PURCHASE', 'SALE', 'SALES_RETURN', 'PURCHASE_RETURN', 'DAMAGE', 'ADJUSTMENT'
+  final String voucherNo;
+  final int qtyIn;  // Loose units added
+  final int qtyOut; // Loose units deducted
+  final double purchaseRate;
+  final double mrp;
+  final String supplierName;
+  final String remarks;
+  final String userId;
+  final String financialYear;
+
+  StockLedgerEntry({
+    this.ledgerId,
+    String? timestamp,
+    required this.batchId,
+    required this.productId,
+    required this.voucherType,
+    required this.voucherNo,
+    this.qtyIn = 0,
+    this.qtyOut = 0,
+    this.purchaseRate = 0.0,
+    this.mrp = 0.0,
+    this.supplierName = '',
+    this.remarks = '',
+    this.userId = 'Admin',
+    this.financialYear = '',
+  }) : timestamp = timestamp ?? DateTime.now().toIso8601String();
+
+  Map<String, dynamic> toMap() {
+    return {
+      if (ledgerId != null) 'ledger_id': ledgerId,
+      'timestamp': timestamp,
+      'batch_id': batchId,
+      'product_id': productId,
+      'voucher_type': voucherType,
+      'voucher_no': voucherNo,
+      'qty_in': qtyIn,
+      'qty_out': qtyOut,
+      'purchase_rate': purchaseRate,
+      'mrp': mrp,
+      'supplier_name': supplierName,
+      'remarks': remarks,
+      'user_id': userId,
+      'financial_year': financialYear,
+    };
+  }
+
+  factory StockLedgerEntry.fromMap(Map<String, dynamic> map) {
+    return StockLedgerEntry(
+      ledgerId: map['ledger_id'] as int?,
+      timestamp: map['timestamp']?.toString(),
+      batchId: map['batch_id']?.toString() ?? '',
+      productId: map['product_id']?.toString() ?? '',
+      voucherType: map['voucher_type']?.toString() ?? '',
+      voucherNo: map['voucher_no']?.toString() ?? '',
+      qtyIn: _integer(map, ['qty_in']),
+      qtyOut: _integer(map, ['qty_out']),
+      purchaseRate: _dbl(map, ['purchase_rate']),
+      mrp: _dbl(map, ['mrp']),
+      supplierName: map['supplier_name']?.toString() ?? '',
+      remarks: map['remarks']?.toString() ?? '',
+      userId: map['user_id']?.toString() ?? 'Admin',
+      financialYear: map['financial_year']?.toString() ?? '',
+    );
+  }
+}
+

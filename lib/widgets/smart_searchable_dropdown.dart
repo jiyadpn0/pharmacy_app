@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 class SmartSearchableDropdown extends StatefulWidget {
   final List<String> options;
@@ -74,10 +75,7 @@ class _SmartSearchableDropdownState extends State<SmartSearchableDropdown> {
 
     final filtered = _getFilteredOptions(currentText);
     if (filtered.isNotEmpty) {
-      int idx = _highlightedIndex;
-      if (idx < 0 || idx >= filtered.length) {
-        idx = 0;
-      }
+      int idx = _highlightedIndex.clamp(0, filtered.length - 1);
       final selectedOption = filtered[idx];
       _controller.text = selectedOption;
       widget.onSelected(selectedOption);
@@ -101,35 +99,60 @@ class _SmartSearchableDropdownState extends State<SmartSearchableDropdown> {
         FocusScope.of(context).unfocus();
       },
       fieldViewBuilder: (context, textController, fieldFocusNode, onFieldSubmitted) {
-        return TextField(
-          controller: textController,
-          focusNode: fieldFocusNode,
-          textAlign: TextAlign.center,
-          style: TextStyle(
-            fontSize: 10,
-            fontWeight: FontWeight.w900,
-            color: widget.textColor ?? Colors.black87,
-          ),
-          decoration: const InputDecoration(
-            isDense: true,
-            contentPadding: EdgeInsets.symmetric(vertical: 2, horizontal: 1),
-            border: InputBorder.none,
-          ),
-          onChanged: (val) {
-            _highlightedIndex = 0;
+        return Focus(
+          onKeyEvent: (node, event) {
+            if (event is KeyDownEvent || event is KeyRepeatEvent) {
+              final opts = _getFilteredOptions(textController.text);
+              if (opts.isNotEmpty) {
+                if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
+                  setState(() {
+                    _highlightedIndex = (_highlightedIndex + 1).clamp(0, opts.length - 1);
+                  });
+                  return KeyEventResult.handled;
+                } else if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+                  setState(() {
+                    _highlightedIndex = (_highlightedIndex - 1).clamp(0, opts.length - 1);
+                  });
+                  return KeyEventResult.handled;
+                } else if (event.logicalKey == LogicalKeyboardKey.enter || event.logicalKey == LogicalKeyboardKey.numpadEnter) {
+                  int idx = _highlightedIndex.clamp(0, opts.length - 1);
+                  final selected = opts[idx];
+                  _controller.text = selected;
+                  widget.onSelected(selected);
+                  FocusScope.of(context).unfocus();
+                  return KeyEventResult.handled;
+                }
+              }
+            }
+            return KeyEventResult.ignored;
           },
-          onSubmitted: (_) {
-            _resolveSelection();
-            FocusScope.of(context).unfocus();
-          },
+          child: TextField(
+            controller: textController,
+            focusNode: fieldFocusNode,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 10,
+              fontWeight: FontWeight.w900,
+              color: widget.textColor ?? Colors.black87,
+            ),
+            decoration: const InputDecoration(
+              isDense: true,
+              contentPadding: EdgeInsets.symmetric(vertical: 2, horizontal: 1),
+              border: InputBorder.none,
+            ),
+            onChanged: (val) {
+              setState(() {
+                _highlightedIndex = 0;
+              });
+            },
+            onSubmitted: (_) {
+              _resolveSelection();
+              FocusScope.of(context).unfocus();
+            },
+          ),
         );
       },
       optionsViewBuilder: (context, onSelected, options) {
-        final highlightedIndex = AutocompleteHighlightedOption.of(context);
-        if (highlightedIndex >= 0 && highlightedIndex < options.length) {
-          _highlightedIndex = highlightedIndex;
-        }
-
         return Align(
           alignment: Alignment.topLeft,
           child: Material(
@@ -141,9 +164,12 @@ class _SmartSearchableDropdownState extends State<SmartSearchableDropdown> {
               itemCount: options.length,
               itemBuilder: (context, index) {
                 final option = options.elementAt(index);
-                final isHighlighted = AutocompleteHighlightedOption.of(context) == index;
+                final isHighlighted = (index == _highlightedIndex.clamp(0, options.length - 1));
                 return InkWell(
-                  onTap: () => onSelected(option),
+                  onTap: () {
+                    _highlightedIndex = index;
+                    onSelected(option);
+                  },
                   child: Container(
                     color: isHighlighted ? Colors.blue.shade50 : Colors.white,
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),

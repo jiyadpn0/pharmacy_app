@@ -1,18 +1,36 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:async';
 import '../providers/app_provider.dart';
 import '../providers/pharmacy_provider.dart';
 import '../providers/mdi_controller.dart';
 import '../widgets/window_controls_bar.dart';
 import '../widgets/draggable_modal.dart';
+import '../widgets/floating_order_cart.dart';
+import '../widgets/split_order_drawer.dart';
 import '../utils/theme_constants.dart';
+import '../utils/app_formatters.dart';
+import '../utils/app_logger.dart';
+import '../widgets/log_console_dialog.dart';
 import 'quick_adjust_dialog.dart';
 import 'current_stock_screen.dart';
 import 'product_profile_screen.dart';
+import '../database/db_helper.dart';
 import '../services/update_checker_service.dart';
 import 'package:pharmacy_app/services/remote_logger_service.dart';
+import '../services/server_config_service.dart';
+import '../services/supabase_sync_service.dart';
+import '../services/supabase_realtime_service.dart';
+import '../services/delta_sync_service.dart';
+import '../services/lan_sync_service.dart';
+import '../services/sync_event_bus.dart';
+import '../services/app_notification_service.dart';
+import '../widgets/notification_panel_dialog.dart';
+import '../widgets/watchdog_panel_dialog.dart';
+import '../widgets/pin_unlock_dialog.dart';
+import 'server_settings_screen.dart';
 import '../utils/unsaved_handler.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -23,30 +41,110 @@ class MainShell extends StatefulWidget {
   State<MainShell> createState() => _MainShellState();
 }
 
-class _MainShellState extends State<MainShell> with WindowListener {
+class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindingObserver {
+  final ScrollController _tabScrollController = ScrollController();
+
+  Timer? _backupTimer;
+  Timer? _cloudSyncTimer;
+  Timer? _hourlySyncTimer;
+  bool _wasConnected = ServerConfigService.instance.isConnected;
+  Future<int>? _unsyncedCountFuture;
+  StreamSubscription? _syncBusSubscription;
+
+  void _refreshUnsyncedCount() {
+    if (mounted) {
+      setState(() {
+        _unsyncedCountFuture = SupabaseSyncService.instance.getUnsyncedTotalCount();
+      });
+    }
+  }
+
+  bool _initialStartupSyncTriggered = false;
+
+  void _handleConnectionChange() {
+    if (!mounted) return;
+    _refreshUnsyncedCount();
+    final isConnectedNow = ServerConfigService.instance.isConnected;
+    if (!_wasConnected && isConnectedNow) {
+      _wasConnected = true;
+      if (_initialStartupSyncTriggered) {
+        debugPrint("Connection restored! Triggering automatic background sync & queue drain instantly...");
+        unawaited(DeltaSyncService.instance.triggerReconnectionCatchupSync());
+      }
+    } else {
+      _wasConnected = isConnectedNow;
+    }
+
+    if (ServerConfigService.instance.isLanSyncEnabled) {
+      if (!LanSyncService.instance.isListening) {
+        LanSyncService.instance.initLanListener(onLanEvent: (event) {
+          if (!mounted) return;
+          final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
+          pharmacy.scheduleDebouncedInventorySync();
+        });
+      }
+    } else {
+      LanSyncService.instance.stopLanListener();
+    }
+  }
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     windowManager.addListener(this);
     HardwareKeyboard.instance.addHandler(_handleGlobalKeys);
+    ServerConfigService.instance.addListener(_handleConnectionChange);
+    SupabaseSyncService.instance.addListener(_refreshUnsyncedCount);
+
+    _syncBusSubscription = SyncEventBus.instance.stream.listen((event) {
+      if (event is TableChangedEvent && mounted) {
+        if (event.tableName == 'stock_batches') {
+          final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
+          pharmacy.scheduleDebouncedInventorySync();
+        }
+      }
+    });
 
     // Silent check for software updates on boot
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (mounted) {
         try {
-          UpdateCheckerService.checkForUpdates(context, silent: true);
+          final prefs = await SharedPreferences.getInstance();
+          final autoUpdateEnabled = prefs.getBool('auto_update_check_enabled') ?? true;
+          if (autoUpdateEnabled && mounted) {
+            UpdateCheckerService.checkForUpdates(context, silent: true);
+          }
         } catch (e) {
           debugPrint("Silent update check failed: $e");
         }
       }
     });
 
-    // Delay auto-backup so it never contends for DB locks during startup
-    Timer(const Duration(seconds: 15), () async {
+    // Delay auto-backup to 5 minutes after launch so it never contends for DB locks during startup sync
+    _backupTimer = Timer(const Duration(minutes: 5), () async {
       if (!mounted) return;
       try {
         final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
-        await pharmacy.performAutoBackupIfNeeded();
+        final backupPath = await pharmacy.performAutoBackupIfNeeded();
+        if (backupPath != null) {
+          AppNotificationService.instance.addNotification(
+            title: "Daily Backup Created",
+            message: "Automated daily database snapshot saved successfully.",
+            type: NotificationType.backup,
+            actionRoute: "settings",
+          );
+        }
+        // Weekly SQLite WAL checkpoint maintenance
+        final prefs = await SharedPreferences.getInstance();
+        final lastVacuumMillis = prefs.getInt('last_db_vacuum_timestamp') ?? 0;
+        final nowMillis = DateTime.now().millisecondsSinceEpoch;
+        if (nowMillis - lastVacuumMillis > 7 * 24 * 60 * 60 * 1000) {
+          await DbHelper.instance.vacuumDatabase();
+          await prefs.setInt('last_db_vacuum_timestamp', nowMillis);
+        }
+
+        await SupabaseSyncService.instance.checkAndPruneOldCloudData();
       } catch (e, stack) {
         RemoteLoggerService.instance.logError(
           e,
@@ -56,13 +154,206 @@ class _MainShellState extends State<MainShell> with WindowListener {
         );
       }
     });
+
+    // Staggered startup cloud sync on app opening to allow connection health check to stabilize
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final mdi = Provider.of<MdiController>(context, listen: false);
+      mdi.onPageMovement = () {
+        if (mounted) {
+          final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
+          pharmacy.refreshInventoryOnPageMovement();
+        }
+      };
+
+      SupabaseSyncService.instance.onDataPulled = () async {
+        if (mounted) {
+          final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
+          await pharmacy.loadFromDatabase();
+          await pharmacy.fetchAccounts();
+          pharmacy.scheduleDebouncedInventorySync();
+        }
+      };
+
+      Timer? eventDebounceTimer;
+      void triggerDebouncedSync() {
+        eventDebounceTimer?.cancel();
+        eventDebounceTimer = Timer(const Duration(milliseconds: 800), () async {
+          if (!mounted) return;
+          if (!ServerConfigService.instance.isWiping) {
+            final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
+            await SupabaseSyncService.instance.syncPendingCloudSalesAndPurchases(pharmacy: pharmacy);
+            if (!SupabaseSyncService.instance.isSyncing) {
+              final pulled = await SupabaseSyncService.instance.syncAllPendingData();
+              if (pulled && mounted) {
+                pharmacy.scheduleDebouncedInventorySync();
+              }
+            }
+          }
+        });
+      }
+
+      // Immediate startup initialization of LAN and Supabase Realtime Sync Listeners
+      Future.microtask(() async {
+        if (!mounted) return;
+        
+        // 1. Initialize Ultra-fast LAN Socket Listener (1ms LAN Sync)
+        if (ServerConfigService.instance.isLanSyncEnabled) {
+          try {
+            await LanSyncService.instance.initLanListener(
+              onLanEvent: (event) async {
+                if (mounted && !ServerConfigService.instance.isWiping) {
+                  final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
+                  final action = event['action']?.toString() ?? '';
+                  final payload = event['payload'];
+                  final eventId = (payload is Map<String, dynamic>)
+                      ? (payload['event_id']?.toString() ?? payload['entry_no']?.toString() ?? '')
+                      : '';
+
+                  LanSyncService.instance.handleIncomingEvent(eventId, () async {
+                    switch (action) {
+                      case 'SALE_SAVED':
+                      case 'SALE_COMPLETED':
+                        if (payload is Map<String, dynamic> && payload.containsKey('batch_deductions')) {
+                          final deductions = payload['batch_deductions'] as List;
+                          for (final item in deductions) {
+                            if (item is Map<String, dynamic>) {
+                              await DbHelper.instance.deductBatchStock(
+                                batchId: item['batch_id'] ?? item['batch_number'],
+                                productId: item['product_id']?.toString(),
+                                qty: (item['quantity_deducted'] ?? item['qty'] ?? 0) as num,
+                              );
+                            }
+                          }
+                          SyncEventBus.instance.emit(TableChangedEvent('stock_batches'));
+                          pharmacy.scheduleDebouncedInventorySync();
+                        } else if (payload is Map<String, dynamic> && payload.containsKey('items') && payload['items'] is List) {
+                          final items = payload['items'] as List;
+                          for (final item in items) {
+                            if (item is Map<String, dynamic>) {
+                              await DbHelper.instance.deductBatchStock(
+                                batchId: item['batch_number'] ?? item['batch_id'],
+                                productId: item['product_id']?.toString(),
+                                qty: (item['qty'] ?? 0) as num,
+                              );
+                            }
+                          }
+                          SyncEventBus.instance.emit(TableChangedEvent('stock_batches'));
+                          pharmacy.scheduleDebouncedInventorySync();
+                        } else {
+                          triggerDebouncedSync();
+                        }
+                        break;
+                      case 'STOCK_DECREMENT':
+                      case 'STOCK_UPDATE':
+                        final List<dynamic> batchList = (payload is List) ? List<dynamic>.from(payload) : <dynamic>[payload];
+                        await pharmacy.applyRemoteRealtimeUpdate('stock_batches', 'UPDATE', batchList);
+                        break;
+                      default:
+                        triggerDebouncedSync();
+                        break;
+                    }
+                  });
+                }
+              },
+            );
+          } catch (e) {
+            debugPrint("LanSyncService startup init note: $e");
+          }
+        }
+
+        // 2. Initialize Supabase Realtime WebSocket Channels & Sequential Phase 1 -> Phase 2 Transition
+        if (ServerConfigService.instance.supabaseUrl.isNotEmpty && ServerConfigService.instance.supabaseAnonKey.isNotEmpty) {
+          if (!mounted) return;
+          if (mounted && !ServerConfigService.instance.isWiping && !_initialStartupSyncTriggered) {
+            _initialStartupSyncTriggered = true;
+            final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
+            unawaited(() async {
+              // PHASE 1: Master Catalog Initial Verification / Download
+              await SupabaseSyncService.instance.ensureMasterCatalogDownloaded(pharmacy: pharmacy);
+              if (!mounted) return;
+
+              // PHASE 2: Initialize Realtime WebSocket Listeners & Catch-up Sync post-Phase 1
+              try {
+                await SupabaseRealtimeService.instance.initialize();
+                SupabaseRealtimeService.instance.startAllRealtimeListeners(
+                  onTableEvent: (String tableName, String eventType, List<Map<String, dynamic>> rows) {
+                    if (mounted && !ServerConfigService.instance.isWiping) {
+                      Future.microtask(() async {
+                        if (!mounted) return;
+                        for (final row in rows) {
+                          final eventId = row['event_id']?.toString() ?? row['entry_no']?.toString() ?? row['invoice_no']?.toString() ?? '';
+                          LanSyncService.instance.handleIncomingEvent(eventId, () async {
+                            await pharmacy.applyRemoteRealtimeUpdate(tableName, eventType, [row]);
+                          });
+                        }
+                      });
+                    }
+                  },
+                  onRealtimeEvent: () {
+                    triggerDebouncedSync();
+                  },
+                );
+              } catch (e) {
+                debugPrint("SupabaseRealtimeService startup init note: $e");
+              }
+              await DeltaSyncService.instance.triggerReconnectionCatchupSync();
+            }());
+          }
+        }
+      });
+    });
+
+    // Multi-computer cloud sync loop for real-time multi-counter reflections (Every 2 minutes)
+    _cloudSyncTimer = Timer.periodic(const Duration(minutes: 2), (_) async {
+      if (!mounted) return;
+      final serverConfig = ServerConfigService.instance;
+      if (serverConfig.isServerModeEnabled && serverConfig.isConnected && serverConfig.autoSyncEnabled) {
+        if (!serverConfig.isWiping) {
+          try {
+            final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
+            await SupabaseSyncService.instance.syncPendingCloudSalesAndPurchases(pharmacy: pharmacy);
+            if (!SupabaseSyncService.instance.isSyncing) {
+              await SupabaseSyncService.instance.syncAllPendingData().timeout(const Duration(seconds: 3));
+            }
+          } catch (_) {}
+        }
+      }
+    });
+
+    // Hourly full data refresh timer
+    _hourlySyncTimer = Timer.periodic(const Duration(hours: 1), (_) async {
+      if (!mounted) return;
+      final serverConfig = ServerConfigService.instance;
+      if (serverConfig.isServerModeEnabled && serverConfig.isConnected && serverConfig.autoSyncEnabled) {
+        if (!serverConfig.isWiping) {
+          await SupabaseSyncService.instance.syncAllPendingData(forceFull: true);
+        }
+      }
+    });
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _backupTimer?.cancel();
+    _cloudSyncTimer?.cancel();
+    _hourlySyncTimer?.cancel();
+    _syncBusSubscription?.cancel();
+    _tabScrollController.dispose();
     windowManager.removeListener(this);
     HardwareKeyboard.instance.removeHandler(_handleGlobalKeys);
+    ServerConfigService.instance.removeListener(_handleConnectionChange);
+    SupabaseSyncService.instance.removeListener(_refreshUnsyncedCount);
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      if (ServerConfigService.instance.isServerModeEnabled) {
+        unawaited(SupabaseRealtimeService.instance.ensureRealtimeListenersActive());
+      }
+    }
   }
 
   @override
@@ -70,6 +361,71 @@ class _MainShellState extends State<MainShell> with WindowListener {
     try {
       bool isPreventClose = await windowManager.isPreventClose();
       if (isPreventClose && mounted) {
+        // Safe Shutdown Guard: Check for unsynced local records before closing window
+        final unsyncedCount = await SupabaseSyncService.instance.getUnsyncedTotalCount();
+        if (unsyncedCount > 0 && mounted) {
+          final String? choice = await showDialog<String>(
+            context: context,
+            barrierDismissible: false,
+            builder: (ctx) => AlertDialog(
+              backgroundColor: const Color(0xFF1E293B),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              title: const Row(
+                children: [
+                  Icon(Icons.warning_amber_rounded, color: Colors.amberAccent, size: 24),
+                  SizedBox(width: 10),
+                  Text(
+                    "Unsynced Data Warning",
+                    style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                ],
+              ),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    "You have $unsyncedCount pending local record(s) awaiting cloud sync.",
+                    style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    "Closing the app now means other billing terminals will not see these entries until this PC is reopened.",
+                    style: TextStyle(color: Colors.white70, fontSize: 12),
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx, 'cancel'),
+                  child: const Text("Cancel", style: TextStyle(color: Colors.grey)),
+                ),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.amber.shade900),
+                  onPressed: () => Navigator.pop(ctx, 'sync_close'),
+                  child: const Text("Sync & Close", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                ),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.red.shade800),
+                  onPressed: () => Navigator.pop(ctx, 'close_now'),
+                  child: const Text("Close Anyway", style: TextStyle(color: Colors.white)),
+                ),
+              ],
+            ),
+          );
+
+          if (choice == 'cancel' || choice == null) {
+            return; // Abort window close
+          }
+
+          if (choice == 'sync_close') {
+            try {
+              await DeltaSyncService.instance.triggerBackgroundSync(forcePostSave: true).timeout(const Duration(seconds: 8));
+            } catch (_) {}
+          }
+        }
+
+        if (!mounted) return;
         final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
         await pharmacy.performAutoBackupIfNeeded(forceOnExit: true);
         await windowManager.destroy();
@@ -88,16 +444,32 @@ class _MainShellState extends State<MainShell> with WindowListener {
   bool _handleGlobalKeys(KeyEvent event) {
     if (event is! KeyDownEvent) return false;
 
+    if (event.logicalKey == LogicalKeyboardKey.f8) {
+      Provider.of<PharmacyProvider>(context, listen: false).toggleOrderPanel();
+      return true;
+    }
+
+    if (event.logicalKey == LogicalKeyboardKey.f9 ||
+        (HardwareKeyboard.instance.isControlPressed &&
+            (event.logicalKey == LogicalKeyboardKey.keyR || event.logicalKey == LogicalKeyboardKey.keyS))) {
+      _triggerManualCloudSync();
+      return true;
+    }
+
     if (HardwareKeyboard.instance.isControlPressed) {
       if (event.logicalKey == LogicalKeyboardKey.arrowRight || event.logicalKey == LogicalKeyboardKey.arrowLeft) {
         final pharma = Provider.of<PharmacyProvider>(context, listen: false);
         final app = Provider.of<AppProvider>(context, listen: false);
 
+        final bool isRight = event.logicalKey == LogicalKeyboardKey.arrowRight;
+
+        pharma.cycleStaffAgent(forward: isRight);
+
         bool hasW3Name = pharma.salesSessions[2]['agent'].toString().trim().isNotEmpty;
         int current = pharma.activeSessionIdx;
         int next;
 
-        if (event.logicalKey == LogicalKeyboardKey.arrowRight) {
+        if (isRight) {
           if (hasW3Name) {
             next = (current + 1) % 3;
           } else {
@@ -117,6 +489,33 @@ class _MainShellState extends State<MainShell> with WindowListener {
       }
     }
     return false;
+  }
+
+  Future<void> _triggerManualCloudSync() async {
+    final syncService = SupabaseSyncService.instance;
+    if (syncService.isSyncing) return;
+
+    final pharma = Provider.of<PharmacyProvider>(context, listen: false);
+    await syncService.syncPendingCloudSalesAndPurchases(pharmacy: pharma);
+    final success = await syncService.syncAllPendingData(forceFull: false, isManualTransfer: true);
+
+    if (mounted) {
+      if (success) {
+        AppNotificationService.instance.addNotification(
+          title: "Cloud Sync Complete",
+          message: "All latest server sales and purchases have been pulled successfully.",
+          type: NotificationType.backup,
+        );
+      } else {
+        final msg = syncService.lastSyncError.isNotEmpty ? syncService.lastSyncError : 'Up to date';
+        AppNotificationService.instance.addNotification(
+          title: "Cloud Sync Status",
+          message: "Sync finished: $msg",
+          type: NotificationType.backup,
+        );
+      }
+      _refreshUnsyncedCount();
+    }
   }
 
   @override
@@ -160,6 +559,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
                   _buildUnifiedTitleBar(context, app),
                   _buildMenuBar(context, app),
                   _buildWindowDock(context, app),
+                  _buildOfflineBanner(),
                 ],
               ),
             ),
@@ -171,6 +571,12 @@ class _MainShellState extends State<MainShell> with WindowListener {
               right: 0,
               child: _buildStatusBar(context),
             ),
+
+            // 5. GLOBAL 50% SPLIT DRAWER
+            const SplitOrderDrawer(),
+
+            // 6. FLOATING DRAGGABLE ORDER BOOK ICON (WHEN MINIMIZED)
+            const FloatingOrderCart(),
           ],
         ),
       ),
@@ -200,17 +606,88 @@ class _MainShellState extends State<MainShell> with WindowListener {
             const SizedBox(width: 16),
             Container(height: 16, width: 1, color: Colors.white24),
             const SizedBox(width: 12),
-            Consumer<PharmacyProvider>(
-              builder: (_, pharma, __) => _buildActiveStaffBar(app, pharma),
+            Expanded(
+              child: Consumer<PharmacyProvider>(
+                builder: (_, pharma, __) => _buildActiveStaffBar(app, pharma),
+              ),
             ),
           ],
         ),
         trailingActions: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
+            IconButton(
+              icon: ListenableBuilder(
+                listenable: SupabaseSyncService.instance,
+                builder: (context, _) {
+                  final syncService = SupabaseSyncService.instance;
+                  final bool showSpinner = syncService.isSyncing && syncService.isManualTransfer && !ServerConfigService.instance.isPureCloud;
+                  return showSpinner
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.cyanAccent),
+                        )
+                      : const Icon(Icons.sync_rounded, color: Colors.cyanAccent, size: 16);
+                },
+              ),
+              onPressed: _triggerManualCloudSync,
+              tooltip: "Pull Latest Server Entries (Ctrl+R / F9)",
+              constraints: const BoxConstraints(maxHeight: 28, maxWidth: 28),
+              padding: const EdgeInsets.all(4),
+            ),
+            const SizedBox(width: 4),
+            _buildUnsyncedIndicatorButton(context),
+            const SizedBox(width: 4),
+            _buildNotificationBellButton(context, app),
+            const SizedBox(width: 4),
+            _buildWatchdogHeaderButton(context, app),
+            const SizedBox(width: 4),
             _buildThemeToggleButton(app),
+            const SizedBox(width: 4),
+            _buildLogConsoleHeaderButton(context, app),
             const SizedBox(width: 8),
             _buildFinancialYearSelector(context),
+            const SizedBox(width: 4),
+            ListenableBuilder(
+              listenable: ServerConfigService.instance,
+              builder: (context, _) {
+                final config = ServerConfigService.instance;
+                IconData icon = Icons.cloud_off_rounded;
+                Color color = Colors.white54;
+                String tooltip = "Server Mode: Disabled (Local Mode)";
+
+                if (config.isPureCloud) {
+                  if (config.isConnected) {
+                    icon = Icons.bolt_rounded;
+                    color = Colors.cyanAccent;
+                    tooltip = "Pure Cloud Live Mode: Active (${config.storeBranchId})";
+                  } else {
+                    icon = Icons.cloud_off_rounded;
+                    color = Colors.orangeAccent;
+                    tooltip = "Pure Cloud Live: Disconnected";
+                  }
+                } else if (config.isServerModeEnabled) {
+                  if (config.isConnected) {
+                    icon = Icons.cloud_done_rounded;
+                    color = Colors.lightGreenAccent;
+                    tooltip = "Server Mode: Connected (${config.storeBranchId})";
+                  } else {
+                    icon = Icons.cloud_off_rounded;
+                    color = Colors.orangeAccent;
+                    tooltip = "Server Mode: Connection Error";
+                  }
+                }
+
+                return IconButton(
+                  icon: Icon(icon, color: color, size: 16),
+                  onPressed: () => app.addTab("Server Settings", const ServerSettingsScreen()),
+                  tooltip: tooltip,
+                  constraints: const BoxConstraints(maxHeight: 28, maxWidth: 28),
+                  padding: const EdgeInsets.all(4),
+                );
+              },
+            ),
             const SizedBox(width: 4),
             IconButton(
               icon: const Icon(Icons.security_outlined, color: Colors.white70, size: 16),
@@ -239,21 +716,113 @@ class _MainShellState extends State<MainShell> with WindowListener {
     );
   }
 
+  Widget _buildNotificationBellButton(BuildContext context, AppProvider app) {
+    final pharma = Provider.of<PharmacyProvider>(context);
+    final activeTask = pharma.syncQueue.firstWhere(
+      (t) => t.status == 'In Progress' || t.status == 'Pending',
+      orElse: () => SyncTask(id: '', title: '', type: ''),
+    );
+    final bool hasActiveTask = activeTask.id.isNotEmpty;
+    final int activeProgressPct = (activeTask.progress * 100).toInt();
+
+    return ListenableBuilder(
+      listenable: AppNotificationService.instance,
+      builder: (context, _) {
+        final service = AppNotificationService.instance;
+        final unread = service.unreadCount;
+
+        return Stack(
+          clipBehavior: Clip.none,
+          children: [
+            IconButton(
+              icon: hasActiveTask
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.2,
+                        valueColor: AlwaysStoppedAnimation<Color>(Colors.amberAccent),
+                      ),
+                    )
+                  : Icon(
+                      unread > 0 ? Icons.notifications_active_rounded : Icons.notifications_outlined,
+                      color: unread > 0 ? Colors.amberAccent : Colors.white70,
+                      size: 16,
+                    ),
+              onPressed: () async {
+                if (service.isNotificationLockEnabled) {
+                  final pharmaProvider = Provider.of<PharmacyProvider>(context, listen: false);
+                  final bool isUnlocked = await PinUnlockDialog.show(
+                    context,
+                    pharmaProvider,
+                    title: "Unlock Notification Center",
+                    message: "Enter Master PIN to view or clear notification alerts.",
+                  );
+
+                  if (!isUnlocked) return;
+                }
+
+                if (!context.mounted) return;
+                NotificationPanelDialog.show(context, onNavigate: (route) {
+                  if (route == 'settings') {
+                    app.openSettings(tab: "Security & Backup");
+                  } else if (route == 'server') {
+                    app.addTab("Server Settings", const ServerSettingsScreen());
+                  } else if (route == 'expiry') {
+                    app.addTab("Current Stock", const CurrentStockScreen());
+                  }
+                });
+              },
+              tooltip: hasActiveTask
+                  ? "Excel Operation in Progress ($activeProgressPct%) - Click to view or cancel"
+                  : (unread > 0 ? "Notification Center ($unread unread)" : "Notification Center"),
+              constraints: const BoxConstraints(maxHeight: 28, maxWidth: 28),
+              padding: const EdgeInsets.all(4),
+            ),
+            if (hasActiveTask)
+              Positioned(
+                right: -4,
+                top: -4,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                  decoration: BoxDecoration(
+                    color: Colors.amber.shade800,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.white, width: 1),
+                  ),
+                  child: Text(
+                    "$activeProgressPct%",
+                    style: const TextStyle(color: Colors.white, fontSize: 8, fontWeight: FontWeight.w900),
+                  ),
+                ),
+              )
+            else if (unread > 0)
+              Positioned(
+                right: 2,
+                top: 2,
+                child: Container(
+                  padding: const EdgeInsets.all(2),
+                  decoration: const BoxDecoration(
+                    color: Colors.red,
+                    shape: BoxShape.circle,
+                  ),
+                  constraints: const BoxConstraints(minWidth: 12, minHeight: 12),
+                  child: Text(
+                    unread > 9 ? '9+' : '$unread',
+                    style: const TextStyle(color: Colors.white, fontSize: 8, fontWeight: FontWeight.bold),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
   Widget _buildActiveStaffBar(AppProvider app, PharmacyProvider pharma) {
-    // 1. Get ONLY ACTIVE staff members from Staff Management
-    List<String> activeStaff = pharma.activeStaffList
-        .map((s) => s.name.trim())
-        .where((n) => n.isNotEmpty)
-        .toList();
-
-    if (activeStaff.isEmpty) {
-      activeStaff = pharma.staffNames
-          .where((n) => n.trim().isNotEmpty)
-          .toList();
-    }
-
-    // Sort A-to-Z alphabetically (A starting on left, Z on right)
-    activeStaff.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    // Get staff list: Most active saved names on left, generic "Staff #" names at maximum right
+    List<String> activeStaff = pharma.staffNames;
 
     if (activeStaff.isEmpty) {
       activeStaff = ["Admin"];
@@ -280,113 +849,231 @@ class _MainShellState extends State<MainShell> with WindowListener {
       app.switchToSalesTab();
     }
 
-    const int maxVisible = 7;
-    final bool hasOverflow = activeStaff.length > maxVisible;
-    final List<String> visibleStaff = hasOverflow ? activeStaff.sublist(0, maxVisible) : activeStaff;
-    final List<String> overflowStaff = hasOverflow ? activeStaff.sublist(maxVisible) : [];
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final double availableWidth = constraints.maxWidth;
 
-    bool isCurrentInOverflow = overflowStaff.any((s) => s.toLowerCase() == currentAgent.toLowerCase());
+        // Estimate width needed per button (~68px for average staff name, ~78px for overflow dropdown)
+        const double approxItemWidth = 68.0;
+        const double overflowBtnWidth = 78.0;
 
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        ...visibleStaff.map((name) {
-          final bool isSelected = currentAgent.toLowerCase() == name.toLowerCase();
-          return Container(
-            margin: const EdgeInsets.only(right: 4),
-            child: InkWell(
-              onTap: () => selectAgent(name),
-              borderRadius: BorderRadius.circular(4),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
-                decoration: BoxDecoration(
-                  color: isSelected ? Colors.amber.shade700 : Colors.white12,
-                  borderRadius: BorderRadius.circular(4),
-                  border: Border.all(
-                    color: isSelected ? Colors.amberAccent : Colors.white24,
-                    width: isSelected ? 1.5 : 1.0,
+        int maxVisible = activeStaff.length;
+        if (availableWidth.isFinite && availableWidth > 0) {
+          final double totalRequiredWidth = activeStaff.length * approxItemWidth;
+          if (totalRequiredWidth > availableWidth) {
+            final double spaceForVisible = availableWidth - overflowBtnWidth;
+            maxVisible = (spaceForVisible / approxItemWidth).floor().clamp(1, activeStaff.length);
+          }
+        }
+
+        final bool hasOverflow = activeStaff.length > maxVisible;
+        final List<String> visibleStaff = hasOverflow ? activeStaff.sublist(0, maxVisible) : activeStaff;
+        final List<String> overflowStaff = hasOverflow ? activeStaff.sublist(maxVisible) : [];
+
+        bool isCurrentInOverflow = overflowStaff.any((s) => s.toLowerCase() == currentAgent.toLowerCase());
+
+        return SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ...visibleStaff.map((name) {
+                final bool isSelected = currentAgent.toLowerCase() == name.toLowerCase();
+                return Container(
+                  margin: const EdgeInsets.only(right: 3),
+                  child: InkWell(
+                    onTap: () => selectAgent(name),
+                    borderRadius: BorderRadius.circular(4),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: isSelected ? _getAgentColor(name) : Colors.white12,
+                        borderRadius: BorderRadius.circular(4),
+                        border: Border.all(
+                          color: isSelected ? _getAgentColor(name).withValues(alpha: 0.9) : Colors.white24,
+                          width: isSelected ? 1.5 : 1.0,
+                        ),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.person,
+                            size: 11,
+                            color: isSelected ? Colors.white : Colors.white70,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            name,
+                            style: TextStyle(
+                              color: isSelected ? Colors.white : Colors.white.withValues(alpha: 0.9),
+                              fontSize: 10,
+                              fontWeight: isSelected ? FontWeight.bold : FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              }),
+              if (hasOverflow)
+                PopupMenuButton<String>(
+                  color: const Color(0xFF1E293B),
+                  elevation: 8,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  onSelected: selectAgent,
+                  itemBuilder: (context) => overflowStaff.map((name) {
+                    final bool isSel = currentAgent.toLowerCase() == name.toLowerCase();
+                    return PopupMenuItem<String>(
+                      value: name,
+                      height: 32,
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.person,
+                            size: 13,
+                            color: isSel ? Colors.amberAccent : Colors.white70,
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            name,
+                            style: TextStyle(
+                              color: isSel ? Colors.amberAccent : Colors.white,
+                              fontSize: 11,
+                              fontWeight: isSel ? FontWeight.bold : FontWeight.normal,
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  }).toList(),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: isCurrentInOverflow ? Colors.amber.shade700 : Colors.white10,
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(
+                        color: isCurrentInOverflow ? Colors.amberAccent : Colors.white24,
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          isCurrentInOverflow ? "Other: $currentAgent" : "Other...",
+                          style: TextStyle(
+                            color: isCurrentInOverflow ? Colors.white : Colors.white70,
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const Icon(Icons.arrow_drop_down, color: Colors.white70, size: 14),
+                      ],
+                    ),
                   ),
                 ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      Icons.person,
-                      size: 11,
-                      color: isSelected ? Colors.white : Colors.white70,
-                    ),
-                    const SizedBox(width: 4),
-                    Text(
-                      name,
-                      style: TextStyle(
-                        color: isSelected ? Colors.white : Colors.white.withValues(alpha: 0.9),
-                        fontSize: 10,
-                        fontWeight: isSelected ? FontWeight.bold : FontWeight.w600,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          );
-        }),
-        if (hasOverflow)
-          PopupMenuButton<String>(
-            color: const Color(0xFF1E293B),
-            elevation: 8,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-            onSelected: selectAgent,
-            itemBuilder: (context) => overflowStaff.map((name) {
-              final bool isSel = currentAgent.toLowerCase() == name.toLowerCase();
-              return PopupMenuItem<String>(
-                value: name,
-                height: 32,
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.person,
-                      size: 13,
-                      color: isSel ? Colors.amberAccent : Colors.white70,
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      name,
-                      style: TextStyle(
-                        color: isSel ? Colors.amberAccent : Colors.white,
-                        fontSize: 11,
-                        fontWeight: isSel ? FontWeight.bold : FontWeight.normal,
-                      ),
-                    ),
-                  ],
-                ),
-              );
-            }).toList(),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildWatchdogHeaderButton(BuildContext context, AppProvider app) {
+    final service = AppNotificationService.instance;
+    final serverConfig = ServerConfigService.instance;
+    return ListenableBuilder(
+      listenable: Listenable.merge([service, serverConfig]),
+      builder: (context, _) {
+        final watchdogNotifs = service.getNotificationsByType(NotificationType.watchdog);
+        final int unreadWatchdog = watchdogNotifs.where((n) => !n.isRead).length;
+        final bool isSynced = serverConfig.isConnected;
+
+        return Tooltip(
+          message: unreadWatchdog > 0
+              ? "Multi-PC Watchdog Feed ($unreadWatchdog new events)"
+              : (isSynced ? "Multi-PC Watchdog Live (System Synced 🟢)" : "Multi-PC Watchdog Live (Offline 🟠)"),
+          child: InkWell(
+            onTap: () {
+              WatchdogPanelDialog.show(context, onNavigate: (route) {
+                if (route == 'settings') {
+                  app.openSettings(tab: "Security & Backup");
+                } else if (route == 'server') {
+                  app.addTab("Server Settings", const ServerSettingsScreen());
+                } else if (route == 'expiry') {
+                  app.addTab("Current Stock", const CurrentStockScreen());
+                }
+              });
+            },
+            borderRadius: BorderRadius.circular(4),
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              height: 22,
+              padding: const EdgeInsets.symmetric(horizontal: 6),
               decoration: BoxDecoration(
-                color: isCurrentInOverflow ? Colors.amber.shade700 : Colors.white10,
+                color: unreadWatchdog > 0
+                    ? Colors.purple.shade900.withValues(alpha: 0.5)
+                    : Colors.white10,
                 borderRadius: BorderRadius.circular(4),
                 border: Border.all(
-                  color: isCurrentInOverflow ? Colors.amberAccent : Colors.white24,
+                  color: unreadWatchdog > 0
+                      ? Colors.purpleAccent
+                      : (isSynced ? Colors.green.shade600 : Colors.white24),
                 ),
               ),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  Icon(
+                    Icons.visibility_rounded,
+                    size: 12,
+                    color: unreadWatchdog > 0 ? Colors.purpleAccent : (isSynced ? Colors.greenAccent : Colors.white70),
+                  ),
+                  const SizedBox(width: 4),
                   Text(
-                    isCurrentInOverflow ? "Other: $currentAgent" : "Other...",
+                    "WATCHDOG 🐕",
                     style: TextStyle(
-                      color: isCurrentInOverflow ? Colors.white : Colors.white70,
-                      fontSize: 10,
+                      color: unreadWatchdog > 0 ? Colors.purpleAccent : Colors.white,
+                      fontSize: 9,
                       fontWeight: FontWeight.bold,
+                      letterSpacing: 0.5,
                     ),
                   ),
-                  const Icon(Icons.arrow_drop_down, color: Colors.white70, size: 14),
+                  if (isSynced) ...[
+                    const SizedBox(width: 4),
+                    Container(
+                      width: 6,
+                      height: 6,
+                      decoration: const BoxDecoration(
+                        color: Colors.greenAccent,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                  ],
+                  if (unreadWatchdog > 0) ...[
+                    const SizedBox(width: 4),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                      decoration: BoxDecoration(
+                        color: Colors.purpleAccent,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Text(
+                        "$unreadWatchdog",
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 8,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
           ),
-      ],
+        );
+      },
     );
   }
 
@@ -432,14 +1119,85 @@ class _MainShellState extends State<MainShell> with WindowListener {
     );
   }
 
+  Widget _buildLogConsoleHeaderButton(BuildContext context, AppProvider app) {
+    final bool isDark = app.isDarkMode;
+    return ListenableBuilder(
+      listenable: AppLogger.instance,
+      builder: (context, _) {
+        final hasErrors = AppLogger.instance.hasNewErrors;
+        return Tooltip(
+          message: "Open Detailed Log Console (Software & Supabase)",
+          child: InkWell(
+            onTap: () {
+              AppLogger.instance.markErrorsAsSeen();
+              showDialog(
+                context: context,
+                builder: (context) => const LogConsoleDialog(),
+              );
+            },
+            borderRadius: BorderRadius.circular(4),
+            child: Container(
+              height: 22,
+              padding: const EdgeInsets.symmetric(horizontal: 6),
+              decoration: BoxDecoration(
+                color: hasErrors
+                    ? Colors.red.shade900.withValues(alpha: 0.5)
+                    : (isDark ? Colors.cyan.shade900.withValues(alpha: 0.3) : Colors.white10),
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(
+                  color: hasErrors
+                      ? Colors.redAccent
+                      : (isDark ? Colors.cyanAccent.withValues(alpha: 0.6) : Colors.white24),
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.terminal_rounded,
+                    size: 12,
+                    color: hasErrors ? Colors.redAccent : Colors.cyanAccent,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    "LOGS",
+                    style: TextStyle(
+                      color: hasErrors ? Colors.redAccent : Colors.cyanAccent,
+                      fontSize: 9,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                  if (hasErrors) ...[
+                    const SizedBox(width: 4),
+                    Container(
+                      width: 6,
+                      height: 6,
+                      decoration: const BoxDecoration(
+                        color: Colors.redAccent,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   Widget _buildMenuBar(BuildContext context, AppProvider app) {
     return Container(
       height: 28,
       width: double.infinity,
       color: const Color(0xFF1E293B),
-      child: Row(
-        children: [
-          const SizedBox(width: 12),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          children: [
+            const SizedBox(width: 12),
           _CompactDropdownMenu(title: "MASTER", actions: [
             _MenuAction("Product Registration", () => app.openProductRegistration()),
             _MenuAction("Supplier Master", () => app.openSupplierList()),
@@ -474,6 +1232,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
                 ),
               );
             }),
+            _MenuAction("Realtime Stock Qty", () => app.openRealtimeStock()),
             _MenuAction("Live Current Stock", () {
               Provider.of<MdiController>(context, listen: false).openWindow(
                 MdiWindow(
@@ -492,7 +1251,6 @@ class _MainShellState extends State<MainShell> with WindowListener {
           ]),
           _CompactDropdownMenu(title: "STOCK MANAGEMENT", actions: [
             _MenuAction("Stock Checking", () => app.openStockChecking()),
-            _MenuAction("Bulk Stock Manager", () => app.openStockManagement()),
             _MenuAction("Quick Adjustment", () {
               showDialog(
                 context: context,
@@ -502,7 +1260,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
             }),
             _MenuAction("Stock Adjustment (Batch)", () => app.openStockAdjustmentBatch()),
             _MenuAction("Damage & Expiry Entry", () => app.openDamageEntry()),
-            _MenuAction("Expiry Check", () => app.openExpiryList()),
+            _MenuAction("Expiry / Non Moving", () => app.openExpiryList()),
           ]),
           _CompactDropdownMenu(title: "ORDER", actions: [
             _MenuAction("Order Book", () => app.openOrderBook()),
@@ -541,15 +1299,14 @@ class _MainShellState extends State<MainShell> with WindowListener {
           ]),
 
           // Add a solid drag handle for the remaining space in the Menu Bar
-          Expanded(
-            child: GestureDetector(
-              behavior: HitTestBehavior.translucent,
-              onPanStart: (_) => windowManager.startDragging(),
-              child: Container(color: Colors.transparent),
-            ),
+          GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onPanStart: (_) => windowManager.startDragging(),
+            child: Container(width: 50, color: Colors.transparent),
           ),
         ],
       ),
+    ),
     );
   }
 
@@ -582,9 +1339,13 @@ class _MainShellState extends State<MainShell> with WindowListener {
 
 
 
-  void _showTabContextMenu(BuildContext context, AppProvider app, Offset position) async {
+  void _showTabContextMenu(BuildContext context, AppProvider app, Offset position, {int? tabIndex}) async {
     final RenderBox? overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
     if (overlay == null) return;
+
+    final int targetIdx = tabIndex ?? app.activeTabIndex;
+    final bool canMoveLeft = targetIdx > 1;
+    final bool canMoveRight = targetIdx > 0 && targetIdx < app.openTabs.length - 1;
 
     final result = await showMenu<String>(
       context: context,
@@ -593,11 +1354,59 @@ class _MainShellState extends State<MainShell> with WindowListener {
         Offset.zero & overlay.size,
       ),
       items: [
+        if (tabIndex != null && targetIdx > 0) ...[
+          PopupMenuItem<String>(
+            value: 'move_left',
+            enabled: canMoveLeft,
+            child: const Row(
+              children: [
+                Icon(Icons.arrow_back, size: 16),
+                SizedBox(width: 8),
+                Text("Move tab left"),
+              ],
+            ),
+          ),
+          PopupMenuItem<String>(
+            value: 'move_right',
+            enabled: canMoveRight,
+            child: const Row(
+              children: [
+                Icon(Icons.arrow_forward, size: 16),
+                SizedBox(width: 8),
+                Text("Move tab right"),
+              ],
+            ),
+          ),
+          const PopupMenuDivider(),
+          PopupMenuItem<String>(
+            value: 'close_others',
+            enabled: app.openTabs.length > 2 || (app.openTabs.length == 2 && targetIdx != 0),
+            child: const Row(
+              children: [
+                Icon(Icons.tab_unselected, size: 16),
+                SizedBox(width: 8),
+                Text("Close other tabs"),
+              ],
+            ),
+          ),
+          PopupMenuItem<String>(
+            value: 'close_right',
+            enabled: targetIdx < app.openTabs.length - 1,
+            child: const Row(
+              children: [
+                Icon(Icons.clear_all, size: 16),
+                SizedBox(width: 8),
+                Text("Close tabs to the right"),
+              ],
+            ),
+          ),
+          const PopupMenuDivider(),
+        ],
         PopupMenuItem<String>(
           value: 'recover',
           enabled: app.closedTabsHistory.isNotEmpty,
-          child: Row(
-            children: const [
+          child: const Row(
+            children: [
               Icon(Icons.restore_page_rounded, size: 16),
               SizedBox(width: 8),
               Text("Recover last closed tab"),
@@ -607,7 +1416,15 @@ class _MainShellState extends State<MainShell> with WindowListener {
       ],
     );
 
-    if (result == 'recover') {
+    if (result == 'move_left') {
+      app.moveTabLeft(targetIdx);
+    } else if (result == 'move_right') {
+      app.moveTabRight(targetIdx);
+    } else if (result == 'close_others') {
+      app.closeOtherTabs(targetIdx);
+    } else if (result == 'close_right') {
+      app.closeTabsToRight(targetIdx);
+    } else if (result == 'recover') {
       app.recoverLastClosedTab();
     }
   }
@@ -634,113 +1451,188 @@ class _MainShellState extends State<MainShell> with WindowListener {
 
     if (allItems.isEmpty) return const SizedBox.shrink();
 
-    return GestureDetector(
-      onSecondaryTapDown: (details) {
-        _showTabContextMenu(context, app, details.globalPosition);
-      },
-      child: Container(
-        height: 32,
-        width: double.infinity,
-        color: const Color(0xFF0F172A),
-        padding: const EdgeInsets.symmetric(horizontal: 4),
-        child: Row(
+    void scrollTabs(double delta) {
+      if (!_tabScrollController.hasClients) return;
+      final target = (_tabScrollController.offset + delta)
+          .clamp(0.0, _tabScrollController.position.maxScrollExtent);
+      _tabScrollController.animateTo(
+        target,
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeOut,
+      );
+    }
+
+    return Container(
+      height: 32,
+      width: double.infinity,
+      color: const Color(0xFF0F172A),
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: Row(
         children: [
+          // Scroll Left Button
+          IconButton(
+            icon: const Icon(Icons.chevron_left, color: Colors.white70, size: 18),
+            onPressed: () => scrollTabs(-150),
+            tooltip: "Scroll tabs left",
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 22, minHeight: 28),
+            hoverColor: Colors.white10,
+          ),
           Expanded(
-            child: ListView.builder(
-              scrollDirection: Axis.horizontal,
-              itemCount: allItems.length,
-              itemBuilder: (context, index) {
-                final item = allItems[index];
-                final bool isActive = item['isActive'] as bool;
-                final bool isHome = item['title'] == 'Home';
-                final String titleText = (item['title'] as String).toUpperCase();
-
-                // RESTORE ORIGINAL MATCHING COLOR PALETTE WITH FIX FOR TEXT VISIBILITY
-                final Color tabBg = isActive
-                    ? (isDark ? const Color(0xFF1E293B) : Colors.white)
-                    : (isDark ? Colors.white.withValues(alpha: 0.05) : Colors.white.withValues(alpha: 0.12));
-
-                final Color txtColor = isActive
-                    ? (isDark ? Colors.amberAccent : const Color(0xFF0F172A))
-                    : Colors.white70;
-
-                final Color closeIconColor = isActive
-                    ? (isDark ? Colors.amberAccent.withValues(alpha: 0.9) : const Color(0xFF0F172A))
-                    : Colors.white38;
-
-                return MouseRegion(
-                  cursor: SystemMouseCursors.click,
-                  child: GestureDetector(
-                    onTap: () {
-                      if (item['type'] == 'tab') {
-                        app.focusTab(item['index'] as int);
-                      } else {
-                        mdi.focusWindow(item['id'] as String);
-                      }
+            child: GestureDetector(
+              onSecondaryTapDown: (details) {
+                _showTabContextMenu(context, app, details.globalPosition);
+              },
+              child: ReorderableListView.builder(
+                scrollController: _tabScrollController,
+                scrollDirection: Axis.horizontal,
+                buildDefaultDragHandles: false,
+                proxyDecorator: (Widget child, int index, Animation<double> animation) {
+                  return AnimatedBuilder(
+                    animation: animation,
+                    builder: (BuildContext context, Widget? child) {
+                      return Material(
+                        elevation: 10,
+                        color: Colors.transparent,
+                        shadowColor: Colors.black87,
+                        child: child,
+                      );
                     },
-                    child: Container(
-                      constraints: const BoxConstraints(minWidth: 50, maxWidth: 140),
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                      margin: const EdgeInsets.only(right: 1, top: 1),
-                      decoration: BoxDecoration(
-                        color: tabBg,
-                        borderRadius: const BorderRadius.vertical(top: Radius.circular(5)),
-                        border: Border(
-                          right: BorderSide(
-                            color: isActive ? Colors.transparent : Colors.white.withValues(alpha: 0.1),
-                            width: 1,
+                    child: child,
+                  );
+                },
+                onReorderItem: (int oldIndex, int newIndex) {
+                  if (oldIndex < app.openTabs.length) {
+                    app.reorderTabs(oldIndex, newIndex);
+                  }
+                },
+                itemCount: allItems.length,
+                itemBuilder: (context, index) {
+                  final item = allItems[index];
+                  final bool isActive = item['isActive'] as bool;
+                  final bool isHome = item['title'] == 'Home';
+                  final String titleText = (item['title'] as String).toUpperCase();
+
+                  final Color tabBg = isActive
+                      ? (isDark ? const Color(0xFF1E293B) : Colors.white)
+                      : (isDark ? Colors.white.withValues(alpha: 0.05) : Colors.white.withValues(alpha: 0.12));
+
+                  final Color txtColor = isActive
+                      ? (isDark ? Colors.amberAccent : const Color(0xFF0F172A))
+                      : Colors.white70;
+
+                  final Color closeIconColor = isActive
+                      ? (isDark ? Colors.amberAccent.withValues(alpha: 0.9) : const Color(0xFF0F172A))
+                      : Colors.white38;
+
+                  final Key itemKey = ValueKey(
+                    item['type'] == 'tab'
+                        ? 'tab_${item['title']}_${item['index']}'
+                        : 'mdi_${item['id']}',
+                  );
+
+                  final double tabMaxWidth = isHome ? 75.0 : (isActive ? 220.0 : 160.0);
+                  final double tabMinWidth = isHome ? 50.0 : 40.0;
+
+                  return ReorderableDragStartListener(
+                    key: itemKey,
+                    index: index,
+                    child: MouseRegion(
+                      cursor: SystemMouseCursors.click,
+                      child: GestureDetector(
+                        onTap: () {
+                          if (item['type'] == 'tab') {
+                            app.focusTab(item['index'] as int);
+                          } else {
+                            mdi.focusWindow(item['id'] as String);
+                          }
+                        },
+                        onSecondaryTapDown: (details) {
+                          _showTabContextMenu(
+                            context,
+                            app,
+                            details.globalPosition,
+                            tabIndex: item['type'] == 'tab' ? item['index'] as int : null,
+                          );
+                        },
+                        child: Container(
+                          constraints: BoxConstraints(minWidth: tabMinWidth, maxWidth: tabMaxWidth),
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          margin: const EdgeInsets.only(right: 1, top: 1),
+                          decoration: BoxDecoration(
+                            color: tabBg,
+                            borderRadius: const BorderRadius.vertical(top: Radius.circular(5)),
+                            border: Border(
+                              right: BorderSide(
+                                color: isActive ? Colors.transparent : Colors.white.withValues(alpha: 0.1),
+                                width: 1,
+                              ),
+                            ),
+                          ),
+                          child: DefaultTextStyle(
+                            style: TextStyle(
+                              color: txtColor,
+                              fontSize: 10.5,
+                              fontWeight: isActive ? FontWeight.w900 : FontWeight.w600,
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (isHome) ...[
+                                  Icon(Icons.home_rounded, size: 13, color: txtColor),
+                                  const SizedBox(width: 4),
+                                ],
+                                Flexible(
+                                  child: Text(
+                                    titleText,
+                                    style: TextStyle(
+                                      color: txtColor,
+                                      fontSize: 10.5,
+                                      fontWeight: isActive ? FontWeight.w900 : FontWeight.w600,
+                                      letterSpacing: 0.3,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                    maxLines: 1,
+                                  ),
+                                ),
+                                if (item['type'] == 'tab' && !isHome) ...[
+                                  const SizedBox(width: 4),
+                                  Material(
+                                    color: Colors.transparent,
+                                    child: InkWell(
+                                      onTap: () => confirmCloseTab(context, item['index'] as int),
+                                      borderRadius: BorderRadius.circular(4),
+                                      hoverColor: Colors.red.withValues(alpha: 0.2),
+                                      child: Padding(
+                                        padding: const EdgeInsets.all(2),
+                                        child: Icon(
+                                          Icons.close,
+                                          size: 11,
+                                          color: closeIconColor,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
                           ),
                         ),
                       ),
-                      child: DefaultTextStyle(
-                        style: TextStyle(
-                          color: txtColor,
-                          fontSize: 10.5,
-                          fontWeight: isActive ? FontWeight.w900 : FontWeight.w600,
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Expanded(
-                              child: Text(
-                                titleText,
-                                style: TextStyle(
-                                  color: txtColor,
-                                  fontSize: 10.5,
-                                  fontWeight: isActive ? FontWeight.w900 : FontWeight.w600,
-                                  letterSpacing: 0.3,
-                                ),
-                                overflow: TextOverflow.ellipsis,
-                                maxLines: 1,
-                              ),
-                            ),
-                            if (item['type'] == 'tab' && !isHome) ...[
-                              const SizedBox(width: 4),
-                              Material(
-                                color: Colors.transparent,
-                                child: InkWell(
-                                  onTap: () => confirmCloseTab(context, item['index'] as int),
-                                  borderRadius: BorderRadius.circular(4),
-                                  hoverColor: Colors.red.withValues(alpha: 0.2),
-                                  child: Padding(
-                                    padding: const EdgeInsets.all(2),
-                                    child: Icon(
-                                      Icons.close,
-                                      size: 11,
-                                      color: closeIconColor,
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ],
-                        ),
-                      ),
                     ),
-                  ),
-                );
-              },
+                  );
+                },
+              ),
             ),
+          ),
+          // Scroll Right Button
+          IconButton(
+            icon: const Icon(Icons.chevron_right, color: Colors.white70, size: 18),
+            onPressed: () => scrollTabs(150),
+            tooltip: "Scroll tabs right",
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 22, minHeight: 28),
+            hoverColor: Colors.white10,
           ),
           // Drag area for the window
           Expanded(
@@ -748,12 +1640,215 @@ class _MainShellState extends State<MainShell> with WindowListener {
             child: GestureDetector(
               behavior: HitTestBehavior.translucent,
               onPanStart: (details) => windowManager.startDragging(),
-              child: const SizedBox(width: 80, height: double.infinity),
+              child: const SizedBox(width: 50, height: double.infinity),
             ),
           ),
         ],
       ),
-    ),
+    );
+  }
+
+  Widget _buildOfflineBanner() {
+    return ListenableBuilder(
+      listenable: ServerConfigService.instance,
+      builder: (context, _) {
+        final config = ServerConfigService.instance;
+        final bool isOffline = config.isPureCloud ? !config.isConnected : (config.isServerModeEnabled && !config.isConnected);
+        if (!isOffline) {
+          return const SizedBox.shrink();
+        }
+        final String bannerText = config.isPureCloud
+            ? "PURE CLOUD LIVE DISCONNECTED — TYPING ENABLED (SAVE, EDIT & DELETE BLOCKED)"
+            : "SERVER DISCONNECTED — WORKING IN OFFLINE MODE (Terminal: ${config.terminalId})";
+
+        return Container(
+          width: double.infinity,
+          color: config.isPureCloud ? Colors.amber.shade900 : Colors.red.shade700,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 16),
+              const SizedBox(width: 8),
+              Text(
+                bannerText,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 11,
+                ),
+              ),
+              const SizedBox(width: 12),
+              TextButton(
+                onPressed: () {
+                  config.connectServer(
+                    url: config.supabaseUrl,
+                    anonKey: config.supabaseAnonKey,
+                    branchId: config.storeBranchId,
+                    enableMode: true,
+                  );
+                },
+                style: TextButton.styleFrom(
+                  backgroundColor: Colors.white.withValues(alpha: 0.2),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                  minimumSize: Size.zero,
+                ),
+                child: const Text("RETRY CONNECTION", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildUnsyncedBoxButton(BuildContext context) {
+    _unsyncedCountFuture ??= SupabaseSyncService.instance.getUnsyncedTotalCount();
+    return ListenableBuilder(
+      listenable: SupabaseSyncService.instance,
+      builder: (context, _) {
+        final syncService = SupabaseSyncService.instance;
+        final isSyncingActive = syncService.isSyncing;
+
+        return FutureBuilder<int>(
+          future: _unsyncedCountFuture,
+          builder: (context, snapshot) {
+            final rawCount = snapshot.data ?? 0;
+            final isError = rawCount < 0;
+            final count = isError ? 0 : rawCount;
+            final hasUnsynced = count > 0;
+
+            final String label = isError
+                ? "Sync Unknown"
+                : ((isSyncingActive && hasUnsynced)
+                    ? "Syncing ($count left)..."
+                    : (hasUnsynced ? "$count Unsynced" : "All Synced"));
+
+            final Color bgColor = isError
+                ? Colors.orange.shade900.withValues(alpha: 0.8)
+                : ((isSyncingActive && hasUnsynced)
+                    ? Colors.amber.shade900.withValues(alpha: 0.8)
+                    : (hasUnsynced ? Colors.red.shade700 : Colors.white12));
+
+            final Color borderColor = isError
+                ? Colors.orangeAccent
+                : ((isSyncingActive && hasUnsynced)
+                    ? Colors.amberAccent
+                    : (hasUnsynced ? Colors.red.shade300 : Colors.white24));
+
+            return Tooltip(
+              message: isError
+                  ? "Unable to determine sync status. Check database/network connection."
+                  : (hasUnsynced
+                      ? "$count pending local record(s) stored in internal storage awaiting cloud sync."
+                      : "All local entries are fully synced with live server."),
+              child: InkWell(
+                onTap: () => _showUnsyncedPanel(context),
+                borderRadius: BorderRadius.circular(6),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: bgColor,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: borderColor),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (isSyncingActive && hasUnsynced)
+                        const SizedBox(
+                          width: 12,
+                          height: 12,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.amberAccent),
+                        )
+                      else
+                        Icon(
+                          isError
+                              ? Icons.sync_problem_rounded
+                              : (hasUnsynced ? Icons.warning_amber_rounded : Icons.cloud_done_rounded),
+                          color: Colors.white,
+                          size: 14,
+                        ),
+                      const SizedBox(width: 4),
+                      Text(
+                        label,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildUnsyncedIndicatorButton(BuildContext context) {
+    return ListenableBuilder(
+      listenable: ServerConfigService.instance,
+      builder: (context, _) {
+        final config = ServerConfigService.instance;
+        if (config.isPureCloud) {
+          final isOnline = config.isConnected;
+          return Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Tooltip(
+                message: isOnline
+                    ? "Pure Cloud Live Mode: Connected (${config.storeBranchId})"
+                    : "Pure Cloud Live Mode: Disconnected (Entries saved inside local storage)",
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: isOnline
+                        ? Colors.cyan.shade900.withValues(alpha: 0.5)
+                        : Colors.red.shade900.withValues(alpha: 0.5),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: isOnline ? Colors.cyan.shade300 : Colors.red.shade300),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        isOnline ? Icons.bolt_rounded : Icons.wifi_off_rounded,
+                        color: isOnline ? Colors.cyanAccent : Colors.orangeAccent,
+                        size: 14,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        isOnline ? "Pure Cloud Live" : "Cloud Offline",
+                        style: TextStyle(
+                          color: isOnline ? Colors.cyanAccent : Colors.orangeAccent,
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(width: 4),
+              _buildUnsyncedBoxButton(context),
+            ],
+          );
+        }
+
+        return _buildUnsyncedBoxButton(context);
+      },
+    );
+  }
+
+  void _showUnsyncedPanel(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (context) => const UnsyncedDiscrepanciesDialog(),
     );
   }
 
@@ -1358,3 +2453,228 @@ void confirmCloseTab(BuildContext context, int tabIndex) {
     }
   });
 }
+
+class UnsyncedDiscrepanciesDialog extends StatefulWidget {
+  const UnsyncedDiscrepanciesDialog({super.key});
+
+  @override
+  State<UnsyncedDiscrepanciesDialog> createState() => _UnsyncedDiscrepanciesDialogState();
+}
+
+class _UnsyncedDiscrepanciesDialogState extends State<UnsyncedDiscrepanciesDialog> with SingleTickerProviderStateMixin {
+  late TabController _tabController;
+  bool _isLoading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _forceSyncNow() async {
+    setState(() => _isLoading = true);
+    try {
+      await SupabaseSyncService.instance.syncAllPendingData(forceFull: false, isManualTransfer: true);
+      if (mounted) {
+        AppNotificationService.instance.addNotification(
+          title: "Cloud Sync Complete",
+          message: "Manual sync finished successfully.",
+          type: NotificationType.backup,
+        );
+        setState(() {});
+      }
+    } catch (e) {
+      if (mounted) {
+        AppNotificationService.instance.addNotification(
+          title: "Cloud Sync Warning",
+          message: "Sync notice: $e",
+          type: NotificationType.backup,
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Container(
+        width: 750,
+        height: 550,
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.cloud_sync_rounded, color: Colors.indigo, size: 24),
+                const SizedBox(width: 10),
+                const Text(
+                  "Unsynced Data & Stock Discrepancies Monitor",
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+                const Spacer(),
+                ElevatedButton.icon(
+                  onPressed: _isLoading ? null : _forceSyncNow,
+                  icon: _isLoading
+                      ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                      : const Icon(Icons.sync_rounded, size: 16, color: Colors.white),
+                  label: Text(_isLoading ? 'Syncing...' : 'Sync All Pending Now'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.indigo,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  icon: const Icon(Icons.close_rounded),
+                  onPressed: () => Navigator.pop(context),
+                ),
+              ],
+            ),
+            const Divider(height: 24),
+            TabBar(
+              controller: _tabController,
+              labelColor: Colors.indigo,
+              unselectedLabelColor: Colors.grey,
+              indicatorColor: Colors.indigo,
+              tabs: const [
+                Tab(text: 'Unsynced Local Entries (Pending Upload)'),
+                Tab(text: 'Stock Discrepancies / Negative Stock'),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: TabBarView(
+                controller: _tabController,
+                children: [
+                  _buildUnsyncedEntriesTab(),
+                  _buildNegativeStockTab(),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildUnsyncedEntriesTab() {
+    return ListenableBuilder(
+      listenable: SupabaseSyncService.instance,
+      builder: (context, _) {
+        return FutureBuilder<List<Map<String, dynamic>>>(
+          future: SupabaseSyncService.instance.getUnsyncedEntriesList(),
+          builder: (context, snapshot) {
+            if (snapshot.connectionState == ConnectionState.waiting) {
+              return const Center(child: CircularProgressIndicator());
+            }
+            final entries = snapshot.data ?? [];
+            if (entries.isEmpty) {
+              return const Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.check_circle_rounded, color: Colors.green, size: 48),
+                    SizedBox(height: 12),
+                    Text("All local entries are fully synced with the server!", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.grey)),
+                  ],
+                ),
+              );
+            }
+
+            return ListView.separated(
+              itemCount: entries.length,
+              separatorBuilder: (_, __) => const Divider(height: 1),
+              itemBuilder: (context, index) {
+                final e = entries[index];
+                final cleanNo = cleanEntryNo(e['entry_no']?.toString() ?? '');
+                final pcName = e['terminal_id']?.toString().isNotEmpty == true
+                    ? e['terminal_id'].toString()
+                    : ServerConfigService.instance.terminalId;
+                return ListTile(
+                  leading: const Icon(Icons.receipt_long_rounded, color: Colors.orange),
+                  title: Row(
+                    children: [
+                      Text("${e['type']} #$cleanNo", style: const TextStyle(fontWeight: FontWeight.bold)),
+                      const SizedBox(width: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: Colors.indigo.shade50,
+                          borderRadius: BorderRadius.circular(4),
+                          border: Border.all(color: Colors.indigo.shade200),
+                        ),
+                        child: Text(
+                          "PC: $pcName",
+                          style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.indigo.shade900),
+                        ),
+                      ),
+                    ],
+                  ),
+                  subtitle: Text("Account: ${e['account']} | Date: ${e['date']}"),
+                  trailing: Text("₹${(e['amount'] as num).toStringAsFixed(2)}", style: const TextStyle(fontWeight: FontWeight.w900, color: Colors.indigo)),
+                );
+              },
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildNegativeStockTab() {
+    return FutureBuilder<List<Map<String, dynamic>>>(
+      future: SupabaseSyncService.instance.getNegativeStockDiscrepancies(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        final items = snapshot.data ?? [];
+        if (items.isEmpty) {
+          return const Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.inventory_2_rounded, color: Colors.green, size: 48),
+                SizedBox(height: 12),
+                Text("No negative stock or offline multi-PC conflicts detected!", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.grey)),
+              ],
+            ),
+          );
+        }
+
+        return ListView.separated(
+          itemCount: items.length,
+          separatorBuilder: (_, __) => const Divider(height: 1),
+          itemBuilder: (context, index) {
+            final item = items[index];
+            return ListTile(
+              leading: const Icon(Icons.warning_amber_rounded, color: Colors.red),
+              title: Text(item['product_name']?.toString() ?? 'Unknown Product', style: const TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: Text("Batch: ${item['batch_number']} | Product ID: ${item['product_id']}"),
+              trailing: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(color: Colors.red.shade100, borderRadius: BorderRadius.circular(6)),
+                child: Text(
+                  "Stock: ${item['current_stock']}",
+                  style: TextStyle(color: Colors.red.shade900, fontWeight: FontWeight.bold),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+

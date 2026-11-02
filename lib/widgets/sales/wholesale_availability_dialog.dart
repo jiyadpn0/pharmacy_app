@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
-import '../../models/erp_models.dart';
 import '../../providers/pharmacy_provider.dart';
 
 class WholesaleAvailabilityDialog extends StatefulWidget {
@@ -109,8 +108,8 @@ class _WholesaleAvailabilityDialogState extends State<WholesaleAvailabilityDialo
     });
   }
 
-  void _handleKeyDown(RawKeyEvent event) {
-    if (event is! RawKeyDownEvent) return;
+  void _handleKeyDown(KeyEvent event) {
+    if (event is! KeyDownEvent) return;
 
     if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
       if (_filteredResults.isNotEmpty) {
@@ -148,9 +147,9 @@ class _WholesaleAvailabilityDialogState extends State<WholesaleAvailabilityDialo
     final int orangeCount = _allResults.where((r) => r.status == WholesalerMatchStatus.brandVariantPurchase).length;
     final int yellowCount = _allResults.where((r) => r.status == WholesalerMatchStatus.directoryMatch).length;
 
-    return RawKeyboardListener(
+    return KeyboardListener(
       focusNode: FocusNode()..requestFocus(),
-      onKey: _handleKeyDown,
+      onKeyEvent: _handleKeyDown,
       child: Dialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         insetPadding: const EdgeInsets.symmetric(horizontal: 40, vertical: 24),
@@ -178,7 +177,7 @@ class _WholesaleAvailabilityDialogState extends State<WholesaleAvailabilityDialo
                     Container(
                       padding: const EdgeInsets.all(8),
                       decoration: BoxDecoration(
-                        color: Colors.blue.shade600.withOpacity(0.2),
+                        color: Colors.blue.shade600.withValues(alpha: 0.2),
                         borderRadius: BorderRadius.circular(8),
                       ),
                       child: const Icon(Icons.storefront_rounded, color: Colors.blueAccent, size: 24),
@@ -219,7 +218,7 @@ class _WholesaleAvailabilityDialogState extends State<WholesaleAvailabilityDialo
                 margin: const EdgeInsets.all(12),
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
                 decoration: BoxDecoration(
-                  color: Colors.blue.shade50.withOpacity(0.5),
+                  color: Colors.blue.shade50.withValues(alpha: 0.5),
                   borderRadius: BorderRadius.circular(10),
                   border: Border.all(color: Colors.blue.shade200),
                 ),
@@ -416,7 +415,7 @@ class _WholesaleAvailabilityDialogState extends State<WholesaleAvailabilityDialo
       decoration: BoxDecoration(
         color: bgColor,
         borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: color.withOpacity(0.4)),
+        border: Border.all(color: color.withValues(alpha: 0.4)),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
@@ -492,16 +491,16 @@ class _WholesaleAvailabilityDialogState extends State<WholesaleAvailabilityDialo
         margin: const EdgeInsets.only(bottom: 8),
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         decoration: BoxDecoration(
-          color: isSelected ? cardBg.withOpacity(0.9) : cardBg,
+          color: isSelected ? cardBg.withValues(alpha: 0.9) : cardBg,
           borderRadius: BorderRadius.circular(10),
           border: Border.all(
-            color: isSelected ? borderColor : borderColor.withOpacity(0.5),
+            color: isSelected ? borderColor : borderColor.withValues(alpha: 0.5),
             width: isSelected ? 2.5 : 1.2,
           ),
           boxShadow: isSelected
               ? [
                   BoxShadow(
-                    color: borderColor.withOpacity(0.2),
+                    color: borderColor.withValues(alpha: 0.2),
                     blurRadius: 6,
                     offset: const Offset(0, 2),
                   )

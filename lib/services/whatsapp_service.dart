@@ -77,6 +77,15 @@ class WhatsAppService {
     return await _launchWhatsAppUrl(context: context, phone: phone, text: sb.toString());
   }
 
+  /// Sends any formatted custom message via WhatsApp.
+  static Future<bool> sendCustomMessage({
+    required BuildContext context,
+    required String phone,
+    required String text,
+  }) async {
+    return await _launchWhatsAppUrl(context: context, phone: phone, text: text);
+  }
+
   /// Copies a local file onto the Windows System Clipboard as a File Drop List (CF_HDROP)
   /// so pressing Ctrl+V in WhatsApp Web/Desktop instantly pastes/attaches the actual PDF file!
   static Future<bool> copyFileToClipboard(String filePath) async {
@@ -264,6 +273,7 @@ class WhatsAppService {
     }
 
     // 3. Launch WhatsApp URL
+    if (!context.mounted) return false;
     bool launched = await _launchWhatsAppUrl(context: context, phone: custMobile, text: sb.toString());
     if (!context.mounted) return false;
 
@@ -380,6 +390,7 @@ class WhatsAppService {
     }
 
     // 3. Launch WhatsApp URL
+    if (!context.mounted) return false;
     bool launched = await _launchWhatsAppUrl(context: context, phone: custMobile, text: sb.toString());
     if (!context.mounted) return false;
 
@@ -467,6 +478,47 @@ class WhatsAppService {
     final comp = CompanyProfile(name: companyName, phone: companyPhone);
     return await sendSalesInvoiceWithPdf(context: context, invoice: inv, companyProfile: comp);
   }
+
+  /// Sends a quick digital invoice text via WhatsApp.
+  static Future<bool> sendDigitalInvoice({
+    required BuildContext context,
+    required String phoneNumber,
+    required String customerName,
+    required String invoiceNo,
+    required double netAmount,
+    required String pharmacyName,
+  }) async {
+    final phone = sanitizePhoneNumber(phoneNumber);
+    if (phone.isEmpty) return false;
+
+    final text = "Dear *$customerName*,\n\n"
+        "Thank you for visiting *$pharmacyName*!\n"
+        "Your Invoice #*$invoiceNo* is ready.\n\n"
+        "*Total Amount*: Rs. ${netAmount.toStringAsFixed(2)}\n\n"
+        "Get well soon!";
+
+    return await sendCustomMessage(context: context, phone: phone, text: text);
+  }
+
+  /// Sends a chronic medication refill reminder via WhatsApp.
+  static Future<bool> sendRefillReminder({
+    required BuildContext context,
+    required String phoneNumber,
+    required String customerName,
+    required String medicineName,
+    required String pharmacyName,
+  }) async {
+    final phone = sanitizePhoneNumber(phoneNumber);
+    if (phone.isEmpty) return false;
+
+    final text = "Hello *$customerName*,\n\n"
+        "This is a friendly reminder from *$pharmacyName*.\n"
+        "Your supply for *$medicineName* may be running low.\n\n"
+        "Reply to this message or visit us to arrange your timely refill!";
+
+    return await sendCustomMessage(context: context, phone: phone, text: text);
+  }
+
 
   static Future<bool> _launchWhatsAppUrl({
     required BuildContext context,

@@ -1,9 +1,11 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import 'package:file_picker/file_picker.dart';
 import '../providers/pharmacy_provider.dart';
+import '../widgets/erp_tooltip.dart';
 import '../utils/app_formatters.dart';
 import '../utils/theme_constants.dart';
 
@@ -17,7 +19,7 @@ class StockAdjustmentBatchReportScreen extends StatefulWidget {
 enum AggregationType { sum, min, max, count, average, none }
 
 class _StockAdjustmentBatchReportScreenState extends State<StockAdjustmentBatchReportScreen> {
-  DateTime _startDate = DateTime.now().subtract(const Duration(days: 30));
+  DateTime _startDate = DateTime.now();
   DateTime _endDate = DateTime.now();
 
   final Map<String, String> _columnFilters = {};
@@ -305,6 +307,74 @@ class _StockAdjustmentBatchReportScreenState extends State<StockAdjustmentBatchR
     );
   }
 
+  void _showAggregationMenu(Offset position, String colKey) {
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
+    final currentAgg = _columnAggregations[colKey] ?? AggregationType.none;
+    final resultStr = _calculateAggregation(colKey, currentAgg);
+
+    final List<PopupMenuEntry<dynamic>> items = [
+      _buildPopupItem(AggregationType.sum, "Sum", Icons.functions),
+      _buildPopupItem(AggregationType.min, "Min", Icons.bar_chart),
+      _buildPopupItem(AggregationType.max, "Max", Icons.bar_chart),
+      _buildPopupItem(AggregationType.count, "Count", Icons.numbers),
+      _buildPopupItem(AggregationType.average, "Average", Icons.abc),
+      const PopupMenuDivider(),
+      _buildPopupItem(AggregationType.none, "None", Icons.check),
+    ];
+
+    if (resultStr.isNotEmpty) {
+      items.addAll([
+        const PopupMenuDivider(),
+        PopupMenuItem<String>(
+          value: "COPY_VALUE",
+          height: 32,
+          child: Row(
+            children: [
+              const Icon(Icons.copy, size: 14, color: Colors.blue),
+              const SizedBox(width: 8),
+              Text("Copy ($resultStr)", style: const TextStyle(fontSize: 11)),
+            ],
+          ),
+        ),
+      ]);
+    }
+
+    showMenu<dynamic>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(position.dx, position.dy, 0, 0),
+        Offset.zero & overlay.size,
+      ),
+      items: items,
+    ).then((selected) {
+      if (selected is AggregationType) {
+        setState(() => _columnAggregations[colKey] = selected);
+      } else if (selected == "COPY_VALUE") {
+        Clipboard.setData(ClipboardData(text: resultStr));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Copied $resultStr to clipboard"), duration: const Duration(seconds: 1)),
+          );
+        }
+      }
+    });
+  }
+
+  PopupMenuItem<AggregationType> _buildPopupItem(AggregationType type, String label, IconData icon) {
+    return PopupMenuItem<AggregationType>(
+      value: type,
+      height: 32,
+      child: Row(
+        children: [
+          Icon(icon, size: 14, color: Colors.blueGrey),
+          const SizedBox(width: 8),
+          Text(label, style: const TextStyle(fontSize: 11)),
+        ],
+      ),
+    );
+  }
+
   Widget _buildGridFooter() {
     final columns = [
       _ColInfo("date", "Date", flex: 1.2),
@@ -327,11 +397,18 @@ class _StockAdjustmentBatchReportScreenState extends State<StockAdjustmentBatchR
 
           return Expanded(
             flex: (col.flex * 10).toInt(),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              decoration: BoxDecoration(border: Border.all(color: Colors.grey.shade300, width: 0.5)),
-              alignment: col.align == TextAlign.left ? Alignment.centerLeft : Alignment.centerRight,
-              child: Text(result, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.blue)),
+            child: GestureDetector(
+              onTapDown: (details) => _showAggregationMenu(details.globalPosition, col.key),
+              onSecondaryTapDown: (details) => _showAggregationMenu(details.globalPosition, col.key),
+              child: ERPTooltip(
+                message: result,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  decoration: BoxDecoration(border: Border.all(color: Colors.grey.shade300, width: 0.5)),
+                  alignment: col.align == TextAlign.left ? Alignment.centerLeft : Alignment.centerRight,
+                  child: Text(result, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.blue)),
+                ),
+              ),
             ),
           );
         }).toList(),

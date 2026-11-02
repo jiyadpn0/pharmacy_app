@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -5,8 +6,8 @@ import 'package:provider/provider.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:intl/intl.dart';
 
-import '../models/erp_models.dart';
 import '../providers/pharmacy_provider.dart';
+import '../services/sync_event_bus.dart';
 import '../utils/search_debouncer.dart';
 import '../utils/theme_constants.dart';
 
@@ -18,7 +19,6 @@ class WholesaleStockDirectoryScreen extends StatefulWidget {
 }
 
 class _WholesaleStockDirectoryScreenState extends State<WholesaleStockDirectoryScreen> {
-  bool _isLoadingWholesalers = false;
   bool _isLoadingProducts = false;
 
   // Master Lists loaded from DB
@@ -45,6 +45,7 @@ class _WholesaleStockDirectoryScreenState extends State<WholesaleStockDirectoryS
   final FocusNode _categoryFocusNode = FocusNode();
 
   final SearchDebouncer _mainSearchDebouncer = SearchDebouncer(milliseconds: 100);
+  StreamSubscription? _syncBusSub;
 
   @override
   void initState() {
@@ -62,10 +63,22 @@ class _WholesaleStockDirectoryScreenState extends State<WholesaleStockDirectoryS
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _loadWholesalers();
     });
+
+    _syncBusSub = SyncEventBus.instance.stream.listen((event) {
+      if (!mounted) return;
+      final table = (event is TableChangedEvent) ? event.tableName : event.toString();
+      if (table == 'stock_batches' || table == 'product_master' || table == 'suppliers' || table == 'purchase_items') {
+        _loadWholesalers();
+        if (_selectedWholesaler.isNotEmpty) {
+          _loadProductsForWholesaler(_selectedWholesaler);
+        }
+      }
+    });
   }
 
   @override
   void dispose() {
+    _syncBusSub?.cancel();
     _mainSearchDebouncer.dispose();
 
     _searchCtrl.dispose();
@@ -79,19 +92,16 @@ class _WholesaleStockDirectoryScreenState extends State<WholesaleStockDirectoryS
 
   /// 1. Load Wholesaler List (Ultra-fast <10ms)
   Future<void> _loadWholesalers() async {
-    setState(() => _isLoadingWholesalers = true);
     final provider = Provider.of<PharmacyProvider>(context, listen: false);
     try {
       final list = await provider.getWholesalerNamesWithCounts();
       if (mounted) {
-        _masterWholesalers = list;
         setState(() {
-          _isLoadingWholesalers = false;
+          _masterWholesalers = list;
         });
       }
     } catch (e) {
       if (mounted) {
-        setState(() => _isLoadingWholesalers = false);
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text("Error loading wholesalers: $e"), backgroundColor: Colors.red),
         );
@@ -248,7 +258,7 @@ class _WholesaleStockDirectoryScreenState extends State<WholesaleStockDirectoryS
               ),
               boxShadow: [
                 BoxShadow(
-                  color: Colors.black.withOpacity(0.15),
+                  color: Colors.black.withValues(alpha: 0.15),
                   blurRadius: 8,
                   offset: const Offset(0, 2),
                 ),
@@ -259,9 +269,9 @@ class _WholesaleStockDirectoryScreenState extends State<WholesaleStockDirectoryS
                 Container(
                   padding: const EdgeInsets.all(10),
                   decoration: BoxDecoration(
-                    color: Colors.blue.shade600.withOpacity(0.2),
+                    color: Colors.blue.shade600.withValues(alpha: 0.2),
                     borderRadius: BorderRadius.circular(10),
-                    border: Border.all(color: Colors.blue.shade400.withOpacity(0.4)),
+                    border: Border.all(color: Colors.blue.shade400.withValues(alpha: 0.4)),
                   ),
                   child: const Icon(Icons.storefront_rounded, color: Colors.blueAccent, size: 24),
                 ),
@@ -300,7 +310,7 @@ class _WholesaleStockDirectoryScreenState extends State<WholesaleStockDirectoryS
                   tooltip: "Refresh Wholesalers",
                   icon: const Icon(Icons.refresh_rounded, color: Colors.white),
                   style: IconButton.styleFrom(
-                    backgroundColor: Colors.white.withOpacity(0.1),
+                    backgroundColor: Colors.white.withValues(alpha: 0.1),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                   ),
                 ),
@@ -530,7 +540,7 @@ class _WholesaleStockDirectoryScreenState extends State<WholesaleStockDirectoryS
           Container(
             padding: const EdgeInsets.all(24),
             decoration: BoxDecoration(
-              color: Colors.blue.shade50.withOpacity(0.5),
+              color: Colors.blue.shade50.withValues(alpha: 0.5),
               shape: BoxShape.circle,
             ),
             child: Icon(Icons.storefront_outlined, size: 64, color: Colors.blue.shade700),
@@ -616,9 +626,9 @@ class _WholesaleStockDirectoryScreenState extends State<WholesaleStockDirectoryS
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
               decoration: BoxDecoration(
-                color: Colors.blue.shade50.withOpacity(isDark ? 0.15 : 1.0),
+                color: Colors.blue.shade50.withValues(alpha: isDark ? 0.15 : 1.0),
                 borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: Colors.blue.shade200.withOpacity(0.5)),
+                border: Border.all(color: Colors.blue.shade200.withValues(alpha: 0.5)),
               ),
               child: Text(
                 item.companyName,
@@ -640,12 +650,12 @@ class _WholesaleStockDirectoryScreenState extends State<WholesaleStockDirectoryS
                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
                 decoration: BoxDecoration(
                   color: item.rank > 0
-                      ? Colors.amber.shade50.withOpacity(isDark ? 0.2 : 1.0)
-                      : Colors.grey.shade100.withOpacity(isDark ? 0.1 : 1.0),
+                      ? Colors.amber.shade50.withValues(alpha: isDark ? 0.2 : 1.0)
+                      : Colors.grey.shade100.withValues(alpha: isDark ? 0.1 : 1.0),
                   borderRadius: BorderRadius.circular(12),
                   border: Border.all(
                     color: item.rank > 0
-                        ? Colors.amber.shade400.withOpacity(0.6)
+                        ? Colors.amber.shade400.withValues(alpha: 0.6)
                         : Colors.grey.shade300,
                   ),
                 ),
@@ -671,13 +681,13 @@ class _WholesaleStockDirectoryScreenState extends State<WholesaleStockDirectoryS
                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
                 decoration: BoxDecoration(
                   color: item.currentStock > 0
-                      ? Colors.green.shade50.withOpacity(isDark ? 0.2 : 1.0)
-                      : Colors.red.shade50.withOpacity(isDark ? 0.15 : 1.0),
+                      ? Colors.green.shade50.withValues(alpha: isDark ? 0.2 : 1.0)
+                      : Colors.red.shade50.withValues(alpha: isDark ? 0.15 : 1.0),
                   borderRadius: BorderRadius.circular(12),
                   border: Border.all(
                     color: item.currentStock > 0
-                        ? Colors.green.shade300.withOpacity(0.6)
-                        : Colors.red.shade200.withOpacity(0.5),
+                        ? Colors.green.shade300.withValues(alpha: 0.6)
+                        : Colors.red.shade200.withValues(alpha: 0.5),
                   ),
                 ),
                 child: Text(
@@ -949,31 +959,63 @@ class _SearchableDropdownWidgetState extends State<_SearchableDropdownWidget> {
                         Icon(widget.icon, size: 16, color: widget.enabled ? Colors.blueAccent : Colors.grey),
                       ],
                       Expanded(
-                        child: TextField(
-                          controller: textController,
-                          focusNode: fieldFocusNode,
-                          enabled: widget.enabled,
-                          style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                            color: widget.enabled ? Colors.black87 : Colors.grey.shade600,
-                          ),
-                          decoration: InputDecoration(
-                            isDense: true,
-                            hintText: widget.defaultOption,
-                            hintStyle: TextStyle(fontSize: 12, color: Colors.grey.shade500, fontWeight: FontWeight.w500),
-                            border: InputBorder.none,
-                            contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                          ),
-                          onChanged: (val) {
-                            _highlightedIndex = 0;
-                          },
-                          onSubmitted: (_) {
-                            _resolveSelection();
-                            if (widget.nextFocus != null) {
-                              widget.nextFocus!.requestFocus();
+                        child: Focus(
+                          onKeyEvent: (node, event) {
+                            if (event is KeyDownEvent || event is KeyRepeatEvent) {
+                              final opts = _getFilteredOptions(textController.text).take(50).toList();
+                              if (opts.isNotEmpty) {
+                                if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
+                                  setState(() {
+                                    _highlightedIndex = (_highlightedIndex + 1).clamp(0, opts.length - 1);
+                                  });
+                                  return KeyEventResult.handled;
+                                } else if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+                                  setState(() {
+                                    _highlightedIndex = (_highlightedIndex - 1).clamp(0, opts.length - 1);
+                                  });
+                                  return KeyEventResult.handled;
+                                } else if (event.logicalKey == LogicalKeyboardKey.enter || event.logicalKey == LogicalKeyboardKey.numpadEnter) {
+                                  int idx = _highlightedIndex.clamp(0, opts.length - 1);
+                                  final selected = opts[idx];
+                                  widget.controller.text = selected;
+                                  widget.onValueChanged(selected);
+                                  if (widget.nextFocus != null) {
+                                    widget.nextFocus!.requestFocus();
+                                  }
+                                  return KeyEventResult.handled;
+                                }
+                              }
                             }
+                            return KeyEventResult.ignored;
                           },
+                          child: TextField(
+                            controller: textController,
+                            focusNode: fieldFocusNode,
+                            enabled: widget.enabled,
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                              color: widget.enabled ? Colors.black87 : Colors.grey.shade600,
+                            ),
+                            decoration: InputDecoration(
+                              isDense: true,
+                              hintText: widget.defaultOption,
+                              hintStyle: TextStyle(fontSize: 12, color: Colors.grey.shade500, fontWeight: FontWeight.w500),
+                              border: InputBorder.none,
+                              contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                            ),
+                            onChanged: (val) {
+                              setState(() {
+                                _highlightedIndex = 0;
+                              });
+                            },
+                            onSubmitted: (_) {
+                              _resolveSelection();
+                              if (widget.nextFocus != null) {
+                                widget.nextFocus!.requestFocus();
+                              }
+                            },
+                          ),
                         ),
                       ),
                       if (widget.enabled && textController.text.isNotEmpty && textController.text != widget.defaultOption)
@@ -994,11 +1036,6 @@ class _SearchableDropdownWidgetState extends State<_SearchableDropdownWidget> {
                 );
               },
               optionsViewBuilder: (context, onSelected, options) {
-                final highlightedIndex = AutocompleteHighlightedOption.of(context);
-                if (highlightedIndex >= 0 && highlightedIndex < options.length) {
-                  _highlightedIndex = highlightedIndex;
-                }
-
                 return Align(
                   alignment: Alignment.topLeft,
                   child: Material(
@@ -1020,9 +1057,12 @@ class _SearchableDropdownWidgetState extends State<_SearchableDropdownWidget> {
                         separatorBuilder: (context, index) => Divider(height: 1, color: Colors.grey.shade100),
                         itemBuilder: (context, index) {
                           final option = options.elementAt(index);
-                          final isHighlighted = AutocompleteHighlightedOption.of(context) == index;
+                          final isHighlighted = (index == _highlightedIndex.clamp(0, options.length - 1));
                           return InkWell(
-                            onTap: () => onSelected(option),
+                            onTap: () {
+                              _highlightedIndex = index;
+                              onSelected(option);
+                            },
                             child: Container(
                               color: isHighlighted ? Colors.blue.shade50 : Colors.white,
                               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),

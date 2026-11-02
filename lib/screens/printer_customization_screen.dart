@@ -3,9 +3,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../utils/theme_constants.dart';
 
 enum DotMatrixPaperSize {
-  inch_8x11_standard,  // 8.5" x 11" Full Sheet
-  inch_8x6_half,       // 8.5" x 6" Half Sheet
-  inch_136_wide,       // 136-Column Wide Sheet
+  inch8x11Standard,  // 8.5" x 11" Full Sheet
+  inch8x6Half,       // 8.5" x 6" Half Sheet
+  inch136Wide,       // 136-Column Wide Sheet
 }
 
 class PrinterCustomizationScreen extends StatefulWidget {
@@ -25,7 +25,7 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
   bool _showReturnPolicy = true;
   String _printMode = "dialog";
 
-  DotMatrixPaperSize _paperSize = DotMatrixPaperSize.inch_8x11_standard;
+  DotMatrixPaperSize _paperSize = DotMatrixPaperSize.inch8x11Standard;
   String _selectedPrinterName = "TVS MSP 250 (80 Col)";
   int _columns = 80;
   int _linesPerPage = 66;
@@ -43,7 +43,7 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
       _selectedPrinterName = prefs.getString('printer_model') ?? "TVS MSP 250 (80 Col)";
       _columns = prefs.getInt('printer_columns') ?? 80;
       _linesPerPage = prefs.getInt('printer_lines') ?? 66;
-      int paperSizeIndex = prefs.getInt('printer_paper_size') ?? DotMatrixPaperSize.inch_8x11_standard.index;
+      int paperSizeIndex = prefs.getInt('printer_paper_size') ?? DotMatrixPaperSize.inch8x11Standard.index;
       if (paperSizeIndex < DotMatrixPaperSize.values.length) {
         _paperSize = DotMatrixPaperSize.values[paperSizeIndex];
       }
@@ -82,15 +82,15 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
     setState(() {
       _selectedPrinterName = printerName;
       if (printerName.contains("TVS MSP 250") || printerName.contains("Epson FX-890") || printerName.contains("Epson LQ-310")) {
-        _paperSize = DotMatrixPaperSize.inch_8x11_standard;
+        _paperSize = DotMatrixPaperSize.inch8x11Standard;
         _columns = 80;
         _linesPerPage = 66;
       } else if (printerName.contains("TVS MSP 345") || printerName.contains("Half Sheet")) {
-        _paperSize = DotMatrixPaperSize.inch_8x6_half;
+        _paperSize = DotMatrixPaperSize.inch8x6Half;
         _columns = 80;
         _linesPerPage = 36;
       } else if (printerName.contains("TVS MSP 455") || printerName.contains("Epson FX-2190")) {
-        _paperSize = DotMatrixPaperSize.inch_136_wide;
+        _paperSize = DotMatrixPaperSize.inch136Wide;
         _columns = 136;
         _linesPerPage = 66;
       }
@@ -101,13 +101,13 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
     if (size == null) return;
     setState(() {
       _paperSize = size;
-      if (size == DotMatrixPaperSize.inch_8x11_standard) {
+      if (size == DotMatrixPaperSize.inch8x11Standard) {
         _columns = 80;
         _linesPerPage = 66;
-      } else if (size == DotMatrixPaperSize.inch_8x6_half) {
+      } else if (size == DotMatrixPaperSize.inch8x6Half) {
         _columns = 80;
         _linesPerPage = 36;
-      } else if (size == DotMatrixPaperSize.inch_136_wide) {
+      } else if (size == DotMatrixPaperSize.inch136Wide) {
         _columns = 136;
         _linesPerPage = 66;
       }
@@ -211,15 +211,15 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
                       decoration: _inputDecoration("Paper Size"),
                       items: const [
                         DropdownMenuItem(
-                          value: DotMatrixPaperSize.inch_8x11_standard,
+                          value: DotMatrixPaperSize.inch8x11Standard,
                           child: Text("8.5\" x 11\" (Full)", style: TextStyle(fontSize: 12)),
                         ),
                         DropdownMenuItem(
-                          value: DotMatrixPaperSize.inch_8x6_half,
+                          value: DotMatrixPaperSize.inch8x6Half,
                           child: Text("8.5\" x 6\" (Half)", style: TextStyle(fontSize: 12)),
                         ),
                         DropdownMenuItem(
-                          value: DotMatrixPaperSize.inch_136_wide,
+                          value: DotMatrixPaperSize.inch136Wide,
                           child: Text("136-Col Wide", style: TextStyle(fontSize: 12)),
                         ),
                       ],

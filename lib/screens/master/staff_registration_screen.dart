@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../../providers/pharmacy_provider.dart';
-import '../../models/erp_models.dart';
 import '../../utils/theme_constants.dart';
 import '../../widgets/pin_unlock_dialog.dart';
 
@@ -328,7 +327,7 @@ class _StaffRegistrationScreenState extends State<StaffRegistrationScreen> {
                             Text("Role / Designation", style: TextStyle(color: c.secondaryText, fontSize: 12, fontWeight: FontWeight.bold)),
                             const SizedBox(height: 4),
                             DropdownButtonFormField<String>(
-                              value: _roleOptions.contains(_selectedRole) ? _selectedRole : _roleOptions.first,
+                              initialValue: _roleOptions.contains(_selectedRole) ? _selectedRole : _roleOptions.first,
                               dropdownColor: c.surface,
                               style: TextStyle(color: c.primaryText, fontSize: 13),
                               decoration: InputDecoration(
@@ -382,7 +381,7 @@ class _StaffRegistrationScreenState extends State<StaffRegistrationScreen> {
                                   ),
                                   Switch(
                                     value: _isActive,
-                                    activeColor: Colors.green,
+                                    activeThumbColor: Colors.green,
                                     onChanged: (val) => setState(() => _isActive = val),
                                   ),
                                 ],
@@ -443,9 +442,9 @@ class _StaffRegistrationScreenState extends State<StaffRegistrationScreen> {
                         // Table Grid Header
                         Container(
                           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFF1E293B),
-                            borderRadius: const BorderRadius.vertical(top: Radius.circular(8)),
+                          decoration: const BoxDecoration(
+                            color: Color(0xFF1E293B),
+                            borderRadius: BorderRadius.vertical(top: Radius.circular(8)),
                           ),
                           child: const Row(
                             children: [
@@ -627,7 +626,7 @@ class _StaffRegistrationScreenState extends State<StaffRegistrationScreen> {
                                                     message: staff.isActive ? "Set Inactive" : "Set Active",
                                                     child: Switch(
                                                       value: staff.isActive,
-                                                      activeColor: Colors.green,
+                                                      activeThumbColor: Colors.green,
                                                       materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
                                                       onChanged: (_) => _toggleStatus(staff),
                                                     ),

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -6,6 +7,9 @@ import 'package:intl/intl.dart';
 import '../../providers/pharmacy_provider.dart';
 import '../../providers/app_provider.dart';
 import '../../utils/theme_constants.dart';
+import '../../utils/app_formatters.dart';
+import '../../services/server_config_service.dart';
+import '../../services/supabase_sync_service.dart';
 
 enum ColumnType { text, numeric, date }
 enum AggregationType { sum, min, max, count, average, none }
@@ -14,7 +18,6 @@ class _ColInfo {
   final String key;
   final String label;
   double width;
-  final double flex;
   final TextAlign align;
   final ColumnType type;
 
@@ -22,7 +25,6 @@ class _ColInfo {
     this.key, 
     this.label, {
     this.width = 100, 
-    this.flex = 1, 
     this.align = TextAlign.left, 
     this.type = ColumnType.text
   });
@@ -48,6 +50,10 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
   Future<List<Map<String, dynamic>>>? _historyFuture;
 
   double _headerHeight = 45.0;
+
+  // Sorting state
+  String? _sortColumnKey;
+  bool _isAscending = true;
   final Map<String, dynamic> _activeFilters = {};
   final Map<String, AggregationType> _columnAggregations = {
     'qty': AggregationType.sum,
@@ -96,6 +102,9 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
   }
 
   void _loadHistory() {
+    if (ServerConfigService.instance.isServerModeEnabled && ServerConfigService.instance.isConnected) {
+      unawaited(SupabaseSyncService.instance.syncAllPendingData());
+    }
     final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
     _historyFuture = pharmacy.getProductSaleHistory(widget.productName, productId: widget.productId);
   }
@@ -137,81 +146,132 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
   }
 
   List<Map<String, dynamic>> _applyFilters(List<Map<String, dynamic>> data) {
-    if (_activeFilters.isEmpty) return data;
+    List<Map<String, dynamic>> filtered = List.from(data);
 
-    return data.where((row) {
-      bool match = true;
-      _activeFilters.forEach((colKey, filter) {
-        if (!match) return;
+    if (_activeFilters.isNotEmpty) {
+      filtered = filtered.where((row) {
+        bool match = true;
+        _activeFilters.forEach((colKey, filter) {
+          if (!match) return;
 
-        if (filter['mode'] == 'values') {
-          List<String> allowed = List<String>.from(filter['selected_values']);
-          String cellVal = row[colKey]?.toString() ?? "";
-          if (!allowed.contains(cellVal)) match = false;
-          return;
-        }
-
-        String condition = filter['condition'];
-        if (condition == 'Clear' || condition == 'None') return;
-
-        final val = row[colKey];
-
-        if (filter['type'] == ColumnType.text) {
-          String cellStr = val?.toString().toLowerCase() ?? "";
-          String filterStr = filter['value1']?.toString().toLowerCase() ?? "";
-
-          if (condition == 'Equals' && cellStr != filterStr) {
-            match = false;
-          } else if (condition == 'Does Not Equal' && cellStr == filterStr) match = false;
-          else if (condition == 'Contains' && !cellStr.contains(filterStr)) match = false;
-          else if (condition == 'Does Not Contain' && cellStr.contains(filterStr)) match = false;
-          else if (condition == 'Begins With' && !cellStr.startsWith(filterStr)) match = false;
-          else if (condition == 'Ends With' && !cellStr.endsWith(filterStr)) match = false;
-        } else if (filter['type'] == ColumnType.numeric) {
-          double cellNum = double.tryParse(val?.toString() ?? "0") ?? 0.0;
-          double v1 = double.tryParse(filter['value1']?.toString() ?? "0") ?? 0.0;
-
-          if (condition == 'Between') {
-            double v2 = double.tryParse(filter['value2']?.toString() ?? "0") ?? 0.0;
-            if (cellNum < v1 || cellNum > v2) match = false;
-          } else {
-            if (condition == 'Equals' && cellNum != v1) {
-              match = false;
-            } else if (condition == 'Does Not Equal' && cellNum == v1) match = false;
-            else if (condition == 'Greater Than' && cellNum <= v1) match = false;
-            else if (condition == 'Less Than' && cellNum >= v1) match = false;
-          }
-        } else if (filter['type'] == ColumnType.date) {
-          DateTime? cellDate = (colKey == 'date' && row['raw_date'] != null)
-              ? row['raw_date']
-              : _parseFlexibleDate(val?.toString() ?? "");
-
-          if (cellDate == null) {
-            match = false;
+          if (filter['mode'] == 'values') {
+            List<String> allowed = List<String>.from(filter['selected_values']);
+            String cellVal = row[colKey]?.toString() ?? "";
+            if (!allowed.contains(cellVal)) match = false;
             return;
           }
 
-          DateTime? d1 = _parseFlexibleDate(filter['value1']?.toString() ?? "");
-          if (d1 == null) return;
+          String condition = filter['condition'];
+          if (condition == 'Clear' || condition == 'None') return;
 
-          cellDate = DateTime(cellDate.year, cellDate.month, cellDate.day);
-          d1 = DateTime(d1.year, d1.month, d1.day);
+          final val = row[colKey];
 
-          if (condition == 'Between') {
-            DateTime? d2 = _parseFlexibleDate(filter['value2']?.toString() ?? "");
-            if (d2 == null) return;
-            d2 = DateTime(d2.year, d2.month, d2.day);
-            if (cellDate.isBefore(d1) || cellDate.isAfter(d2)) match = false;
-          } else {
-            if (condition == 'Equals' && !cellDate.isAtSameMomentAs(d1)) {
+          if (filter['type'] == ColumnType.text) {
+            String cellStr = val?.toString().toLowerCase() ?? "";
+            String filterStr = filter['value1']?.toString().toLowerCase() ?? "";
+
+            if (condition == 'Equals' && cellStr != filterStr) {
               match = false;
-            } else if (condition == 'Before' && !cellDate.isBefore(d1)) match = false;
-            else if (condition == 'After' && !cellDate.isAfter(d1)) match = false;
+            } else if (condition == 'Does Not Equal' && cellStr == filterStr) match = false;
+            else if (condition == 'Contains' && !cellStr.contains(filterStr)) match = false;
+            else if (condition == 'Does Not Contain' && cellStr.contains(filterStr)) match = false;
+            else if (condition == 'Begins With' && !cellStr.startsWith(filterStr)) match = false;
+            else if (condition == 'Ends With' && !cellStr.endsWith(filterStr)) match = false;
+          } else if (filter['type'] == ColumnType.numeric) {
+            double cellNum = double.tryParse(formatSaleDisplayNo(val?.toString())) ?? 0.0;
+            double v1 = double.tryParse(filter['value1']?.toString() ?? "0") ?? 0.0;
+
+            if (condition == 'Between') {
+              double v2 = double.tryParse(filter['value2']?.toString() ?? "0") ?? 0.0;
+              if (cellNum < v1 || cellNum > v2) match = false;
+            } else {
+              if (condition == 'Equals' && cellNum != v1) {
+                match = false;
+              } else if (condition == 'Does Not Equal' && cellNum == v1) match = false;
+              else if (condition == 'Greater Than' && cellNum <= v1) match = false;
+              else if (condition == 'Less Than' && cellNum >= v1) match = false;
+            }
+          } else if (filter['type'] == ColumnType.date) {
+            DateTime? cellDate = (colKey == 'date' && row['raw_date'] != null)
+                ? row['raw_date']
+                : _parseFlexibleDate(val?.toString() ?? "");
+
+            if (cellDate == null) {
+              match = false;
+              return;
+            }
+
+            DateTime? d1 = _parseFlexibleDate(filter['value1']?.toString() ?? "");
+            if (d1 == null) return;
+
+            cellDate = DateTime(cellDate.year, cellDate.month, cellDate.day);
+            d1 = DateTime(d1.year, d1.month, d1.day);
+
+            if (condition == 'Between') {
+              DateTime? d2 = _parseFlexibleDate(filter['value2']?.toString() ?? "");
+              if (d2 == null) return;
+              d2 = DateTime(d2.year, d2.month, d2.day);
+              if (cellDate.isBefore(d1) || cellDate.isAfter(d2)) match = false;
+            } else {
+              if (condition == 'Equals' && !cellDate.isAtSameMomentAs(d1)) {
+                match = false;
+              } else if (condition == 'Before' && !cellDate.isBefore(d1)) match = false;
+              else if (condition == 'After' && !cellDate.isAfter(d1)) match = false;
+            }
           }
+        });
+        return match;
+      }).toList();
+    }
+
+    if (_sortColumnKey != null) {
+      final colDef = _getColumns().firstWhere((c) => c.key == _sortColumnKey, orElse: () => _getColumns().first);
+      final isNum = colDef.type == ColumnType.numeric;
+      final isDate = colDef.type == ColumnType.date;
+
+      filtered.sort((a, b) {
+        dynamic valA = a[_sortColumnKey];
+        dynamic valB = b[_sortColumnKey];
+
+        int comp = 0;
+        if (isNum) {
+          double numA = (valA is num) ? valA.toDouble() : (double.tryParse(formatSaleDisplayNo(valA?.toString() ?? '')) ?? 0.0);
+          double numB = (valB is num) ? valB.toDouble() : (double.tryParse(formatSaleDisplayNo(valB?.toString() ?? '')) ?? 0.0);
+          comp = numA.compareTo(numB);
+        } else if (isDate) {
+          DateTime? dateA = (a['raw_date'] is DateTime && _sortColumnKey == 'date') ? a['raw_date'] : _parseFlexibleDate(valA?.toString() ?? '');
+          DateTime? dateB = (b['raw_date'] is DateTime && _sortColumnKey == 'date') ? b['raw_date'] : _parseFlexibleDate(valB?.toString() ?? '');
+          if (dateA == null && dateB == null) {
+            comp = 0;
+          } else if (dateA == null) comp = -1;
+          else if (dateB == null) comp = 1;
+          else comp = dateA.compareTo(dateB);
+        } else {
+          String strA = valA?.toString().toLowerCase() ?? '';
+          String strB = valB?.toString().toLowerCase() ?? '';
+          comp = strA.compareTo(strB);
         }
+        return _isAscending ? comp : -comp;
       });
-      return match;
-    }).toList();
+    }
+
+    return filtered;
+  }
+
+  void _onColumnHeaderTap(String key) {
+    setState(() {
+      if (_sortColumnKey == key) {
+        if (_isAscending) {
+          _isAscending = false;
+        } else {
+          _sortColumnKey = null;
+          _isAscending = true;
+        }
+      } else {
+        _sortColumnKey = key;
+        _isAscending = true;
+      }
+    });
   }
 
   void _openAdvancedFilterDialog(_ColInfo col, Offset tapPosition) async {
@@ -307,22 +367,56 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
     );
   }
 
-  void _showAggregationMenu(Offset position, String colKey) {
-    showMenu<AggregationType>(
-      context: context,
-      position: RelativeRect.fromLTRB(position.dx, position.dy, position.dx, position.dy),
-      items: [
-        _buildPopupItem(AggregationType.sum, "Sum", Icons.functions),
-        _buildPopupItem(AggregationType.min, "Min", Icons.bar_chart),
-        _buildPopupItem(AggregationType.max, "Max", Icons.bar_chart),
-        _buildPopupItem(AggregationType.count, "Count", Icons.numbers),
-        _buildPopupItem(AggregationType.average, "Average", Icons.abc),
+  void _showAggregationMenu(Offset position, String colKey, List<Map<String, dynamic>> data) {
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
+    final currentAgg = _columnAggregations[colKey] ?? AggregationType.none;
+    final resultStr = _calculateAggregation(colKey, currentAgg, data);
+
+    final List<PopupMenuEntry<dynamic>> items = [
+      _buildPopupItem(AggregationType.sum, "Sum", Icons.functions),
+      _buildPopupItem(AggregationType.min, "Min", Icons.bar_chart),
+      _buildPopupItem(AggregationType.max, "Max", Icons.bar_chart),
+      _buildPopupItem(AggregationType.count, "Count", Icons.numbers),
+      _buildPopupItem(AggregationType.average, "Average", Icons.abc),
+      const PopupMenuDivider(),
+      _buildPopupItem(AggregationType.none, "None", Icons.check),
+    ];
+
+    if (resultStr.isNotEmpty) {
+      items.addAll([
         const PopupMenuDivider(),
-        _buildPopupItem(AggregationType.none, "None", Icons.check),
-      ],
+        PopupMenuItem<String>(
+          value: "COPY_VALUE",
+          height: 32,
+          child: Row(
+            children: [
+              const Icon(Icons.copy, size: 14, color: Colors.blue),
+              const SizedBox(width: 8),
+              Text("Copy ($resultStr)", style: const TextStyle(fontSize: 11)),
+            ],
+          ),
+        ),
+      ]);
+    }
+
+    showMenu<dynamic>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(position.dx, position.dy, 0, 0),
+        Offset.zero & overlay.size,
+      ),
+      items: items,
     ).then((selected) {
-      if (selected != null) {
+      if (selected is AggregationType) {
         setState(() => _columnAggregations[colKey] = selected);
+      } else if (selected == "COPY_VALUE") {
+        Clipboard.setData(ClipboardData(text: resultStr));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Copied $resultStr to clipboard"), duration: const Duration(seconds: 1)),
+          );
+        }
       }
     });
   }
@@ -338,8 +432,8 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
 
       cells.add(
         GestureDetector(
-          onTapDown: (details) => _showAggregationMenu(details.globalPosition, col.key),
-          onSecondaryTapDown: (details) => _showAggregationMenu(details.globalPosition, col.key),
+          onTapDown: (details) => _showAggregationMenu(details.globalPosition, col.key, data),
+          onSecondaryTapDown: (details) => _showAggregationMenu(details.globalPosition, col.key, data),
           child: Container(
             width: cellWidth,
             padding: const EdgeInsets.symmetric(horizontal: 4),
@@ -405,6 +499,7 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
             return {
               'entry_no': h['entry_no']?.toString() ?? '',
               'raw_entry_no': h['entry_no']?.toString() ?? '',
+              'terminal_id': h['terminal_id']?.toString() ?? '',
               'type': 'Sales',
               'date': dateStr,
               'raw_date': rawDt,
@@ -434,6 +529,7 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
                     return Scrollbar(
                       controller: _scrollCtrl,
                       child: SingleChildScrollView(
+                        controller: _scrollCtrl,
                         scrollDirection: Axis.horizontal,
                         child: SizedBox(
                           width: effectiveWidth,
@@ -449,6 +545,9 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
                                     (idx) => _GridHeaderCell(
                                       col: _columns[idx],
                                       width: _columns[idx].width,
+                                      isSorted: _sortColumnKey == _columns[idx].key,
+                                      isAscending: _isAscending,
+                                      onSortTap: () => _onColumnHeaderTap(_columns[idx].key),
                                       onAdvancedTap: (pos) => _openAdvancedFilterDialog(_columns[idx], pos),
                                       onResize: (newWidth) => setState(() => _columns[idx].width = newWidth.clamp(40, 500)),
                                       onHeightResize: (newHeight) => setState(() => _headerHeight = newHeight.clamp(40, 150)),
@@ -534,7 +633,7 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
                                                 ),
                                                 child: Row(
                                                   children: [
-                                                    _histCell(h['entry_no']?.toString() ?? '', _columns[0].width),
+                                                    _histCell(formatInvoiceDisplay(h['entry_no']?.toString() ?? '', h['terminal_id']?.toString()), _columns[0].width),
                                                     _histCell(h['type']?.toString() ?? 'Sales', _columns[1].width),
                                                     _histCell(h['date']?.toString() ?? '', _columns[2].width),
                                                     _histCell(h['batch']?.toString() ?? '', _columns[3].width),
@@ -591,8 +690,8 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
         context: context,
         builder: (ctx) => AlertDialog(
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-          title: Row(
-            children: const [
+          title: const Row(
+            children: [
               Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 24),
               SizedBox(width: 8),
               Text("Another Financial Year", style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
@@ -625,7 +724,7 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
 
     try {
       final appProvider = Provider.of<AppProvider>(context, listen: false);
-      appProvider.openSales(invoiceNo: entryNo);
+      appProvider.openSales(invoiceNo: entryNo, highlightProduct: widget.productName);
     } catch (e) {
       debugPrint("Error opening sales entry: $e");
     }
@@ -640,6 +739,11 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
       child: Text(val, style: TextStyle(fontSize: 11, color: color), overflow: TextOverflow.ellipsis)
     );
   }
+
+  // Helper method to format entry number for display as plain number
+  String formatInvoiceDisplay(String entryNo, String? terminalId) {
+    return formatSaleDisplayNo(entryNo);
+  }
 }
 
 // ============================================================================
@@ -648,6 +752,9 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
 class _GridHeaderCell extends StatefulWidget {
   final _ColInfo col;
   final double width;
+  final bool isSorted;
+  final bool isAscending;
+  final VoidCallback? onSortTap;
   final Function(Offset) onAdvancedTap;
   final Function(String condition, String value) onQuickFilter;
   final Function(double) onResize;
@@ -656,6 +763,9 @@ class _GridHeaderCell extends StatefulWidget {
   const _GridHeaderCell({
     required this.col, 
     required this.width, 
+    this.isSorted = false,
+    this.isAscending = true,
+    this.onSortTap,
     required this.onAdvancedTap, 
     required this.onQuickFilter, 
     required this.onResize, 
@@ -720,11 +830,13 @@ class _GridHeaderCellState extends State<_GridHeaderCell> {
       items = ['Equals', 'Before', 'After', 'Between'];
     }
 
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
     final result = await showMenu<String>(
       context: context,
-      position: RelativeRect.fromLTRB(
-        details.globalPosition.dx, details.globalPosition.dy + 10,
-        details.globalPosition.dx, 0,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(details.globalPosition.dx, details.globalPosition.dy + 10, 0, 0),
+        Offset.zero & overlay.size,
       ),
       items: items.map((e) => PopupMenuItem(value: e, height: 30, child: Text(e, style: const TextStyle(fontSize: 11)))).toList(),
     );
@@ -760,13 +872,34 @@ class _GridHeaderCellState extends State<_GridHeaderCell> {
                   Row(
                     children: [
                       Expanded(
-                        child: Padding(
-                          padding: const EdgeInsets.only(left: 6, top: 4, bottom: 2),
-                          child: Text(
-                            widget.col.label,
-                            style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey.shade800),
-                            overflow: TextOverflow.ellipsis,
-                            maxLines: 1,
+                        child: InkWell(
+                          onTap: widget.onSortTap,
+                          child: Padding(
+                            padding: const EdgeInsets.only(left: 6, top: 4, bottom: 2),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Flexible(
+                                  child: Text(
+                                    widget.col.label,
+                                    style: TextStyle(
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.bold,
+                                      color: widget.isSorted ? Colors.blue.shade900 : Colors.grey.shade800,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                                if (widget.isSorted) ...[
+                                  const SizedBox(width: 2),
+                                  Icon(
+                                    widget.isAscending ? Icons.arrow_upward : Icons.arrow_downward,
+                                    size: 11,
+                                    color: Colors.blue.shade900,
+                                  ),
+                                ],
+                              ],
+                            ),
                           ),
                         ),
                       ),

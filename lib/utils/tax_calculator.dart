@@ -53,6 +53,25 @@ class TaxResult {
 }
 
 class TaxCalculator {
+  /// Extracts 2-digit Indian state code from a GSTIN if present (e.g. "32AAAAA0000A1Z5" -> "32")
+  static String getStateCode(String gstin) {
+    final clean = gstin.trim();
+    if (clean.length >= 2 && RegExp(r'^\d{2}').hasMatch(clean.substring(0, 2))) {
+      return clean.substring(0, 2);
+    }
+    return "";
+  }
+
+  /// Determines whether a transaction is Interstate based on Supplier & Store GSTIN state codes
+  static bool isInterstate(String companyGstin, String supplierGstin) {
+    final companyState = getStateCode(companyGstin);
+    final supplierState = getStateCode(supplierGstin);
+    if (companyState.isNotEmpty && supplierState.isNotEmpty && companyState != supplierState) {
+      return true;
+    }
+    return false;
+  }
+
   /// Converts rupees (double) to integer paise cleanly
   static int toPaise(double rupees) => (rupees * 100).round();
 
@@ -65,12 +84,12 @@ class TaxCalculator {
     return (value * mod).round() / mod;
   }
 
-  /// Rounds GST percentage to whole number if it is within 0.1% upside or downside.
-  /// E.g., 17.99 -> 18.0, 4.99 -> 5.0, 5.01 -> 5.0, 5.03 -> 5.0, 18.00 -> 18.0.
+  /// Rounds GST percentage to whole number if it is within near-integer floating point epsilon (0.01%).
+  /// E.g., 17.99 -> 18.0, 4.99 -> 5.0, 18.00 -> 18.0, while preserving valid fractional rates like 12.1%, 5.05%.
   static double roundGstPercent(double gst) {
     if (gst <= 0) return 0.0;
     final double rounded = gst.roundToDouble();
-    if ((gst - rounded).abs() <= 0.101) {
+    if ((gst - rounded).abs() <= 0.0101) {
       return rounded;
     }
     return gst;
@@ -150,5 +169,37 @@ class TaxCalculator {
   static TaxResult calculateExclusive(double taxableAmount, double gstPercent) {
     final int taxablePaise = toPaise(taxableAmount);
     return calculateExclusivePaise(taxablePaise, gstPercent);
+  }
+
+  /// Calculates diluted landed cost per pack/strip including free quantity and tax
+  static double calculateLandedCostPerPack({
+    required double purchaseRate,
+    required int qty,
+    required int fQty,
+    required double discPercent,
+    required double gstPercent,
+  }) {
+    int totalPacks = qty + fQty;
+    if (totalPacks <= 0) return purchaseRate;
+
+    double gross = purchaseRate * qty;
+    double discAmt = (gross * discPercent) / 100.0;
+    double taxable = gross - discAmt;
+    if (taxable < 0) taxable = 0.0;
+    
+    double gstAmt = (taxable * roundGstPercent(gstPercent)) / 100.0;
+    double lineTotal = taxable + gstAmt;
+
+    return lineTotal / totalPacks;
+  }
+
+  /// Calculates unit landed cost per individual tablet/loose unit
+  static double calculateLooseUnitCost({
+    required double landingCostPerPack,
+    required int packSize,
+  }) {
+    int pSize = packSize > 0 ? packSize : 1;
+    int basePaise = toPaise(landingCostPerPack);
+    return ((basePaise / pSize).round()) / 100.0;
   }
 }

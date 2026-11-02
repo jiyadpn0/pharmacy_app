@@ -171,7 +171,8 @@ class ProductRepository {
           pm.reorder_level,
           pm.max_level,
           pm.patent,
-          pm.schedule
+          pm.schedule,
+          pm.packing AS master_packing
         FROM stock_batches sb
         LEFT JOIN product_master pm ON sb.product_id = pm.id
       ''';
@@ -232,6 +233,10 @@ class ProductRepository {
           gen = pharmacyProvider.resolveGenericName(pName, productId: pId);
         }
 
+        int bPack = (row['batch_packing'] as num?)?.toInt() ?? 0;
+        int mPack = (row['master_packing'] as num?)?.toInt() ?? 0;
+        int finalPackSize = (bPack > 1) ? bPack : ((mPack > 1) ? mPack : (bPack > 0 ? bPack : (mPack > 0 ? mPack : 1)));
+
         return Product(
           id: pId,
           name: pName,
@@ -250,7 +255,7 @@ class ProductRepository {
           sDiscPercent: (row['s_disc_percent'] as num?)?.toDouble() ?? 0.0,
           supplier: row['supplier_name']?.toString() ?? '',
           rack: batchRack.isNotEmpty ? batchRack : masterRack,
-          packSize: (row['batch_packing'] as num?)?.toInt() ?? 1,
+          packSize: finalPackSize,
           reorderLevel: reorder,
           maxLevel: (row['max_level'] as num?)?.toInt() ?? 100,
           patent: row['patent']?.toString() ?? '',
@@ -341,9 +346,9 @@ class ProductRepository {
       final cleanQuery = query.trim().replaceAll("'", "''");
       final results = await db.rawQuery('''
         SELECT pm.*
-        FROM product_master_fts fts
+        FROM product_search_fts fts
         JOIN product_master pm ON fts.id = pm.id
-        WHERE product_master_fts MATCH ?
+        WHERE product_search_fts MATCH ?
         LIMIT 50
       ''', ['$cleanQuery*']);
       return results;

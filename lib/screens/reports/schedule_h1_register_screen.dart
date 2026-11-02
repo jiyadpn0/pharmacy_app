@@ -15,7 +15,7 @@ class ScheduleH1RegisterScreen extends StatefulWidget {
 }
 
 class _ScheduleH1RegisterScreenState extends State<ScheduleH1RegisterScreen> {
-  DateTime _fromDate = DateTime(DateTime.now().year, DateTime.now().month, 1);
+  DateTime _fromDate = DateTime.now();
   DateTime _toDate = DateTime.now();
   String _searchQuery = "";
   bool _isLoading = false;

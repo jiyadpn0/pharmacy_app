@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import '../providers/pharmacy_provider.dart';
+import '../services/server_config_service.dart';
+import '../utils/app_dialogs.dart';
 import '../widgets/app_date_picker.dart';
 import '../utils/app_formatters.dart';
 import '../utils/search_debouncer.dart';
@@ -16,7 +18,7 @@ class PaymentEntryScreen extends StatefulWidget {
 
 class _PaymentEntryScreenState extends State<PaymentEntryScreen> {
   bool isSaving = false;
-  DateTime _startDate = DateTime(DateTime.now().year, DateTime.now().month, 1);
+  DateTime _startDate = DateTime.now();
   DateTime _endDate = DateTime.now();
   String _supplierSearchQuery = "";
   String? _selectedSupplier;
@@ -511,94 +513,156 @@ class _PaymentEntryScreenState extends State<PaymentEntryScreen> {
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          backgroundColor: c.surface,
-          title: Row(
-            children: [
-              Icon(isEdit ? Icons.edit : Icons.payment, color: isEdit ? Colors.orange : Colors.green),
-              const SizedBox(width: 10),
-              Text(isEdit ? "Edit Payment Entry" : "New Payment Entry", style: TextStyle(color: c.primaryText)),
-            ],
-          ),
-          content: SizedBox(
-            width: 400,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
+        builder: (context, setDialogState) {
+          bool isAmountMod = isEdit && (double.tryParse(amountCtrl.text) ?? 0.0) != existing.amount;
+          bool isInvoiceMod = isEdit && invoiceCtrl.text.trim() != existing.invoiceNo.trim();
+          bool isRemarksMod = isEdit && remarksCtrl.text.trim() != existing.remarks.trim();
+          bool isMethodMod = isEdit && method != existing.paymentMethod;
+          bool isDateMod = isEdit && DateFormat('dd/MM/yyyy').format(paymentDate) != DateFormat('dd/MM/yyyy').format(existing.date);
+
+          return AlertDialog(
+            backgroundColor: c.surface,
+            title: Row(
               children: [
-                Row(
-                  children: [
-                    Expanded(child: _dialogInput(c, "Payment No", noCtrl, enabled: false)),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: InkWell(
-                        onTap: () async {
-                          final picked = await showAppDatePicker(context: context, initialDate: paymentDate, firstDate: DateTime(2000), lastDate: DateTime(2100));
-                          if (picked != null) setDialogState(() => paymentDate = picked);
-                        },
-                        child: _dialogFieldLabel(c, "Date", DateFormat('dd/MM/yyyy').format(paymentDate)),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                _dialogInput(c, "Amount", amountCtrl, isNum: true, autofocus: true),
-                const SizedBox(height: 12),
-                _dialogInput(c, "Invoice / Ref", invoiceCtrl),
-                const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Text("Method: ", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: c.secondaryText)),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: DropdownButton<String>(
-                        value: method,
-                        isExpanded: true,
-                        dropdownColor: c.surface,
-                        style: TextStyle(color: c.primaryText, fontSize: 13, fontWeight: FontWeight.bold),
-                        items: ["CASH", "UPI", "BANK"].map((e) => DropdownMenuItem(value: e, child: Text(e, style: TextStyle(color: c.primaryText)))).toList(),
-                        onChanged: (v) => setDialogState(() => method = v!),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                _dialogInput(c, "Remarks", remarksCtrl),
+                Icon(isEdit ? Icons.edit : Icons.payment, color: isEdit ? Colors.orange : Colors.green),
+                const SizedBox(width: 10),
+                Text(isEdit ? "Edit Payment Entry" : "New Payment Entry", style: TextStyle(color: c.primaryText)),
               ],
             ),
-          ),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: Text("CANCEL", style: TextStyle(color: c.secondaryText))),
-            ElevatedButton(
-              onPressed: () async {
-                if (amountCtrl.text.isEmpty || isSaving) return;
-                setDialogState(() => isSaving = true);
-                try {
-                  final provider = Provider.of<PharmacyProvider>(context, listen: false);
-                  final payObj = SupplierPayment(
-                    id: noCtrl.text,
-                    supplierName: _selectedSupplier!,
-                    date: paymentDate,
-                    amount: double.tryParse(amountCtrl.text) ?? 0.0,
-                    invoiceNo: invoiceCtrl.text,
-                    paymentMethod: method,
-                    remarks: remarksCtrl.text,
-                  );
-                  
-                  if (isEdit) {
-                    await provider.updateSupplierPayment(payObj);
-                  } else {
-                    await provider.addSupplierPayment(payObj);
-                  }
-                  if (ctx.mounted) Navigator.pop(ctx);
-                } finally {
-                  setDialogState(() => isSaving = false);
-                }
-              },
-              style: ElevatedButton.styleFrom(backgroundColor: isEdit ? Colors.orange : Colors.green, foregroundColor: Colors.white),
-              child: Text(isEdit ? "UPDATE PAYMENT" : "SAVE PAYMENT"),
+            content: SizedBox(
+              width: 400,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(child: _dialogInput(c, "Payment No", noCtrl, enabled: false)),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: InkWell(
+                          onTap: () async {
+                            final picked = await showAppDatePicker(context: context, initialDate: paymentDate, firstDate: DateTime(2000), lastDate: DateTime(2100));
+                            if (!ctx.mounted || !mounted) return;
+                            if (picked != null) setDialogState(() => paymentDate = picked);
+                          },
+                          child: _dialogFieldLabel(c, "Date", DateFormat('dd/MM/yyyy').format(paymentDate), isModified: isDateMod),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  _dialogInput(c, "Amount", amountCtrl, isNum: true, autofocus: true, isModified: isAmountMod),
+                  const SizedBox(height: 12),
+                  _dialogInput(c, "Invoice / Ref", invoiceCtrl, isModified: isInvoiceMod),
+                  const SizedBox(height: 12),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: isMethodMod ? const Color(0xFFFEF3C7) : c.inputBg,
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: isMethodMod ? Colors.orange : c.border),
+                    ),
+                    child: Row(
+                      children: [
+                        Text("Method: ", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: c.secondaryText)),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: DropdownButton<String>(
+                            value: method,
+                            isExpanded: true,
+                            underline: const SizedBox.shrink(),
+                            dropdownColor: c.surface,
+                            style: TextStyle(color: c.primaryText, fontSize: 13, fontWeight: FontWeight.bold),
+                            items: ["CASH", "UPI", "BANK"].map((e) => DropdownMenuItem(value: e, child: Text(e, style: TextStyle(color: c.primaryText)))).toList(),
+                            onChanged: (v) => setDialogState(() => method = v!),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  _dialogInput(c, "Remarks", remarksCtrl, isModified: isRemarksMod),
+                ],
+              ),
             ),
-          ],
-        ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: Text("CANCEL", style: TextStyle(color: c.secondaryText))),
+              ElevatedButton(
+                onPressed: () async {
+                  if (amountCtrl.text.isEmpty || isSaving) return;
+                  if (ServerConfigService.instance.isPureCloud && !ServerConfigService.instance.isConnected) {
+                    AppDialogs.showFastDialog(
+                      context: context,
+                      title: "Pure Cloud Live Disconnected",
+                      content: "Cannot save payment entry while disconnected from Supabase Cloud Server.\n\nPlease check your internet connection.",
+                    );
+                    return;
+                  }
+                  if (isEdit) {
+                    final bool? confirmSave = await showDialog<bool>(
+                      context: context,
+                      builder: (dialogCtx) => AlertDialog(
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                        title: const Row(
+                          children: [
+                            Icon(Icons.save_rounded, color: Colors.blue, size: 28),
+                            SizedBox(width: 10),
+                            Text("Update Payment Entry", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+                          ],
+                        ),
+                        content: Text(
+                          "Are you sure you want to update Payment Entry ${noCtrl.text}?\nAll modifications will be saved to supplier ledger.",
+                          style: const TextStyle(fontSize: 14, height: 1.4),
+                        ),
+                        actions: [
+                          OutlinedButton(
+                            onPressed: () => Navigator.pop(dialogCtx, false),
+                            child: const Text("Cancel"),
+                          ),
+                          ElevatedButton(
+                            onPressed: () => Navigator.pop(dialogCtx, true),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.blue.shade800,
+                              foregroundColor: Colors.white,
+                            ),
+                            child: const Text("Update Payment", style: TextStyle(fontWeight: FontWeight.bold)),
+                          ),
+                        ],
+                      ),
+                    );
+                    if (confirmSave != true || !mounted) return;
+                  }
+
+                  if (!ctx.mounted || !mounted) return;
+                  setDialogState(() => isSaving = true);
+                  try {
+                    final provider = Provider.of<PharmacyProvider>(context, listen: false);
+                    final payObj = SupplierPayment(
+                      id: noCtrl.text,
+                      supplierName: _selectedSupplier!,
+                      date: paymentDate,
+                      amount: double.tryParse(amountCtrl.text) ?? 0.0,
+                      invoiceNo: invoiceCtrl.text,
+                      paymentMethod: method,
+                      remarks: remarksCtrl.text,
+                    );
+                    
+                    if (isEdit) {
+                      await provider.updateSupplierPayment(payObj);
+                    } else {
+                      await provider.addSupplierPayment(payObj);
+                    }
+                    if (ctx.mounted) Navigator.pop(ctx);
+                  } finally {
+                    if (ctx.mounted) setDialogState(() => isSaving = false);
+                  }
+                },
+                style: ElevatedButton.styleFrom(backgroundColor: isEdit ? Colors.orange : Colors.green, foregroundColor: Colors.white),
+                child: Text(isEdit ? "UPDATE PAYMENT" : "SAVE PAYMENT"),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
@@ -615,81 +679,125 @@ class _PaymentEntryScreenState extends State<PaymentEntryScreen> {
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          backgroundColor: c.surface,
-          title: Row(
-            children: [
-              Icon(isEdit ? Icons.edit : Icons.receipt_long, color: Colors.orange.shade800),
-              const SizedBox(width: 10),
-              Text(isEdit ? "Edit Credit Note" : "New Credit Note Entry", style: TextStyle(color: c.primaryText)),
-            ],
-          ),
-          content: SizedBox(
-            width: 400,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
+        builder: (context, setDialogState) {
+          bool isAmountMod = isEdit && (double.tryParse(amountCtrl.text) ?? 0.0) != existing.amount;
+          bool isInvoiceMod = isEdit && invoiceCtrl.text.trim() != existing.invoiceNo.trim();
+          bool isRemarksMod = isEdit && remarksCtrl.text.trim() != existing.remarks.trim();
+          bool isDateMod = isEdit && DateFormat('dd/MM/yyyy').format(cnDate) != DateFormat('dd/MM/yyyy').format(existing.date);
+
+          return AlertDialog(
+            backgroundColor: c.surface,
+            title: Row(
               children: [
-                Row(
-                  children: [
-                    Expanded(child: _dialogInput(c, "CN Number", noCtrl, enabled: false)),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: InkWell(
-                        onTap: () async {
-                          final picked = await showAppDatePicker(context: context, initialDate: cnDate, firstDate: DateTime(2000), lastDate: DateTime(2100));
-                          if (picked != null) setDialogState(() => cnDate = picked);
-                        },
-                        child: _dialogFieldLabel(c, "Date", DateFormat('dd/MM/yyyy').format(cnDate)),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                _dialogInput(c, "Credit Amount", amountCtrl, isNum: true, autofocus: true),
-                const SizedBox(height: 12),
-                _dialogInput(c, "Invoice / Purchase Ref", invoiceCtrl),
-                const SizedBox(height: 12),
-                _dialogInput(c, "Remarks / Reason", remarksCtrl),
+                Icon(isEdit ? Icons.edit : Icons.receipt_long, color: Colors.orange.shade800),
+                const SizedBox(width: 10),
+                Text(isEdit ? "Edit Credit Note" : "New Credit Note Entry", style: TextStyle(color: c.primaryText)),
               ],
             ),
-          ),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: Text("CANCEL", style: TextStyle(color: c.secondaryText))),
-            ElevatedButton(
-              onPressed: () async {
-                if (amountCtrl.text.isEmpty || isSaving) return;
-                setDialogState(() => isSaving = true);
-                try {
-                  final provider = Provider.of<PharmacyProvider>(context, listen: false);
-                  final cnObj = SupplierCreditNote(
-                    id: noCtrl.text,
-                    supplierName: _selectedSupplier!,
-                    date: cnDate,
-                    amount: double.tryParse(amountCtrl.text) ?? 0.0,
-                    invoiceNo: invoiceCtrl.text,
-                    remarks: remarksCtrl.text,
-                  );
-                  
-                  if (isEdit) {
-                    await provider.updateSupplierCreditNote(cnObj);
-                  } else {
-                    await provider.addSupplierCreditNote(cnObj);
-                  }
-                  if (ctx.mounted) Navigator.pop(ctx);
-                } finally {
-                  setDialogState(() => isSaving = false);
-                }
-              },
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.orange.shade800, foregroundColor: Colors.white),
-              child: Text(isEdit ? "UPDATE CREDIT NOTE" : "SAVE CREDIT NOTE"),
+            content: SizedBox(
+              width: 400,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(child: _dialogInput(c, "CN Number", noCtrl, enabled: false)),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: InkWell(
+                          onTap: () async {
+                            final picked = await showAppDatePicker(context: context, initialDate: cnDate, firstDate: DateTime(2000), lastDate: DateTime(2100));
+                            if (!ctx.mounted || !mounted) return;
+                            if (picked != null) setDialogState(() => cnDate = picked);
+                          },
+                          child: _dialogFieldLabel(c, "Date", DateFormat('dd/MM/yyyy').format(cnDate), isModified: isDateMod),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  _dialogInput(c, "Credit Amount", amountCtrl, isNum: true, autofocus: true, isModified: isAmountMod),
+                  const SizedBox(height: 12),
+                  _dialogInput(c, "Invoice / Purchase Ref", invoiceCtrl, isModified: isInvoiceMod),
+                  const SizedBox(height: 12),
+                  _dialogInput(c, "Remarks / Reason", remarksCtrl, isModified: isRemarksMod),
+                ],
+              ),
             ),
-          ],
-        ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: Text("CANCEL", style: TextStyle(color: c.secondaryText))),
+              ElevatedButton(
+                onPressed: () async {
+                  if (amountCtrl.text.isEmpty || isSaving) return;
+                  if (isEdit) {
+                    final bool? confirmSave = await showDialog<bool>(
+                      context: context,
+                      builder: (dialogCtx) => AlertDialog(
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                        title: const Row(
+                          children: [
+                            Icon(Icons.save_rounded, color: Colors.blue, size: 28),
+                            SizedBox(width: 10),
+                            Text("Update Credit Note", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+                          ],
+                        ),
+                        content: Text(
+                          "Are you sure you want to update Credit Note ${noCtrl.text}?\nAll modifications will be saved to supplier ledger.",
+                          style: const TextStyle(fontSize: 14, height: 1.4),
+                        ),
+                        actions: [
+                          OutlinedButton(
+                            onPressed: () => Navigator.pop(dialogCtx, false),
+                            child: const Text("Cancel"),
+                          ),
+                          ElevatedButton(
+                            onPressed: () => Navigator.pop(dialogCtx, true),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.blue.shade800,
+                              foregroundColor: Colors.white,
+                            ),
+                            child: const Text("Update Credit Note", style: TextStyle(fontWeight: FontWeight.bold)),
+                          ),
+                        ],
+                      ),
+                    );
+                    if (confirmSave != true || !mounted) return;
+                  }
+
+                  if (!ctx.mounted || !mounted) return;
+                  setDialogState(() => isSaving = true);
+                  try {
+                    final provider = Provider.of<PharmacyProvider>(context, listen: false);
+                    final cnObj = SupplierCreditNote(
+                      id: noCtrl.text,
+                      supplierName: _selectedSupplier!,
+                      date: cnDate,
+                      amount: double.tryParse(amountCtrl.text) ?? 0.0,
+                      invoiceNo: invoiceCtrl.text,
+                      remarks: remarksCtrl.text,
+                    );
+                    
+                    if (isEdit) {
+                      await provider.updateSupplierCreditNote(cnObj);
+                    } else {
+                      await provider.addSupplierCreditNote(cnObj);
+                    }
+                    if (ctx.mounted) Navigator.pop(ctx);
+                  } finally {
+                    if (ctx.mounted) setDialogState(() => isSaving = false);
+                  }
+                },
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.orange.shade800, foregroundColor: Colors.white),
+                child: Text(isEdit ? "UPDATE CREDIT NOTE" : "SAVE CREDIT NOTE"),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
 
-  Widget _dialogInput(AppThemeColors c, String label, TextEditingController ctrl, {bool isNum = false, bool enabled = true, bool autofocus = false}) {
+  Widget _dialogInput(AppThemeColors c, String label, TextEditingController ctrl, {bool isNum = false, bool enabled = true, bool autofocus = false, bool isModified = false}) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -699,15 +807,21 @@ class _PaymentEntryScreenState extends State<PaymentEntryScreen> {
           controller: ctrl,
           enabled: enabled,
           autofocus: autofocus,
-          keyboardType: isNum ? TextInputType.number : TextInputType.text,
-          decoration: InputDecoration(isDense: true, border: OutlineInputBorder(borderSide: BorderSide(color: c.border)), contentPadding: const EdgeInsets.all(8), fillColor: c.inputBg, filled: true),
+          keyboardType: isNum ? const TextInputType.numberWithOptions(decimal: true) : TextInputType.text,
+          decoration: InputDecoration(
+            isDense: true,
+            border: OutlineInputBorder(borderSide: BorderSide(color: isModified ? Colors.orange : c.border)),
+            contentPadding: const EdgeInsets.all(8),
+            fillColor: isModified ? const Color(0xFFFEF3C7) : c.inputBg,
+            filled: true,
+          ),
           style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: c.primaryText),
         ),
       ],
     );
   }
 
-  Widget _dialogFieldLabel(AppThemeColors c, String label, String value) {
+  Widget _dialogFieldLabel(AppThemeColors c, String label, String value, {bool isModified = false}) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -716,7 +830,11 @@ class _PaymentEntryScreenState extends State<PaymentEntryScreen> {
         Container(
           width: double.infinity,
           padding: const EdgeInsets.all(8),
-          decoration: BoxDecoration(border: Border.all(color: c.border), borderRadius: BorderRadius.circular(4), color: c.inputBg),
+          decoration: BoxDecoration(
+            border: Border.all(color: isModified ? Colors.orange : c.border),
+            borderRadius: BorderRadius.circular(4),
+            color: isModified ? const Color(0xFFFEF3C7) : c.inputBg,
+          ),
           child: Text(value, style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: c.primaryText)),
         ),
       ],
@@ -727,6 +845,7 @@ class _PaymentEntryScreenState extends State<PaymentEntryScreen> {
     return InkWell(
       onTap: () async {
         final DateTimeRange? picked = await showDateRangePicker(context: context, firstDate: DateTime(2000), lastDate: DateTime(2100), initialDateRange: DateTimeRange(start: _startDate, end: _endDate));
+        if (!mounted) return;
         if (picked != null) {
           setState(() { _startDate = picked.start; _endDate = picked.end; });
         }
@@ -774,24 +893,27 @@ class _PaymentEntryScreenState extends State<PaymentEntryScreen> {
   }
 
   Widget _buildLedgerRows(AppThemeColors c, List<_LedgerRowData> ledgerData, PharmacyProvider provider) {
-    double tempBalance = 0;
+    int tempBalancePaise = 0;
     int lastSettledIndex = -1;
 
     for (int i = 0; i < ledgerData.length; i++) {
-      tempBalance += ledgerData[i].debit;
-      tempBalance -= ledgerData[i].credit;
-      if (tempBalance.abs() < 0.01) {
+      tempBalancePaise += (ledgerData[i].debit * 100).round();
+      tempBalancePaise -= (ledgerData[i].credit * 100).round();
+      if (tempBalancePaise == 0) {
         lastSettledIndex = i;
       }
     }
 
     double runningBalance = 0;
+    int runningBalancePaise = 0;
     List<Widget> visibleRows = [];
 
     for (int i = 0; i < ledgerData.length; i++) {
       var row = ledgerData[i];
       runningBalance += row.debit;
       runningBalance -= row.credit;
+      runningBalancePaise += (row.debit * 100).round();
+      runningBalancePaise -= (row.credit * 100).round();
 
       bool inRange = row.date.isAfter(_startDate.subtract(const Duration(seconds: 1))) &&
           row.date.isBefore(_endDate.add(const Duration(days: 1)));
@@ -799,8 +921,8 @@ class _PaymentEntryScreenState extends State<PaymentEntryScreen> {
       if (inRange) {
         Color balColor = c.primaryText; 
         
-        if (i > lastSettledIndex && runningBalance.abs() >= 0.01) {
-          balColor = runningBalance > 0 ? Colors.greenAccent : Colors.redAccent;
+        if (i > lastSettledIndex && runningBalancePaise != 0) {
+          balColor = runningBalancePaise > 0 ? Colors.greenAccent : Colors.redAccent;
         }
 
         visibleRows.add(_buildGridRow(c, row, runningBalance, provider, balColor));

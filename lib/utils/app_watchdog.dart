@@ -46,7 +46,7 @@ class StateSnapshot<T> {
 
 /// Global Application Watchdog and Transaction Recovery Safety Net
 class AppWatchdog {
-  static const Duration defaultTimeout = Duration(seconds: 5);
+  static const Duration defaultTimeout = Duration(seconds: 15);
 
   /// Executes an asynchronous [action] wrapped with a strict Watchdog timeout guard.
   ///

@@ -6,7 +6,8 @@ import '../../providers/pharmacy_provider.dart';
 import '../../providers/app_provider.dart';
 
 class StockEnquiriesScreen extends StatefulWidget {
-  const StockEnquiriesScreen({Key? key}) : super(key: key);
+  final String? initialQuery;
+  const StockEnquiriesScreen({super.key, this.initialQuery});
 
   @override
   State<StockEnquiriesScreen> createState() => _StockEnquiriesScreenState();
@@ -20,12 +21,18 @@ class _StockEnquiriesScreenState extends State<StockEnquiriesScreen> {
   String _searchQuery = "";
   String _sortBy = "most"; // 'most', 'lowest', 'latest', 'name'
   bool _isLoading = false;
+  int? _selectedIndex;
+  int? _lastTapIndex;
+  DateTime? _lastTapTime;
 
   List<Map<String, dynamic>> _enquiries = [];
 
   @override
   void initState() {
     super.initState();
+    if (widget.initialQuery != null && widget.initialQuery!.isNotEmpty) {
+      _searchQuery = widget.initialQuery!;
+    }
     _applyPreset("Today");
   }
 
@@ -127,7 +134,7 @@ class _StockEnquiriesScreenState extends State<StockEnquiriesScreen> {
               color: Colors.white,
               border: Border(bottom: BorderSide(color: Colors.grey.shade300)),
               boxShadow: [
-                BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 4, offset: const Offset(0, 2))
+                BoxShadow(color: Colors.black.withValues(alpha: 0.03), blurRadius: 4, offset: const Offset(0, 2))
               ]
             ),
             child: Column(
@@ -267,122 +274,171 @@ class _StockEnquiriesScreenState extends State<StockEnquiriesScreen> {
                           borderRadius: BorderRadius.circular(8),
                           border: Border.all(color: Colors.grey.shade300),
                           boxShadow: [
-                            BoxShadow(color: Colors.black.withOpacity(0.02), blurRadius: 4)
+                            BoxShadow(color: Colors.black.withValues(alpha: 0.02), blurRadius: 4)
                           ]
                         ),
-                        child: Column(
-                          children: [
-                            // Table Header
-                            Container(
-                              height: 36,
-                              padding: const EdgeInsets.symmetric(horizontal: 12),
-                              decoration: BoxDecoration(
-                                color: const Color(0xFF2C3E50),
-                                borderRadius: const BorderRadius.vertical(top: Radius.circular(7)),
-                              ),
-                              child: Row(
-                                children: const [
-                                  SizedBox(width: 40, child: Text("SLR", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
-                                  Expanded(flex: 3, child: Text("PRODUCT NAME", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
-                                  SizedBox(width: 120, child: Text("TIMES ENQUIRED", textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
-                                  SizedBox(width: 120, child: Text("TOTAL SHORT QTY", textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
-                                  SizedBox(width: 160, child: Text("LAST ENQUIRY DATE", textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
-                                  SizedBox(width: 130, child: Text("CURRENT STOCK", textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
-                                  SizedBox(width: 160, child: Text("ACTION", textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
-                                ],
-                              ),
-                            ),
-                            // Table Body
-                            Expanded(
-                              child: ListView.separated(
-                                itemCount: filtered.length,
-                                separatorBuilder: (_, __) => Divider(height: 1, color: Colors.grey.shade200),
-                                itemBuilder: (ctx, idx) {
-                                  final item = filtered[idx];
-                                  final prodName = (item['product_name'] ?? '').toString();
-                                  final timesEnquired = (item['times_enquired'] as num?)?.toInt() ?? 0;
-                                  final shortQty = (item['total_short_qty'] as num?)?.toInt() ?? 0;
-                                  final rawDate = (item['last_enquiry_date'] ?? '').toString();
-                                  
-                                  String dateStr = rawDate;
-                                  try {
-                                    if (rawDate.isNotEmpty) {
-                                      final dt = DateTime.parse(rawDate);
-                                      dateStr = DateFormat('dd/MM/yyyy hh:mm a').format(dt);
-                                    }
-                                  } catch (_) {}
-
-                                  final pharma = Provider.of<PharmacyProvider>(context, listen: false);
-                                  final liveStock = pharma.getTotalStockForProduct(prodName);
-
-                                  return Container(
-                                    height: 38,
-                                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                                    color: idx % 2 == 0 ? Colors.white : const Color(0xFFF9FAFB),
-                                    child: Row(
-                                      children: [
-                                        SizedBox(width: 40, child: Text("${idx + 1}", style: const TextStyle(fontSize: 12, color: Colors.black54))),
-                                        Expanded(
-                                          flex: 3, 
-                                          child: Text(prodName, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.black87))
-                                        ),
-                                        SizedBox(
-                                          width: 120, 
-                                          child: Container(
-                                            alignment: Alignment.center,
-                                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                                            decoration: BoxDecoration(color: Colors.red.shade50, borderRadius: BorderRadius.circular(12)),
-                                            child: Text("$timesEnquired times", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.red.shade800)),
-                                          )
-                                        ),
-                                        SizedBox(
-                                          width: 120, 
-                                          child: Text("$shortQty units", textAlign: TextAlign.center, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.black87))
-                                        ),
-                                        SizedBox(
-                                          width: 160, 
-                                          child: Text(dateStr, textAlign: TextAlign.center, style: const TextStyle(fontSize: 11, color: Colors.black87))
-                                        ),
-                                        SizedBox(
-                                          width: 130, 
-                                          child: Container(
-                                            alignment: Alignment.center,
-                                            child: Text(
-                                              liveStock > 0 ? "$liveStock units" : "OUT OF STOCK",
-                                              style: TextStyle(
-                                                fontSize: 11, 
-                                                fontWeight: FontWeight.bold, 
-                                                color: liveStock > 0 ? Colors.green.shade800 : Colors.red.shade700
-                                              ),
-                                            ),
-                                          )
-                                        ),
-                                        SizedBox(
-                                          width: 160, 
-                                          child: Center(
-                                            child: ElevatedButton.icon(
-                                              style: ElevatedButton.styleFrom(
-                                                backgroundColor: Colors.blue.shade700,
-                                                foregroundColor: Colors.white,
-                                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
-                                              ),
-                                              icon: const Icon(Icons.add_shopping_cart_rounded, size: 14),
-                                              label: const Text("Add Special Order", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
-                                              onPressed: () {
-                                                final app = Provider.of<AppProvider>(context, listen: false);
-                                                app.openSpecialOrders();
-                                              },
-                                            ),
-                                          )
-                                        ),
-                                      ],
+                        child: LayoutBuilder(
+                          builder: (context, constraints) {
+                            const double minWidth = 1100.0;
+                            final tableWidth = constraints.maxWidth > minWidth ? constraints.maxWidth : minWidth;
+                            return SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
+                              child: SizedBox(
+                                width: tableWidth,
+                                child: Column(
+                                  children: [
+                                    // Table Header
+                                    Container(
+                                      height: 38,
+                                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                                      decoration: const BoxDecoration(
+                                        color: Color(0xFF2C3E50),
+                                        borderRadius: BorderRadius.vertical(top: Radius.circular(7)),
+                                      ),
+                                      child: const Row(
+                                        children: [
+                                          SizedBox(width: 40, child: Text("SLR", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
+                                          SizedBox(width: 250, child: Text("PRODUCT NAME", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
+                                          SizedBox(width: 90, child: Text("DATE", textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
+                                          SizedBox(width: 80, child: Text("AGENT", textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
+                                          SizedBox(width: 140, child: Text("TOTAL TIMES ENTERED", textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
+                                          SizedBox(width: 110, child: Text("ENQUIRY QTY", textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
+                                          SizedBox(width: 120, child: Text("CURRENT STOCK", textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
+                                          SizedBox(width: 150, child: Text("LAST ENQUIRY DATE", textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
+                                          SizedBox(width: 140, child: Text("ACTION", textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11))),
+                                        ],
+                                      ),
                                     ),
-                                  );
-                                },
+                                    // Table Body
+                                    Expanded(
+                                      child: ListView.separated(
+                                        itemCount: filtered.length,
+                                        separatorBuilder: (_, __) => Divider(height: 1, color: Colors.grey.shade200),
+                                        itemBuilder: (ctx, idx) {
+                                          final item = filtered[idx];
+                                          final prodName = (item['product_name'] ?? '').toString();
+                                          final timesEnquired = (item['times_enquired'] as num?)?.toInt() ?? 0;
+                                          final shortQty = (item['total_short_qty'] as num?)?.toInt() ?? 0;
+                                          final rawFirstDate = (item['date'] ?? '').toString();
+                                          final rawLastDate = (item['last_enquiry_date'] ?? '').toString();
+                                          final agent = (item['agent'] ?? '').toString();
+
+                                          String firstDateStr = "-";
+                                          try {
+                                            if (rawFirstDate.isNotEmpty) {
+                                              final dt = DateTime.parse(rawFirstDate);
+                                              firstDateStr = DateFormat('dd/MM/yyyy').format(dt);
+                                            }
+                                          } catch (_) {}
+
+                                          String lastDateStr = "-";
+                                          try {
+                                            if (rawLastDate.isNotEmpty) {
+                                              final dt = DateTime.parse(rawLastDate);
+                                              lastDateStr = DateFormat('dd/MM/yyyy hh:mm a').format(dt);
+                                            }
+                                          } catch (_) {}
+
+                                          final pharma = Provider.of<PharmacyProvider>(context, listen: false);
+                                          final liveStock = pharma.getTotalStockForProduct(prodName);
+                                          final bool isSelected = (idx == _selectedIndex);
+
+                                          return InkWell(
+                                            onTap: () {
+                                              final now = DateTime.now();
+                                              setState(() => _selectedIndex = idx);
+                                              if (_lastTapIndex == idx && _lastTapTime != null && now.difference(_lastTapTime!) < const Duration(milliseconds: 350)) {
+                                                _lastTapTime = null;
+                                                _lastTapIndex = null;
+                                                if (prodName.isNotEmpty) {
+                                                  Provider.of<AppProvider>(context, listen: false).openStockEnquiries(initialQuery: prodName);
+                                                }
+                                              } else {
+                                                _lastTapIndex = idx;
+                                                _lastTapTime = now;
+                                              }
+                                            },
+                                            child: Container(
+                                              height: 38,
+                                              padding: const EdgeInsets.symmetric(horizontal: 12),
+                                              color: isSelected ? const Color(0xFFBAE6FD) : (idx % 2 == 0 ? Colors.white : const Color(0xFFF9FAFB)),
+                                              child: Row(
+                                                children: [
+                                                  SizedBox(width: 40, child: Text("${idx + 1}", style: const TextStyle(fontSize: 12, color: Colors.black54))),
+                                                  SizedBox(
+                                                    width: 250, 
+                                                    child: Text(prodName, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.black87), overflow: TextOverflow.ellipsis),
+                                                  ),
+                                                  SizedBox(
+                                                    width: 90, 
+                                                    child: Text(firstDateStr, textAlign: TextAlign.center, style: const TextStyle(fontSize: 11, color: Colors.black87))
+                                                  ),
+                                                  SizedBox(
+                                                    width: 80, 
+                                                    child: Text(agent.isEmpty ? "-" : agent, textAlign: TextAlign.center, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: Colors.black87))
+                                                  ),
+                                                  SizedBox(
+                                                    width: 140, 
+                                                    child: Container(
+                                                      alignment: Alignment.center,
+                                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                                                      decoration: BoxDecoration(color: Colors.red.shade50, borderRadius: BorderRadius.circular(12)),
+                                                      child: Text("$timesEnquired times", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.red.shade800)),
+                                                    )
+                                                  ),
+                                                  SizedBox(
+                                                    width: 110, 
+                                                    child: Text("$shortQty units", textAlign: TextAlign.center, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.black87))
+                                                  ),
+                                                  SizedBox(
+                                                    width: 120, 
+                                                    child: Container(
+                                                      alignment: Alignment.center,
+                                                      child: Text(
+                                                        liveStock > 0 ? "$liveStock units" : "OUT OF STOCK",
+                                                        style: TextStyle(
+                                                          fontSize: 11, 
+                                                          fontWeight: FontWeight.bold, 
+                                                          color: liveStock > 0 ? Colors.green.shade800 : Colors.red.shade700
+                                                        ),
+                                                      ),
+                                                    )
+                                                  ),
+                                                  SizedBox(
+                                                    width: 150, 
+                                                    child: Text(lastDateStr, textAlign: TextAlign.center, style: const TextStyle(fontSize: 11, color: Colors.black87))
+                                                  ),
+                                                  SizedBox(
+                                                    width: 140, 
+                                                    child: Center(
+                                                      child: ElevatedButton.icon(
+                                                        style: ElevatedButton.styleFrom(
+                                                          backgroundColor: Colors.blue.shade700,
+                                                          foregroundColor: Colors.white,
+                                                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+                                                        ),
+                                                        icon: const Icon(Icons.add_shopping_cart_rounded, size: 13),
+                                                        label: const Text("Special Order", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+                                                        onPressed: () {
+                                                          final app = Provider.of<AppProvider>(context, listen: false);
+                                                          app.openSpecialOrders();
+                                                        },
+                                                      ),
+                                                    )
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                          );
+                                        },
+                                      ),
+                                    )
+                                  ],
+                                ),
                               ),
-                            )
-                          ],
+                            );
+                          },
                         ),
                       ),
           )
@@ -442,14 +498,14 @@ class _StockEnquiriesScreenState extends State<StockEnquiriesScreen> {
           borderRadius: BorderRadius.circular(8),
           border: Border.all(color: Colors.grey.shade300),
           boxShadow: [
-            BoxShadow(color: Colors.black.withOpacity(0.02), blurRadius: 4, offset: const Offset(0, 2))
+            BoxShadow(color: Colors.black.withValues(alpha: 0.02), blurRadius: 4, offset: const Offset(0, 2))
           ]
         ),
         child: Row(
           children: [
             Container(
               padding: const EdgeInsets.all(8),
-              decoration: BoxDecoration(color: color.withOpacity(0.1), borderRadius: BorderRadius.circular(6)),
+              decoration: BoxDecoration(color: color.withValues(alpha: 0.1), borderRadius: BorderRadius.circular(6)),
               child: Icon(icon, color: color, size: 20),
             ),
             const SizedBox(width: 10),

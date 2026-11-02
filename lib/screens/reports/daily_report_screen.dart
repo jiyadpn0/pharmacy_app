@@ -4,13 +4,10 @@ import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../providers/pharmacy_provider.dart';
-import '../../widgets/app_date_picker.dart';
+import '../../utils/app_formatters.dart';
 import '../../utils/report_pdf_generator.dart';
 import '../../utils/printer_service.dart';
 import '../../services/whatsapp_service.dart';
-import '../../utils/theme_constants.dart';
-import '../../widgets/erp_tooltip.dart';
-import '../../widgets/pin_unlock_dialog.dart';
 
 class CashCounterData {
   int count500;
@@ -173,19 +170,15 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
   bool _isShowingMonthSummary = false;
 
   List<SaleInvoice> _monthSales = [];
-  List<PurchaseEntry> _monthPurchases = [];
   List<SaleReturnInvoice> _monthReturns = [];
 
   String? _selectedStaff; // null = Show Staff Selector view, "ALL" or staff name
-
-  List<String> get _baseStaffList => ["ALL", ...Provider.of<PharmacyProvider>(context, listen: false).staffNames];
 
   List<SaleInvoice> _allDaySales = [];
   List<SaleInvoice> _daySales = [];
   List<PurchaseEntry> _dayPurchases = [];
   List<SupplierPayment> _daySupplierPayments = [];
   List<SaleReturnInvoice> _dayReturns = [];
-  List<StockWriteOff> _dayDamages = [];
 
   CashCounterData _openingCounter = CashCounterData();
   CashCounterData _closingCounter = CashCounterData();
@@ -202,7 +195,7 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
   List<DetailLineItem> _bankToCashItems = [];
 
   // Headings Filter Dropdown Selection
-  Set<String> _selectedHeadings = {
+  final Set<String> _selectedHeadings = {
     'PRE_ENTER',
     'DIFFERENCE',
     'NOT_RECEIVED',
@@ -616,6 +609,8 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
   bool _hasCustomPurchases = false;
   bool _hasCustomCashToBank = false;
   bool _hasCustomBankToCash = false;
+
+  bool get hasAnyCustomField => _hasCustomCreditPayments || _hasCustomPrePayments || _hasCustomExpenses || _hasCustomCashToBank || _hasCustomBankToCash;
   bool _isTotalSaleSynced = false;
   double? _customTotalSaleAmount;
   bool _autoFetchOpeningSale = true;
@@ -1183,57 +1178,61 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
   }
 
   Future<void> _saveSettingsForDate() async {
-    final prefs = await _getPrefs();
-    final keyTag = _staffStorageKey();
+    try {
+      final prefs = await _getPrefs();
+      final keyTag = _staffStorageKey();
 
-    prefs.setString("cash_counter_opening_$keyTag", jsonEncode(_openingCounter.toJson()));
-    prefs.setString("cash_counter_closing_$keyTag", jsonEncode(_closingCounter.toJson()));
-    prefs.setString("items_credit_payments_$keyTag", jsonEncode(_creditPaymentItems.map((e) => e.toJson()).toList()));
-    prefs.setString("items_pre_payments_$keyTag", jsonEncode(_prePaymentItems.map((e) => e.toJson()).toList()));
-    prefs.setString("items_not_received_$keyTag", jsonEncode(_notReceivedItems.map((e) => e.toJson()).toList()));
-    prefs.setString("items_sales_return_$keyTag", jsonEncode(_salesReturnItems.map((e) => e.toJson()).toList()));
-    prefs.setString("items_expenses_$keyTag", jsonEncode(_expenseItems.map((e) => e.toJson()).toList()));
-    prefs.setString("items_supplier_paid_$keyTag", jsonEncode(_supplierPaidItems.map((e) => e.toJson()).toList()));
-    prefs.setString("items_purchases_$keyTag", jsonEncode(_purchaseItems.map((e) => e.toJson()).toList()));
-    prefs.setString("items_cash_to_bank_$keyTag", jsonEncode(_cashToBankItems.map((e) => e.toJson()).toList()));
-    prefs.setString("items_bank_to_cash_$keyTag", jsonEncode(_bankToCashItems.map((e) => e.toJson()).toList()));
-    prefs.setBool("total_sale_synced_$keyTag", _isTotalSaleSynced);
-    prefs.setBool("auto_fetch_opening_sale_$keyTag", _autoFetchOpeningSale);
-    prefs.setBool("auto_fetch_closing_sale_$keyTag", _autoFetchClosingSale);
-    if (_customOpeningBillNo != null) {
-      prefs.setString("custom_opening_bill_$keyTag", _customOpeningBillNo!);
-    } else {
-      prefs.remove("custom_opening_bill_$keyTag");
-    }
-    if (_customOpeningTimeStr != null) {
-      prefs.setString("custom_opening_time_$keyTag", _customOpeningTimeStr!);
-    } else {
-      prefs.remove("custom_opening_time_$keyTag");
-    }
-    if (_customOpeningAmount != null) {
-      prefs.setDouble("custom_opening_amount_$keyTag", _customOpeningAmount!);
-    } else {
-      prefs.remove("custom_opening_amount_$keyTag");
-    }
-    if (_customClosingBillNo != null) {
-      prefs.setString("custom_closing_bill_$keyTag", _customClosingBillNo!);
-    } else {
-      prefs.remove("custom_closing_bill_$keyTag");
-    }
-    if (_customClosingTimeStr != null) {
-      prefs.setString("custom_closing_time_$keyTag", _customClosingTimeStr!);
-    } else {
-      prefs.remove("custom_closing_time_$keyTag");
-    }
-    if (_customClosingAmount != null) {
-      prefs.setDouble("custom_closing_amount_$keyTag", _customClosingAmount!);
-    } else {
-      prefs.remove("custom_closing_amount_$keyTag");
-    }
-    if (_customTotalSaleAmount != null) {
-      prefs.setDouble("total_sale_amount_$keyTag", _customTotalSaleAmount!);
-    } else {
-      prefs.remove("total_sale_amount_$keyTag");
+      await prefs.setString("cash_counter_opening_$keyTag", jsonEncode(_openingCounter.toJson()));
+      await prefs.setString("cash_counter_closing_$keyTag", jsonEncode(_closingCounter.toJson()));
+      await prefs.setString("items_credit_payments_$keyTag", jsonEncode(_creditPaymentItems.map((e) => e.toJson()).toList()));
+      await prefs.setString("items_pre_payments_$keyTag", jsonEncode(_prePaymentItems.map((e) => e.toJson()).toList()));
+      await prefs.setString("items_not_received_$keyTag", jsonEncode(_notReceivedItems.map((e) => e.toJson()).toList()));
+      await prefs.setString("items_sales_return_$keyTag", jsonEncode(_salesReturnItems.map((e) => e.toJson()).toList()));
+      await prefs.setString("items_expenses_$keyTag", jsonEncode(_expenseItems.map((e) => e.toJson()).toList()));
+      await prefs.setString("items_supplier_paid_$keyTag", jsonEncode(_supplierPaidItems.map((e) => e.toJson()).toList()));
+      await prefs.setString("items_purchases_$keyTag", jsonEncode(_purchaseItems.map((e) => e.toJson()).toList()));
+      await prefs.setString("items_cash_to_bank_$keyTag", jsonEncode(_cashToBankItems.map((e) => e.toJson()).toList()));
+      await prefs.setString("items_bank_to_cash_$keyTag", jsonEncode(_bankToCashItems.map((e) => e.toJson()).toList()));
+      await prefs.setBool("total_sale_synced_$keyTag", _isTotalSaleSynced);
+      await prefs.setBool("auto_fetch_opening_sale_$keyTag", _autoFetchOpeningSale);
+      await prefs.setBool("auto_fetch_closing_sale_$keyTag", _autoFetchClosingSale);
+      if (_customOpeningBillNo != null) {
+        await prefs.setString("custom_opening_bill_$keyTag", _customOpeningBillNo!);
+      } else {
+        await prefs.remove("custom_opening_bill_$keyTag");
+      }
+      if (_customOpeningTimeStr != null) {
+        await prefs.setString("custom_opening_time_$keyTag", _customOpeningTimeStr!);
+      } else {
+        await prefs.remove("custom_opening_time_$keyTag");
+      }
+      if (_customOpeningAmount != null) {
+        await prefs.setDouble("custom_opening_amount_$keyTag", _customOpeningAmount!);
+      } else {
+        await prefs.remove("custom_opening_amount_$keyTag");
+      }
+      if (_customClosingBillNo != null) {
+        await prefs.setString("custom_closing_bill_$keyTag", _customClosingBillNo!);
+      } else {
+        await prefs.remove("custom_closing_bill_$keyTag");
+      }
+      if (_customClosingTimeStr != null) {
+        await prefs.setString("custom_closing_time_$keyTag", _customClosingTimeStr!);
+      } else {
+        await prefs.remove("custom_closing_time_$keyTag");
+      }
+      if (_customClosingAmount != null) {
+        await prefs.setDouble("custom_closing_amount_$keyTag", _customClosingAmount!);
+      } else {
+        await prefs.remove("custom_closing_amount_$keyTag");
+      }
+      if (_customTotalSaleAmount != null) {
+        await prefs.setDouble("total_sale_amount_$keyTag", _customTotalSaleAmount!);
+      } else {
+        await prefs.remove("total_sale_amount_$keyTag");
+      }
+    } catch (e) {
+      debugPrint("Error saving daily report settings: $e");
     }
   }
 
@@ -1245,8 +1244,8 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
     final startOfDay = DateTime(_selectedDate.year, _selectedDate.month, _selectedDate.day, 0, 0, 0);
     final endOfDay = DateTime(_selectedDate.year, _selectedDate.month, _selectedDate.day, 23, 59, 59);
 
-    final sales = await p.fetchSalesInDateRange(startOfDay, endOfDay, loadItems: false, limit: 1000, offset: 0);
-    final purchases = await p.fetchPurchasesInDateRange(startOfDay, endOfDay, loadItems: false, limit: 1000, offset: 0);
+    final sales = await p.fetchSalesInDateRange(startOfDay, endOfDay, loadItems: false, limit: 1000, offset: 0, tryOnlineFirst: true);
+    final purchases = await p.fetchPurchasesInDateRange(startOfDay, endOfDay, loadItems: false, limit: 1000, offset: 0, tryOnlineFirst: true);
     final returns = await p.fetchSaleReturnsInDateRange(startOfDay, endOfDay, loadItems: false, limit: 1000, offset: 0);
 
     final supplierPays = p.supplierPayments.where((sp) {
@@ -1254,10 +1253,7 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
       return spd.isAtSameMomentAs(DateTime(_selectedDate.year, _selectedDate.month, _selectedDate.day));
     }).toList();
 
-    final damages = p.writeOffs.where((wo) {
-      final wod = DateTime(wo.date.year, wo.date.month, wo.date.day);
-      return wod.isAtSameMomentAs(DateTime(_selectedDate.year, _selectedDate.month, _selectedDate.day));
-    }).toList();
+
 
     _allDaySales = sales.where((s) => !s.isDeleted).toList();
 
@@ -1276,14 +1272,13 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
       _dayPurchases = purchases.where((pe) => !pe.isDeleted).toList();
       _dayReturns = returns.where((r) => !r.isDeleted).toList();
       _daySupplierPayments = supplierPays;
-      _dayDamages = damages;
 
       if (!_hasCustomNotReceived) {
         final creditSalesInvoices = _daySales.where((s) => s.customerAcc.toUpperCase() == "CREDIT").toList();
         _notReceivedItems = creditSalesInvoices
             .map((s) => DetailLineItem(
                   id: s.entryNo,
-                  name: s.patient.isEmpty ? "Credit Customer #${s.entryNo}" : "${s.patient} (Bill #${s.entryNo})",
+                  name: s.patient.isEmpty ? "Credit Customer #${formatSaleDisplayNo(s.entryNo)}" : "${s.patient} (Bill #${formatSaleDisplayNo(s.entryNo)})",
                   amount: s.grandTotal,
                 ))
             .toList();
@@ -1354,8 +1349,6 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
     final f10 = FocusNode();
     final f5 = FocusNode();
     final fCoins = FocusNode();
-    final fUpi = FocusNode();
-    final fCard = FocusNode();
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       f500.requestFocus();
@@ -1574,7 +1567,6 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
     required Color primaryColor,
   }) {
     final rowHolders = currentItems.map((e) => _DialogRowHolder(e.copy())).toList();
-    final searchCtrl = TextEditingController();
     final totalNotifier = ValueNotifier<double>(rowHolders.fold(0.0, (s, r) => s + r.item.amount));
 
     showDialog(
@@ -1582,11 +1574,6 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
       builder: (dialogCtx) {
         return StatefulBuilder(
           builder: (ctx, setDialogState) {
-            final filterQuery = searchCtrl.text.trim().toLowerCase();
-            final filteredHolders = rowHolders.where((h) {
-              return h.nameCtrl.text.toLowerCase().contains(filterQuery) ||
-                     h.noteCtrl.text.toLowerCase().contains(filterQuery);
-            }).toList();
 
             return Dialog(
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
@@ -2330,7 +2317,7 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
     DateTime? openingDt;
 
     if (_autoFetchOpeningSale && autoOpeningSale != null) {
-      openingBillDisplay = "Bill #${autoOpeningSale.entryNo}${autoOpeningSale.patient.isNotEmpty ? ' • ${autoOpeningSale.patient}' : (autoOpeningSale.customerAcc.isNotEmpty ? ' • ${autoOpeningSale.customerAcc}' : '')}";
+      openingBillDisplay = "Bill #${formatSaleDisplayNo(autoOpeningSale.entryNo)}${autoOpeningSale.patient.isNotEmpty ? ' • ${autoOpeningSale.patient}' : (autoOpeningSale.customerAcc.isNotEmpty ? ' • ${autoOpeningSale.customerAcc}' : '')}";
       openingTimeDisplay = DateFormat('hh:mm a').format(autoOpeningSale.date);
       openingAmountDisplay = autoOpeningSale.grandTotal;
       openingDt = autoOpeningSale.date;
@@ -2340,7 +2327,7 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
       openingAmountDisplay = _customOpeningAmount ?? 0.0;
       openingDt = _parseTimeToTodayDate(_selectedDate, _customOpeningTimeStr!);
     } else if (autoOpeningSale != null) {
-      openingBillDisplay = "Bill #${autoOpeningSale.entryNo}${autoOpeningSale.patient.isNotEmpty ? ' • ${autoOpeningSale.patient}' : (autoOpeningSale.customerAcc.isNotEmpty ? ' • ${autoOpeningSale.customerAcc}' : '')}";
+      openingBillDisplay = "Bill #${formatSaleDisplayNo(autoOpeningSale.entryNo)}${autoOpeningSale.patient.isNotEmpty ? ' • ${autoOpeningSale.patient}' : (autoOpeningSale.customerAcc.isNotEmpty ? ' • ${autoOpeningSale.customerAcc}' : '')}";
       openingTimeDisplay = DateFormat('hh:mm a').format(autoOpeningSale.date);
       openingAmountDisplay = autoOpeningSale.grandTotal;
       openingDt = autoOpeningSale.date;
@@ -2354,7 +2341,7 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
     DateTime? closingDt;
 
     if (_autoFetchClosingSale && autoClosingSale != null) {
-      closingBillDisplay = "Bill #${autoClosingSale.entryNo}${autoClosingSale.patient.isNotEmpty ? ' • ${autoClosingSale.patient}' : (autoClosingSale.customerAcc.isNotEmpty ? ' • ${autoClosingSale.customerAcc}' : '')}";
+      closingBillDisplay = "Bill #${formatSaleDisplayNo(autoClosingSale.entryNo)}${autoClosingSale.patient.isNotEmpty ? ' • ${autoClosingSale.patient}' : (autoClosingSale.customerAcc.isNotEmpty ? ' • ${autoClosingSale.customerAcc}' : '')}";
       closingTimeDisplay = DateFormat('hh:mm a').format(autoClosingSale.date);
       closingAmountDisplay = autoClosingSale.grandTotal;
       closingDt = autoClosingSale.date;
@@ -2364,7 +2351,7 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
       closingAmountDisplay = _customClosingAmount ?? 0.0;
       closingDt = _parseTimeToTodayDate(_selectedDate, _customClosingTimeStr!);
     } else if (autoClosingSale != null) {
-      closingBillDisplay = "Bill #${autoClosingSale.entryNo}${autoClosingSale.patient.isNotEmpty ? ' • ${autoClosingSale.patient}' : (autoClosingSale.customerAcc.isNotEmpty ? ' • ${autoClosingSale.customerAcc}' : '')}";
+      closingBillDisplay = "Bill #${formatSaleDisplayNo(autoClosingSale.entryNo)}${autoClosingSale.patient.isNotEmpty ? ' • ${autoClosingSale.patient}' : (autoClosingSale.customerAcc.isNotEmpty ? ' • ${autoClosingSale.customerAcc}' : '')}";
       closingTimeDisplay = DateFormat('hh:mm a').format(autoClosingSale.date);
       closingAmountDisplay = autoClosingSale.grandTotal;
       closingDt = autoClosingSale.date;
@@ -2973,7 +2960,7 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
                         _notReceivedItems = creditSalesInvoices
                             .map((s) => DetailLineItem(
                                   id: s.entryNo,
-                                  name: s.patient.isEmpty ? "Credit Customer #${s.entryNo}" : "${s.patient} (Bill #${s.entryNo})",
+                                  name: s.patient.isEmpty ? "Credit Customer #${formatSaleDisplayNo(s.entryNo)}" : "${s.patient} (Bill #${formatSaleDisplayNo(s.entryNo)})",
                                   amount: s.grandTotal,
                                 ))
                             .toList();
@@ -3669,7 +3656,6 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
     ]);
 
     _monthSales = (results[0] as List<SaleInvoice>).where((s) => !s.isDeleted).toList();
-    _monthPurchases = (results[1] as List<PurchaseEntry>).where((pe) => !pe.isDeleted).toList();
     _monthReturns = (results[2] as List<SaleReturnInvoice>).where((r) => !r.isDeleted).toList();
 
     if (mounted) {
@@ -3681,11 +3667,8 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
 
   Widget _buildMonthlySummaryPanel() {
     final double salesTotal = _monthSales.fold(0.0, (sum, s) => sum + s.grandTotal);
-    final double purchasesTotal = _monthPurchases.fold(0.0, (sum, p) => sum + p.grandTotal);
     final double returnsTotal = _monthReturns.fold(0.0, (sum, r) => sum + r.grandTotal);
     final int invoiceCount = _monthSales.length;
-
-    final double netMonthFlow = salesTotal - returnsTotal - totalExpenses;
 
     const double colDateWidth = 140;
     const double colInvoicesWidth = 110;
@@ -3747,8 +3730,8 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
                               records: _monthSales
                                   .map((s) => HeadingDetailRecord(
                                         dateStr: DateFormat('dd/MM/yyyy (EEE)').format(s.date),
-                                        name: s.patient.isNotEmpty ? s.patient : "Customer (Bill #${s.entryNo})",
-                                        remark: "Sales Invoice #${s.entryNo} • Account: ${s.customerAcc}",
+                                        name: s.patient.isNotEmpty ? s.patient : "Customer (Bill #${formatSaleDisplayNo(s.entryNo)})",
+                                        remark: "Sales Invoice #${formatSaleDisplayNo(s.entryNo)} • Account: ${s.customerAcc}",
                                         amount: s.grandTotal,
                                       ))
                                   .toList(),
@@ -3770,8 +3753,8 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
                               records: _monthSales
                                   .map((s) => HeadingDetailRecord(
                                         dateStr: DateFormat('dd/MM/yyyy (EEE)').format(s.date),
-                                        name: s.patient.isNotEmpty ? s.patient : "Customer (Bill #${s.entryNo})",
-                                        remark: "Gross Sales Inv #${s.entryNo}",
+                                        name: s.patient.isNotEmpty ? s.patient : "Customer (Bill #${formatSaleDisplayNo(s.entryNo)})",
+                                        remark: "Gross Sales Inv #${formatSaleDisplayNo(s.entryNo)}",
                                         amount: s.grandTotal,
                                       ))
                                   .toList(),
@@ -3994,15 +3977,15 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
                       columnSpacing: 24,
                       horizontalMargin: 12,
                       columns: [
-                        DataColumn(label: SizedBox(width: colDateWidth, child: const Text("DATE", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)))),
-                        DataColumn(label: SizedBox(width: colInvoicesWidth, child: const Text("INVOICES", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)))),
-                        DataColumn(label: SizedBox(width: colGrossWidth, child: const Text("GROSS SALES (₹)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)))),
-                        DataColumn(label: SizedBox(width: colReturnsWidth, child: const Text("RETURNS (₹)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)))),
-                        DataColumn(label: SizedBox(width: colNetWidth, child: const Text("NET REVENUE (₹)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)))),
+                        const DataColumn(label: SizedBox(width: colDateWidth, child: Text("DATE", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)))),
+                        const DataColumn(label: SizedBox(width: colInvoicesWidth, child: Text("INVOICES", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)))),
+                        const DataColumn(label: SizedBox(width: colGrossWidth, child: Text("GROSS SALES (₹)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)))),
+                        const DataColumn(label: SizedBox(width: colReturnsWidth, child: Text("RETURNS (₹)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)))),
+                        const DataColumn(label: SizedBox(width: colNetWidth, child: Text("NET REVENUE (₹)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)))),
                         if (_showNotReceived)
-                          DataColumn(label: SizedBox(width: colNotReceivedWidth, child: const Text("NOT RECEIVED (₹)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)))),
+                          const DataColumn(label: SizedBox(width: colNotReceivedWidth, child: Text("NOT RECEIVED (₹)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)))),
                         if (_showExpenses)
-                          DataColumn(label: SizedBox(width: colExpensesWidth, child: const Text("EXPENSES (₹)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)))),
+                          const DataColumn(label: SizedBox(width: colExpensesWidth, child: Text("EXPENSES (₹)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)))),
                         for (var customHeading in _customHeadings)
                           DataColumn(label: SizedBox(width: colExpensesWidth, child: Text("${customHeading.name} (₹)", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11)))),
                       ],
@@ -4050,11 +4033,11 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
       backgroundColor: const Color(0xFFF1F5F9),
       appBar: AppBar(
         backgroundColor: const Color(0xFF0F172A),
-        title: Row(
+        title: const Row(
           children: [
-            const Icon(Icons.history_edu_rounded, color: Colors.amberAccent, size: 22),
-            const SizedBox(width: 10),
-            const Text("REGISTER HISTORY ARCHIVE", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.white)),
+            Icon(Icons.history_edu_rounded, color: Colors.amberAccent, size: 22),
+            SizedBox(width: 10),
+            Text("REGISTER HISTORY ARCHIVE", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.white)),
           ],
         ),
         actions: [
@@ -4392,9 +4375,7 @@ class _DailyReportScreenState extends State<DailyReportScreen> {
                     regularItems.add(s);
                   }
                 }
-                if (historyItem == null) {
-                  historyItem = "HISTORY";
-                }
+                historyItem ??= "HISTORY";
 
                 final List<String?> gridItems = [];
                 for (final item in regularItems) {
@@ -4633,7 +4614,7 @@ class CustomHeadingData {
         'id': id,
         'name': name,
         'amount': amount,
-        'color': color.value,
+        'color': color.toARGB32(),
         'isIncome': isIncome,
       };
 

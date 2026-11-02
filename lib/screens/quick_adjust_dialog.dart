@@ -26,8 +26,6 @@ class _QuickAdjustDialogState extends State<QuickAdjustDialog> {
   Product? _selectedProduct;
   Product? _selectedBatch;
   Key _batchDropdownKey = UniqueKey();
-  String _reason = "Physical Verification";
-  String _doneBy = "ADMIN";
   int _systemStock = 0;
   bool _isLoading = false;
   String? _focusedProductText;
@@ -88,6 +86,22 @@ class _QuickAdjustDialogState extends State<QuickAdjustDialog> {
       return;
     }
 
+    // Require specific reason for Schedule H1 / Controlled substances
+    final bool isControlledItem = _selectedProduct != null &&
+        (_selectedProduct!.isControlled || _selectedProduct!.isNrx || _selectedProduct!.schedule.toUpperCase().contains("H1"));
+    if (isControlledItem) {
+      final reasonText = _reasonCtrl.text.trim();
+      if (reasonText.isEmpty || reasonText.toUpperCase() == "PHYSICAL VERIFICATION") {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("A specific reason is mandatory for Schedule H1 / Controlled drug adjustments."),
+            backgroundColor: Colors.red,
+          ),
+        );
+        return;
+      }
+    }
+
     // Prevent deducting more stock than physically exists
     if (variance < 0 && physicalStock < 0) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -101,10 +115,18 @@ class _QuickAdjustDialogState extends State<QuickAdjustDialog> {
 
     try {
       final int pack = _selectedBatch!.packSize > 0 ? _selectedBatch!.packSize : 1;
-      // Landing cost per single loose tablet/capsule
-      final double unitLandingCost = _selectedBatch!.landingCost > 0 
-          ? (_selectedBatch!.landingCost / pack) 
-          : (_selectedBatch!.purchaseRate / pack);
+      
+      // 4-Tier Rate Selection Hierarchy for Stock Adjustments
+      final rates = await provider.getAdjustmentRates(
+        productId: _selectedBatch!.id,
+        batchNumber: _selectedBatch!.batch,
+        defaultMrp: _selectedBatch!.mrp,
+        defaultSaleRate: _selectedBatch!.salePrice,
+      );
+      final double batchLandingCost = rates['landingCost'] ?? _selectedBatch!.landingCost;
+      final double unitLandingCost = batchLandingCost > 0 
+          ? (batchLandingCost / pack) 
+          : (_selectedBatch!.purchaseRate > 0 ? (_selectedBatch!.purchaseRate / pack) : (_selectedBatch!.mrp / pack));
 
       final adjustmentItem = StockAdjustmentItem(
         product: _selectedBatch!,
@@ -274,6 +296,30 @@ class _QuickAdjustDialogState extends State<QuickAdjustDialog> {
                 );
               },
             ),
+            if (_selectedProduct != null &&
+                (_selectedProduct!.isControlled || _selectedProduct!.isNrx || _selectedProduct!.schedule.toUpperCase().contains("H1"))) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: Colors.red.shade50,
+                  border: Border.all(color: Colors.red.shade300),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.warning_amber_rounded, size: 16, color: Colors.red),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        "RESTRICTED SUBSTANCE (${_selectedProduct!.schedule.isNotEmpty ? _selectedProduct!.schedule : 'SCHEDULE H1 / NRX'}) — Audit Reason Mandatory",
+                        style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.red),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
             const SizedBox(height: 12),
 
             Row(
@@ -450,11 +496,7 @@ class _QuickAdjustDialogState extends State<QuickAdjustDialog> {
                     defaultOption: "Physical Verification",
                     isStrict: true,
                     height: 32,
-                    onValueChanged: (val) {
-                      setState(() {
-                        _reason = val.isEmpty ? "Physical Verification" : val;
-                      });
-                    },
+                    onValueChanged: (_) {},
                   ),
                 ),
                 const SizedBox(width: 8),
@@ -468,11 +510,7 @@ class _QuickAdjustDialogState extends State<QuickAdjustDialog> {
                     defaultOption: "ADMIN",
                     isStrict: false,
                     height: 32,
-                    onValueChanged: (val) {
-                      setState(() {
-                        _doneBy = val.isEmpty ? "ADMIN" : val;
-                      });
-                    },
+                    onValueChanged: (_) {},
                   ),
                 ),
               ],

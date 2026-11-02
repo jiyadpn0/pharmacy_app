@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
@@ -37,7 +38,7 @@ class RemoteLoggerService {
 
   /// Initializes the logger, cleans up expired cache files (> 7 days), and syncs.
   Future<void> init() async {
-    await _purgeExpiredLogs();
+    unawaited(_purgeExpiredLogs());
     syncOfflineLogs();
   }
 

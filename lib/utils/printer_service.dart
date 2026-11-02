@@ -1,6 +1,6 @@
-import 'dart:typed_data';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
@@ -380,79 +380,103 @@ class PrinterService {
 
     showDialog(
       context: context,
-      builder: (ctx) => Dialog(
-        insetPadding: const EdgeInsets.all(20),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        child: SizedBox(
-          width: MediaQuery.of(context).size.width * 0.85,
-          height: MediaQuery.of(context).size.height * 0.9,
-          child: Column(
-            children: [
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-                decoration: BoxDecoration(
-                  color: Colors.blue.shade900,
-                  borderRadius: const BorderRadius.vertical(top: Radius.circular(12)),
-                ),
-                child: Row(
-                  children: [
-                    const Icon(Icons.picture_as_pdf_rounded, color: Colors.amberAccent, size: 24),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        displayTitle,
-                        style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
-                      ),
+      builder: (ctx) => Focus(
+        autofocus: true,
+        onKeyEvent: (node, event) {
+          if (event is KeyDownEvent) {
+            final isCtrl = HardwareKeyboard.instance.isControlPressed;
+            if (isCtrl && event.logicalKey == LogicalKeyboardKey.keyS) {
+              if (ctx.mounted) {
+                savePdfToDisk(ctx, doc, displayTitle);
+              }
+              return KeyEventResult.handled;
+            } else if (event.logicalKey == LogicalKeyboardKey.escape) {
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (ctx.mounted && Navigator.of(ctx).canPop()) {
+                  Navigator.pop(ctx);
+                }
+              });
+              return KeyEventResult.handled;
+            }
+          }
+          return KeyEventResult.ignored;
+        },
+        child: Dialog(
+            insetPadding: const EdgeInsets.all(20),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            child: SizedBox(
+              width: MediaQuery.of(context).size.width * 0.88,
+              height: MediaQuery.of(context).size.height * 0.92,
+              child: Column(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                    decoration: BoxDecoration(
+                      color: Colors.blue.shade900,
+                      borderRadius: const BorderRadius.vertical(top: Radius.circular(12)),
                     ),
-                    ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.teal,
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                      ),
-                      onPressed: () {
-                        savePdfToDisk(context, doc, displayTitle);
-                      },
-                      icon: const Icon(Icons.save_alt_rounded, size: 18),
-                      label: const Text("Save to Memory", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.picture_as_pdf_rounded, color: Colors.amberAccent, size: 24),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            displayTitle,
+                            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
+                          ),
+                        ),
+                        ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.teal,
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                          ),
+                          onPressed: () {
+                            savePdfToDisk(context, doc, displayTitle);
+                          },
+                          icon: const Icon(Icons.save_alt_rounded, size: 18),
+                          label: const Text("Save PDF (Ctrl+S)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)),
+                        ),
+                        const SizedBox(width: 8),
+                        ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFFEA4335),
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                          ),
+                          onPressed: () {
+                            openGmailWithPdf(context, doc, displayTitle);
+                          },
+                          icon: const Icon(Icons.mail_rounded, size: 18),
+                          label: const Text("Share via Gmail", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)),
+                        ),
+                        const SizedBox(width: 12),
+                        IconButton(
+                          icon: const Icon(Icons.close, color: Colors.white),
+                          onPressed: () => Navigator.pop(ctx),
+                          tooltip: "Close Preview (Esc)",
+                        ),
+                      ],
                     ),
-                    const SizedBox(width: 8),
-                    ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFFEA4335),
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                      ),
-                      onPressed: () {
-                        openGmailWithPdf(context, doc, displayTitle);
-                      },
-                      icon: const Icon(Icons.mail_rounded, size: 18),
-                      label: const Text("Share via Gmail", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                  ),
+                  Expanded(
+                    child: PdfPreview(
+                      build: (format) => doc.save(),
+                      allowPrinting: true,
+                      allowSharing: true,
+                      canChangePageFormat: true,
+                      canChangeOrientation: true,
+                      canDebug: false,
+                      maxPageWidth: 750,
+                      pdfFileName: "$displayTitle.pdf",
                     ),
-                    const SizedBox(width: 12),
-                    IconButton(
-                      icon: const Icon(Icons.close, color: Colors.white),
-                      onPressed: () => Navigator.pop(ctx),
-                      tooltip: "Close Preview",
-                    ),
-                  ],
-                ),
+                  ),
+                ],
               ),
-              Expanded(
-                child: PdfPreview(
-                  build: (format) => doc.save(),
-                  allowPrinting: true,
-                  allowSharing: true,
-                  canChangePageFormat: true,
-                  canChangeOrientation: true,
-                  maxPageWidth: 700,
-                ),
-              ),
-            ],
+            ),
           ),
         ),
-      ),
-    );
+      );
   }
 }
 
@@ -510,6 +534,7 @@ Future<void> printWithCurrentProfile({
 
   // Default / "dialog": Show centralized print options modal
   if (invoice is SaleInvoice) {
+    if (!context.mounted) return;
     await PrinterService.showPrintDialog(
       context: context,
       invoice: invoice,

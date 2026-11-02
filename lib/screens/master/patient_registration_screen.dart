@@ -1,5 +1,7 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:file_picker/file_picker.dart';
 import '../../providers/pharmacy_provider.dart';
 import '../../utils/theme_constants.dart';
 import '../../widgets/pin_unlock_dialog.dart';
@@ -26,6 +28,24 @@ class _PatientRegistrationScreenState extends State<PatientRegistrationScreen> {
   Patient? _editingPatient;
   bool _isActive = true;
   String? _focusedPatientText;
+  String? _attachedRxPath;
+
+  void _pickPrescriptionFile() async {
+    final res = await FilePicker.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['pdf', 'jpg', 'jpeg', 'png'],
+    );
+    if (res != null && res.files.single.path != null) {
+      setState(() {
+        _attachedRxPath = res.files.single.path;
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Attached prescription file: ${res.files.single.name}"), backgroundColor: Colors.green),
+        );
+      }
+    }
+  }
 
   @override
   void initState() {
@@ -141,6 +161,31 @@ class _PatientRegistrationScreenState extends State<PatientRegistrationScreen> {
                             _buildField("Address", _addressCtrl, Icons.location_on, maxLines: 2),
                             const SizedBox(height: 16),
                             _buildField("Email Address", _emailCtrl, Icons.email),
+                            const SizedBox(height: 16),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: OutlinedButton.icon(
+                                    onPressed: _pickPrescriptionFile,
+                                    icon: const Icon(Icons.attach_file_rounded, size: 18),
+                                    label: Text(
+                                      _attachedRxPath == null
+                                          ? "Attach Digital Rx / EHR File"
+                                          : "Rx Attached (${_attachedRxPath!.split(Platform.pathSeparator).last})",
+                                      style: const TextStyle(fontSize: 11),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                ),
+                                if (_attachedRxPath != null) ...[
+                                  const SizedBox(width: 8),
+                                  IconButton(
+                                    icon: const Icon(Icons.close, color: Colors.red, size: 18),
+                                    onPressed: () => setState(() => _attachedRxPath = null),
+                                  ),
+                                ],
+                              ],
+                            ),
                             const SizedBox(height: 16),
                             Row(
                               children: [

@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:intl/intl.dart';
 import '../providers/pharmacy_provider.dart';
 import '../utils/app_formatters.dart';
+import '../utils/tax_calculator.dart';
 
 class GstExportService {
   /// Generates official government GSTR-1 JSON payload map matching GST portal specifications.
@@ -11,9 +12,12 @@ class GstExportService {
     DateTime to, {
     PharmacyProvider? provider,
   }) async {
-    final String gstin = (provider != null && provider.companyProfile.gstIn.isNotEmpty)
+    final String sellerGstin = (provider != null && provider.companyProfile.gstIn.isNotEmpty)
         ? provider.companyProfile.gstIn
         : "32AAAAA0000A1Z5";
+    final String sellerStateCode = TaxCalculator.getStateCode(sellerGstin).isNotEmpty 
+        ? TaxCalculator.getStateCode(sellerGstin) 
+        : "32";
 
     final String financialPeriod = DateFormat('MM20yy').format(from); // e.g., "032026"
 
@@ -38,7 +42,7 @@ class GstExportService {
 
     for (var s in activeSales) {
       bool isB2B = (s.customerAcc.toUpperCase() == "CREDIT" && s.mobile.length >= 10);
-      String pos = "32"; // Default state code
+      String pos = sellerStateCode; // Dynamic state code
 
       // Line item calculation in integer paise
       for (var item in s.items) {
@@ -174,7 +178,7 @@ class GstExportService {
     int grossTurnoverPaise = activeSales.fold(0, (sum, s) => sum + s.grandTotalPaise);
 
     return {
-      "gstin": gstin,
+      "gstin": sellerGstin,
       "fp": financialPeriod,
       "gt": grossTurnoverPaise.toRupees(),
       "cur_gt": grossTurnoverPaise.toRupees(),
@@ -218,5 +222,116 @@ class GstExportService {
     final file = File(destinationPath);
     await file.writeAsString(jsonString);
     return file;
+  }
+
+  /// Formats official NIC E-Invoicing JSON Schema v1.03 payload for B2B/Export IRN generation
+  static Map<String, dynamic> generateEInvoicePayload(
+    SaleInvoice s, {
+    required CompanyProfile company,
+  }) {
+    final dateStr = DateFormat('dd/MM/yyyy').format(s.date);
+    final String sellerGstin = company.gstIn.isNotEmpty ? company.gstIn : "32AAAAA0000A1Z5";
+    final String sellerStateCode = TaxCalculator.getStateCode(sellerGstin).isNotEmpty 
+        ? TaxCalculator.getStateCode(sellerGstin) 
+        : "32";
+
+    List<Map<String, dynamic>> itemList = [];
+    int lineNo = 1;
+
+    int totalTaxableP = 0;
+    int totalCgstP = 0;
+    int totalSgstP = 0;
+    int totalIgstP = 0;
+
+    for (var item in s.items) {
+      double taxVal = (item.totalPaise - item.gstAmtPaise) / 100.0;
+      if (taxVal < 0) taxVal = 0.0;
+
+      totalTaxableP += (item.totalPaise - item.gstAmtPaise);
+      totalCgstP += item.cgstAmtPaise;
+      totalSgstP += item.sgstAmtPaise;
+      totalIgstP += item.igstAmtPaise;
+
+      itemList.add({
+        "SlNo": lineNo.toString(),
+        "PrdDesc": item.product.name,
+        "IsServc": "N",
+        "HsnCd": item.product.hsnCode.isNotEmpty ? item.product.hsnCode : "3004",
+        "Qty": item.qty,
+        "Unit": "BOX",
+        "UnitPrice": item.sRate,
+        "TotAmt": (item.qty * item.sRate).toStringAsFixed(2),
+        "Discount": 0.0,
+        "PreTaxVal": 0.0,
+        "AssVal": taxVal.toStringAsFixed(2),
+        "GstRt": item.gstPercent,
+        "IgstAmt": (item.igstAmtPaise / 100.0).toStringAsFixed(2),
+        "CgstAmt": (item.cgstAmtPaise / 100.0).toStringAsFixed(2),
+        "SgstAmt": (item.sgstAmtPaise / 100.0).toStringAsFixed(2),
+        "CesRt": 0.0,
+        "CesAmt": 0.0,
+        "CesNonAdvlAmt": 0.0,
+        "StateCesRt": 0.0,
+        "StateCesAmt": 0.0,
+        "OthChrg": 0.0,
+        "TotItemVal": (item.totalPaise / 100.0).toStringAsFixed(2),
+      });
+      lineNo++;
+    }
+
+    final buyerName = s.patient.isNotEmpty ? s.patient : "Counter Customer";
+
+    final double netInvVal = (s.grandTotalPaise / 100.0);
+    final double computedSum = (totalTaxableP + totalCgstP + totalSgstP + totalIgstP) / 100.0;
+    final double roundOffAmt = TaxCalculator.round(netInvVal - computedSum, 2);
+
+    return {
+      "Version": "1.03",
+      "TranDtls": {
+        "TaxSch": "GST",
+        "SupTyp": "B2B",
+        "RegRev": "Y",
+        "EcmGstin": null,
+        "IgstOnIntra": "N"
+      },
+      "DocDtls": {
+        "Typ": "INV",
+        "No": s.entryNo,
+        "Dt": dateStr
+      },
+      "SellerDtls": {
+        "Gstin": sellerGstin,
+        "LglName": company.name,
+        "TrdName": company.name,
+        "Addr1": company.address,
+        "Loc": "KALPETTA",
+        "Pin": 673121,
+        "Stcd": sellerStateCode,
+        "Ph": company.phone,
+        "Em": company.email
+      },
+      "BuyerDtls": {
+        "Gstin": s.customerAcc.toUpperCase() == "CREDIT" ? "32AAAAA0000A1Z5" : "URP",
+        "LglName": buyerName,
+        "TrdName": buyerName,
+        "Pos": sellerStateCode,
+        "Addr1": "KERALA",
+        "Loc": "KERALA",
+        "Pin": 673121,
+        "Stcd": sellerStateCode,
+        "Ph": s.mobile
+      },
+      "ItemList": itemList,
+      "ValDtls": {
+        "AssVal": (totalTaxableP / 100.0).toStringAsFixed(2),
+        "CgstVal": (totalCgstP / 100.0).toStringAsFixed(2),
+        "SgstVal": (totalSgstP / 100.0).toStringAsFixed(2),
+        "IgstVal": (totalIgstP / 100.0).toStringAsFixed(2),
+        "Discount": 0.0,
+        "OthChrg": 0.0,
+        "RndOffAmt": roundOffAmt.toStringAsFixed(2),
+        "TotInvVal": netInvVal.toStringAsFixed(2)
+      }
+    };
   }
 }

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../app_date_picker.dart';
 import '../../utils/theme_constants.dart';
+import '../../utils/app_formatters.dart';
 
 class SalesHeader extends StatelessWidget {
   final String entryNo;
@@ -62,7 +63,7 @@ class SalesHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
-    final cleanDisplayNo = entryNo.replaceAll(RegExp(r'^(SALE-|ORD-)'), '');
+    final cleanDisplayNo = formatSaleDisplayNo(entryNo);
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),

@@ -362,7 +362,7 @@ class _AccountRegistrationScreenState extends State<AccountRegistrationScreen> {
                                             width: 12,
                                             height: 12,
                                             decoration: BoxDecoration(
-                                              color: Color(int.parse(acc.color)),
+                                              color: Color(int.tryParse(acc.color) ?? 0xFF94A3B8),
                                               shape: BoxShape.circle,
                                             ),
                                           ),

@@ -1,10 +1,18 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import '../providers/pharmacy_provider.dart';
+import '../providers/app_provider.dart';
+import '../services/server_config_service.dart';
+import '../services/sync_event_bus.dart';
 import '../widgets/app_date_picker.dart';
+import '../widgets/erp_tooltip.dart';
 import '../utils/search_debouncer.dart';
 import '../utils/theme_constants.dart';
+
+enum AggregationType { sum, min, max, count, average, none }
 
 class CustomerLedgerScreen extends StatefulWidget {
   final String? initialPatient;
@@ -15,7 +23,7 @@ class CustomerLedgerScreen extends StatefulWidget {
 }
 
 class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
-  DateTime _startDate = DateTime(DateTime.now().year, DateTime.now().month, 1);
+  DateTime _startDate = DateTime.now();
   DateTime _endDate = DateTime.now();
   String _patientSearchQuery = "";
   String? _selectedPatient;
@@ -25,12 +33,21 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
   
   List<_LedgerRowData> _ledgerData = [];
   bool _isLoadingLedger = false;
+  int? _selectedIndex;
+  int? _lastTapIndex;
+  DateTime? _lastTapTime;
 
   int _gridStatusFilter = 0; // 0: All, 1: Due, 2: Settled/Excess
+
+  // Sorting state for ledger table
+  String? _sortKey;
+  bool _isAscending = true;
+  final Map<String, AggregationType> _columnAggregations = {};
 
   Map<String, double> _balCache = {};
   Map<String, bool> _activeCache = {};
   List<String> _sortedPatients = [];
+  StreamSubscription? _syncBusSub;
 
   @override
   void initState() {
@@ -41,10 +58,22 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
       _fetchLedgerData();
     }
     WidgetsBinding.instance.addPostFrameCallback((_) => _recomputePatientCache());
+
+    _syncBusSub = SyncEventBus.instance.stream.listen((event) {
+      if (!mounted) return;
+      final table = (event is TableChangedEvent) ? event.tableName : event.toString();
+      if (table == 'patients' || table == 'sales_invoices' || table == 'sales_items' || table == 'sales_payments' || table == 'patient_payments') {
+        _recomputePatientCache();
+        if (_selectedPatient != null && _isLedgerView) {
+          _fetchLedgerData();
+        }
+      }
+    });
   }
 
   @override
   void dispose() {
+    _syncBusSub?.cancel();
     _searchDebouncer.dispose();
     _ledgerScrollCtrl.dispose();
     super.dispose();
@@ -83,26 +112,25 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
   }
 
   void _fetchLedgerData() async {
-    if (_selectedPatient == null) return;
+    if (_selectedPatient == null || !mounted) return;
     setState(() => _isLoadingLedger = true);
     final p = Provider.of<PharmacyProvider>(context, listen: false);
     final data = await p.fetchPatientLedger(_selectedPatient!);
-    if (mounted) {
-      setState(() {
-        _ledgerData = data.map((m) => _LedgerRowData(
-          date: m['date'],
-          reference: m['reference'],
-          debit: m['debit'],
-          credit: m['credit'],
-          type: m['type'],
-          method: m['method'],
-          invoice: m['invoice'],
-          remarks: m['remarks'],
-        )).toList();
-        _isLoadingLedger = false;
-      });
-      _scrollToBottom();
-    }
+    if (!mounted) return;
+    setState(() {
+      _ledgerData = data.map((m) => _LedgerRowData(
+        date: m['date'],
+        reference: m['reference'],
+        debit: m['debit'],
+        credit: m['credit'],
+        type: m['type'],
+        method: m['method'],
+        invoice: m['invoice'],
+        remarks: m['remarks'],
+      )).toList();
+      _isLoadingLedger = false;
+    });
+    _scrollToBottom();
   }
 
   void _scrollToBottom() {
@@ -335,6 +363,7 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
                   child: _buildLedgerRows(c, ledgerData, provider),
                 ),
               ),
+              _buildLedgerFooter(c, ledgerData),
             ],
           ),
         ),
@@ -421,7 +450,13 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text((_selectedPatient ?? "UNKNOWN").toUpperCase(), style: TextStyle(fontWeight: FontWeight.w900, fontSize: 18, letterSpacing: 0.5, color: c.primaryText)),
-              Text("Customer Transaction Ledger", style: TextStyle(fontSize: 12, color: c.secondaryText, fontWeight: FontWeight.w500)),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text("Customer Transaction Ledger", style: TextStyle(fontSize: 12, color: c.secondaryText, fontWeight: FontWeight.w500)),
+                  _buildCloudStatusBadge(c),
+                ],
+              ),
             ],
           ),
           const Spacer(),
@@ -444,6 +479,32 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         elevation: 0,
+      ),
+    );
+  }
+
+  Widget _buildCloudStatusBadge(AppThemeColors c) {
+    final isServer = ServerConfigService.instance.isServerModeEnabled;
+    final isConnected = ServerConfigService.instance.isConnected;
+    final bool isLive = isServer && isConnected;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      margin: const EdgeInsets.only(left: 10),
+      decoration: BoxDecoration(
+        color: (isLive ? Colors.green : Colors.orange).withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: (isLive ? Colors.green : Colors.orange).withValues(alpha: 0.4), width: 1),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(isLive ? Icons.cloud_done : Icons.cloud_off, size: 12, color: isLive ? Colors.green : Colors.orange),
+          const SizedBox(width: 4),
+          Text(
+            isLive ? "SUPABASE LIVE" : "OFFLINE PRE-LOADED",
+            style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: isLive ? Colors.green : Colors.orange),
+          ),
+        ],
       ),
     );
   }
@@ -483,8 +544,13 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
                     Expanded(
                       child: InkWell(
                         onTap: () async {
-                          final picked = await showAppDatePicker(context: context, initialDate: paymentDate, firstDate: DateTime(2000), lastDate: DateTime(2100));
-                          if (picked != null) setDialogState(() => paymentDate = picked);
+                          final picked = await showAppDatePicker(context: ctx, initialDate: paymentDate, firstDate: DateTime(2000), lastDate: DateTime(2100));
+                          if (!ctx.mounted || !mounted) return;
+                          if (picked != null) {
+                            setDialogState(() {
+                              paymentDate = picked;
+                            });
+                          }
                         },
                         child: _dialogFieldLabel(c, "Date", DateFormat('dd/MM/yyyy').format(paymentDate)),
                       ),
@@ -541,9 +607,10 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
                     await provider.addPatientPayment(payObj);
                   }
                   if (ctx.mounted) Navigator.pop(ctx);
+                  if (!mounted) return;
                   _fetchLedgerData();
                 } finally {
-                  setDialogState(() => isSaving = false);
+                  if (ctx.mounted) setDialogState(() => isSaving = false);
                 }
               },
               style: ElevatedButton.styleFrom(backgroundColor: isEdit ? Colors.orange : Colors.green, foregroundColor: Colors.white),
@@ -593,6 +660,7 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
     return InkWell(
       onTap: () async {
         final DateTimeRange? picked = await showDateRangePicker(context: context, firstDate: DateTime(2000), lastDate: DateTime(2100), initialDateRange: DateTimeRange(start: _startDate, end: _endDate));
+        if (!mounted) return;
         if (picked != null) {
           setState(() { _startDate = picked.start; _endDate = picked.end; });
         }
@@ -617,55 +685,119 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
       color: const Color(0xFF334155),
       child: Row(
         children: [
-          _hCell("DATE", width: 100),
-          _hCell("ENTRY NO / REF", width: 150),
-          _hCell("INVOICE NO", width: 120),
-          _hCell("SALES (DR)", flex: 1, align: TextAlign.right),
-          _hCell("RECEIPT (CR)", flex: 1, align: TextAlign.right),
-          _hCell("BALANCE", flex: 1, align: TextAlign.right),
-          _hCell("ACT", width: 60, align: TextAlign.center),
+          _hCell("DATE", 'date', width: 100),
+          _hCell("ENTRY NO / REF", 'entry', width: 150),
+          _hCell("INVOICE NO", 'invoice', width: 120),
+          _hCell("SALES (DR)", 'debit', flex: 1, align: TextAlign.right),
+          _hCell("RECEIPT (CR)", 'credit', flex: 1, align: TextAlign.right),
+          _hCell("BALANCE", 'balance', flex: 1, align: TextAlign.right),
+          _hCell("ACT", 'act', width: 60, align: TextAlign.center),
         ],
       ),
     );
   }
 
-  Widget _hCell(String t, {double? width, int? flex, TextAlign align = TextAlign.left}) {
-    Widget child = Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12),
-      alignment: align == TextAlign.left ? Alignment.centerLeft : Alignment.centerRight,
-      child: Text(t, style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold)),
+  Widget _hCell(String t, String key, {double? width, int? flex, TextAlign align = TextAlign.left}) {
+    bool isSorted = _sortKey == key;
+    Widget child = InkWell(
+      onTap: () {
+        if (key == 'act') return;
+        setState(() {
+          if (_sortKey == key) {
+            if (_isAscending) {
+              _isAscending = false;
+            } else {
+              _sortKey = null;
+              _isAscending = true;
+            }
+          } else {
+            _sortKey = key;
+            _isAscending = true;
+          }
+        });
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        alignment: align == TextAlign.left ? Alignment.centerLeft : Alignment.centerRight,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Flexible(
+              child: Text(
+                t,
+                style: TextStyle(
+                  color: isSorted ? Colors.amberAccent : Colors.white,
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                ),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            if (isSorted) ...[
+              const SizedBox(width: 2),
+              Icon(
+                _isAscending ? Icons.arrow_upward : Icons.arrow_downward,
+                size: 11,
+                color: Colors.amberAccent,
+              ),
+            ],
+          ],
+        ),
+      ),
     );
     if (width != null) return SizedBox(width: width, child: child);
     return Expanded(flex: flex ?? 1, child: child);
   }
 
-  Widget _buildLedgerRows(AppThemeColors c, List<_LedgerRowData> ledgerData, PharmacyProvider provider) {
-    double tempBalance = 0;
+  Widget _buildLedgerRows(AppThemeColors c, List<_LedgerRowData> originalData, PharmacyProvider provider) {
+    List<_LedgerRowData> ledgerData = List.from(originalData);
+
+    if (_sortKey != null) {
+      ledgerData.sort((a, b) {
+        int comp = 0;
+        if (_sortKey == 'date') {
+          comp = a.date.compareTo(b.date);
+        } else if (_sortKey == 'entry') {
+          comp = a.reference.toLowerCase().compareTo(b.reference.toLowerCase());
+        } else if (_sortKey == 'invoice') {
+          comp = a.invoice.toLowerCase().compareTo(b.invoice.toLowerCase());
+        } else if (_sortKey == 'debit') {
+          comp = a.debit.compareTo(b.debit);
+        } else if (_sortKey == 'credit') {
+          comp = a.credit.compareTo(b.credit);
+        }
+        return _isAscending ? comp : -comp;
+      });
+    }
+    int tempBalancePaise = 0;
     int lastSettledIndex = -1;
     for (int i = 0; i < ledgerData.length; i++) {
-      tempBalance += ledgerData[i].debit;
-      tempBalance -= ledgerData[i].credit;
-      if (tempBalance.abs() < 0.01) {
+      tempBalancePaise += (ledgerData[i].debit * 100).round();
+      tempBalancePaise -= (ledgerData[i].credit * 100).round();
+      if (tempBalancePaise == 0) {
         lastSettledIndex = i;
       }
     }
 
     double runningBalance = 0;
+    int runningBalancePaise = 0;
     List<Widget> visibleRows = [];
     for (int i = 0; i < ledgerData.length; i++) {
       var row = ledgerData[i];
       runningBalance += row.debit;
       runningBalance -= row.credit;
+      runningBalancePaise += (row.debit * 100).round();
+      runningBalancePaise -= (row.credit * 100).round();
 
       bool inRange = row.date.isAfter(_startDate.subtract(const Duration(seconds: 1))) &&
           row.date.isBefore(_endDate.add(const Duration(days: 1)));
       
       if (inRange) {
         Color balColor = c.primaryText; 
-        if (i > lastSettledIndex && runningBalance.abs() >= 0.01) {
-          balColor = runningBalance > 0 ? Colors.redAccent : Colors.greenAccent;
+        if (i > lastSettledIndex && runningBalancePaise != 0) {
+          balColor = runningBalancePaise > 0 ? Colors.redAccent : Colors.greenAccent;
         }
-        visibleRows.add(_buildGridRow(c, row, runningBalance, provider, balColor));
+        visibleRows.add(_buildGridRow(c, row, runningBalance, provider, balColor, i));
       }
     }
 
@@ -679,55 +811,235 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
     );
   }
 
-  Widget _buildGridRow(AppThemeColors c, _LedgerRowData data, double balance, PharmacyProvider provider, Color balColor) {
+  Widget _buildGridRow(AppThemeColors c, _LedgerRowData data, double balance, PharmacyProvider provider, Color balColor, int index) {
     bool isPay = data.type == 'RECEIPT' || data.type == 'SALE RETURN';
     bool isAuto = data.reference.startsWith("AUTO-");
     bool isRecentReturn = data.type == 'SALE RETURN' && 
                           DateTime.now().difference(data.date).inDays <= 7;
+    bool isSelected = index == _selectedIndex;
 
     String cleanBalance = balance.abs() < 0.01 ? "0.00" : balance.toStringAsFixed(2);
     
+    return InkWell(
+      onTap: () {
+        final now = DateTime.now();
+        setState(() => _selectedIndex = index);
+        if (_lastTapIndex == index && _lastTapTime != null && now.difference(_lastTapTime!) < const Duration(milliseconds: 350)) {
+          _lastTapTime = null;
+          _lastTapIndex = null;
+          String inv = data.invoice.isNotEmpty ? data.invoice : data.reference;
+          if (inv.isNotEmpty) {
+            Provider.of<AppProvider>(context, listen: false).openSales(invoiceNo: inv);
+          }
+        } else {
+          _lastTapIndex = index;
+          _lastTapTime = now;
+        }
+      },
+      child: Container(
+        height: 35,
+        decoration: BoxDecoration(
+          color: isSelected ? const Color(0xFFBAE6FD) : (isRecentReturn ? Colors.tealAccent.withValues(alpha: 0.15) 
+               : data.type == 'RECEIPT' ? Colors.green.withValues(alpha: 0.12) 
+               : data.type == 'SALE RETURN' ? Colors.orange.withValues(alpha: 0.12)
+               : c.cardBg),
+          border: Border(
+            bottom: BorderSide(color: isSelected ? Colors.blue.shade300 : c.border),
+            left: isRecentReturn ? BorderSide(color: Colors.teal.shade400, width: 4) : BorderSide.none,
+          )
+        ),
+        child: Row(
+          children: [
+            _cell(c, DateFormat('dd/MM/yy').format(data.date), width: 100),
+            _cell(c, data.reference, width: 150, fontWeight: FontWeight.bold),
+            _cell(c, data.invoice, width: 120, color: c.secondaryText, fontWeight: FontWeight.w500),
+            _cell(c, data.debit > 0 ? data.debit.toStringAsFixed(2) : "", flex: 1, align: TextAlign.right),
+            _cell(c, data.credit > 0 ? data.credit.toStringAsFixed(2) : "", flex: 1, align: TextAlign.right, fontWeight: FontWeight.bold),
+            _cell(c, cleanBalance, flex: 1, align: TextAlign.right, color: balColor, fontWeight: FontWeight.bold),
+            
+            SizedBox(
+              width: 60,
+              child: (isPay && !isAuto && data.type != 'SALE RETURN') ? Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  InkWell(
+                    onTap: () {
+                      final payment = provider.patientPayments.firstWhere((p) => p.id == data.reference);
+                      _showPaymentDialog(existing: payment);
+                    },
+                    child: const Icon(Icons.edit, size: 14, color: Colors.orange),
+                  ),
+                  const SizedBox(width: 8),
+                  InkWell(
+                    onTap: () => _showDeleteConfirm(data.reference),
+                    child: const Icon(Icons.delete, size: 14, color: Colors.red),
+                  ),
+                ],
+              ) : null,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _calculateAggregation(String colKey, AggregationType type, List<_LedgerRowData> ledgerData) {
+    if (type == AggregationType.none || ledgerData.isEmpty) return "";
+    if (type == AggregationType.count) return "${ledgerData.length}";
+
+    List<double> values = [];
+    double runningBal = 0.0;
+    for (var row in ledgerData) {
+      runningBal += row.debit;
+      runningBal -= row.credit;
+      if (colKey == 'debit') {
+        values.add(row.debit);
+      } else if (colKey == 'credit') {
+        values.add(row.credit);
+      } else if (colKey == 'balance') {
+        values.add(runningBal);
+      }
+    }
+
+    if (values.isEmpty) return "";
+
+    switch (type) {
+      case AggregationType.sum:
+        return "₹${values.fold(0.0, (s, v) => s + v).toStringAsFixed(2)}";
+      case AggregationType.min:
+        return "₹${values.reduce((a, b) => a < b ? a : b).toStringAsFixed(2)}";
+      case AggregationType.max:
+        return "₹${values.reduce((a, b) => a > b ? a : b).toStringAsFixed(2)}";
+      case AggregationType.average:
+        return "₹${(values.fold(0.0, (s, v) => s + v) / values.length).toStringAsFixed(2)}";
+      default:
+        return "";
+    }
+  }
+
+  void _showAggregationMenu(Offset position, String colKey, List<_LedgerRowData> ledgerData) {
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
+    final currentAgg = _columnAggregations[colKey] ?? AggregationType.none;
+    final resultStr = _calculateAggregation(colKey, currentAgg, ledgerData);
+
+    final List<PopupMenuEntry<dynamic>> items = [
+      _buildPopupItem(AggregationType.sum, "Sum", Icons.functions),
+      _buildPopupItem(AggregationType.min, "Min", Icons.bar_chart),
+      _buildPopupItem(AggregationType.max, "Max", Icons.bar_chart),
+      _buildPopupItem(AggregationType.count, "Count", Icons.numbers),
+      _buildPopupItem(AggregationType.average, "Average", Icons.abc),
+      const PopupMenuDivider(),
+      _buildPopupItem(AggregationType.none, "None", Icons.check),
+    ];
+
+    if (resultStr.isNotEmpty) {
+      items.addAll([
+        const PopupMenuDivider(),
+        PopupMenuItem<String>(
+          value: "COPY_VALUE",
+          height: 32,
+          child: Row(
+            children: [
+              const Icon(Icons.copy, size: 14, color: Colors.blue),
+              const SizedBox(width: 8),
+              Text("Copy ($resultStr)", style: const TextStyle(fontSize: 11)),
+            ],
+          ),
+        ),
+      ]);
+    }
+
+    showMenu<dynamic>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(position.dx, position.dy, 0, 0),
+        Offset.zero & overlay.size,
+      ),
+      items: items,
+    ).then((selected) {
+      if (selected is AggregationType) {
+        setState(() => _columnAggregations[colKey] = selected);
+      } else if (selected == "COPY_VALUE") {
+        Clipboard.setData(ClipboardData(text: resultStr));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Copied $resultStr to clipboard"), duration: const Duration(seconds: 1)),
+          );
+        }
+      }
+    });
+  }
+
+  PopupMenuItem<AggregationType> _buildPopupItem(AggregationType type, String label, IconData icon) {
+    return PopupMenuItem<AggregationType>(
+      value: type,
+      height: 32,
+      child: Row(
+        children: [
+          Icon(icon, size: 14, color: Colors.blueGrey),
+          const SizedBox(width: 8),
+          Text(label, style: const TextStyle(fontSize: 11)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLedgerFooter(AppThemeColors c, List<_LedgerRowData> ledgerData) {
+    double totalDebit = 0;
+    double totalCredit = 0;
+    for (var r in ledgerData) {
+      totalDebit += r.debit;
+      totalCredit += r.credit;
+    }
+    double netBal = totalDebit - totalCredit;
+
+    Widget footerCell(String colKey, String defaultVal, {double? width, int? flex, TextAlign align = TextAlign.left}) {
+      final selectedAgg = _columnAggregations[colKey];
+      String displayVal = defaultVal;
+      if (selectedAgg != null && selectedAgg != AggregationType.none) {
+        displayVal = _calculateAggregation(colKey, selectedAgg, ledgerData);
+      }
+
+      Widget childWidget = Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        alignment: align == TextAlign.left ? Alignment.centerLeft : Alignment.centerRight,
+        child: Text(
+          displayVal,
+          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.blue),
+          overflow: TextOverflow.ellipsis,
+        ),
+      );
+
+      Widget inner = ERPTooltip(message: displayVal, child: childWidget);
+
+      Widget cell = GestureDetector(
+        onTapDown: (details) => _showAggregationMenu(details.globalPosition, colKey, ledgerData),
+        onSecondaryTapDown: (details) => _showAggregationMenu(details.globalPosition, colKey, ledgerData),
+        child: inner,
+      );
+
+      if (width != null) {
+        return SizedBox(width: width, child: cell);
+      }
+      return Expanded(flex: flex ?? 1, child: cell);
+    }
+
     return Container(
-      height: 35,
+      height: 32,
       decoration: BoxDecoration(
-        color: isRecentReturn ? Colors.tealAccent.withValues(alpha: 0.15) 
-             : data.type == 'RECEIPT' ? Colors.green.withValues(alpha: 0.12) 
-             : data.type == 'SALE RETURN' ? Colors.orange.withValues(alpha: 0.12)
-             : c.cardBg,
-        border: Border(
-          bottom: BorderSide(color: c.border),
-          left: isRecentReturn ? BorderSide(color: Colors.teal.shade400, width: 4) : BorderSide.none,
-        )
+        color: const Color(0xFFE8EAF6),
+        border: Border(top: BorderSide(color: Colors.grey.shade400, width: 1)),
       ),
       child: Row(
         children: [
-          _cell(c, DateFormat('dd/MM/yy').format(data.date), width: 100),
-          _cell(c, data.reference, width: 150, fontWeight: FontWeight.bold),
-          _cell(c, data.invoice, width: 120, color: c.secondaryText, fontWeight: FontWeight.w500),
-          _cell(c, data.debit > 0 ? data.debit.toStringAsFixed(2) : "", flex: 1, align: TextAlign.right),
-          _cell(c, data.credit > 0 ? data.credit.toStringAsFixed(2) : "", flex: 1, align: TextAlign.right, fontWeight: FontWeight.bold),
-          _cell(c, cleanBalance, flex: 1, align: TextAlign.right, color: balColor, fontWeight: FontWeight.bold),
-          
-          SizedBox(
-            width: 60,
-            child: (isPay && !isAuto && data.type != 'SALE RETURN') ? Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                InkWell(
-                  onTap: () {
-                    final payment = provider.patientPayments.firstWhere((p) => p.id == data.reference);
-                    _showPaymentDialog(existing: payment);
-                  },
-                  child: const Icon(Icons.edit, size: 14, color: Colors.orange),
-                ),
-                const SizedBox(width: 8),
-                InkWell(
-                  onTap: () => _showDeleteConfirm(data.reference),
-                  child: const Icon(Icons.delete, size: 14, color: Colors.red),
-                ),
-              ],
-            ) : null,
-          ),
+          footerCell('date', 'TOTAL', width: 100),
+          footerCell('entry', '${ledgerData.length} Entries', width: 150),
+          footerCell('invoice', '', width: 120),
+          footerCell('debit', '₹${totalDebit.toStringAsFixed(2)}', flex: 1, align: TextAlign.right),
+          footerCell('credit', '₹${totalCredit.toStringAsFixed(2)}', flex: 1, align: TextAlign.right),
+          footerCell('balance', '₹${netBal.toStringAsFixed(2)}', flex: 1, align: TextAlign.right),
+          footerCell('act', '', width: 60, align: TextAlign.center),
         ],
       ),
     );
@@ -747,7 +1059,7 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
             onPressed: () {
               Provider.of<PharmacyProvider>(context, listen: false).deletePatientPayment(refId);
               Navigator.pop(ctx);
-              _fetchLedgerData();
+              if (mounted) _fetchLedgerData();
             },
             style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
             child: const Text("DELETE"),

@@ -9,6 +9,7 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import '../../providers/pharmacy_provider.dart';
 import '../../utils/theme_constants.dart';
+import '../../database/db_helper.dart';
 
 class ReorderAssistantScreen extends StatefulWidget {
   const ReorderAssistantScreen({super.key});
@@ -207,6 +208,61 @@ class _ReorderAssistantScreenState extends State<ReorderAssistantScreen> {
     );
   }
 
+  Future<void> _savePoToDatabase() async {
+    final activeItems = _reorderItems.where((r) => _selectedItemIds.contains(r['id'].toString())).toList();
+    if (activeItems.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Please select at least one product to generate PO."), backgroundColor: Colors.red),
+      );
+      return;
+    }
+
+    final db = await DbHelper.instance.database;
+    final now = DateTime.now();
+    final orderId = "PO-${now.millisecondsSinceEpoch.toString().substring(5)}";
+    final supplierName = _selectedSupplier != "ALL" ? _selectedSupplier : (activeItems.first['supplier']?.toString() ?? "Wholesaler");
+
+    double totalAmt = 0.0;
+    for (var r in activeItems) {
+      String id = r['id'].toString();
+      int orderQty = int.tryParse(_qtyControllers[id]?.text ?? '0') ?? 0;
+      double pRate = (r['purchase_rate'] as num?)?.toDouble() ?? 0.0;
+      totalAmt += (orderQty * pRate);
+    }
+
+    await db.insert('order_confirmations', {
+      'order_id': orderId,
+      'wholesaler_name': supplierName,
+      'total_amount': totalAmt,
+      'status': 'PENDING',
+      'created_at': DateFormat('yyyy-MM-dd HH:mm:ss').format(now),
+    });
+
+    for (var r in activeItems) {
+      String id = r['id'].toString();
+      int orderQty = int.tryParse(_qtyControllers[id]?.text ?? '0') ?? 0;
+      double pRate = (r['purchase_rate'] as num?)?.toDouble() ?? 0.0;
+
+      await db.insert('order_confirmation_items', {
+        'order_id': orderId,
+        'product_id': id,
+        'product_name': r['product_name']?.toString() ?? '',
+        'qty': orderQty,
+        'purchase_rate': pRate,
+      });
+    }
+
+    _printPoPdf();
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text("Purchase Order #$orderId saved successfully for ₹${totalAmt.toStringAsFixed(2)}!"),
+        backgroundColor: Colors.green,
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final provider = Provider.of<PharmacyProvider>(context);
@@ -237,6 +293,13 @@ class _ReorderAssistantScreenState extends State<ReorderAssistantScreen> {
         backgroundColor: Colors.blue.shade900,
         foregroundColor: Colors.white,
         actions: [
+          ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.amber.shade800, foregroundColor: Colors.white),
+            onPressed: _savePoToDatabase,
+            icon: const Icon(Icons.add_shopping_cart_rounded, size: 16),
+            label: const Text("GENERATE PO", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)),
+          ),
+          const SizedBox(width: 8),
           IconButton(icon: const Icon(Icons.picture_as_pdf_rounded), tooltip: "Export PO PDF", onPressed: _printPoPdf),
           IconButton(icon: const Icon(Icons.explicit_rounded), tooltip: "Export PO Excel", onPressed: _exportPoExcel),
           const SizedBox(width: 10),

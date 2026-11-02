@@ -48,6 +48,7 @@ class MainDashboard extends StatelessWidget {
                   _MenuAction("Stock Adjustment Report", () => provider.openStockAdjustmentBatchReport()),
                 ]),
                 _buildDropdownMenu(context, "STOCK", [
+                  _MenuAction("Realtime Stock Qty", () => provider.openRealtimeStock()),
                   _MenuAction("Stock Ledger", () => provider.openStockLedger()),
                   _MenuAction("Consolidate Stock Position", () => provider.openConsolidateStock()),
                   _MenuAction("Wholesale Stock Directory", () => provider.openWholesaleStockDirectory()),
@@ -79,7 +80,7 @@ class MainDashboard extends StatelessWidget {
                 ),
                 IconButton(
                   icon: const Icon(Icons.notifications_none, color: Colors.white70),
-                  tooltip: "Expiry List",
+                  tooltip: "Expiry / Non Moving",
                   onPressed: () => provider.openExpiryList(),
                 ),
                 IconButton(

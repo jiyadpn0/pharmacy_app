@@ -56,8 +56,10 @@ class _PrescriptionRegistrationScreenState extends State<PrescriptionRegistratio
   }
 
   void _createNew() async {
+    _entryNoCtrl.text = "...";
     final p = Provider.of<PharmacyProvider>(context, listen: false);
     final nextNo = await p.getNextPrescriptionNo();
+    if (!mounted) return;
     setState(() {
       _activePrescription = null;
       _isDetailView = true;
@@ -138,12 +140,11 @@ class _PrescriptionRegistrationScreenState extends State<PrescriptionRegistratio
     );
 
     final assignedNo = await Provider.of<PharmacyProvider>(context, listen: false).addPrescription(p);
+    if (!mounted) return;
     setState(() => _isDetailView = false);
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          backgroundColor: Colors.green,
-          content: Text("Prescription #$assignedNo Saved!")));
-    }
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        backgroundColor: Colors.green,
+        content: Text("Prescription #$assignedNo Saved!")));
   }
 
   void _navigate(int direction) {
@@ -577,7 +578,9 @@ class _PrescriptionRegistrationScreenState extends State<PrescriptionRegistratio
                 },
                 onSelected: (Product p) {
                   _itemNameCtrls[index].text = p.name;
-                  _itemQtyFocusNodes[index].requestFocus();
+                  if (index >= 0 && index < _itemQtyFocusNodes.length && _itemQtyFocusNodes[index].canRequestFocus) {
+                    _itemQtyFocusNodes[index].requestFocus();
+                  }
                 },
                 displayStringForOption: (Product p) => p.name,
                 fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) {
@@ -585,7 +588,9 @@ class _PrescriptionRegistrationScreenState extends State<PrescriptionRegistratio
                     controller: controller,
                     focusNode: focusNode,
                     onSubmitted: (v) {
-                      if (v.isNotEmpty) _itemQtyFocusNodes[index].requestFocus();
+                      if (v.isNotEmpty && index >= 0 && index < _itemQtyFocusNodes.length && _itemQtyFocusNodes[index].canRequestFocus) {
+                        _itemQtyFocusNodes[index].requestFocus();
+                      }
                     },
                     decoration: const InputDecoration(border: InputBorder.none, isDense: true, contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 8)),
                     style: const TextStyle(fontSize: 12),
@@ -597,7 +602,7 @@ class _PrescriptionRegistrationScreenState extends State<PrescriptionRegistratio
                     child: Material(
                       elevation: 4.0,
                       child: SizedBox(
-                        width: 450,
+                        width: 650,
                         child: ListView.builder(
                           padding: EdgeInsets.zero,
                           shrinkWrap: true,

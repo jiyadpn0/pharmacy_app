@@ -16,7 +16,7 @@ class InventoryProvider extends ChangeNotifier {
 
   Future<void> refreshInventoryValuation() async {
     try {
-      _totalInventoryValuation = await InventoryRepository.getTotalInventoryValuation();
+      _totalInventoryValuation = await _repo.getTotalPurchaseValuation();
       notifyListeners();
     } catch (e) {
       debugPrint("Error refreshing inventory valuation: $e");

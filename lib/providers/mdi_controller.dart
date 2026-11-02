@@ -47,6 +47,8 @@ class MdiController extends ChangeNotifier {
   final List<MdiWindow> _windows = [];
   List<MdiWindow> get windows => _windows;
 
+  VoidCallback? onPageMovement;
+
   void openWindow(MdiWindow window) {
     int index = _windows.indexWhere((w) => w.id == window.id);
     if (index != -1) {
@@ -58,6 +60,7 @@ class MdiController extends ChangeNotifier {
     } else {
       _windows.add(window);
     }
+    onPageMovement?.call();
     notifyListeners();
   }
 
@@ -66,6 +69,7 @@ class MdiController extends ChangeNotifier {
     if (index != -1 && index != _windows.length - 1) {
       MdiWindow win = _windows.removeAt(index);
       _windows.add(win.copyWith(isMinimized: false));
+      onPageMovement?.call();
       notifyListeners();
     }
   }

@@ -48,10 +48,69 @@ class BackupService {
       }
 
       debugPrint("Database Backup Created Successfully: ${backupFile.path}");
+      await enforceBackupRetentionPolicy(customPath: customPath);
       return backupFile.path;
     } catch (e) {
       debugPrint("Database Backup Failed: $e");
       return null;
+    }
+  }
+
+  /// Verifies SQLite database file health using PRAGMA quick_check
+  static Future<bool> verifyDatabaseIntegrity(File dbFile) async {
+    try {
+      if (!await dbFile.exists()) return false;
+      final testDb = await openDatabase(dbFile.path, readOnly: true);
+      final result = await testDb.rawQuery('PRAGMA quick_check;');
+      await testDb.close();
+      if (result.isNotEmpty && result.first.values.first.toString().toLowerCase() == 'ok') {
+        return true;
+      }
+      return false;
+    } catch (e) {
+      debugPrint("Integrity Check Failed for ${dbFile.path}: $e");
+      return false;
+    }
+  }
+
+  /// Restores a selected database backup after validating its integrity
+  static Future<bool> restoreDatabaseBackup(File backupFile) async {
+    try {
+      if (!await verifyDatabaseIntegrity(backupFile)) {
+        debugPrint("Restore Aborted: Selected backup file failed integrity check.");
+        return false;
+      }
+
+      final dbPath = await getDatabasesPath();
+      final targetFile = File(join(dbPath, 'pharmacy.db'));
+
+      // Close current DB connection & checkpoint WAL
+      await DbHelper.instance.close();
+
+      await backupFile.copy(targetFile.path);
+      debugPrint("Database Restored Successfully from ${backupFile.path}");
+      return true;
+    } catch (e) {
+      debugPrint("Database Restore Failed: $e");
+      return false;
+    }
+  }
+
+  /// Auto-cleans backups keeping the latest maxBackups (default: 30)
+  static Future<void> enforceBackupRetentionPolicy({String? customPath, int maxBackups = 30}) async {
+    try {
+      final backupList = await getBackupList(customPath: customPath);
+      if (backupList.length > maxBackups) {
+        final toDelete = backupList.sublist(maxBackups);
+        for (var file in toDelete) {
+          if (await file.exists()) {
+            await file.delete();
+            debugPrint("Cleaned old backup file: ${file.path}");
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint("Error enforcing retention policy: $e");
     }
   }
 
