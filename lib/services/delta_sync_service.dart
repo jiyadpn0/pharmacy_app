@@ -8,6 +8,7 @@ import '../utils/app_logger.dart';
 import '../utils/app_formatters.dart';
 import 'supabase_sync_service.dart';
 import 'server_config_service.dart';
+import 'stock_outbox_service.dart';
 
 /// Non-blocking, incremental background sync engine (Delta Sync).
 /// Periodically syncs unsynced local invoices and fetches changed products/stock
@@ -79,6 +80,10 @@ class DeltaSyncService {
     final config = ServerConfigService.instance;
     if (!config.isServerModeEnabled || !config.isConnected) return false;
 
+    // Drain durable outbox upon reconnection and reconcile stock
+    await StockOutboxService.instance.drainOutbox();
+    await StockOutboxService.instance.reconcileLocalStockFromCloud();
+
     return await _executeDeltaSyncCycle(forcePostSave: true);
   }
 
@@ -108,6 +113,9 @@ class DeltaSyncService {
       _isSyncing = true;
       try {
         final prefs = await SharedPreferences.getInstance();
+
+        // 0. Drain durable local outbox first so pending atomic stock mutations reach server
+        await StockOutboxService.instance.drainOutbox();
 
         // 1. Check for cloud resets / fetch missing cloud records across sales, purchases, and adjustments FIRST
         await SupabaseSyncService.instance.syncAllPendingCloudRecords();

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -71,7 +72,12 @@ class ServerConfigService extends ChangeNotifier {
   String get supabaseAnonKey => _supabaseAnonKey;
   String get storeBranchId => _storeBranchId;
   String get terminalId => _terminalId;
-  String get machineUuid => _machineUuid;
+  String get machineUuid {
+    if (_machineUuid.isEmpty) {
+      _machineUuid = "MACH_${DateTime.now().microsecondsSinceEpoch}_${Random().nextInt(100000)}";
+    }
+    return _machineUuid;
+  }
   bool get isTerminalConfigured => _isTerminalConfigured;
   bool get isWiping => _isWiping;
 
@@ -146,58 +152,68 @@ class ServerConfigService extends ChangeNotifier {
 
   /// Verifies that other active computers on Supabase do not share the exact same Terminal ID / Terminal Prefix.
   /// Reports a setup issue if duplicate terminal configuration is detected.
-  Future<String?> verifyDistinctTerminalId() async {
-    final cleanUrl = cleanServerUrl(_supabaseUrl);
-    if (cleanUrl.isEmpty || _supabaseAnonKey.isEmpty) return null;
-
-    if (_terminalId.trim().isEmpty) {
+  Future<String?> verifyDistinctTerminalId({
+    List<Map<String, dynamic>>? activeComputers,
+    String? currentTerminalId,
+  }) async {
+    final effectiveTerm = (currentTerminalId ?? _terminalId).trim().toUpperCase();
+    if (effectiveTerm.isEmpty) {
       _duplicateTerminalWarning = "SETUP ISSUE: Terminal ID is missing! Each PC must have a unique Terminal ID.";
       notifyListeners();
       return _duplicateTerminalWarning;
     }
 
     try {
-      final uri = Uri.parse('$cleanUrl/rest/v1/active_computers?branch_id=eq.$_storeBranchId&select=machine_id,terminal_id,last_seen_at');
-      final response = await http.get(uri, headers: restHeaders).timeout(const Duration(seconds: 5));
-
-      if (response.statusCode == 200) {
-        final List list = jsonDecode(response.body) as List;
-        final currentTerm = _terminalId.trim().toUpperCase();
-        final currentPref = terminalPrefix.toUpperCase();
-        final now = DateTime.now();
-
-        for (var item in list) {
-          final otherMachine = item['machine_id']?.toString().trim() ?? '';
-          if (otherMachine.isNotEmpty && otherMachine == _machineUuid) continue;
-
-          final lastSeenStr = item['last_seen_at']?.toString() ?? '';
-          final lastSeen = DateTime.tryParse(lastSeenStr);
-          if (lastSeen != null && now.difference(lastSeen).inMinutes > 10) continue;
-
-          final otherTerm = item['terminal_id']?.toString().trim().toUpperCase() ?? '';
-          if (otherTerm.isEmpty) continue;
-
-          // 1. Exact Duplicate Terminal ID Check
-          if (otherTerm == currentTerm) {
-            _duplicateTerminalWarning = "CRITICAL SETUP CONFLICT: Another computer ($otherMachine) is actively using the identical Terminal ID '$_terminalId' in branch '$_storeBranchId'. Please assign a distinct Terminal ID (e.g. POS-02) in Server Settings.";
-            notifyListeners();
-            return _duplicateTerminalWarning;
-          }
-
-          // 2. Overlapping Sequence Prefix Check
-          final cleanOther = otherTerm.replaceAll(RegExp(r'[^0-9]'), '');
-          final numOther = int.tryParse(cleanOther);
-          final otherPref = numOther != null ? 'T$numOther-' : (cleanOther.isNotEmpty ? 'T$cleanOther-' : '$otherTerm-');
-
-          if (otherPref == currentPref) {
-            _duplicateTerminalWarning = "SETUP ISSUE DETECTED: Both PCs share terminal sequence prefix '$currentPref' (This PC: '$_terminalId', Other PC: '$otherTerm'). Please assign distinct Terminal IDs (e.g. POS-01 and POS-02) in Server Settings.";
-            notifyListeners();
-            return _duplicateTerminalWarning;
-          }
+      List list;
+      if (activeComputers != null) {
+        list = activeComputers;
+      } else {
+        final cleanUrl = cleanServerUrl(_supabaseUrl);
+        if (cleanUrl.isEmpty || _supabaseAnonKey.isEmpty) return null;
+        final uri = Uri.parse('$cleanUrl/rest/v1/active_computers?branch_id=eq.$_storeBranchId&select=machine_id,terminal_id,last_seen_at');
+        final response = await http.get(uri, headers: restHeaders).timeout(const Duration(seconds: 5));
+        if (response.statusCode == 200) {
+          list = jsonDecode(response.body) as List;
+        } else {
+          list = [];
         }
       }
 
-      if (!_isTerminalConfigured && _terminalId == 'POS-01') {
+      final currentTerm = effectiveTerm;
+      final currentPref = terminalPrefix.toUpperCase();
+      final now = DateTime.now();
+
+      for (var item in list) {
+        final otherMachine = item['machine_id']?.toString().trim() ?? '';
+        if (otherMachine.isNotEmpty && otherMachine == _machineUuid) continue;
+
+        final lastSeenStr = item['last_seen_at']?.toString() ?? item['last_seen']?.toString() ?? '';
+        final lastSeen = DateTime.tryParse(lastSeenStr);
+        if (lastSeen != null && now.difference(lastSeen).inMinutes > 10) continue;
+
+        final otherTerm = item['terminal_id']?.toString().trim().toUpperCase() ?? '';
+        if (otherTerm.isEmpty) continue;
+
+        // 1. Exact Duplicate Terminal ID Check
+        if (otherTerm == currentTerm) {
+          _duplicateTerminalWarning = "CRITICAL SETUP CONFLICT: Another computer ($otherMachine) is actively using the identical Terminal ID '$currentTerm' in branch '$_storeBranchId'. Please assign a distinct Terminal ID (e.g. POS-02) in Server Settings.";
+          notifyListeners();
+          return _duplicateTerminalWarning;
+        }
+
+        // 2. Overlapping Sequence Prefix Check
+        final cleanOther = otherTerm.replaceAll(RegExp(r'[^0-9]'), '');
+        final numOther = int.tryParse(cleanOther);
+        final otherPref = numOther != null ? 'T$numOther-' : (cleanOther.isNotEmpty ? 'T$cleanOther-' : '$otherTerm-');
+
+        if (otherPref == currentPref) {
+          _duplicateTerminalWarning = "SETUP ISSUE DETECTED: Both PCs share terminal sequence prefix '$currentPref' (This PC: '$currentTerm', Other PC: '$otherTerm'). Please assign distinct Terminal IDs (e.g. POS-01 and POS-02) in Server Settings.";
+          notifyListeners();
+          return _duplicateTerminalWarning;
+        }
+      }
+
+      if (!_isTerminalConfigured && effectiveTerm == 'POS-01') {
         _duplicateTerminalWarning = "NOTICE: Terminal ID is using default 'POS-01'. If multiple PCs are running, ensure other computers use distinct IDs (e.g., POS-02).";
         notifyListeners();
         return _duplicateTerminalWarning;
@@ -446,18 +462,6 @@ class ServerConfigService extends ChangeNotifier {
       await prefs.setBool(_keyAutoSync, enabled);
     } catch (e) {
       debugPrint('Error saving auto sync setting: $e');
-    }
-    notifyListeners();
-  }
-
-  /// Sets the terminal identifier for this computer (e.g., POS-01, POS-02).
-  Future<void> setTerminalId(String terminalId) async {
-    _terminalId = terminalId.trim().isEmpty ? 'POS-01' : terminalId.trim();
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_keyTerminalId, _terminalId);
-    } catch (e) {
-      debugPrint('Error saving terminal ID: $e');
     }
     notifyListeners();
   }

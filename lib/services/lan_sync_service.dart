@@ -49,6 +49,32 @@ class LanSyncService {
     applyAction();
   }
 
+  /// Batch deduplication guard: filters out already-processed events and applies remaining rows in a single batch
+  void handleIncomingEventsBatch(List<Map<String, dynamic>> rows, void Function(List<Map<String, dynamic>> validRows) applyAction) {
+    if (rows.isEmpty) return;
+    final List<Map<String, dynamic>> validRows = [];
+    for (final row in rows) {
+      final eventId = (row['event_id'] ?? row['entry_no'] ?? row['invoice_no'] ?? '').toString().trim();
+      if (eventId.isEmpty) {
+        validRows.add(row);
+        continue;
+      }
+      if (_processedEvents.contains(eventId)) {
+        debugPrint("⚡ [Deduplication Guard]: Skipping duplicate event ID '$eventId'");
+        continue;
+      }
+      _processedEvents.add(eventId);
+      if (_processedEvents.length > 1000) {
+        _processedEvents.remove(_processedEvents.first);
+      }
+      unawaited(DbHelper.instance.markEventProcessed(eventId, 'REALTIME_EVENT'));
+      validRows.add(row);
+    }
+    if (validRows.isNotEmpty) {
+      applyAction(validRows);
+    }
+  }
+
   Future<bool> isEventProcessed(String eventId) async {
     final cleanId = eventId.trim();
     if (cleanId.isEmpty) return false;

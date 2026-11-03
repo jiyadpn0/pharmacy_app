@@ -48,8 +48,8 @@ class SupabaseRealtimeService {
             tableName == 'stock_adjustments' ||
             tableName == 'stock_batches' ||
             tableName == 'product_master')
-        ? 50
-        : 150;
+        ? 300
+        : 400;
 
     _bufferTimers[key]?.cancel();
     _bufferTimers[key] = Timer(Duration(milliseconds: batchDelayMs), () {

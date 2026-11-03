@@ -15,10 +15,27 @@ class IsolateComputeService {
 
   /// Decodes large JSON strings in a background isolate
   Future<List<dynamic>> parseJsonList(String jsonString) async {
-    if (jsonString.length < 5120) {
-      return (jsonDecode(jsonString) as List<dynamic>);
+    if (jsonString.length < 1024) {
+      try {
+        final decoded = jsonDecode(jsonString);
+        return decoded is List<dynamic> ? decoded : [decoded];
+      } catch (_) {
+        return [];
+      }
     }
     return await compute(_decodeJsonListIsolate, jsonString);
+  }
+
+  /// Decodes any JSON string (List or Map) in a background isolate
+  Future<dynamic> parseJsonDynamic(String jsonString) async {
+    if (jsonString.length < 1024) {
+      try {
+        return jsonDecode(jsonString);
+      } catch (_) {
+        return null;
+      }
+    }
+    return await compute(_decodeJsonDynamicIsolate, jsonString);
   }
 
   /// Encodes large Dart maps/lists to JSON strings in a background isolate
@@ -33,6 +50,14 @@ List<dynamic> _decodeJsonListIsolate(String jsonStr) {
     return decoded is List<dynamic> ? decoded : [decoded];
   } catch (_) {
     return [];
+  }
+}
+
+dynamic _decodeJsonDynamicIsolate(String jsonStr) {
+  try {
+    return jsonDecode(jsonStr);
+  } catch (_) {
+    return null;
   }
 }
 

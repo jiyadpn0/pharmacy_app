@@ -340,17 +340,26 @@ class ProductRepository {
 
   /// High-performance Full-Text Search (FTS5) for medicines and stock
   static Future<List<Map<String, dynamic>>> searchProductsFts(String query) async {
-    if (query.trim().isEmpty) return [];
+    final cleanQuery = query.trim();
+    if (cleanQuery.isEmpty) return [];
     try {
       final db = await DbHelper.instance.database;
-      final cleanQuery = query.trim().replaceAll("'", "''");
+      final tokens = cleanQuery
+          .replaceAll(RegExp(r'[^\w\s]'), ' ')
+          .trim()
+          .split(RegExp(r'\s+'))
+          .where((w) => w.isNotEmpty)
+          .map((w) => '"$w"*')
+          .join(' ');
+      if (tokens.isEmpty) return [];
+
       final results = await db.rawQuery('''
         SELECT pm.*
         FROM product_search_fts fts
         JOIN product_master pm ON fts.id = pm.id
         WHERE product_search_fts MATCH ?
         LIMIT 50
-      ''', ['$cleanQuery*']);
+      ''', [tokens]);
       return results;
     } catch (e) {
       debugPrint("FTS search fallback note: $e");

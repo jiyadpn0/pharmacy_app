@@ -16,6 +16,7 @@ import 'delta_sync_service.dart';
 import 'remote_logger_service.dart';
 import 'server_config_service.dart';
 import 'supabase_realtime_service.dart';
+import 'stock_outbox_service.dart';
 
 enum CategorySyncState { queued, transferring, completed, error }
 
@@ -270,7 +271,7 @@ class SupabaseSyncService extends ChangeNotifier {
       final res = await http.get(uri, headers: config.restHeaders).timeout(const Duration(seconds: 4));
 
       if (res.statusCode == 200) {
-        final List<dynamic> rows = jsonDecode(res.body);
+        final List<dynamic> rows = await _safeParseJsonList(res.body);
         if (rows.isNotEmpty) {
           final cloudEpoch = rows.first['value']?.toString().trim() ?? '';
           if (cloudEpoch.isNotEmpty) {
@@ -337,7 +338,7 @@ class SupabaseSyncService extends ChangeNotifier {
               final uri = Uri.parse('$cleanUrl/rest/v1/$tableName?$keyColumn=in.($filterStr)&select=$keyColumn');
               final res = await http.get(uri, headers: config.restHeaders).timeout(const Duration(seconds: 4));
               if (res.statusCode == 200) {
-                final List<dynamic> cloudRows = jsonDecode(res.body);
+                final List<dynamic> cloudRows = await _safeParseJsonList(res.body);
                 final foundKeys = cloudRows.map((r) => r[keyColumn]?.toString().trim() ?? '').where((k) => k.isNotEmpty).toList();
                 if (foundKeys.isNotEmpty) {
                   final placeholders = List.filled(foundKeys.length, '?').join(',');
@@ -540,7 +541,7 @@ class SupabaseSyncService extends ChangeNotifier {
       final uri = Uri.parse('$cleanUrl/rest/v1/sales_invoices?entry_no=eq.${Uri.encodeComponent(entryNo)}&select=*');
       final res = await http.get(uri, headers: config.restHeaders).timeout(const Duration(seconds: 8));
       if (res.statusCode == 200) {
-        final List<dynamic> data = jsonDecode(res.body);
+        final List<dynamic> data = await _safeParseJsonList(res.body);
         if (data.isNotEmpty) {
           return Map<String, dynamic>.from(data.first);
         }
@@ -560,7 +561,7 @@ class SupabaseSyncService extends ChangeNotifier {
       final uri = Uri.parse('$cleanUrl/rest/v1/purchase_entries?entry_no=eq.${Uri.encodeComponent(entryNo)}&select=*');
       final res = await http.get(uri, headers: config.restHeaders).timeout(const Duration(seconds: 8));
       if (res.statusCode == 200) {
-        final List<dynamic> data = jsonDecode(res.body);
+        final List<dynamic> data = await _safeParseJsonList(res.body);
         if (data.isNotEmpty) {
           return Map<String, dynamic>.from(data.first);
         }
@@ -585,7 +586,7 @@ class SupabaseSyncService extends ChangeNotifier {
       final salesUri = Uri.parse('$cleanUrl/rest/v1/sales_invoices?patient=eq.$encodedName&is_deleted=eq.0&select=*');
       final salesRes = await http.get(salesUri, headers: headers).timeout(const Duration(milliseconds: 2500));
       if (salesRes.statusCode == 200) {
-        final List<dynamic> salesData = jsonDecode(salesRes.body);
+        final List<dynamic> salesData = await _safeParseJsonList(salesRes.body);
         for (var row in salesData) {
           if (row is Map<String, dynamic>) {
             await db.insert('sales_invoices', Map<String, dynamic>.from(row), conflictAlgorithm: sql.ConflictAlgorithm.replace);
@@ -597,7 +598,7 @@ class SupabaseSyncService extends ChangeNotifier {
       final returnsUri = Uri.parse('$cleanUrl/rest/v1/sales_return_invoices?patient=eq.$encodedName&is_deleted=eq.0&select=*');
       final returnsRes = await http.get(returnsUri, headers: headers).timeout(const Duration(milliseconds: 2500));
       if (returnsRes.statusCode == 200) {
-        final List<dynamic> returnsData = jsonDecode(returnsRes.body);
+        final List<dynamic> returnsData = await _safeParseJsonList(returnsRes.body);
         for (var row in returnsData) {
           if (row is Map<String, dynamic>) {
             await db.insert('sales_return_invoices', Map<String, dynamic>.from(row), conflictAlgorithm: sql.ConflictAlgorithm.replace);
@@ -609,7 +610,7 @@ class SupabaseSyncService extends ChangeNotifier {
       final payUri = Uri.parse('$cleanUrl/rest/v1/patient_payments?patient_name=eq.$encodedName&select=*');
       final payRes = await http.get(payUri, headers: headers).timeout(const Duration(milliseconds: 2500));
       if (payRes.statusCode == 200) {
-        final List<dynamic> payData = jsonDecode(payRes.body);
+        final List<dynamic> payData = await _safeParseJsonList(payRes.body);
         for (var row in payData) {
           if (row is Map<String, dynamic>) {
             await db.insert('patient_payments', Map<String, dynamic>.from(row), conflictAlgorithm: sql.ConflictAlgorithm.replace);
@@ -717,7 +718,7 @@ class SupabaseSyncService extends ChangeNotifier {
         final res = await http.get(remoteUri, headers: headers).timeout(const Duration(seconds: 20));
 
         if (res.statusCode == 200) {
-          final List<dynamic> remoteData = jsonDecode(res.body);
+          final List<dynamic> remoteData = await _safeParseJsonList(res.body);
           final List<Map<String, dynamic>> missingRows = [];
 
           if (remoteData.isNotEmpty) {
@@ -772,7 +773,7 @@ class SupabaseSyncService extends ChangeNotifier {
                   final itemsUri = Uri.parse('$cleanUrl/rest/v1/$itemsTable?$fkCol=in.($encodedEntry,$encodedClean)&select=*');
                   final itemsRes = await http.get(itemsUri, headers: headers).timeout(const Duration(seconds: 4));
                   if (itemsRes.statusCode == 200) {
-                    final List<dynamic> itemsData = jsonDecode(itemsRes.body);
+                    final List<dynamic> itemsData = await _safeParseJsonList(itemsRes.body);
                     if (itemsData.isNotEmpty) {
                       await db.delete(itemsTable, where: '$fkCol = ? OR $fkCol = ?', whereArgs: [rawEntryNo, cleanNo]);
                       final Set<String> seenSigs = {};
@@ -1046,7 +1047,7 @@ class SupabaseSyncService extends ChangeNotifier {
         final uri = Uri.parse('$cleanUrl/rest/v1/stock_batches?updated_at=gt.$sinceStr&select=id&limit=1');
         final res = await http.get(uri, headers: config.restHeaders).timeout(const Duration(seconds: 3));
         if (res.statusCode == 200) {
-          final List<dynamic> items = jsonDecode(res.body);
+          final List<dynamic> items = await _safeParseJsonList(res.body);
           if (items.isNotEmpty) {
             _lastStreamPollTime = DateTime.now();
             triggerInstantSync();
@@ -1314,7 +1315,7 @@ class SupabaseSyncService extends ChangeNotifier {
       final uri = Uri.parse(query);
       final res = await http.get(uri, headers: config.restHeaders).timeout(const Duration(milliseconds: 1500));
       if (res.statusCode == 200) {
-        final List<dynamic> data = jsonDecode(res.body);
+        final List<dynamic> data = await _safeParseJsonList(res.body);
         if (data.isNotEmpty) {
           final rawVal = data.first[column]?.toString() ?? '';
           return rawVal;
@@ -1333,7 +1334,7 @@ class SupabaseSyncService extends ChangeNotifier {
       final uri = Uri.parse('$cleanUrl/rest/v1/sales_invoices?select=*&order=created_at.desc&limit=$limit');
       final res = await http.get(uri, headers: config.restHeaders).timeout(const Duration(seconds: 8));
       if (res.statusCode == 200) {
-        final List<dynamic> data = jsonDecode(res.body);
+        final List<dynamic> data = await _safeParseJsonList(res.body);
         return data.cast<Map<String, dynamic>>();
       }
     } catch (e) {
@@ -1351,7 +1352,7 @@ class SupabaseSyncService extends ChangeNotifier {
       final uri = Uri.parse('$cleanUrl/rest/v1/purchase_entries?select=*&order=created_at.desc&limit=$limit');
       final res = await http.get(uri, headers: config.restHeaders).timeout(const Duration(seconds: 8));
       if (res.statusCode == 200) {
-        final List<dynamic> data = jsonDecode(res.body);
+        final List<dynamic> data = await _safeParseJsonList(res.body);
         return data.cast<Map<String, dynamic>>();
       }
     } catch (e) {
@@ -1449,6 +1450,49 @@ class SupabaseSyncService extends ChangeNotifier {
         return copy;
       }).toList();
 
+      // Priority 1: Server-side atomic convergence RPC with idempotency key and ledger tracking
+      final idempKey = StockOutboxService.generateIdempotencyKey(
+        branchId: branchId,
+        terminalId: headerPayload['terminal_id']?.toString() ?? config.terminalId,
+        operationType: 'PURCHASE',
+        referenceNo: purchaseHeader['entry_no']?.toString() ?? '',
+      );
+
+      final rpcUriConvergence = Uri.parse('$cleanUrl/rest/v1/rpc/fn_process_purchase_atomic');
+      try {
+        final resConvergence = await http.post(
+          rpcUriConvergence,
+          headers: config.restHeaders,
+          body: jsonEncode({
+            'p_purchase': headerPayload,
+            'p_items': itemsPayload,
+            'p_idempotency_key': idempKey,
+          }),
+        ).timeout(const Duration(seconds: 10));
+
+        if (resConvergence.statusCode >= 200 && resConvergence.statusCode < 300) {
+          final resMap = await _safeParseJson(resConvergence.body);
+          if (resMap is Map && resMap['success'] == true) {
+            final db = await DbHelper.instance.database;
+            final entryNo = purchaseHeader['entry_no']?.toString() ?? '';
+            if (entryNo.isNotEmpty) {
+              await db.rawUpdate(
+                'UPDATE purchase_entries SET is_synced = 1, is_cloud_synced = 1 WHERE entry_no = ? OR sup_inv_no = ?',
+                [entryNo, entryNo],
+              );
+              await db.rawUpdate(
+                'UPDATE purchase_items SET is_synced = 1, is_cloud_synced = 1 WHERE entry_no = ?',
+                [entryNo],
+              );
+            }
+            AppLogger.instance.supabase("Cloud Sync: Purchase $entryNo processed atomically via fn_process_purchase_atomic.");
+            notifyListeners();
+            return true;
+          }
+        }
+      } catch (_) {}
+
+      // Priority 2: Fallback to fn_save_purchase_entry_atomic
       final rpcUri = Uri.parse('$cleanUrl/rest/v1/rpc/fn_save_purchase_entry_atomic');
       final res = await http.post(
         rpcUri,
@@ -1460,7 +1504,7 @@ class SupabaseSyncService extends ChangeNotifier {
       ).timeout(const Duration(seconds: 8));
 
       if (res.statusCode >= 200 && res.statusCode < 300) {
-        final resMap = jsonDecode(res.body);
+        final resMap = await _safeParseJson(res.body);
         if (resMap is Map && resMap['success'] == true) {
           final db = await DbHelper.instance.database;
           final entryNo = purchaseHeader['entry_no']?.toString() ?? '';
@@ -1740,34 +1784,37 @@ class SupabaseSyncService extends ChangeNotifier {
           final branchParam = config.storeBranchId.isNotEmpty ? 'branch_id=eq.${config.storeBranchId}&' : '';
           var uri = Uri.parse('${config.supabaseUrl}/rest/v1/$endpoint?${branchParam}select=*&limit=$limit&offset=$offset$timeFilter');
           var res = await http.get(uri, headers: config.restHeaders).timeout(const Duration(seconds: 25));
+          List items = await _safeParseJsonList(res.body);
 
-          if (res.statusCode >= 400 || (res.statusCode == 200 && jsonDecode(res.body) is List && (jsonDecode(res.body) as List).isEmpty && offset == 0)) {
+          if (res.statusCode >= 400 || (res.statusCode == 200 && items.isEmpty && offset == 0)) {
             if (branchParam.isNotEmpty) {
               final fallbackUri = Uri.parse('${config.supabaseUrl}/rest/v1/$endpoint?select=*&limit=$limit&offset=$offset$timeFilter');
               final fallbackRes = await http.get(fallbackUri, headers: config.restHeaders).timeout(const Duration(seconds: 25));
-              if (fallbackRes.statusCode == 200 && jsonDecode(fallbackRes.body) is List && (jsonDecode(fallbackRes.body) as List).isNotEmpty) {
+              final fbItems = await _safeParseJsonList(fallbackRes.body);
+              if (fallbackRes.statusCode == 200 && fbItems.isNotEmpty) {
                 res = fallbackRes;
+                items = fbItems;
               }
             }
-            if (timeFilter.isNotEmpty && (res.statusCode >= 400 || (jsonDecode(res.body) is List && (jsonDecode(res.body) as List).isEmpty))) {
+            if (timeFilter.isNotEmpty && (res.statusCode >= 400 || items.isEmpty)) {
               final fallbackUri = Uri.parse('${config.supabaseUrl}/rest/v1/$endpoint?${branchParam}select=*&limit=$limit&offset=$offset');
               final fallbackRes = await http.get(fallbackUri, headers: config.restHeaders).timeout(const Duration(seconds: 25));
-              if (fallbackRes.statusCode == 200 && jsonDecode(fallbackRes.body) is List && (jsonDecode(fallbackRes.body) as List).isNotEmpty) {
+              final fbItems = await _safeParseJsonList(fallbackRes.body);
+              if (fallbackRes.statusCode == 200 && fbItems.isNotEmpty) {
                 res = fallbackRes;
+                items = fbItems;
               } else if (branchParam.isNotEmpty) {
                 final fallbackNoBranchUri = Uri.parse('${config.supabaseUrl}/rest/v1/$endpoint?select=*&limit=$limit&offset=$offset');
                 final fallbackNoBranchRes = await http.get(fallbackNoBranchUri, headers: config.restHeaders).timeout(const Duration(seconds: 25));
                 if (fallbackNoBranchRes.statusCode == 200) {
                   res = fallbackNoBranchRes;
+                  items = await _safeParseJsonList(res.body);
                 }
               }
             }
           }
 
           if (res.statusCode == 200) {
-            final List items = res.body.length > 10240
-                ? await compute(_parseJsonListIsolate, res.body)
-                : (jsonDecode(res.body) as List<dynamic>);
             if (items.isEmpty) {
               hasMore = false;
               pageSuccess = true;
@@ -2876,6 +2923,40 @@ class SupabaseSyncService extends ChangeNotifier {
         };
       }).toList();
 
+      // Priority 1: Server-side atomic convergence RPC with idempotency key, row-locking, and stock ledger
+      final idempKey = StockOutboxService.generateIdempotencyKey(
+        branchId: branchId,
+        terminalId: terminalId,
+        operationType: 'SALE',
+        referenceNo: entryNo,
+      );
+
+      final rpcUriConvergence = Uri.parse('$cleanUrl/rest/v1/rpc/fn_process_sale_atomic');
+      try {
+        final respConvergence = await http.post(
+          rpcUriConvergence,
+          headers: config.restHeaders,
+          body: jsonEncode({
+            'p_invoice': invoicePayload,
+            'p_items': itemPayloads,
+            'p_idempotency_key': idempKey,
+          }),
+        ).timeout(const Duration(seconds: 10));
+
+        if (respConvergence.statusCode >= 200 && respConvergence.statusCode < 300) {
+          final resMap = await _safeParseJson(respConvergence.body);
+          if (resMap is Map && resMap['success'] == true) {
+            final db = await DbHelper.instance.database;
+            await db.rawUpdate('UPDATE sales_invoices SET is_synced = 1, is_cloud_synced = 1 WHERE entry_no = ? OR invoice_no = ?', [entryNo, entryNo]);
+            await db.rawUpdate('UPDATE sales_items SET is_synced = 1, is_cloud_synced = 1 WHERE invoice_no = ?', [entryNo]);
+            AppLogger.instance.supabase("Cloud Sync: Invoice $entryNo processed atomically via fn_process_sale_atomic.");
+            notifyListeners();
+            return true;
+          }
+        }
+      } catch (_) {}
+
+      // Priority 2: Fallback to legacy fn_save_sale_invoice_atomic
       final rpcUri = Uri.parse('$cleanUrl/rest/v1/rpc/fn_save_sale_invoice_atomic');
       final rpcPayload = {
         'p_invoice': invoicePayload,
@@ -2889,7 +2970,7 @@ class SupabaseSyncService extends ChangeNotifier {
       ).timeout(const Duration(seconds: 8));
 
       if (response.statusCode >= 200 && response.statusCode < 300) {
-        final resMap = jsonDecode(response.body);
+        final resMap = await _safeParseJson(response.body);
         if (resMap is Map && resMap['success'] == true) {
           final db = await DbHelper.instance.database;
           await db.rawUpdate('UPDATE sales_invoices SET is_synced = 1, is_cloud_synced = 1 WHERE entry_no = ? OR invoice_no = ?', [entryNo, entryNo]);
@@ -3089,33 +3170,24 @@ class SupabaseSyncService extends ChangeNotifier {
           );
         }
 
-        // Also push batch stock updates to Supabase stock_batches
-        final db = await DbHelper.instance.database;
-        for (var it in items) {
-          final pId = it['product_id']?.toString() ?? '';
-          final batchNum = it['batch']?.toString() ?? it['batch_number']?.toString() ?? '';
-          if (pId.isNotEmpty && batchNum.isNotEmpty) {
-            final res = await db.rawQuery(
-              'SELECT SUM(current_stock) as total_stock FROM stock_batches WHERE product_id = ? AND LOWER(TRIM(batch_number)) = LOWER(TRIM(?))',
-              [pId, batchNum],
-            );
-            final localStock = (res.isNotEmpty && res.first['total_stock'] != null)
-                ? (res.first['total_stock'] as num).toInt()
-                : 0;
-
-            await pushStockBatch({
-              'product_id': pId,
-              'batch_number': batchNum,
-              'expiry_date': it['expiry']?.toString() ?? it['expiry_date']?.toString() ?? '',
-              'current_quantity': localStock,
-              'current_stock': localStock,
-              'purchase_rate': _toDouble(it['p_rate'] ?? it['unit_price']),
-              'mrp': _toDouble(it['mrp']),
-              'selling_rate': _toDouble(it['s_rate'] ?? it['selling_rate']),
-              'packing': _toInt(it['packin'] ?? it['packing'], 1),
-            });
-          }
-        }
+        // Queue/dispatch purchase stock increments to durable outbox rather than overwriting cloud stock with local snapshot
+        final idempKey = StockOutboxService.generateIdempotencyKey(
+          branchId: branchId,
+          terminalId: (purchase['terminal_id']?.toString().trim().isNotEmpty == true)
+              ? purchase['terminal_id'].toString().trim()
+              : config.terminalId,
+          operationType: 'PURCHASE',
+          referenceNo: entryNoVal,
+        );
+        unawaited(StockOutboxService.instance.queueOperation(
+          operationType: 'PURCHASE',
+          referenceNo: entryNoVal,
+          payload: {
+            'header': purchasePayload,
+            'items': items,
+          },
+          idempotencyKey: idempKey,
+        ));
         AppLogger.instance.supabase("Cloud Sync: Purchase entry $entryNoVal and items saved successfully via REST.");
         notifyListeners();
         return true;
@@ -4731,11 +4803,9 @@ class SupabaseSyncService extends ChangeNotifier {
           final cnt = int.tryParse(totalStr);
           if (cnt != null && cnt > 0) return cnt;
         }
-        if (jsonDecode(res.body) is List) {
-          final List list = jsonDecode(res.body);
-          if (list.isNotEmpty && list.first is Map && list.first.containsKey('count')) {
-            return (list.first['count'] as int?) ?? 0;
-          }
+        final List list = await _safeParseJsonList(res.body);
+        if (list.isNotEmpty && list.first is Map && list.first.containsKey('count')) {
+          return (list.first['count'] as int?) ?? 0;
         }
       }
     } catch (_) {}
@@ -4792,9 +4862,7 @@ class SupabaseSyncService extends ChangeNotifier {
           }
         }
 
-        final List<dynamic> items = res.body.length > 10240
-            ? await compute(_parseJsonListIsolate, res.body)
-            : (jsonDecode(res.body) as List<dynamic>);
+        final List<dynamic> items = await _safeParseJsonList(res.body);
 
         if (items.isEmpty) {
           hasMore = false;
@@ -4817,7 +4885,11 @@ class SupabaseSyncService extends ChangeNotifier {
       } else {
         hasMore = false;
       }
-      await Future.delayed(Duration.zero);
+      if (DbHelper.isBillingActive) {
+        await Future.delayed(const Duration(milliseconds: 50));
+      } else {
+        await Future.delayed(Duration.zero);
+      }
     }
 
     updateCategoryProgress(categoryId, processed: totalSaved, total: totalSaved > 0 ? totalSaved : totalRemote, state: CategorySyncState.completed);
@@ -6101,7 +6173,7 @@ class SupabaseSyncService extends ChangeNotifier {
             break; // Column doesn't exist
           }
 
-          final List<dynamic> rows = jsonDecode(getRes.body);
+          final List<dynamic> rows = await _safeParseJsonList(getRes.body);
           if (rows.isEmpty) {
             return true; // 0 rows left
           }
@@ -7566,7 +7638,66 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authen
 NOTIFY pgrst, 'reload schema';
 ''';
   }
+
+  /// Parses JSON payload off the main UI isolate to eliminate frame drops and keep 60/120 FPS
+  static Future<dynamic> _safeParseJson(String jsonStr) async {
+    if (jsonStr.isEmpty) return null;
+    if (jsonStr.length < 1024) {
+      try {
+        return jsonDecode(jsonStr);
+      } catch (_) {
+        return null;
+      }
+    }
+    try {
+      return await compute(_parseJsonAnyIsolate, jsonStr);
+    } catch (_) {
+      try {
+        return jsonDecode(jsonStr);
+      } catch (_) {
+        return null;
+      }
+    }
+  }
+
+  /// Parses JSON array off the main UI isolate to eliminate frame drops during large sync payloads
+  static Future<List<dynamic>> _safeParseJsonList(String jsonStr) async {
+    if (jsonStr.isEmpty) return [];
+    if (jsonStr.length < 1024) {
+      try {
+        final res = jsonDecode(jsonStr);
+        return res is List<dynamic> ? res : [res];
+      } catch (_) {
+        return [];
+      }
+    }
+    try {
+      return await compute(_parseJsonListIsolate, jsonStr);
+    } catch (_) {
+      try {
+        final res = jsonDecode(jsonStr);
+        return res is List<dynamic> ? res : [res];
+      } catch (_) {
+        return [];
+      }
+    }
+  }
 }
 
-List<dynamic> _parseJsonListIsolate(String body) => jsonDecode(body) as List<dynamic>;
+List<dynamic> _parseJsonListIsolate(String body) {
+  try {
+    final res = jsonDecode(body);
+    return res is List<dynamic> ? res : [res];
+  } catch (_) {
+    return [];
+  }
+}
+
+dynamic _parseJsonAnyIsolate(String body) {
+  try {
+    return jsonDecode(body);
+  } catch (_) {
+    return null;
+  }
+}
 

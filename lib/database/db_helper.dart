@@ -261,9 +261,10 @@ class DbHelper {
     } catch (_) {}
 
     await checkAndMigrateColumns(db);
+    await _ensureFtsSearch(db);
+    await ensureStockConvergenceTables(db);
     await _ensurePerformanceIndexes(db);
     await cleanDuplicateLineItems(db);
-    await ensureStockConvergenceTables(db);
     return db;
   }
 
@@ -329,8 +330,115 @@ class DbHelper {
     }
   }
 
+  /// Ensures SQLite FTS5 (Full-Text Search) virtual table and triggers exist for instant sub-5ms search
+  Future<void> _ensureFtsSearch(Database db) async {
+    try {
+      await ensureColumnExists(db, 'product_master', 'sku', 'TEXT');
+
+      // Check if product_search_fts exists and has the required schema including sku
+      bool needsRecreate = false;
+      try {
+        final tableInfo = await db.rawQuery('PRAGMA table_info(product_search_fts)');
+        if (tableInfo.isEmpty) {
+          needsRecreate = true;
+        } else {
+          final colNames = tableInfo.map((c) => c['name']?.toString()).toSet();
+          if (!colNames.contains('sku')) {
+            needsRecreate = true;
+          }
+        }
+      } catch (_) {
+        needsRecreate = true;
+      }
+
+      if (needsRecreate) {
+        await db.execute('DROP TABLE IF EXISTS product_search_fts;');
+        await db.execute('''
+          CREATE VIRTUAL TABLE product_search_fts USING fts5(
+            id UNINDEXED,
+            name,
+            generic_name,
+            barcode,
+            sku,
+            hsn_code,
+            rack_id,
+            tokenize='unicode61 remove_diacritics 1'
+          );
+        ''');
+      }
+
+      await db.execute('DROP TRIGGER IF EXISTS ai_product_master_fts;');
+      await db.execute('DROP TRIGGER IF EXISTS au_product_master_fts;');
+      await db.execute('DROP TRIGGER IF EXISTS ad_product_master_fts;');
+
+      await db.execute('''
+        CREATE TRIGGER IF NOT EXISTS ai_product_master_fts AFTER INSERT ON product_master BEGIN
+          INSERT INTO product_search_fts(id, name, generic_name, barcode, sku, hsn_code, rack_id)
+          VALUES (new.id, new.name, IFNULL(new.generic_name, ''), IFNULL(new.barcode, ''), IFNULL(new.sku, new.id), IFNULL(new.hsn_code, ''), IFNULL(new.rack_id, ''));
+        END;
+      ''');
+
+      await db.execute('''
+        CREATE TRIGGER IF NOT EXISTS au_product_master_fts AFTER UPDATE OF name, generic_name, barcode, sku, hsn_code, rack_id ON product_master BEGIN
+          DELETE FROM product_search_fts WHERE id = old.id;
+          INSERT INTO product_search_fts(id, name, generic_name, barcode, sku, hsn_code, rack_id)
+          VALUES (new.id, new.name, IFNULL(new.generic_name, ''), IFNULL(new.barcode, ''), IFNULL(new.sku, new.id), IFNULL(new.hsn_code, ''), IFNULL(new.rack_id, ''));
+        END;
+      ''');
+
+      await db.execute('''
+        CREATE TRIGGER IF NOT EXISTS ad_product_master_fts AFTER DELETE ON product_master BEGIN
+          DELETE FROM product_search_fts WHERE id = old.id;
+        END;
+      ''');
+
+      // Populate FTS table if empty or if records were missing
+      final ftsCount = Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM product_search_fts')) ?? 0;
+      final masterCount = Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM product_master')) ?? 0;
+      if (ftsCount < masterCount || needsRecreate) {
+        await db.execute('''
+          INSERT INTO product_search_fts(id, name, generic_name, barcode, sku, hsn_code, rack_id)
+          SELECT id, name, IFNULL(generic_name, ''), IFNULL(barcode, ''), IFNULL(sku, id), IFNULL(hsn_code, ''), IFNULL(rack_id, '')
+          FROM product_master
+          WHERE id NOT IN (SELECT id FROM product_search_fts);
+        ''');
+        debugPrint("DbHelper: Synchronized product_search_fts table with $masterCount records.");
+      }
+    } catch (ftsError) {
+      debugPrint("DbHelper FTS5 Initialization Note: $ftsError");
+    }
+  }
+
   Future<void> _ensurePerformanceIndexes(Database db) async {
     try {
+      // Ensure columns exist for composite performance indexes
+      await ensureColumnExists(db, 'stock_batches', 'branch_id', "TEXT DEFAULT 'MAIN_STORE'");
+      await ensureColumnExists(db, 'stock_batches', 'current_quantity', "INTEGER DEFAULT 0");
+      try {
+        await db.execute("UPDATE stock_batches SET current_quantity = current_stock WHERE (current_quantity = 0 OR current_quantity IS NULL) AND current_stock != 0;");
+      } catch (_) {}
+
+      await ensureColumnExists(db, 'sales_invoices', 'branch_id', "TEXT DEFAULT 'MAIN_STORE'");
+      await ensureColumnExists(db, 'sales_invoices', 'invoice_date', "TEXT");
+      try {
+        await db.execute("UPDATE sales_invoices SET invoice_date = date WHERE (invoice_date IS NULL OR invoice_date = '') AND date IS NOT NULL;");
+      } catch (_) {}
+
+      await ensureColumnExists(db, 'stock_ledger', 'branch_id', "TEXT DEFAULT 'MAIN_STORE'");
+      await ensureColumnExists(db, 'stock_ledger', 'batch_number', "TEXT");
+      await ensureColumnExists(db, 'stock_ledger', 'created_at', "TEXT");
+      try {
+        await db.execute("UPDATE stock_ledger SET created_at = timestamp WHERE (created_at IS NULL OR created_at = '') AND timestamp IS NOT NULL;");
+      } catch (_) {}
+
+      // Composite indexes on high-traffic tables
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_stock_batches_branch_product ON stock_batches(branch_id, product_id, current_quantity);');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_sales_branch_date ON sales_invoices(branch_id, invoice_date DESC);');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_ledger_branch_batch ON stock_ledger(branch_id, batch_number, created_at DESC);');
+      try {
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_outbox_status_retries ON stock_outbox(status, retry_count, created_at ASC);');
+      } catch (_) {}
+
       // Enforce composite uniqueness to prevent cross-terminal duplicate entry insertions
       await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_sales_inv_fy_entry ON sales_invoices(financial_year, entry_no);');
       await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_pur_entries_fy_entry ON purchase_entries(financial_year, entry_no);');
@@ -618,58 +726,7 @@ class DbHelper {
       await db.execute('CREATE INDEX IF NOT EXISTS idx_park_key ON parked_sales(park_key);');
 
       // FTS5 Virtual Table for Instant Local Medicine Search (< 1ms)
-      try {
-        await db.execute('''
-          CREATE VIRTUAL TABLE IF NOT EXISTS product_search_fts USING fts5(
-            id UNINDEXED,
-            name,
-            generic_name,
-            barcode,
-            hsn_code,
-            rack_id,
-            tokenize='unicode61 remove_diacritics 1'
-          );
-        ''');
-
-        await db.execute('DROP TRIGGER IF EXISTS ai_product_master_fts;');
-        await db.execute('DROP TRIGGER IF EXISTS au_product_master_fts;');
-        await db.execute('DROP TRIGGER IF EXISTS ad_product_master_fts;');
-
-        await db.execute('''
-          CREATE TRIGGER IF NOT EXISTS ai_product_master_fts AFTER INSERT ON product_master BEGIN
-            INSERT INTO product_search_fts(id, name, generic_name, barcode, hsn_code, rack_id)
-            VALUES (new.id, new.name, IFNULL(new.generic_name, ''), IFNULL(new.barcode, ''), IFNULL(new.hsn_code, ''), IFNULL(new.rack_id, ''));
-          END;
-        ''');
-
-        await db.execute('''
-          CREATE TRIGGER IF NOT EXISTS au_product_master_fts AFTER UPDATE OF name, generic_name, barcode, hsn_code, rack_id ON product_master BEGIN
-            DELETE FROM product_search_fts WHERE id = old.id;
-            INSERT INTO product_search_fts(id, name, generic_name, barcode, hsn_code, rack_id)
-            VALUES (new.id, new.name, IFNULL(new.generic_name, ''), IFNULL(new.barcode, ''), IFNULL(new.hsn_code, ''), IFNULL(new.rack_id, ''));
-          END;
-        ''');
-
-        await db.execute('''
-          CREATE TRIGGER IF NOT EXISTS ad_product_master_fts AFTER DELETE ON product_master BEGIN
-            DELETE FROM product_search_fts WHERE id = old.id;
-          END;
-        ''');
-
-        // Populate FTS table if empty but product_master has records
-        final ftsCount = Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM product_search_fts')) ?? 0;
-        final masterCount = Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM product_master')) ?? 0;
-        if (ftsCount == 0 && masterCount > 0) {
-          await db.execute('''
-            INSERT INTO product_search_fts(id, name, generic_name, barcode, hsn_code, rack_id)
-            SELECT id, name, IFNULL(generic_name, ''), IFNULL(barcode, ''), IFNULL(hsn_code, ''), IFNULL(rack_id, '')
-            FROM product_master;
-          ''');
-          debugPrint("DbHelper: Populated product_search_fts table with $masterCount records.");
-        }
-      } catch (ftsError) {
-        debugPrint("DbHelper FTS5 Initialization Note: $ftsError");
-      }
+      await _ensureFtsSearch(db);
 
       // Create new Ledger Engine tables
       await db.execute('''
@@ -2637,6 +2694,7 @@ class DbHelper {
       ''');
       await db.execute('CREATE INDEX IF NOT EXISTS idx_stock_outbox_status ON stock_outbox(status, created_at);');
       await db.execute('CREATE INDEX IF NOT EXISTS idx_stock_outbox_ref ON stock_outbox(operation_type, reference_no);');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_outbox_status_retries ON stock_outbox(status, retry_count, created_at ASC);');
 
       // 2. Processed Sync Events Table (for idempotent event handling across Realtime, LAN, Delta Sync)
       await db.execute('''
@@ -2648,9 +2706,37 @@ class DbHelper {
       ''');
       await db.execute('CREATE INDEX IF NOT EXISTS idx_proc_sync_events_time ON processed_sync_events(processed_at);');
 
-      // 3. Stock Ledger Columns
+      // 3. Stock Ledger Table & Columns
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS stock_ledger (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          timestamp TEXT,
+          created_at TEXT,
+          batch_id TEXT,
+          product_id TEXT,
+          voucher_type TEXT,
+          voucher_no TEXT,
+          qty_in INTEGER DEFAULT 0,
+          qty_out INTEGER DEFAULT 0,
+          quantity_delta INTEGER DEFAULT 0,
+          closing_balance INTEGER DEFAULT 0,
+          purchase_rate REAL DEFAULT 0.0,
+          mrp REAL DEFAULT 0.0,
+          supplier_name TEXT,
+          remarks TEXT,
+          user_id TEXT,
+          financial_year TEXT,
+          branch_id TEXT DEFAULT 'MAIN_STORE',
+          terminal_id TEXT DEFAULT 'POS-01',
+          idempotency_key TEXT
+        )
+      ''');
+
       final ledgerCols = await db.rawQuery('PRAGMA table_info(stock_ledger)');
       final colNames = ledgerCols.map((c) => c['name']?.toString()).toSet();
+      if (!colNames.contains('batch_number')) {
+        await db.execute('ALTER TABLE stock_ledger ADD COLUMN batch_number TEXT');
+      }
       if (!colNames.contains('idempotency_key')) {
         await db.execute('ALTER TABLE stock_ledger ADD COLUMN idempotency_key TEXT');
       }
@@ -2666,8 +2752,15 @@ class DbHelper {
       if (!colNames.contains('closing_balance')) {
         await db.execute('ALTER TABLE stock_ledger ADD COLUMN closing_balance INTEGER DEFAULT 0');
       }
+      if (!colNames.contains('created_at')) {
+        await db.execute('ALTER TABLE stock_ledger ADD COLUMN created_at TEXT');
+      }
+      try {
+        await db.execute("UPDATE stock_ledger SET created_at = timestamp WHERE (created_at IS NULL OR created_at = '') AND timestamp IS NOT NULL;");
+      } catch (_) {}
       await db.execute('CREATE INDEX IF NOT EXISTS idx_sl_idemp ON stock_ledger(idempotency_key);');
       await db.execute('CREATE INDEX IF NOT EXISTS idx_sl_branch ON stock_ledger(branch_id, product_id);');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_ledger_branch_batch ON stock_ledger(branch_id, batch_number, created_at DESC);');
     } catch (e) {
       debugPrint("ensureStockConvergenceTables error: $e");
     }
@@ -2692,7 +2785,7 @@ class DbHelper {
   }
 
   /// Marks a sync/LAN event as processed in SQLite
-  Future<void> markEventProcessed(String eventId, String source, [DatabaseExecutor? executor]) async {
+  Future<void> markEventProcessed(String eventId, [String source = 'LAN', DatabaseExecutor? executor]) async {
     final clean = eventId.trim();
     if (clean.isEmpty) return;
     final db = executor ?? await database;
@@ -2714,8 +2807,10 @@ class DbHelper {
     DatabaseExecutor txn, {
     required String batchNumber,
     required String productId,
-    required String voucherType,
-    required String voucherNo,
+    String? voucherType,
+    String? entryType,
+    String? voucherNo,
+    String? referenceNo,
     required int quantityDelta,
     int qtyIn = 0,
     int qtyOut = 0,
@@ -2730,12 +2825,15 @@ class DbHelper {
     String? idempotencyKey,
   }) async {
     final config = ServerConfigService.instance;
+    final vType = voucherType ?? entryType ?? 'STOCK_MOVE';
+    final vNo = voucherNo ?? referenceNo ?? '';
     await txn.insert('stock_ledger', {
       'timestamp': DateTime.now().toIso8601String(),
       'batch_id': batchNumber,
+      'batch_number': batchNumber,
       'product_id': productId,
-      'voucher_type': voucherType,
-      'voucher_no': voucherNo,
+      'voucher_type': vType,
+      'voucher_no': vNo,
       'qty_in': qtyIn > 0 ? qtyIn : (quantityDelta > 0 ? quantityDelta : 0),
       'qty_out': qtyOut > 0 ? qtyOut : (quantityDelta < 0 ? quantityDelta.abs() : 0),
       'quantity_delta': quantityDelta,

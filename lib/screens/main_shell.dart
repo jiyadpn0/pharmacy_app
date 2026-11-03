@@ -31,6 +31,7 @@ import '../widgets/notification_panel_dialog.dart';
 import '../widgets/watchdog_panel_dialog.dart';
 import '../widgets/pin_unlock_dialog.dart';
 import 'server_settings_screen.dart';
+import '../services/stock_outbox_service.dart';
 import '../utils/unsaved_handler.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -277,15 +278,12 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
                 await SupabaseRealtimeService.instance.initialize();
                 SupabaseRealtimeService.instance.startAllRealtimeListeners(
                   onTableEvent: (String tableName, String eventType, List<Map<String, dynamic>> rows) {
-                    if (mounted && !ServerConfigService.instance.isWiping) {
+                    if (mounted && !ServerConfigService.instance.isWiping && rows.isNotEmpty) {
                       Future.microtask(() async {
                         if (!mounted) return;
-                        for (final row in rows) {
-                          final eventId = row['event_id']?.toString() ?? row['entry_no']?.toString() ?? row['invoice_no']?.toString() ?? '';
-                          LanSyncService.instance.handleIncomingEvent(eventId, () async {
-                            await pharmacy.applyRemoteRealtimeUpdate(tableName, eventType, [row]);
-                          });
-                        }
+                        LanSyncService.instance.handleIncomingEventsBatch(rows, (validRows) async {
+                          await pharmacy.applyRemoteRealtimeUpdate(tableName, eventType, validRows);
+                        });
                       });
                     }
                   },
@@ -560,6 +558,8 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
                   _buildMenuBar(context, app),
                   _buildWindowDock(context, app),
                   _buildOfflineBanner(),
+                  _buildDuplicateTerminalBanner(),
+                  _buildRejectedOutboxBanner(),
                 ],
               ),
             ),
@@ -1695,6 +1695,115 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
                   minimumSize: Size.zero,
                 ),
                 child: const Text("RETRY CONNECTION", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildDuplicateTerminalBanner() {
+    return ListenableBuilder(
+      listenable: ServerConfigService.instance,
+      builder: (context, _) {
+        final config = ServerConfigService.instance;
+        final warning = config.duplicateTerminalWarning;
+        if (warning == null || warning.isEmpty) {
+          return const SizedBox.shrink();
+        }
+
+        return Container(
+          width: double.infinity,
+          color: Colors.red.shade900,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.error_outline_rounded, color: Colors.amberAccent, size: 18),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  warning,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 12,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+              ),
+              const SizedBox(width: 12),
+              ElevatedButton.icon(
+                icon: const Icon(Icons.settings, size: 14),
+                label: const Text("CONFIGURE TERMINAL", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.amberAccent,
+                  foregroundColor: Colors.black,
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  minimumSize: Size.zero,
+                ),
+                onPressed: () {
+                  showDialog(
+                    context: context,
+                    builder: (ctx) => const Dialog(
+                      child: SizedBox(
+                        width: 900,
+                        height: 650,
+                        child: ServerSettingsScreen(),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildRejectedOutboxBanner() {
+    return ListenableBuilder(
+      listenable: StockOutboxService.instance.rejectedCount,
+      builder: (context, _) {
+        final count = StockOutboxService.instance.rejectedCount.value;
+        if (count <= 0) return const SizedBox.shrink();
+
+        return Container(
+          width: double.infinity,
+          color: Colors.deepOrange.shade900,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 5),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 16),
+              const SizedBox(width: 8),
+              Text(
+                "CRITICAL: $count stock operation(s) were REJECTED by Cloud Server (insufficient stock / race condition).",
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 11,
+                ),
+              ),
+              const SizedBox(width: 12),
+              TextButton(
+                onPressed: () async {
+                  await StockOutboxService.instance.reconcileLocalStockFromCloud();
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Triggered local inventory reconciliation from cloud.')),
+                    );
+                  }
+                },
+                style: TextButton.styleFrom(
+                  backgroundColor: Colors.white24,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                  minimumSize: Size.zero,
+                ),
+                child: const Text("RECONCILE STOCK", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
               ),
             ],
           ),

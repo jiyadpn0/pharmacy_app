@@ -29,6 +29,7 @@ import '../services/server_config_service.dart';
 import '../services/lan_sync_service.dart';
 import '../services/sync_event_bus.dart';
 import '../services/invoice_recovery_service.dart';
+import '../services/stock_outbox_service.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 typedef Transaction = sql.Transaction;
@@ -8964,6 +8965,25 @@ class PharmacyProvider extends ChangeNotifier {
                 throw "Stock race condition on RowID $rowid during sale allocation.";
               }
 
+              // Audit Stock Ledger entry
+              final saleIdempKey = StockOutboxService.generateIdempotencyKey(
+                branchId: ServerConfigService.instance.storeBranchId,
+                terminalId: ServerConfigService.instance.terminalId,
+                operationType: 'SALE',
+                referenceNo: finalEntryNo,
+              );
+              await DbHelper.instance.recordStockLedgerEntryInTxn(
+                txn,
+                entryType: 'SALE',
+                referenceNo: finalEntryNo,
+                productId: item.product.id,
+                batchNumber: item.product.batch.trim(),
+                quantityDelta: -deductFromThisRow,
+                branchId: ServerConfigService.instance.storeBranchId,
+                terminalId: ServerConfigService.instance.terminalId,
+                idempotencyKey: saleIdempKey,
+              );
+
               remainingQtyToDeduct -= deductFromThisRow;
             }
 
@@ -9173,6 +9193,23 @@ class PharmacyProvider extends ChangeNotifier {
             'is_deleted': sale.isDeleted ? 1 : 0,
             'terminal_id': ServerConfigService.instance.terminalId,
           };
+
+          // Queue in durable outbox for atomic server-side processing
+          final saleIdempKey = StockOutboxService.generateIdempotencyKey(
+            branchId: ServerConfigService.instance.storeBranchId,
+            terminalId: ServerConfigService.instance.terminalId,
+            operationType: 'SALE',
+            referenceNo: finalEntryNo,
+          );
+          await StockOutboxService.instance.queueOperation(
+            operationType: 'SALE',
+            referenceNo: finalEntryNo,
+            payload: {
+              'header': saleMap,
+              'items': itemsPayload,
+            },
+            idempotencyKey: saleIdempKey,
+          );
 
           await SupabaseSyncService.instance.pushSalesInvoice(saleMap, itemsPayload);
         } catch (e) {
@@ -9405,6 +9442,24 @@ class PharmacyProvider extends ChangeNotifier {
             });
 
             await txn.rawUpdate('UPDATE product_master SET purchase_rate = ?, mrp = ?, sale_rate = ?, packing = ?, hsn_code = ? WHERE id = ?', [item.pRate, item.mrp, item.sRate, item.packin, item.hsnCode, productId]);
+
+            // Audit Stock Ledger entry for purchase
+            await DbHelper.instance.recordStockLedgerEntryInTxn(
+              txn,
+              entryType: 'PURCHASE',
+              referenceNo: finalEntryNo,
+              productId: productId,
+              batchNumber: item.batch.trim(),
+              quantityDelta: looseQty,
+              branchId: ServerConfigService.instance.storeBranchId,
+              terminalId: ServerConfigService.instance.terminalId,
+              idempotencyKey: StockOutboxService.generateIdempotencyKey(
+                branchId: ServerConfigService.instance.storeBranchId,
+                terminalId: ServerConfigService.instance.terminalId,
+                operationType: 'PURCHASE',
+                referenceNo: finalEntryNo,
+              ),
+            );
           }
           
           // 1. DO NOT DELETE ZERO STOCK ROWS! (Commented out or removed)
@@ -9575,6 +9630,23 @@ class PharmacyProvider extends ChangeNotifier {
             's_rate': it.sRate,
             'l_cost': it.lCost,
           }).toList();
+
+          final purIdempKey = StockOutboxService.generateIdempotencyKey(
+            branchId: ServerConfigService.instance.storeBranchId,
+            terminalId: ServerConfigService.instance.terminalId,
+            operationType: 'PURCHASE',
+            referenceNo: finalEntryNo,
+          );
+
+          await StockOutboxService.instance.queueOperation(
+            operationType: 'PURCHASE',
+            referenceNo: finalEntryNo,
+            payload: {
+              'header': headerMap,
+              'items': itemsMap,
+            },
+            idempotencyKey: purIdempKey,
+          );
 
           final ok = await SupabaseSyncService.instance.savePurchaseEntryAtomicRPC(
             purchaseHeader: headerMap,
@@ -9834,6 +9906,24 @@ class PharmacyProvider extends ChangeNotifier {
               }
             }
 
+            // Audit Stock Ledger entry for adjustment
+            await DbHelper.instance.recordStockLedgerEntryInTxn(
+              txn,
+              entryType: 'ADJUSTMENT',
+              referenceNo: finalEntryNo,
+              productId: item.product.id,
+              batchNumber: item.product.batch,
+              quantityDelta: item.qty,
+              branchId: ServerConfigService.instance.storeBranchId,
+              terminalId: ServerConfigService.instance.terminalId,
+              idempotencyKey: StockOutboxService.generateIdempotencyKey(
+                branchId: ServerConfigService.instance.storeBranchId,
+                terminalId: ServerConfigService.instance.terminalId,
+                operationType: 'ADJUSTMENT',
+                referenceNo: finalEntryNo,
+              ),
+            );
+
             final pIndex = _products.indexWhere((p) => p.id == item.product.id && p.batch == item.product.batch);
             if (pIndex != -1) _products[pIndex].stock += item.qty;
 
@@ -9862,6 +9952,40 @@ class PharmacyProvider extends ChangeNotifier {
       }
 
       await syncInventoryFromDb();
+
+      // Queue in durable outbox for server-side atomic stock adjustment
+      final adjIdempKey = StockOutboxService.generateIdempotencyKey(
+        branchId: ServerConfigService.instance.storeBranchId,
+        terminalId: ServerConfigService.instance.terminalId,
+        operationType: 'ADJUSTMENT',
+        referenceNo: finalEntryNo,
+      );
+      unawaited(StockOutboxService.instance.queueOperation(
+        operationType: 'ADJUSTMENT',
+        referenceNo: finalEntryNo,
+        payload: {
+          'header': {
+            'entry_no': finalEntryNo,
+            'date': adj.date.toIso8601String(),
+            'done_by': adj.doneBy,
+            'reason': adj.reason,
+            'grand_total': adj.grandTotal,
+            'financial_year': fy,
+            'branch_id': ServerConfigService.instance.storeBranchId,
+            'terminal_id': ServerConfigService.instance.terminalId,
+          },
+          'items': adj.items.map((it) => {
+            'adjustment_no': finalEntryNo,
+            'product_id': it.product.id,
+            'batch_number': it.product.batch,
+            'qty': it.qty,
+            'purchase_rate': it.purchaseRate,
+            'total': it.total,
+          }).toList(),
+        },
+        idempotencyKey: adjIdempKey,
+      ));
+
       return finalEntryNo;
     } catch (e) {
       debugPrint("Save Stock Adjustment Error: $e");
@@ -10000,6 +10124,24 @@ class PharmacyProvider extends ChangeNotifier {
             throw "STOCK RACE CONDITION!\n\nSomeone else just sold or moved the units of '${writeOff.product.name}' (Batch: ${writeOff.product.batch}) at the same time.\n\nTransaction aborted.";
           }
 
+          // Audit Stock Ledger entry for write-off
+          await DbHelper.instance.recordStockLedgerEntryInTxn(
+            txn,
+            entryType: 'WRITE_OFF',
+            referenceNo: writeOff.id,
+            productId: writeOff.product.id,
+            batchNumber: writeOff.product.batch,
+            quantityDelta: -writeOff.quantity,
+            branchId: ServerConfigService.instance.storeBranchId,
+            terminalId: ServerConfigService.instance.terminalId,
+            idempotencyKey: StockOutboxService.generateIdempotencyKey(
+              branchId: ServerConfigService.instance.storeBranchId,
+              terminalId: ServerConfigService.instance.terminalId,
+              operationType: 'WRITE_OFF',
+              referenceNo: writeOff.id,
+            ),
+          );
+
           // 4. SYNC IN-MEMORY STATE
           final pIndex = _products.indexWhere((p) => p.id == writeOff.product.id && p.batch == writeOff.product.batch);
           if (pIndex != -1) _products[pIndex].stock -= writeOff.quantity;
@@ -10010,6 +10152,31 @@ class PharmacyProvider extends ChangeNotifier {
 
         _writeOffs.add(writeOff);
         await syncInventoryFromDb();
+
+        // Queue in durable outbox for server-side atomic write-off
+        final woIdempKey = StockOutboxService.generateIdempotencyKey(
+          branchId: ServerConfigService.instance.storeBranchId,
+          terminalId: ServerConfigService.instance.terminalId,
+          operationType: 'WRITE_OFF',
+          referenceNo: writeOff.id,
+        );
+        unawaited(StockOutboxService.instance.queueOperation(
+          operationType: 'WRITE_OFF',
+          referenceNo: writeOff.id,
+          payload: {
+            'id': writeOff.id,
+            'date': writeOff.date.toIso8601String(),
+            'product_id': writeOff.product.id,
+            'batch_number': writeOff.product.batch,
+            'quantity': writeOff.quantity,
+            'reason': writeOff.reason,
+            'loss_value': writeOff.lossValue,
+            'financial_year': fy,
+            'branch_id': ServerConfigService.instance.storeBranchId,
+            'terminal_id': ServerConfigService.instance.terminalId,
+          },
+          idempotencyKey: woIdempKey,
+        ));
       } catch (e) {
         debugPrint("Save Write-Off Error: $e");
         rethrow; // Throws back to UI to trigger the SnackBar error
@@ -10117,6 +10284,23 @@ class PharmacyProvider extends ChangeNotifier {
               purchaseRate: (item['purchase_rate'] as num?)?.toDouble() ?? 0.0,
               expiryDate: item['expiry_date']?.toString() ?? '',
             );
+
+            await DbHelper.instance.recordStockLedgerEntryInTxn(
+              txn,
+              entryType: 'VOID_SALE',
+              referenceNo: entryNo,
+              productId: pId,
+              batchNumber: batch,
+              quantityDelta: totalUnits,
+              branchId: ServerConfigService.instance.storeBranchId,
+              terminalId: ServerConfigService.instance.terminalId,
+              idempotencyKey: StockOutboxService.generateIdempotencyKey(
+                branchId: ServerConfigService.instance.storeBranchId,
+                terminalId: ServerConfigService.instance.terminalId,
+                operationType: 'VOID_SALE',
+                referenceNo: entryNo,
+              ),
+            );
           }
         }
 
@@ -10146,6 +10330,17 @@ class PharmacyProvider extends ChangeNotifier {
       try {
         LanSyncService.instance.broadcastEvent('SALE_DELETED', {'entry_no': entryNo});
       } catch (_) {}
+
+      // Queue void sale to durable outbox
+      unawaited(StockOutboxService.instance.queueOperation(
+        operationType: 'VOID_SALE',
+        referenceNo: entryNo,
+        payload: {
+          'entry_no': entryNo,
+          'branch_id': ServerConfigService.instance.storeBranchId,
+          'terminal_id': ServerConfigService.instance.terminalId,
+        },
+      ));
     } catch (e) {
       debugPrint("Delete Sale Error: $e");
       rethrow;
@@ -10277,6 +10472,24 @@ class PharmacyProvider extends ChangeNotifier {
               throw "STOCK RACE CONDITION!\n\nUnits of '${item['product_name']}' (Batch: $batch) were just sold or moved.\n\nTransaction aborted.";
             }
 
+            // Audit Stock Ledger entry for purchase void
+            await DbHelper.instance.recordStockLedgerEntryInTxn(
+              txn,
+              entryType: 'VOID_PURCHASE',
+              referenceNo: entryNo,
+              productId: productId,
+              batchNumber: batch,
+              quantityDelta: -totalQty,
+              branchId: ServerConfigService.instance.storeBranchId,
+              terminalId: ServerConfigService.instance.terminalId,
+              idempotencyKey: StockOutboxService.generateIdempotencyKey(
+                branchId: ServerConfigService.instance.storeBranchId,
+                terminalId: ServerConfigService.instance.terminalId,
+                operationType: 'VOID_PURCHASE',
+                referenceNo: entryNo,
+              ),
+            );
+
             await txn.rawDelete(
               'DELETE FROM stock_batches WHERE product_id = ? AND batch_number = ? AND current_stock = 0', 
               [productId, batch]
@@ -10312,6 +10525,17 @@ class PharmacyProvider extends ChangeNotifier {
       try {
         LanSyncService.instance.broadcastEvent('PURCHASE_DELETED', {'entry_no': entryNo});
       } catch (_) {}
+
+      // Queue void purchase to durable outbox
+      unawaited(StockOutboxService.instance.queueOperation(
+        operationType: 'VOID_PURCHASE',
+        referenceNo: entryNo,
+        payload: {
+          'entry_no': entryNo,
+          'branch_id': ServerConfigService.instance.storeBranchId,
+          'terminal_id': ServerConfigService.instance.terminalId,
+        },
+      ));
     } catch (e) { 
       debugPrint("Delete Purchase Error: $e"); 
       rethrow;
@@ -10925,6 +11149,25 @@ class PharmacyProvider extends ChangeNotifier {
               purchaseRate: item.purchaseRate,
               expiryDate: item.product.expiry,
             );
+
+            // Audit Stock Ledger entry for sales return
+            final sretQty = item.qty + item.fQty;
+            await DbHelper.instance.recordStockLedgerEntryInTxn(
+              txn,
+              entryType: 'SALES_RETURN',
+              referenceNo: finalEntryNo,
+              productId: pId,
+              batchNumber: item.product.batch,
+              quantityDelta: sretQty,
+              branchId: ServerConfigService.instance.storeBranchId,
+              terminalId: ServerConfigService.instance.terminalId,
+              idempotencyKey: StockOutboxService.generateIdempotencyKey(
+                branchId: ServerConfigService.instance.storeBranchId,
+                terminalId: ServerConfigService.instance.terminalId,
+                operationType: 'SALES_RETURN',
+                referenceNo: finalEntryNo,
+              ),
+            );
           }
         });
 
@@ -11029,6 +11272,55 @@ class PharmacyProvider extends ChangeNotifier {
 
       await syncInventoryFromDb();
       invalidateNavCache('sales_return_invoices');
+
+      // Queue in durable outbox for server-side atomic stock addition
+      final sretIdempKey = StockOutboxService.generateIdempotencyKey(
+        branchId: ServerConfigService.instance.storeBranchId,
+        terminalId: ServerConfigService.instance.terminalId,
+        operationType: 'SALES_RETURN',
+        referenceNo: finalEntryNo,
+      );
+      unawaited(StockOutboxService.instance.queueOperation(
+        operationType: 'SALES_RETURN',
+        referenceNo: finalEntryNo,
+        payload: {
+          'header': {
+            'entry_no': finalEntryNo,
+            'date': ret.date.toIso8601String(),
+            'customer_acc': ret.customerAcc,
+            'patient': ret.patient,
+            'doctor': ret.doctor,
+            'original_invoice_no': ret.originalInvoiceNo,
+            'sub_total': ret.subTotal,
+            'discount': ret.discount,
+            'round_off': ret.roundOff,
+            'grand_total': ret.grandTotal,
+            'narration': ret.narration,
+            'gst_mode': ret.gstMode,
+            'financial_year': fy,
+            'branch_id': ServerConfigService.instance.storeBranchId,
+            'terminal_id': ServerConfigService.instance.terminalId,
+          },
+          'items': ret.items.map((it) => {
+            'return_no': finalEntryNo,
+            'product_id': it.product.id,
+            'product_name': it.product.name,
+            'batch_number': it.product.batch,
+            'expiry_date': it.product.expiry,
+            'quantity': it.qty + it.fQty,
+            'mrp': it.product.mrp,
+            'sale_rate': it.product.salePrice,
+            'disc_percent': it.discPercent,
+            'disc_amt': it.discAmt,
+            'total': it.total,
+            'purchase_rate': it.purchaseRate,
+            'packing': it.packin,
+            'gst_percent': it.gstPercent,
+          }).toList(),
+        },
+        idempotencyKey: sretIdempKey,
+      ));
+
       return finalEntryNo;
     } catch (e) {
       debugPrint("Save Sale Return Error: $e");
@@ -11240,6 +11532,24 @@ class PharmacyProvider extends ChangeNotifier {
               throw "STOCK LOCK TRIGGERED!\n\nCannot return $requestedLooseQty units of '${item.productName}'. Insufficient shelf stock available.";
             }
 
+            // Audit Stock Ledger entry for purchase return
+            await DbHelper.instance.recordStockLedgerEntryInTxn(
+              txn,
+              entryType: 'PURCHASE_RETURN',
+              referenceNo: finalEntryNo,
+              productId: productId,
+              batchNumber: item.batch,
+              quantityDelta: -requestedLooseQty,
+              branchId: ServerConfigService.instance.storeBranchId,
+              terminalId: ServerConfigService.instance.terminalId,
+              idempotencyKey: StockOutboxService.generateIdempotencyKey(
+                branchId: ServerConfigService.instance.storeBranchId,
+                terminalId: ServerConfigService.instance.terminalId,
+                operationType: 'PURCHASE_RETURN',
+                referenceNo: finalEntryNo,
+              ),
+            );
+
             final pIndex = _products.indexWhere((p) => p.id == productId && p.batch == item.batch);
             if (pIndex != -1) _products[pIndex].stock -= requestedLooseQty;
             final mIndex = _productMaster.indexWhere((p) => p.id == productId);
@@ -11284,6 +11594,54 @@ class PharmacyProvider extends ChangeNotifier {
       if (_purchaseReturns.length > 50) _purchaseReturns.removeLast();
 
       await syncInventoryFromDb();
+
+      // Queue in durable outbox for server-side atomic stock deduction
+      final pretIdempKey = StockOutboxService.generateIdempotencyKey(
+        branchId: ServerConfigService.instance.storeBranchId,
+        terminalId: ServerConfigService.instance.terminalId,
+        operationType: 'PURCHASE_RETURN',
+        referenceNo: finalEntryNo,
+      );
+      unawaited(StockOutboxService.instance.queueOperation(
+        operationType: 'PURCHASE_RETURN',
+        referenceNo: finalEntryNo,
+        payload: {
+          'header': {
+            'entry_no': finalEntryNo,
+            'date': ret.date.toIso8601String(),
+            'supplier_name': ret.supplierName,
+            'original_purchase_no': ret.originalPurchaseNo,
+            'done_by': ret.doneBy,
+            'gst_mode': ret.gstMode,
+            'grand_total': ret.grandTotal,
+            'financial_year': fy,
+            'branch_id': ServerConfigService.instance.storeBranchId,
+            'terminal_id': ServerConfigService.instance.terminalId,
+          },
+          'items': ret.items.map((it) => {
+            'entry_no': finalEntryNo,
+            'product_name': it.productName,
+            'batch': it.batch,
+            'expiry': it.expiry,
+            'qty': it.qty,
+            'loose_qty': it.looseQty,
+            'f_qty': it.fQty,
+            'packin': it.packin,
+            'mrp': it.mrp,
+            'p_rate': it.pRate,
+            's_rate': it.sRate,
+            'disc_percent': it.discPercent,
+            'gst_percent': it.gstPercent,
+            'total': it.total,
+            'reason': it.reason,
+            'supplier': it.supplier,
+            'sup_inv_no': cleanInvoiceNo(it.supInvNo),
+            'hsn_code': it.hsnCode,
+          }).toList(),
+        },
+        idempotencyKey: pretIdempKey,
+      ));
+
       return finalEntryNo;
     } catch (e) {
       debugPrint("Save Purchase Return Error: $e");
@@ -12797,6 +13155,62 @@ class PharmacyProvider extends ChangeNotifier {
 
     try {
       final db = await DbHelper.instance.database;
+
+      // 1. Try blazing fast SQLite FTS5 Full-Text Search (< 1ms)
+      final tokens = cleanQ
+          .replaceAll(RegExp(r'[^\w\s]'), ' ')
+          .trim()
+          .split(RegExp(r'\s+'))
+          .where((w) => w.isNotEmpty)
+          .map((w) => '"$w"*')
+          .join(' ');
+
+      if (tokens.isNotEmpty) {
+        try {
+          final ftsSql = '''
+            SELECT 
+              pm.id, pm.name, pm.generic_name, pm.hsn_code, pm.gst_percent, pm.packing,
+              pm.mrp, pm.purchase_rate, pm.sale_rate, pm.rack_id, pm.category_id,
+              pm.schedule, pm.patent, pm.reorder_level, pm.manufacturer_id,
+              IFNULL(SUM(sb.current_stock), 0) as total_stock
+            FROM product_search_fts fts
+            JOIN product_master pm ON fts.id = pm.id
+            LEFT JOIN stock_batches sb ON pm.id = sb.product_id
+            WHERE product_search_fts MATCH ?
+            ${stockOnly ? 'AND (sb.current_stock > 0 OR sb.current_quantity > 0)' : ''}
+            GROUP BY pm.id
+            ORDER BY 
+              CASE WHEN LOWER(pm.name) LIKE ? THEN 1 ELSE 2 END,
+              total_stock DESC,
+              pm.name ASC
+            LIMIT ?
+          ''';
+          final ftsRows = await db.rawQuery(ftsSql, [tokens, '$cleanQ%', limit]);
+          if (ftsRows.isNotEmpty) {
+            return ftsRows.map((r) => Product(
+              id: r['id'].toString(),
+              name: r['name']?.toString() ?? 'UNKNOWN',
+              genericName: r['generic_name']?.toString() ?? '',
+              hsnCode: r['hsn_code']?.toString() ?? '',
+              gstPercent: (r['gst_percent'] as num?)?.toDouble() ?? 12.0,
+              packSize: (r['packing'] as num?)?.toInt() ?? 1,
+              mrp: (r['mrp'] as num?)?.toDouble() ?? 0.0,
+              purchaseRate: (r['purchase_rate'] as num?)?.toDouble() ?? 0.0,
+              salePrice: (r['sale_rate'] as num?)?.toDouble() ?? 0.0,
+              rack: r['rack_id']?.toString() ?? '',
+              category: r['category_id']?.toString() ?? 'General',
+              schedule: r['schedule']?.toString() ?? '',
+              patent: r['patent']?.toString() ?? '',
+              reorderLevel: (r['reorder_level'] as num?)?.toInt() ?? 10,
+              manufacturer: r['manufacturer_id']?.toString() ?? '',
+              stock: (r['total_stock'] as num?)?.toInt() ?? 0,
+            )).toList();
+          }
+        } catch (ftsErr) {
+          debugPrint("FTS search fallback note: $ftsErr");
+        }
+      }
+
       final String prefixPattern = '$cleanQ%';
       final String containsPattern = '%$cleanQ%';
 
@@ -12809,7 +13223,7 @@ class PharmacyProvider extends ChangeNotifier {
         FROM product_master pm
         LEFT JOIN stock_batches sb ON pm.id = sb.product_id
         WHERE (pm.name LIKE ? ${includeGenerics ? 'OR pm.generic_name LIKE ?' : ''})
-        ${stockOnly ? 'AND sb.current_stock > 0' : ''}
+        ${stockOnly ? 'AND (sb.current_stock > 0 OR sb.current_quantity > 0)' : ''}
         GROUP BY pm.id
         ORDER BY 
           CASE WHEN LOWER(pm.name) LIKE ? THEN 1 ELSE 2 END,
@@ -16910,6 +17324,7 @@ class PharmacyProvider extends ChangeNotifier {
     final db = await DbHelper.instance.database;
     final isDeleteEvent = eventType.toUpperCase() == 'DELETE';
 
+    final List<Map<String, dynamic>> deleteRows = [];
     final List<Map<String, dynamic>> upsertRows = [];
 
     for (final row in rows) {
@@ -16923,56 +17338,7 @@ class PharmacyProvider extends ChangeNotifier {
             final bool isRowSoftDeleted = _i(sanitized['is_deleted']) == 1;
 
             if (isDeleteEvent || isRowSoftDeleted) {
-              // Handle DELETE / Soft-DELETE events
-              if (tableName == 'sales_invoices') {
-                final key = sanitized['entry_no'] ?? sanitized['invoice_no'];
-                if (key != null) {
-                  await db.delete('sales_invoices', where: 'entry_no = ?', whereArgs: [key]);
-                  await db.delete('sales_items', where: 'invoice_no = ?', whereArgs: [key]);
-                }
-              } else if (tableName == 'purchase_entries') {
-                final key = sanitized['entry_no'];
-                if (key != null) {
-                  await db.delete('purchase_entries', where: 'entry_no = ?', whereArgs: [key]);
-                  await db.delete('purchase_items', where: 'entry_no = ?', whereArgs: [key]);
-                }
-              } else if (tableName == 'sales_return_invoices') {
-                final key = sanitized['entry_no'];
-                if (key != null) {
-                  await db.delete('sales_return_invoices', where: 'entry_no = ?', whereArgs: [key]);
-                  await db.delete('sales_return_items', where: 'return_no = ?', whereArgs: [key]);
-                }
-              } else if (tableName == 'purchase_return_entries') {
-                final key = sanitized['entry_no'];
-                if (key != null) {
-                  await db.delete('purchase_return_entries', where: 'entry_no = ?', whereArgs: [key]);
-                  await db.delete('purchase_return_items', where: 'entry_no = ?', whereArgs: [key]);
-                }
-              } else if (tableName == 'sales_items') {
-                final key = sanitized['invoice_no'];
-                final pId = sanitized['product_id'];
-                final bNo = sanitized['batch_number'];
-                if (key != null && pId != null) {
-                  await db.delete('sales_items', where: 'invoice_no = ? AND product_id = ? AND batch_number = ?', whereArgs: [key, pId, bNo]);
-                }
-              } else if (tableName == 'purchase_items') {
-                final key = sanitized['entry_no'];
-                final pId = sanitized['product_id'];
-                final bNo = sanitized['batch_number'];
-                if (key != null && pId != null) {
-                  await db.delete('purchase_items', where: 'entry_no = ? AND product_id = ? AND batch_number = ?', whereArgs: [key, pId, bNo]);
-                }
-              } else if (tableName == 'product_master') {
-                final key = sanitized['id'];
-                if (key != null) {
-                  await db.delete('product_master', where: 'id = ?', whereArgs: [key]);
-                }
-              } else {
-                final pk = sanitized.containsKey('id') ? 'id' : (sanitized.containsKey('entry_no') ? 'entry_no' : '');
-                if (pk.isNotEmpty && sanitized[pk] != null) {
-                  await db.delete(tableName, where: '$pk = ?', whereArgs: [sanitized[pk]]);
-                }
-              }
+              deleteRows.add(sanitized);
             } else {
               upsertRows.add(sanitized);
             }
@@ -16983,10 +17349,65 @@ class PharmacyProvider extends ChangeNotifier {
       }
     }
 
-    if (upsertRows.isNotEmpty) {
+    if (deleteRows.isNotEmpty || upsertRows.isNotEmpty) {
       try {
         await db.transaction((txn) async {
           final batch = txn.batch();
+
+          // 1. Batch deletes
+          for (final sanitized in deleteRows) {
+            if (tableName == 'sales_invoices') {
+              final key = sanitized['entry_no'] ?? sanitized['invoice_no'];
+              if (key != null) {
+                batch.delete('sales_invoices', where: 'entry_no = ?', whereArgs: [key]);
+                batch.delete('sales_items', where: 'invoice_no = ?', whereArgs: [key]);
+              }
+            } else if (tableName == 'purchase_entries') {
+              final key = sanitized['entry_no'];
+              if (key != null) {
+                batch.delete('purchase_entries', where: 'entry_no = ?', whereArgs: [key]);
+                batch.delete('purchase_items', where: 'entry_no = ?', whereArgs: [key]);
+              }
+            } else if (tableName == 'sales_return_invoices') {
+              final key = sanitized['entry_no'];
+              if (key != null) {
+                batch.delete('sales_return_invoices', where: 'entry_no = ?', whereArgs: [key]);
+                batch.delete('sales_return_items', where: 'return_no = ?', whereArgs: [key]);
+              }
+            } else if (tableName == 'purchase_return_entries') {
+              final key = sanitized['entry_no'];
+              if (key != null) {
+                batch.delete('purchase_return_entries', where: 'entry_no = ?', whereArgs: [key]);
+                batch.delete('purchase_return_items', where: 'entry_no = ?', whereArgs: [key]);
+              }
+            } else if (tableName == 'sales_items') {
+              final key = sanitized['invoice_no'];
+              final pId = sanitized['product_id'];
+              final bNo = sanitized['batch_number'];
+              if (key != null && pId != null) {
+                batch.delete('sales_items', where: 'invoice_no = ? AND product_id = ? AND batch_number = ?', whereArgs: [key, pId, bNo]);
+              }
+            } else if (tableName == 'purchase_items') {
+              final key = sanitized['entry_no'];
+              final pId = sanitized['product_id'];
+              final bNo = sanitized['batch_number'];
+              if (key != null && pId != null) {
+                batch.delete('purchase_items', where: 'entry_no = ? AND product_id = ? AND batch_number = ?', whereArgs: [key, pId, bNo]);
+              }
+            } else if (tableName == 'product_master') {
+              final key = sanitized['id'];
+              if (key != null) {
+                batch.delete('product_master', where: 'id = ?', whereArgs: [key]);
+              }
+            } else {
+              final pk = sanitized.containsKey('id') ? 'id' : (sanitized.containsKey('entry_no') ? 'entry_no' : '');
+              if (pk.isNotEmpty && sanitized[pk] != null) {
+                batch.delete(tableName, where: '$pk = ?', whereArgs: [sanitized[pk]]);
+              }
+            }
+          }
+
+          // 2. Batch upserts
           for (final item in upsertRows) {
             if (tableName == 'sales_items') {
               final invNo = item['invoice_no']?.toString() ?? '';
@@ -17012,12 +17433,23 @@ class PharmacyProvider extends ChangeNotifier {
                   whereArgs: [entryNo, cleanEnt, "%_$cleanEnt", pId, bNo],
                 );
               }
+            } else if (tableName == 'stock_batches') {
+              final pId = item['product_id']?.toString() ?? '';
+              final bNo = (item['batch_number'] ?? item['batch'] ?? '').toString().trim();
+              if (pId.isNotEmpty && bNo.isNotEmpty) {
+                batch.delete(
+                  'stock_batches',
+                  where: 'product_id = ? AND IFNULL(TRIM(batch_number), "") = ? COLLATE NOCASE',
+                  whereArgs: [pId, bNo],
+                );
+              }
             }
             batch.insert(tableName, item, conflictAlgorithm: sql.ConflictAlgorithm.replace);
           }
+
           await batch.commit(noResult: true);
         });
-        debugPrint('⏱️ [PERF TIMING] Fast SQLite batch transaction completed for $tableName (${upsertRows.length} rows) in ${sw.elapsedMilliseconds}ms');
+        debugPrint('⏱️ [PERF TIMING] Fast SQLite unified batch transaction completed for $tableName (${deleteRows.length} deletes, ${upsertRows.length} upserts) in ${sw.elapsedMilliseconds}ms');
       } catch (e) {
         debugPrint("Error applying batch remote realtime update to $tableName: $e");
       }
@@ -17038,12 +17470,12 @@ class PharmacyProvider extends ChangeNotifier {
 
   void _debounceRealtimeInventoryRefresh() {
     _realtimeInventoryTimer?.cancel();
-    _realtimeInventoryTimer = Timer(const Duration(milliseconds: 100), () async {
+    _realtimeInventoryTimer = Timer(const Duration(milliseconds: 350), () async {
       await syncInventoryFromDb();
       await _recalculateTodayStatsFromDb();
       notifyListeners();
       SyncEventBus.instance.notifyTableChanged('stock_batches');
-      debugPrint('⏱️ [PERF TIMING] Debounced Realtime Inventory Refresh Completed.');
+      debugPrint('⏱️ [PERF TIMING] Debounced Realtime Inventory Refresh Completed (350ms window).');
     });
   }
 

@@ -13,7 +13,7 @@ import 'supabase_sync_service.dart';
 class UpdateCheckerService {
   static const String _defaultRepoOwner = 'jiyadpn0';
   static const String _defaultRepoName = 'pharmacy_app';
-  static const String defaultCodeVersion = '3.3.9';
+  static const String defaultCodeVersion = '3.4.0';
 
   static String _activeVersion = defaultCodeVersion;
 

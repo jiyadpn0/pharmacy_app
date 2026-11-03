@@ -6,7 +6,6 @@ import 'package:sqflite/sqflite.dart' as sql;
 import '../database/db_helper.dart';
 import '../utils/app_logger.dart';
 import 'server_config_service.dart';
-import 'supabase_sync_service.dart';
 
 /// Models a durable local outbox item for transactional stock-changing operations.
 class StockOutboxEntry {
