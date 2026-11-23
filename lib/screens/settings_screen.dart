@@ -13,6 +13,7 @@ import '../widgets/draggable_modal.dart';
 import '../utils/watchdog_mixin.dart';
 import '../services/update_checker_service.dart';
 import '../services/excel_worker_service.dart';
+import '../services/stock_outbox_service.dart';
 import 'printer_customization_screen.dart';
 import 'edited_invoices_screen.dart';
 import 'server_settings_screen.dart';
@@ -123,7 +124,7 @@ class _SettingsScreenState extends State<SettingsScreen> with WatchdogMixin<Sett
                   Expanded(
                     child: _activeTab == "Edited Invoices"
                         ? const EditedInvoicesScreen(headless: true)
-                        : const ServerSettingsScreen(embedInTab: true),
+                        : ServerSettingsScreen(key: ServerSettingsScreen.globalKey, embedInTab: true),
                   ),
                 ],
               ),
@@ -1798,6 +1799,15 @@ class _SettingsScreenState extends State<SettingsScreen> with WatchdogMixin<Sett
   }
 
   void _saveSettings() async {
+    // If the user is currently on the "Cloud & Server Sync" tab, save the server URL and connect
+    if (_activeTab == "Cloud & Server Sync") {
+      final serverState = ServerSettingsScreen.globalKey.currentState;
+      if (serverState != null) {
+        await serverState.saveAndConnect();
+        return;
+      }
+    }
+
     final provider = Provider.of<PharmacyProvider>(context, listen: false);
     final updatedProfile = CompanyProfile(
       name: _nameCtrl.text.trim(),
@@ -1995,22 +2005,59 @@ class _SettingsScreenState extends State<SettingsScreen> with WatchdogMixin<Sett
                 {'id': 'vouchers', 'title': 'Vouchers', 'subtitle': 'Payment & receipt cash vouchers', 'icon': Icons.receipt_rounded},
               ], c),
               const SizedBox(height: 24),
-              Row(
+              Wrap(
+                spacing: 16,
+                runSpacing: 12,
                 children: [
                   ElevatedButton.icon(
-                    onPressed: _selectedResetCategoryIds.isEmpty ? null : () => _confirmAndExecuteFullWipe(context, provider),
-                    icon: const Icon(Icons.delete_forever_rounded, size: 22),
+                    onPressed: () async {
+                      await StockOutboxService.instance.clearAll();
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('🧹 Local Outbox Queue cleared successfully.')),
+                        );
+                      }
+                    },
+                    icon: const Icon(Icons.cleaning_services_rounded, size: 20),
+                    label: const Text(
+                      "🧹 CLEAR PENDING OUTBOX QUEUE",
+                      style: TextStyle(fontWeight: FontWeight.w900, fontSize: 13),
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.blueGrey.shade800,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                      elevation: 2,
+                    ),
+                  ),
+                  ElevatedButton.icon(
+                    onPressed: _selectedResetCategoryIds.isEmpty ? null : () => _confirmAndExecuteFullWipe(context, provider, cloudWipe: false),
+                    icon: const Icon(Icons.cleaning_services_rounded, size: 20),
                     label: Text(
-                      "🚨 PERMANENTLY RESET SELECTED DATA (${_selectedResetCategoryIds.length} ITEMS SELECTED)",
+                      "RESET THIS LOCAL PC ONLY (${_selectedResetCategoryIds.length} ITEMS)",
                       style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 13),
                     ),
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.red.shade700,
+                      backgroundColor: Colors.orange.shade800,
                       foregroundColor: Colors.white,
                       disabledBackgroundColor: Colors.grey.shade400,
-                      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 18),
+                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                      elevation: 3,
+                      elevation: 2,
+                    ),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _selectedResetCategoryIds.isEmpty ? null : () => _confirmAndExecuteFullWipe(context, provider, cloudWipe: true),
+                    icon: const Icon(Icons.delete_forever_rounded, size: 20, color: Colors.red),
+                    label: Text(
+                      "🚨 FULL SYSTEM WIPE (LOCAL PC + CLOUD SERVER)",
+                      style: TextStyle(fontWeight: FontWeight.w900, fontSize: 12, color: Colors.red.shade900),
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      side: BorderSide(color: Colors.red.shade700, width: 1.5),
+                      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                     ),
                   ),
                 ],
@@ -2146,20 +2193,22 @@ class _SettingsScreenState extends State<SettingsScreen> with WatchdogMixin<Sett
     );
   }
 
-  Future<void> _confirmAndExecuteFullWipe(BuildContext context, PharmacyProvider provider) async {
+  Future<void> _confirmAndExecuteFullWipe(BuildContext context, PharmacyProvider provider, {bool cloudWipe = false}) async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Row(
+        title: Row(
           children: [
-            Icon(Icons.delete_forever_rounded, color: Colors.red, size: 28),
-            SizedBox(width: 10),
-            Text('Confirm Full System Reset', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+            Icon(cloudWipe ? Icons.delete_forever_rounded : Icons.cleaning_services_rounded, color: cloudWipe ? Colors.red : Colors.orange, size: 28),
+            const SizedBox(width: 10),
+            Text(cloudWipe ? 'Confirm FULL CLOUD + LOCAL Wipe' : 'Confirm Local PC Database Reset', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
           ],
         ),
-        content: const Text(
-          'Are you 100% sure you want to permanently erase ALL sales, inventory, products, and purchase records from this computer and the cloud server?\n\nThis action cannot be undone!',
-          style: TextStyle(fontSize: 13),
+        content: Text(
+          cloudWipe
+              ? 'Are you 100% sure you want to permanently erase ALL selected data from BOTH this computer and the Supabase Cloud Server?\n\nThis will delete data across all connected computers! This action cannot be undone!'
+              : 'Are you sure you want to reset selected data on THIS LOCAL PC ONLY?\n\n• Supabase Cloud data will NOT be deleted.\n• Other connected PCs will NOT be affected.\n• You can re-import clean data from Cloud at any time.',
+          style: const TextStyle(fontSize: 13),
         ),
         actions: [
           TextButton(
@@ -2167,9 +2216,9 @@ class _SettingsScreenState extends State<SettingsScreen> with WatchdogMixin<Sett
             child: const Text('CANCEL'),
           ),
           ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red.shade800, foregroundColor: Colors.white),
+            style: ElevatedButton.styleFrom(backgroundColor: cloudWipe ? Colors.red.shade800 : Colors.orange.shade800, foregroundColor: Colors.white),
             onPressed: () => Navigator.of(context).pop(true),
-            child: const Text('YES, ERASE EVERYTHING'),
+            child: Text(cloudWipe ? 'YES, ERASE CLOUD & LOCAL' : 'YES, RESET THIS PC ONLY'),
           ),
         ],
       ),
@@ -2177,68 +2226,98 @@ class _SettingsScreenState extends State<SettingsScreen> with WatchdogMixin<Sett
 
     if (confirmed == true && context.mounted) {
       final progressNotifier = ValueNotifier<double>(0.0);
-      final statusNotifier = ValueNotifier<String>('Starting Full Database Reset...');
+      final statusNotifier = ValueNotifier<String>(cloudWipe ? 'Starting Full Database Reset...' : 'Starting Local PC Reset...');
 
+      BuildContext? progressDialogContext;
       showDialog(
         context: context,
         barrierDismissible: false,
-        builder: (dialogCtx) => AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          content: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 12),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const SizedBox(width: 28, height: 28, child: CircularProgressIndicator(strokeWidth: 3, color: Colors.red)),
-                const SizedBox(height: 16),
-                const Text('Full System Reset in Progress...', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-                const SizedBox(height: 12),
-                ValueListenableBuilder<String>(
-                  valueListenable: statusNotifier,
-                  builder: (context, statusText, _) => Text(
-                    statusText,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(fontSize: 11, color: Colors.blueGrey, fontWeight: FontWeight.w600),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                ValueListenableBuilder<double>(
-                  valueListenable: progressNotifier,
-                  builder: (context, progress, _) {
-                    int pctInt = (progress.clamp(0.0, 1.0) * 100).toInt();
-                    return Column(
-                      children: [
-                        ClipRRect(
-                          borderRadius: BorderRadius.circular(6),
-                          child: LinearProgressIndicator(
-                            value: progress.clamp(0.0, 1.0),
-                            minHeight: 10,
-                            color: Colors.red.shade700,
-                            backgroundColor: Colors.red.shade100,
+        builder: (dialogCtx) {
+          progressDialogContext = dialogCtx;
+          return AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            content: SizedBox(
+              width: 460,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    SizedBox(width: 32, height: 32, child: CircularProgressIndicator(strokeWidth: 3, color: cloudWipe ? Colors.red : Colors.orange)),
+                    const SizedBox(height: 16),
+                    Text(cloudWipe ? 'Full System Reset in Progress...' : 'Local PC Reset in Progress...', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                    const SizedBox(height: 12),
+                    SizedBox(
+                      height: 38,
+                      child: Center(
+                        child: ValueListenableBuilder<String>(
+                          valueListenable: statusNotifier,
+                          builder: (context, statusText, _) => Text(
+                            statusText,
+                            textAlign: TextAlign.center,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontSize: 11, color: Colors.blueGrey, fontWeight: FontWeight.w600),
                           ),
                         ),
-                        const SizedBox(height: 8),
-                        Text('$pctInt%', style: TextStyle(fontWeight: FontWeight.w900, color: Colors.red.shade900, fontSize: 14)),
-                      ],
-                    );
-                  },
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    ValueListenableBuilder<double>(
+                      valueListenable: progressNotifier,
+                      builder: (context, progress, _) {
+                        int pctInt = (progress.clamp(0.0, 1.0) * 100).toInt();
+                        return Column(
+                          children: [
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(6),
+                              child: LinearProgressIndicator(
+                                value: progress.clamp(0.0, 1.0),
+                                minHeight: 10,
+                                color: cloudWipe ? Colors.red.shade700 : Colors.orange.shade700,
+                                backgroundColor: cloudWipe ? Colors.red.shade100 : Colors.orange.shade100,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            Text('$pctInt%', style: TextStyle(fontWeight: FontWeight.w900, color: cloudWipe ? Colors.red.shade900 : Colors.orange.shade900, fontSize: 14)),
+                          ],
+                        );
+                      },
+                    ),
+                  ],
                 ),
-              ],
+              ),
             ),
-          ),
-        ),
-      );
-
-      final Map<String, dynamic> result = await provider.performFullSystemWipe(
-        selectedCategories: _selectedResetCategoryIds,
-        onProgress: (pct, msg) {
-          progressNotifier.value = pct;
-          statusNotifier.value = msg;
+          );
         },
       );
 
-      if (context.mounted && Navigator.canPop(context)) {
-        Navigator.of(context).pop();
+      Map<String, dynamic> result = {'success': false, 'error': 'Operation aborted'};
+      try {
+        result = cloudWipe
+            ? await provider.performFullSystemWipe(
+                selectedCategories: _selectedResetCategoryIds,
+                onProgress: (pct, msg) {
+                  progressNotifier.value = pct;
+                  statusNotifier.value = msg;
+                },
+              )
+            : await provider.performLocalOnlySystemReset(
+                selectedCategories: _selectedResetCategoryIds,
+                onProgress: (pct, msg) {
+                  progressNotifier.value = pct;
+                  statusNotifier.value = msg;
+                },
+              );
+      } catch (err) {
+        debugPrint("Error executing system reset: $err");
+        result = {'success': false, 'error': err.toString()};
+      } finally {
+        if (progressDialogContext != null && progressDialogContext!.mounted) {
+          Navigator.of(progressDialogContext!).pop();
+        } else if (context.mounted && Navigator.of(context, rootNavigator: true).canPop()) {
+          Navigator.of(context, rootNavigator: true).pop();
+        }
       }
 
       if (context.mounted) {

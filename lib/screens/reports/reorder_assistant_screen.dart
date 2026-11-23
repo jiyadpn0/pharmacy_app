@@ -9,7 +9,7 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import '../../providers/pharmacy_provider.dart';
 import '../../utils/theme_constants.dart';
-import '../../database/db_helper.dart';
+import '../../services/buy_planning_service.dart';
 
 class ReorderAssistantScreen extends StatefulWidget {
   const ReorderAssistantScreen({super.key});
@@ -217,47 +217,43 @@ class _ReorderAssistantScreenState extends State<ReorderAssistantScreen> {
       return;
     }
 
-    final db = await DbHelper.instance.database;
-    final now = DateTime.now();
-    final orderId = "PO-${now.millisecondsSinceEpoch.toString().substring(5)}";
-    final supplierName = _selectedSupplier != "ALL" ? _selectedSupplier : (activeItems.first['supplier']?.toString() ?? "Wholesaler");
-
-    double totalAmt = 0.0;
+    final List<Map<String, dynamic>> itemsToOrder = [];
     for (var r in activeItems) {
       String id = r['id'].toString();
       int orderQty = int.tryParse(_qtyControllers[id]?.text ?? '0') ?? 0;
-      double pRate = (r['purchase_rate'] as num?)?.toDouble() ?? 0.0;
-      totalAmt += (orderQty * pRate);
-    }
+      if (orderQty <= 0) continue;
 
-    await db.insert('order_confirmations', {
-      'order_id': orderId,
-      'wholesaler_name': supplierName,
-      'total_amount': totalAmt,
-      'status': 'PENDING',
-      'created_at': DateFormat('yyyy-MM-dd HH:mm:ss').format(now),
-    });
-
-    for (var r in activeItems) {
-      String id = r['id'].toString();
-      int orderQty = int.tryParse(_qtyControllers[id]?.text ?? '0') ?? 0;
-      double pRate = (r['purchase_rate'] as num?)?.toDouble() ?? 0.0;
-
-      await db.insert('order_confirmation_items', {
-        'order_id': orderId,
-        'product_id': id,
-        'product_name': r['product_name']?.toString() ?? '',
-        'qty': orderQty,
-        'purchase_rate': pRate,
+      itemsToOrder.add({
+        'id': id,
+        'name': r['product_name'] ?? '',
+        'brand': r['brand'] ?? '',
+        'supplier': _selectedSupplier != "ALL" ? _selectedSupplier : (r['supplier']?.toString() ?? "Wholesaler"),
+        'orderQty': orderQty,
+        'packSize': (r['packin'] as num?)?.toInt() ?? 1,
+        'pRate': (r['purchase_rate'] as num?)?.toDouble() ?? 0.0,
       });
     }
+
+    if (itemsToOrder.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("All selected products have order quantity 0."), backgroundColor: Colors.orange),
+      );
+      return;
+    }
+
+    final createdOrders = await BuyPlanningService.instance.generatePurchaseOrders(
+      selectedItems: itemsToOrder,
+      orderDate: DateTime.now(),
+      customNotes: "Generated via Reorder Assistant on ${DateFormat('dd/MM/yyyy').format(DateTime.now())}",
+    );
 
     _printPoPdf();
 
     if (!mounted) return;
+    final totalAmt = createdOrders.fold(0.0, (sum, o) => sum + o.totalAmount);
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text("Purchase Order #$orderId saved successfully for ₹${totalAmt.toStringAsFixed(2)}!"),
+        content: Text("Generated ${createdOrders.length} Purchase Order(s) successfully for ₹${totalAmt.toStringAsFixed(2)}!"),
         backgroundColor: Colors.green,
       ),
     );

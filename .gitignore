@@ -52,3 +52,10 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Windows desktop root binary artifacts
+/*.dll
+/*.exe
+/data/
+native_assets.json
+.FullName

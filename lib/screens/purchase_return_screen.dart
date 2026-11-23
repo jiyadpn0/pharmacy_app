@@ -8,6 +8,8 @@ import 'package:file_picker/file_picker.dart';
 import '../providers/pharmacy_provider.dart';
 import '../providers/app_provider.dart';
 import '../services/server_config_service.dart';
+import '../services/supabase_sync_service.dart';
+import '../services/pure_cloud_service.dart';
 
 import '../windows/window_spawner.dart';
 import '../utils/app_dialogs.dart';
@@ -236,6 +238,7 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
   void initState() {
     super.initState();
     UnsavedChangesRegistry.register("PURCHASE RETURN", this);
+    ServerConfigService.instance.addListener(_onConfigChanged);
     _entryNo = widget.initialEntryNo ?? "...";
     final p = Provider.of<PharmacyProvider>(context, listen: false);
     Future.microtask(() async {
@@ -246,7 +249,6 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
         if (mounted) setState(() => _entryNo = next);
       }
     });
-    _resetPage();
 
     if (widget.initialExpiredItems != null && widget.initialExpiredItems!.isNotEmpty) {
       for (var p in widget.initialExpiredItems!) {
@@ -332,8 +334,13 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
     });
   }
 
+  void _onConfigChanged() {
+    if (mounted) setState(() {});
+  }
+
   @override
   void dispose() {
+    ServerConfigService.instance.removeListener(_onConfigChanged);
     UnsavedChangesRegistry.unregister("PURCHASE RETURN");
     _gridScrollCtrl.dispose();
     _verticalGridScrollCtrl.dispose();
@@ -692,8 +699,9 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
     if (safeRow >= 0 && !_navCols.contains(col)) {
       if (col < _navCols.first) {
         safeCol = _navCols.first;
-      } else if (col > _navCols.last) safeCol = _navCols.last;
-      else {
+      } else if (col > _navCols.last) {
+        safeCol = _navCols.last;
+      } else {
         safeCol = _navCols.reduce((a, b) => (a - col).abs() < (b - col).abs() ? a : b);
       }
     }
@@ -814,8 +822,11 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
         if (list.isNotEmpty) {
           if (_supplierSearchList.value.isNotEmpty) {
             _onSupplierSelected(_supplierSearchList.value[_searchIdx.value]);
-          } else if (_isSelectingBatch) _finalizeBatchSelection(list[_searchIdx.value] as Product);
-          else _onProductSelected(list[_searchIdx.value] as Product);
+          } else if (_isSelectingBatch) {
+            _finalizeBatchSelection(list[_searchIdx.value] as Product);
+          } else {
+            _onProductSelected(list[_searchIdx.value] as Product);
+          }
           return true;
         }
       }
@@ -836,13 +847,13 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
       return false;
     }
 
-    final ctrl = _getGridCtrl(row, col);
-
     if ((key == LogicalKeyboardKey.tab || key == LogicalKeyboardKey.enter || key == LogicalKeyboardKey.numpadEnter) && isShift) {
       int curIdx = _navCols.indexOf(col);
       if (curIdx > 0) {
         _moveFocus(row, _navCols[curIdx - 1]);
-      } else if (row > 0) _moveFocus(row - 1, _navCols.last);
+      } else if (row > 0) {
+        _moveFocus(row - 1, _navCols.last);
+      }
       return true;
     }
 
@@ -1441,21 +1452,25 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
 
       String targetEntryNo = isEdit ? _entryNo : "";
       if (!isEdit) {
-        final requested = cleanEntryNo(_entryNo);
-        final resolvedNo = await p.resolveGuaranteedNextEntryNo('purchase_return_entries', requested);
-        if (resolvedNo != requested && requested.isNotEmpty) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text("Return #$requested already taken. Automatically saved as Return #$resolvedNo"),
-                backgroundColor: Colors.blueAccent,
-                duration: const Duration(seconds: 4),
-              ),
+        String requested = cleanEntryNo(_entryNo);
+        try {
+          if (ServerConfigService.instance.isConnected) {
+            final allocated = await SupabaseSyncService.instance.allocateRemoteAtomicSequence(
+              'purchase_return_entries',
+              p.selectedFinancialYear,
             );
+            if (allocated != null && allocated > 0) {
+              requested = allocated.toString();
+            }
           }
-        }
-        targetEntryNo = resolvedNo;
-        _entryNo = resolvedNo;
+          final bool taken = await p.isEntryTaken('purchase_return_entries', requested);
+          if (taken || requested.isEmpty || requested == "AUTO") {
+            requested = await p.resolveGuaranteedNextEntryNo('purchase_return_entries', requested.isNotEmpty ? requested : "1", checkCloud: true);
+          }
+        } catch (_) {}
+
+        targetEntryNo = requested;
+        _entryNo = requested;
       }
 
       setState(() => _isLoading = true);
@@ -1633,7 +1648,7 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
     if (!mounted) return;
     final p = Provider.of<PharmacyProvider>(context, listen: false);
     _closeAllDropdowns();
-    FocusScope.of(context).unfocus();
+    FocusManager.instance.primaryFocus?.unfocus();
 
     for (var m in _gridCtrls.values) {
       for (var c in m.values) { c.dispose(); }
@@ -1802,8 +1817,12 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
   }
 
   Widget _buildTopToolbar() {
-    bool canSave = !_isExistingEntry && !_isDeleted;
-    bool canEdit = _isExistingEntry && !_isDeleted;
+    final bool isPureCloud = ServerConfigService.instance.isPureCloud;
+    final bool isCloudConnected = ServerConfigService.instance.isConnected;
+    final bool isOfflineBlocked = isPureCloud && !isCloudConnected;
+
+    bool canSave = !isOfflineBlocked && !_isExistingEntry && !_isDeleted;
+    bool canEdit = !isOfflineBlocked && _isExistingEntry && !_isDeleted;
 
     return Container(
       height: 52,
@@ -1833,9 +1852,9 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               _topActionBtn(Icons.add_box_rounded, "New (F2)", Colors.blue, onTap: _resetPage),
-              _topActionBtn(Icons.check_circle_rounded, "Save (F6)", canSave ? Colors.green : Colors.grey.shade400, onTap: canSave ? () => _saveReturn(isEdit: false) : () {}),
-              _topActionBtn(Icons.edit_document, "Edit", canEdit ? Colors.orange : Colors.grey.shade400, onTap: canEdit ? () => _saveReturn(isEdit: true) : () {}),
-              _topActionBtn(Icons.delete_forever_rounded, "Delete", canEdit ? const Color(0xFFD32F2F) : Colors.grey.shade400, onTap: canEdit ? _showDeleteConfirm : () {}),
+              _topActionBtn(Icons.check_circle_rounded, "Save (F6)", canSave ? Colors.green : Colors.grey.shade400, onTap: canSave ? () => _saveReturn(isEdit: false) : null),
+              _topActionBtn(Icons.edit_document, "Edit", canEdit ? Colors.orange : Colors.grey.shade400, onTap: canEdit ? () => _saveReturn(isEdit: true) : null),
+              _topActionBtn(Icons.delete_forever_rounded, "Delete", canEdit ? const Color(0xFFD32F2F) : Colors.grey.shade400, onTap: canEdit ? _showDeleteConfirm : null),
               _topActionBtn(Icons.search_rounded, "Find (F3)", const Color(0xFF3F51B5), onTap: _showFindDialog),
               _topActionBtn(Icons.print_rounded, "Print", Colors.blueGrey, onTap: _exportToPdf),
               _topActionBtn(Icons.file_download_outlined, "Export", Colors.green.shade800, onTap: _exportToExcel),
@@ -1874,6 +1893,14 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
     if (res == true) {
       try {
         setState(() => _isLoading = true);
+        if (PureCloudService.instance.isActive) {
+          await PureCloudService.instance.deleteDocument(
+            table: 'purchase_return_entries',
+            itemsTable: 'purchase_return_items',
+            foreignKey: 'entry_no',
+            entryNo: _entryNo,
+          );
+        }
         await p.deletePurchaseReturn(_entryNo);
         p.logAudit('DELETE_PURCHASE_RETURN', 'Purchase Return Entry $_entryNo deleted by ${_doneByCtrl.text.isNotEmpty ? _doneByCtrl.text : "Admin"}.', userId: _doneByCtrl.text.isNotEmpty ? _doneByCtrl.text : "Admin");
         if (mounted) {
@@ -2041,31 +2068,32 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
               Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  _headerColumn("Date", InkWell(
-                    onTap: _isDeleted ? null : () async {
-                      final picked = await showAppDatePicker(context: context, initialDate: _date, firstDate: DateTime(2000), lastDate: DateTime(2100));
-                      if (picked != null) {
-                        setState(() => _date = DateTime(picked.year, picked.month, picked.day, _date.hour, _date.minute));
-                      }
-                    },
-                    child: Container(
-                      height: 26,
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFFFF3E0),
-                        borderRadius: BorderRadius.circular(4),
-                        border: Border.all(color: Colors.orange.shade300),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
+                  _headerColumn("Date", Builder(
+                    builder: (btnCtx) => InkWell(
+                      onTap: _isDeleted ? null : () async {
+                        final picked = await showAppDatePicker(context: btnCtx, initialDate: _date, firstDate: DateTime(2000), lastDate: DateTime(2100));
+                        if (picked != null) {
+                          setState(() => _date = DateTime(picked.year, picked.month, picked.day, _date.hour, _date.minute));
+                        }
+                      },
+                      child: Container(
+                        height: 26,
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFFFF3E0),
+                          borderRadius: BorderRadius.circular(4),
+                          border: Border.all(color: Colors.orange.shade300),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
                           Text(DateFormat('d/M/yy').format(_date), style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black)),
                           const SizedBox(width: 4),
                           Icon(Icons.calendar_month, size: 13, color: Colors.orange.shade800),
                         ],
                       ),
                     ),
-                  )),
+                  ))),
                   const SizedBox(width: 6),
                   _headerColumn("Time", InkWell(
                     onTap: _isDeleted ? null : () async {
@@ -2333,15 +2361,6 @@ class _PurchaseReturnScreenState extends State<PurchaseReturnScreen> implements 
 
     return SizedBox(width: width, child: field);
   }
-
-  Widget _entryNavBtn(String txt, {VoidCallback? onTap}) => InkWell(
-    onTap: onTap,
-    child: Container(
-      width: 22, height: 26, alignment: Alignment.center,
-      decoration: BoxDecoration(color: Colors.grey.shade200, border: Border.all(color: Colors.grey.shade400)),
-      child: Text(txt, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-    ),
-  );
 
   Widget _buildGridHeader() => Container(
     height: 32, color: const Color(0xFF37474F),

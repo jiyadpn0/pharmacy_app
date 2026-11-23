@@ -7,6 +7,7 @@ class FluentNavButton extends StatefulWidget {
   final VoidCallback? onTap;
   final String tooltip;
   final bool isBusy;
+  final bool showSpinnerOnBusy;
   final double width;
   final double height;
   final Color? activeColor;
@@ -18,6 +19,7 @@ class FluentNavButton extends StatefulWidget {
     required this.onTap,
     this.tooltip = "",
     this.isBusy = false,
+    this.showSpinnerOnBusy = false,
     this.width = 24.0,
     this.height = 26.0,
     this.activeColor,
@@ -88,7 +90,7 @@ class _FluentNavButtonState extends State<FluentNavButton> {
                     ]
                   : null,
             ),
-            child: widget.isBusy
+            child: (widget.isBusy && widget.showSpinnerOnBusy)
                 ? SizedBox(
                     width: 12,
                     height: 12,
@@ -99,7 +101,7 @@ class _FluentNavButtonState extends State<FluentNavButton> {
                   )
                 : Icon(
                     widget.icon,
-                    size: 15,
+                    size: widget.width <= 22 ? 13 : 15,
                     color: !isEnabled
                         ? Colors.grey.shade400
                         : (_isHovered ? primaryColor : Colors.grey.shade800),

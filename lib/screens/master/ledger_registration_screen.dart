@@ -109,6 +109,9 @@ class _LedgerRegistrationScreenState extends State<LedgerRegistrationScreen> {
             id: existing.id,
             name: _nameCtrl.text.trim(),
             mobile: _phoneCtrl.text.trim(),
+            specialization: existing.specialization,
+            regNo: existing.regNo,
+            isActive: existing.isActive,
           );
           await provider.updateDoctor(updated);
         } else {

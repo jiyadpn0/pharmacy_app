@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../../providers/pharmacy_provider.dart';
+import '../../providers/app_provider.dart';
 import '../../widgets/pin_unlock_dialog.dart';
 import '../../utils/theme_constants.dart';
 
@@ -108,7 +109,7 @@ class _SupplierListScreenState extends State<SupplierListScreen> {
                           Expanded(flex: 2, child: Text("MOBILE", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12))),
                           Expanded(flex: 2, child: Text("DL NUMBER", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12))),
                           Expanded(flex: 2, child: Text("GST NUMBER", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12))),
-                          SizedBox(width: 100, child: Text("ACTIONS", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12), textAlign: TextAlign.center)),
+                          SizedBox(width: 140, child: Text("ACTIONS", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12), textAlign: TextAlign.center)),
                         ],
                       ),
                     ),
@@ -130,10 +131,15 @@ class _SupplierListScreenState extends State<SupplierListScreen> {
                                 Expanded(flex: 2, child: Text(s.dlNumber.toUpperCase(), style: TextStyle(color: c.primaryText))),
                                 Expanded(flex: 2, child: Text(s.gstIn.toUpperCase(), style: TextStyle(color: c.primaryText))),
                                 SizedBox(
-                                  width: 100,
+                                  width: 140,
                                   child: Row(
                                     mainAxisAlignment: MainAxisAlignment.center,
                                     children: [
+                                      IconButton(
+                                        icon: const Icon(Icons.history, color: Colors.indigo, size: 18),
+                                        onPressed: () => Provider.of<AppProvider>(context, listen: false).openSupplierLedger(supplierName: s.name),
+                                        tooltip: "Supplier Ledger",
+                                      ),
                                       IconButton(
                                         icon: const Icon(Icons.edit, color: Colors.blue, size: 18),
                                         onPressed: () => _showSupplierDialog(context, supplier: s),

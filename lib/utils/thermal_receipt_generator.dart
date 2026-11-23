@@ -2,6 +2,7 @@ import 'dart:typed_data';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import '../models/erp_models.dart';
+import 'app_formatters.dart';
 
 class ThermalReceiptGenerator {
   static Future<Uint8List> buildThermalReceipt(
@@ -49,11 +50,17 @@ class ThermalReceiptGenerator {
               pw.Row(
                 mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
                 children: [
-                  pw.Text("Inv: ${invoice.entryNo}", style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold)),
+                  pw.Text("Inv: ${formatSaleDisplayNo(invoice.entryNo?.toString())}", style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold)),
                   pw.Text("Dt: ${invoice.date.toString().substring(0, 10)}", style: const pw.TextStyle(fontSize: 9)),
                 ],
               ),
-              pw.Text("Customer/Party: $partyName", style: const pw.TextStyle(fontSize: 9)),
+              pw.Row(
+                mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+                children: [
+                  pw.Text("Customer/Party: $partyName", style: const pw.TextStyle(fontSize: 9)),
+                  pw.Text("Ref: ${invoice.entryNo}", style: const pw.TextStyle(fontSize: 7, color: PdfColors.grey700)),
+                ],
+              ),
               pw.Divider(borderStyle: pw.BorderStyle.dashed, thickness: 0.5),
 
               // Items Header

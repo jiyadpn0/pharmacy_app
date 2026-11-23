@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:sqflite/sqflite.dart' as sql;
 import '../database/db_helper.dart';
 import '../utils/app_formatters.dart';
+import '../utils/app_logger.dart';
 import 'server_config_service.dart';
 import 'supabase_realtime_service.dart';
 
@@ -211,7 +212,7 @@ class DiscrepancyAuditService {
     return [];
   }
 
-  Future<List<DiscrepancyItemRow>> _fetchSalesItemRows(String key) async {
+  Future<List<DiscrepancyItemRow>> fetchSalesItemRows(String key) async {
     try {
       final db = await DbHelper.instance.database;
       final localItems = await db.rawQuery(
@@ -455,10 +456,10 @@ class DiscrepancyAuditService {
       serverItemsFuture,
     ]);
 
-    final localRows = resultsList[0] as List<Map<String, dynamic>>;
-    final serverRows = resultsList[1] as List<Map<String, dynamic>>;
-    final localItems = resultsList[2] as List<Map<String, dynamic>>;
-    final serverItems = resultsList[3] as List<Map<String, dynamic>>;
+    final localRows = resultsList[0];
+    final serverRows = resultsList[1];
+    final localItems = resultsList[2];
+    final serverItems = resultsList[3];
 
     // Map local items by normalized invoice key
     final localItemsByInv = <String, List<Map<String, dynamic>>>{};
@@ -662,10 +663,10 @@ class DiscrepancyAuditService {
       serverItemsFuture,
     ]);
 
-    final localRows = resultsList[0] as List<Map<String, dynamic>>;
-    final serverRows = resultsList[1] as List<Map<String, dynamic>>;
-    final localItems = resultsList[2] as List<Map<String, dynamic>>;
-    final serverItems = resultsList[3] as List<Map<String, dynamic>>;
+    final localRows = resultsList[0];
+    final serverRows = resultsList[1];
+    final localItems = resultsList[2];
+    final serverItems = resultsList[3];
 
     // Map local purchase items by normalized entry key
     final localItemsByEntry = <String, List<Map<String, dynamic>>>{};
@@ -830,23 +831,29 @@ class DiscrepancyAuditService {
     bool showOnlyDiscrepancies = true,
   }) async {
     final db = await DbHelper.instance.database;
-    final localRows = await db.rawQuery(
-      'SELECT * FROM stock_batches ORDER BY rowid DESC LIMIT ?',
-      [limit],
-    );
+    final localRows = await db.rawQuery('''
+      SELECT sb.*, pm.name as product_name
+      FROM stock_batches sb
+      LEFT JOIN product_master pm ON sb.product_id = pm.id
+      ORDER BY sb.rowid DESC LIMIT ?
+    ''', [limit]);
 
     final serverRows = await _fetchServerRecords('stock_batches', limit: limit);
 
     final localMap = <String, Map<String, dynamic>>{};
     for (var r in localRows) {
-      final key = '${r['product_name']}_${r['batch_no']}'.trim().toUpperCase();
-      if (key.isNotEmpty) localMap[key] = Map<String, dynamic>.from(r);
+      final pId = (r['product_id'] ?? '').toString().trim();
+      final bNo = (r['batch_number'] ?? r['batch'] ?? r['batch_no'] ?? '').toString().trim().toUpperCase();
+      final key = '${pId}_$bNo';
+      if (key != '_') localMap[key] = Map<String, dynamic>.from(r);
     }
 
     final serverMap = <String, Map<String, dynamic>>{};
     for (var r in serverRows) {
-      final key = '${r['product_name']}_${r['batch_no']}'.trim().toUpperCase();
-      if (key.isNotEmpty) serverMap[key] = r;
+      final pId = (r['product_id'] ?? '').toString().trim();
+      final bNo = (r['batch_number'] ?? r['batch'] ?? r['batch_no'] ?? '').toString().trim().toUpperCase();
+      final key = '${pId}_$bNo';
+      if (key != '_') serverMap[key] = r;
     }
 
     final allKeys = {...localMap.keys, ...serverMap.keys};
@@ -857,51 +864,63 @@ class DiscrepancyAuditService {
       final srv = serverMap[k];
 
       if (loc == null && srv != null) {
+        final bNo = (srv['batch_number'] ?? srv['batch'] ?? srv['batch_no'] ?? '-').toString();
+        final srvQty = _parseNum(srv['current_quantity'] ?? srv['quantity'] ?? srv['current_stock']);
         results.add(DiscrepancyRecord(
           category: 'stock_batches',
           primaryKey: k,
-          title: '${srv['product_name'] ?? 'Product'}',
-          date: (srv['expiry_date'] ?? '').toString(),
-          customer: 'Batch: ${srv['batch_no'] ?? '-'}',
+          title: '${srv['product_name'] ?? srv['name'] ?? 'Product ${srv['product_id'] ?? ''}'}',
+          date: (srv['expiry_date'] ?? srv['expiry'] ?? '').toString(),
+          customer: 'Batch: $bNo',
           agent: 'Stock',
           localData: {},
           serverData: srv,
           fields: [
-            DiscrepancyField(fieldName: 'quantity', fieldLabel: 'Stock Qty', localValue: 'MISSING LOCALLY', serverValue: srv['quantity']),
+            DiscrepancyField(fieldName: 'quantity', fieldLabel: 'Stock Qty', localValue: 'MISSING LOCALLY', serverValue: srvQty),
           ],
           isMissingLocally: true,
         ));
       } else if (loc != null && srv == null) {
+        final bNo = (loc['batch_number'] ?? loc['batch'] ?? loc['batch_no'] ?? '-').toString();
+        final locQty = _parseNum(loc['current_stock'] ?? loc['quantity']);
         results.add(DiscrepancyRecord(
           category: 'stock_batches',
           primaryKey: k,
-          title: '${loc['product_name'] ?? 'Product'}',
-          date: (loc['expiry_date'] ?? '').toString(),
-          customer: 'Batch: ${loc['batch_no'] ?? '-'}',
+          title: '${loc['product_name'] ?? 'Product ${loc['product_id'] ?? ''}'}',
+          date: (loc['expiry_date'] ?? loc['expiry'] ?? '').toString(),
+          customer: 'Batch: $bNo',
           agent: 'Stock',
           localData: loc,
           serverData: {},
           fields: [
-            DiscrepancyField(fieldName: 'quantity', fieldLabel: 'Stock Qty', localValue: loc['quantity'], serverValue: 'NOT ON SERVER'),
+            DiscrepancyField(fieldName: 'quantity', fieldLabel: 'Stock Qty', localValue: locQty, serverValue: 'NOT ON SERVER'),
           ],
           isMissingOnServer: true,
         ));
       } else if (loc != null && srv != null) {
+        final locQty = _parseNum(loc['current_stock'] ?? loc['quantity']);
+        final srvQty = _parseNum(srv['current_quantity'] ?? srv['quantity'] ?? srv['current_stock']);
+        final locRate = _parseNum(loc['sale_rate'] ?? loc['rate'] ?? loc['selling_rate']);
+        final srvRate = _parseNum(srv['selling_rate'] ?? srv['sale_rate'] ?? srv['rate']);
+        final locMrp = _parseNum(loc['mrp']);
+        final srvMrp = _parseNum(srv['mrp']);
+
+        final bNo = (loc['batch_number'] ?? loc['batch'] ?? srv['batch_number'] ?? '-').toString();
+        final prodTitle = (loc['product_name'] ?? srv['product_name'] ?? 'Product ${loc['product_id'] ?? ''}').toString();
+
         final fields = [
-          DiscrepancyField(fieldName: 'product_name', fieldLabel: 'Product', localValue: loc['product_name'], serverValue: srv['product_name']),
-          DiscrepancyField(fieldName: 'batch_no', fieldLabel: 'Batch No', localValue: loc['batch_no'], serverValue: srv['batch_no']),
-          DiscrepancyField(fieldName: 'expiry_date', fieldLabel: 'Expiry', localValue: loc['expiry_date'], serverValue: srv['expiry_date']),
-          DiscrepancyField(fieldName: 'quantity', fieldLabel: 'Stock Qty', localValue: loc['quantity'], serverValue: srv['quantity']),
-          DiscrepancyField(fieldName: 'mrp', fieldLabel: 'MRP', localValue: loc['mrp'], serverValue: srv['mrp']),
-          DiscrepancyField(fieldName: 'rate', fieldLabel: 'Rate', localValue: loc['rate'], serverValue: srv['rate']),
+          DiscrepancyField(fieldName: 'quantity', fieldLabel: 'Stock Qty', localValue: locQty, serverValue: srvQty),
+          DiscrepancyField(fieldName: 'mrp', fieldLabel: 'MRP', localValue: locMrp, serverValue: srvMrp),
+          DiscrepancyField(fieldName: 'rate', fieldLabel: 'Sale Rate', localValue: locRate, serverValue: srvRate),
+          DiscrepancyField(fieldName: 'expiry_date', fieldLabel: 'Expiry', localValue: loc['expiry_date'] ?? loc['expiry'], serverValue: srv['expiry_date'] ?? srv['expiry']),
         ];
 
         final rec = DiscrepancyRecord(
           category: 'stock_batches',
           primaryKey: k,
-          title: '${srv['product_name'] ?? loc['product_name'] ?? 'Product'}',
+          title: prodTitle,
           date: (srv['expiry_date'] ?? loc['expiry_date'] ?? '').toString(),
-          customer: 'Batch: ${srv['batch_no'] ?? loc['batch_no'] ?? '-'}',
+          customer: 'Batch: $bNo',
           agent: 'Stock',
           localData: loc,
           serverData: srv,
@@ -940,10 +959,10 @@ class DiscrepancyAuditService {
       serverItemsFuture,
     ]);
 
-    final localRows = resultsList[0] as List<Map<String, dynamic>>;
-    final serverRows = resultsList[1] as List<Map<String, dynamic>>;
-    final localItems = resultsList[2] as List<Map<String, dynamic>>;
-    final serverItems = resultsList[3] as List<Map<String, dynamic>>;
+    final localRows = resultsList[0];
+    final serverRows = resultsList[1];
+    final localItems = resultsList[2];
+    final serverItems = resultsList[3];
 
     final localItemsByReturn = <String, List<Map<String, dynamic>>>{};
     for (var r in localItems) {
@@ -1072,10 +1091,10 @@ class DiscrepancyAuditService {
       serverItemsFuture,
     ]);
 
-    final localRows = resultsList[0] as List<Map<String, dynamic>>;
-    final serverRows = resultsList[1] as List<Map<String, dynamic>>;
-    final localItems = resultsList[2] as List<Map<String, dynamic>>;
-    final serverItems = resultsList[3] as List<Map<String, dynamic>>;
+    final localRows = resultsList[0];
+    final serverRows = resultsList[1];
+    final localItems = resultsList[2];
+    final serverItems = resultsList[3];
 
     final localItemsByReturn = <String, List<Map<String, dynamic>>>{};
     for (var r in localItems) {
@@ -1495,8 +1514,81 @@ class DiscrepancyAuditService {
         await _postServerRecords('$cat?on_conflict=entry_no', [serverPayload]);
 
         return true;
-      } else if (cat == 'product_master' || cat == 'stock_batches') {
-        // Master Data 2-Way Reconciliation by timestamp or presence
+      } else if (cat == 'stock_batches') {
+        // Multi-counter Conflict Resolution: Cloud is the single authoritative source of truth for stock quantities.
+        final loc = record.localData;
+        final srv = record.serverData;
+
+        final pId = (srv['product_id'] ?? loc['product_id'] ?? '').toString().trim();
+        final bNo = (srv['batch_number'] ?? srv['batch'] ?? loc['batch_number'] ?? loc['batch'] ?? '').toString().trim();
+
+        if (srv.isNotEmpty) {
+          // Cloud Server is authoritative: auto-heal local SQLite stock to match cloud state
+          final srvQty = (srv['current_quantity'] ?? srv['quantity'] ?? srv['current_stock'] as num?)?.toInt() ?? 0;
+          final mrp = (srv['mrp'] as num?)?.toDouble() ?? 0.0;
+          final pRate = (srv['purchase_rate'] as num?)?.toDouble() ?? 0.0;
+          final sRate = (srv['selling_rate'] ?? srv['sale_rate'] as num?)?.toDouble() ?? mrp;
+          final exp = (srv['expiry_date'] ?? srv['expiry'] ?? '').toString();
+          final pack = (srv['packing'] as num?)?.toInt() ?? 1;
+
+          final localQty = (loc['current_stock'] ?? loc['quantity'] as num?)?.toInt() ?? 0;
+
+          // 1. Update or Insert local SQLite batch
+          final updated = await db.rawUpdate(
+            'UPDATE stock_batches SET current_stock = ?, mrp = ?, sale_rate = ?, purchase_rate = ?, is_synced = 1, updated_at = ? WHERE product_id = ? AND LOWER(TRIM(batch_number)) = LOWER(TRIM(?))',
+            [srvQty, mrp, sRate, pRate, DateTime.now().toUtc().toIso8601String(), pId, bNo],
+          );
+
+          if (updated == 0 && pId.isNotEmpty && bNo.isNotEmpty) {
+            final prodCheck = await db.rawQuery('SELECT 1 FROM product_master WHERE id = ? LIMIT 1', [pId]);
+            if (prodCheck.isEmpty) {
+              final prodName = (srv['product_name'] ?? srv['name'] ?? 'Product $pId').toString().trim();
+              await db.rawInsert('''
+                INSERT OR IGNORE INTO product_master (id, name, mrp, purchase_rate, sale_rate, packing, is_active, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+              ''', [pId, prodName, mrp, pRate, sRate, pack, DateTime.now().toUtc().toIso8601String()]);
+            }
+
+            await db.insert('stock_batches', {
+              'product_id': pId,
+              'batch_number': bNo,
+              'expiry_date': exp,
+              'current_stock': srvQty,
+              'mrp': mrp,
+              'sale_rate': sRate,
+              'purchase_rate': pRate,
+              'packing': pack,
+              'is_active': 1,
+            });
+          }
+
+          // 2. Audit Trail: Log the conflict resolution event for compliance & tracking
+          if (localQty != srvQty) {
+            await DbHelper.logSyncConflict(
+              tableName: 'stock_batches',
+              recordIdentifier: '$pId / $bNo',
+              fieldName: 'current_stock',
+              localValue: localQty,
+              remoteValue: srvQty,
+            );
+            AppLogger.instance.supabase("🔄 Stock Conflict Auto-Healed: Batch $bNo (product $pId) local was $localQty, adjusted to cloud authoritative $srvQty.");
+          }
+        } else if (loc.isNotEmpty && srv.isEmpty) {
+          // Batch exists locally but completely missing on server: Push to cloud
+          final cleanPayload = Map<String, dynamic>.from(loc);
+          cleanPayload['branch_id'] = config.storeBranchId;
+          cleanPayload['terminal_id'] = config.terminalId;
+          cleanPayload['current_quantity'] = loc['current_stock'] ?? 0;
+          cleanPayload['selling_rate'] = loc['sale_rate'] ?? loc['mrp'] ?? 0.0;
+          cleanPayload.remove('current_stock');
+          cleanPayload.remove('sale_rate');
+          cleanPayload.remove('product_name');
+          SupabaseRealtimeService.instance.markKeyRecentlyPushed(pk);
+          await _postServerRecords(cat, [cleanPayload]);
+          AppLogger.instance.supabase("🔄 Stock Reconciled: Pushed missing local batch $bNo (product $pId) to cloud server.");
+        }
+        return true;
+      } else if (cat == 'product_master') {
         final loc = record.localData;
         final srv = record.serverData;
 

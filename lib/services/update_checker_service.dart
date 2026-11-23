@@ -13,7 +13,7 @@ import 'supabase_sync_service.dart';
 class UpdateCheckerService {
   static const String _defaultRepoOwner = 'jiyadpn0';
   static const String _defaultRepoName = 'pharmacy_app';
-  static const String defaultCodeVersion = '3.4.0';
+  static const String defaultCodeVersion = '3.6.2';
 
   static String _activeVersion = defaultCodeVersion;
 
@@ -25,20 +25,22 @@ class UpdateCheckerService {
     try {
       String foundVersion = defaultCodeVersion;
 
-      // Read version.json in app directory (ground truth for actual files on disk)
-      try {
-        final appExePath = Platform.resolvedExecutable;
-        final appDir = File(appExePath).parent.path;
-        final versionFile = File('$appDir${Platform.pathSeparator}version.json');
-        if (await versionFile.exists()) {
-          final content = await versionFile.readAsString();
-          final Map<String, dynamic> data = jsonDecode(content);
-          final String fileVer = (data['version'] ?? '').toString().trim();
-          if (fileVer.isNotEmpty) {
-            foundVersion = fileVer;
+      if (!kDebugMode) {
+        // Read version.json in app directory (ground truth for actual files on disk)
+        try {
+          final appExePath = Platform.resolvedExecutable;
+          final appDir = File(appExePath).parent.path;
+          final versionFile = File('$appDir${Platform.pathSeparator}version.json');
+          if (await versionFile.exists()) {
+            final content = await versionFile.readAsString();
+            final Map<String, dynamic> data = jsonDecode(content);
+            final String fileVer = (data['version'] ?? '').toString().trim();
+            if (fileVer.isNotEmpty) {
+              foundVersion = fileVer;
+            }
           }
-        }
-      } catch (_) {}
+        } catch (_) {}
+      }
 
       _activeVersion = foundVersion;
     } catch (_) {}
@@ -99,6 +101,7 @@ class UpdateCheckerService {
         barrierDismissible: false,
         builder: (ctx) => Center(
           child: Container(
+            width: 380,
             padding: const EdgeInsets.all(32),
             decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
             child: Column(
@@ -106,7 +109,18 @@ class UpdateCheckerService {
               children: [
                 const CircularProgressIndicator(),
                 const SizedBox(height: 24),
-                Text("Checking GitHub Releases ($targetRepo)...", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.black87)),
+                SizedBox(
+                  height: 38,
+                  child: Center(
+                    child: Text(
+                      "Checking GitHub Releases ($targetRepo)...",
+                      textAlign: TextAlign.center,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.black87),
+                    ),
+                  ),
+                ),
               ],
             ),
           ),
@@ -356,9 +370,20 @@ class UpdateCheckerService {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              ValueListenableBuilder<String>(
-                valueListenable: statusNotifier,
-                builder: (context, statusText, _) => Text(statusText, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+              SizedBox(
+                height: 32,
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: ValueListenableBuilder<String>(
+                    valueListenable: statusNotifier,
+                    builder: (context, statusText, _) => Text(
+                      statusText,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                ),
               ),
               const SizedBox(height: 16),
               ValueListenableBuilder<double>(

@@ -1,5 +1,18 @@
+import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:window_manager/window_manager.dart';
+
+class _TopBarScrollBehavior extends MaterialScrollBehavior {
+  const _TopBarScrollBehavior();
+
+  @override
+  Set<PointerDeviceKind> get dragDevices => {
+        PointerDeviceKind.touch,
+        PointerDeviceKind.mouse,
+        PointerDeviceKind.trackpad,
+        PointerDeviceKind.stylus,
+      };
+}
 
 class WindowControlsBar extends StatelessWidget {
   final String? title;
@@ -31,99 +44,160 @@ class WindowControlsBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      height: height,
-      decoration: BoxDecoration(
-        color: backgroundColor,
-        borderRadius: borderRadius,
-        border: Border(
-          bottom: BorderSide(color: Colors.white.withValues(alpha: 0.05)),
-        ),
+    final borderDecoration = BoxDecoration(
+      color: backgroundColor,
+      borderRadius: borderRadius,
+      border: Border(
+        bottom: BorderSide(color: Colors.white.withValues(alpha: 0.05)),
       ),
-      child: Row(
-        children: [
-          // 1. LEFT SIDE: Logo & Staff Chips
-          const SizedBox(width: 12),
-          if (titleWidget != null) Flexible(child: titleWidget!),
-          if (title != null && titleWidget == null)
-            Text(
-              title!,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 12,
-                fontWeight: FontWeight.bold,
+    );
+
+    final rowContent = Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // 1. LEFT ANCHOR: Title / Logo Widget (Anchored on far left, never flexed/squeezed/clipped)
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            const SizedBox(width: 12),
+            if (titleWidget != null)
+              titleWidget!
+            else if (title != null)
+              Text(
+                title!,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
-            ),
-          
-          // 2. MIDDLE: Drag Area + Menus (Flexible & Scrollable)
-          Expanded(
-            child: GestureDetector(
-              behavior: HitTestBehavior.translucent,
-              onPanStart: (details) {
-                if (onClose == null) windowManager.startDragging();
-              },
-              onDoubleTap: () async {
-                if (onClose != null) return;
-                if (await windowManager.isMaximized()) {
-                  await windowManager.unmaximize();
-                } else {
-                  await windowManager.maximize();
-                }
-              },
-              child: Container(
-                color: Colors.transparent, // CRITICAL: Makes the empty space draggable
-                padding: const EdgeInsets.symmetric(horizontal: 24),
-                alignment: Alignment.centerLeft,
-                child: navigationMenu != null
-                    ? SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        physics: const NeverScrollableScrollPhysics(),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [navigationMenu!],
-                        ),
-                      )
-                    : const SizedBox.expand(), // Ensures the handle fills all available space
-              ),
-            ),
-          ),
+          ],
+        ),
 
-          // 3. RIGHT SIDE: Actions
-          if (trailingActions != null) trailingActions!,
-          const SizedBox(width: 8),
-
-          // 4. ABSOLUTE FAR RIGHT: OS Window Controls
-          if (onClose == null) ...[
-            _buildBtn(Icons.remove, hoverColor: Colors.white24, onTap: () => windowManager.minimize()),
-
-            _buildBtn(Icons.filter_none, hoverColor: Colors.white24, size: 14, onTap: () async {
+        // 2. MIDDLE FLEXIBLE AREA: Takes ONLY remaining space between Left Logo and Right Window Controls
+        Expanded(
+          child: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onPanStart: (details) {
+              if (onClose == null) windowManager.startDragging();
+            },
+            onDoubleTap: () async {
+              if (onClose != null) return;
               if (await windowManager.isMaximized()) {
                 await windowManager.unmaximize();
               } else {
                 await windowManager.maximize();
               }
-            }),
-          ],
+            },
+            child: Container(
+              color: Colors.transparent, // Draggable empty middle area
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  // Navigation Menus (if passed directly on title bar, e.g. main_dashboard.dart)
+                  if (navigationMenu != null) ...[
+                    Flexible(
+                      child: ScrollConfiguration(
+                        behavior: const _TopBarScrollBehavior(),
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          physics: const BouncingScrollPhysics(),
+                          child: navigationMenu!,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                  ],
 
-          _buildBtn(
-            Icons.close,
-            hoverColor: const Color(0xFFE81123),
-            isClose: true,
-            onTap: onClose ?? () => windowManager.close(),
+                  // Trailing Actions (Status & Action Badges): Uses only available middle space and scrolls if constrained
+                  if (trailingActions != null)
+                    Expanded(
+                      child: Align(
+                        alignment: Alignment.centerRight,
+                        child: ScrollConfiguration(
+                          behavior: const _TopBarScrollBehavior(),
+                          child: SingleChildScrollView(
+                            scrollDirection: Axis.horizontal,
+                            physics: const BouncingScrollPhysics(),
+                            child: trailingActions!,
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
           ),
-        ],
-      ),
+        ),
+
+        // 3. RIGHT ANCHOR: OS Window Controls (Anchored on far right)
+        _buildWindowControls(),
+      ],
+    );
+
+    return Container(
+      height: height,
+      decoration: borderDecoration,
+      child: borderRadius != null
+          ? ClipRRect(
+              borderRadius: borderRadius!,
+              child: rowContent,
+            )
+          : rowContent,
     );
   }
 
-  Widget _buildBtn(IconData icon, {required Color hoverColor, required VoidCallback onTap, double size = 18, bool isClose = false}) {
+  Widget _buildWindowControls() {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (onClose == null) ...[
+          _buildBtn(
+            Icons.remove,
+            hoverColor: Colors.white24,
+            onTap: onMinimize ?? () => windowManager.minimize(),
+          ),
+          _buildBtn(
+            Icons.filter_none,
+            hoverColor: Colors.white24,
+            size: 14,
+            onTap: onMaximize ?? () async {
+              if (await windowManager.isMaximized()) {
+                await windowManager.unmaximize();
+              } else {
+                await windowManager.maximize();
+              }
+            },
+          ),
+        ],
+        _buildBtn(
+          Icons.close,
+          hoverColor: const Color(0xFFE81123),
+          isClose: true,
+          onTap: onClose ?? () => windowManager.close(),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildBtn(
+    IconData icon, {
+    required Color hoverColor,
+    required VoidCallback onTap,
+    double size = 16,
+    bool isClose = false,
+  }) {
     return Material(
       color: Colors.transparent,
       child: InkWell(
         onTap: onTap,
         hoverColor: hoverColor,
         child: Container(
-          width: 48,
+          width: 46,
           height: double.infinity,
           alignment: Alignment.center,
           child: Icon(icon, color: Colors.white, size: size),

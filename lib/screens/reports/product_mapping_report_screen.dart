@@ -726,10 +726,15 @@ class _ProductMappingReportScreenState extends State<ProductMappingReportScreen>
             String text = "";
             if (col.key == "wholesaler") {
               text = m.wholesalerName;
-            } else if (col.key == "external_code") text = m.externalCode;
-            else if (col.key == "external_name") text = m.externalName;
-            else if (col.key == "internal_name") text = m.internalName;
-            else if (col.key == "product_id") text = m.productId;
+            } else if (col.key == "external_code") {
+              text = m.externalCode;
+            } else if (col.key == "external_name") {
+              text = m.externalName;
+            } else if (col.key == "internal_name") {
+              text = m.internalName;
+            } else if (col.key == "product_id") {
+              text = m.productId;
+            }
 
             return Expanded(
               flex: (col.flex * 10).toInt(),

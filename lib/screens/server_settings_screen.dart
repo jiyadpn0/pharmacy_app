@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -16,6 +17,7 @@ import '../services/lan_sync_service.dart';
 import '../services/app_notification_service.dart';
 import '../services/invoice_recovery_service.dart';
 import '../widgets/server_discrepancy_dialog.dart';
+import '../widgets/lan_terminal_discovery_dialog.dart';
 import '../utils/app_dialogs.dart';
 import '../utils/theme_constants.dart';
 
@@ -23,14 +25,13 @@ class ServerSettingsScreen extends StatefulWidget {
   final bool embedInTab;
   const ServerSettingsScreen({super.key, this.embedInTab = false});
 
+  static final GlobalKey<ServerSettingsScreenState> globalKey = GlobalKey<ServerSettingsScreenState>();
+
   @override
-  State<ServerSettingsScreen> createState() => _ServerSettingsScreenState();
+  State<ServerSettingsScreen> createState() => ServerSettingsScreenState();
 
   static Widget buildLiveTransferMonitorCardStatic(SupabaseSyncService syncService, AppThemeColors c) {
     final bool isExport = syncService.isExportMode;
-    final double overallPctDouble = syncService.syncProgress.clamp(0.0, 1.0);
-    final int overallPct = (overallPctDouble * 100).toInt();
-    final int overallRemainingPct = (100 - overallPct).clamp(0, 100);
 
     final categories = syncService.categorySyncStatuses.isNotEmpty
         ? syncService.categorySyncStatuses
@@ -144,6 +145,35 @@ class ServerSettingsScreen extends StatefulWidget {
               ),
             ],
           ),
+          if (syncService.lastSyncError.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.red.shade50,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.red.shade300),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.error_outline_rounded, size: 16, color: Colors.red),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      syncService.lastSyncError,
+                      style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.red),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ] else if (syncService.syncStatusMessage.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              'ℹ️ ${syncService.syncStatusMessage}',
+              style: TextStyle(fontSize: 10, fontStyle: FontStyle.italic, color: c.isDark ? Colors.grey.shade400 : Colors.grey.shade700),
+            ),
+          ],
           const SizedBox(height: 12),
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -269,7 +299,7 @@ class ServerSettingsScreen extends StatefulWidget {
   }
 }
 
-class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
+class ServerSettingsScreenState extends State<ServerSettingsScreen> {
   final TextEditingController _urlCtrl = TextEditingController();
   final TextEditingController _keyCtrl = TextEditingController();
   final TextEditingController _branchCtrl = TextEditingController();
@@ -384,7 +414,7 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
     }
   }
 
-  Future<void> _saveAndConnect() async {
+  Future<void> saveAndConnect() async {
     final url = _urlCtrl.text.trim();
     final key = _keyCtrl.text.trim();
     final branch = _branchCtrl.text.trim();
@@ -411,9 +441,9 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(_isServerModeEnabled
-              ? (connected ? 'Connected to Cloud Server successfully!' : 'Saved settings, but server connection failed.')
+              ? (connected ? 'Connected to Cloud Server successfully!' : 'Connection Failed! Cloud Server is disconnected.')
               : 'Switched to Local Standalone Mode.'),
-          backgroundColor: connected || !_isServerModeEnabled ? Colors.green.shade800 : Colors.orange.shade800,
+          backgroundColor: connected || !_isServerModeEnabled ? Colors.green.shade800 : Colors.red.shade900,
         ),
       );
     }
@@ -486,17 +516,16 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
           );
 
           final provider = Provider.of<PharmacyProvider>(context, listen: false);
-          final success = await DbHelper.instance.restoreBackupFile(file);
-          if (success) {
-            await provider.loadFromDatabase();
-          }
+          final result = await provider.restoreFromBackup(file);
           if (mounted && Navigator.canPop(context)) Navigator.pop(context);
 
-          if (success && mounted) {
+          if (mounted) {
+            final bool isSuccess = result;
+            final String msg = isSuccess ? "Database restored successfully." : "Failed to restore database.";
             ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text("⚡ Database Restored Successfully! All data matches imported file."),
-                backgroundColor: Colors.green,
+              SnackBar(
+                content: Text(msg),
+                backgroundColor: isSuccess ? Colors.green : Colors.red.shade800,
                 behavior: SnackBarBehavior.floating,
               ),
             );
@@ -516,6 +545,31 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
       final config = ServerConfigService.instance;
       if (!config.isConnected || config.supabaseUrl.isEmpty || config.supabaseAnonKey.isEmpty) return -1;
 
+      final cleanUrl = ServerConfigService.cleanServerUrl(config.supabaseUrl);
+      final headers = {
+        'apikey': config.supabaseAnonKey.trim(),
+        'Authorization': 'Bearer ${config.supabaseAnonKey.trim()}',
+      };
+
+      // 1. High-Performance Planner Count for Large Catalog (product_master)
+      // PostgreSQL sequential exact count scan triggers statement timeout (error 57014) on 200,000+ rows.
+      // PostgREST count=estimated with select=id & Range: 0-0 returns in < 300ms from PostgreSQL query planner!
+      if (endpoint == 'product_master') {
+        final estHeaders = Map<String, String>.from(headers)
+          ..['Prefer'] = 'count=estimated'
+          ..['Range'] = '0-0';
+        final estUri = Uri.parse('$cleanUrl/rest/v1/product_master?select=id');
+        final estRes = await http.get(estUri, headers: estHeaders).timeout(const Duration(seconds: 4));
+        if (estRes.statusCode == 200 || estRes.statusCode == 206) {
+          final contentRange = estRes.headers['content-range'] ?? '';
+          if (contentRange.contains('/')) {
+            final totalStr = contentRange.split('/').last.trim();
+            final cnt = int.tryParse(totalStr);
+            if (cnt != null && cnt >= 0) return cnt;
+          }
+        }
+      }
+
       String filterParam = queryFilter ?? '';
       if (filterParam.isEmpty) {
         if (['purchase_entries', 'sales_return_invoices', 'purchase_return_entries', 'patient_payments', 'supplier_payments', 'supplier_credit_notes'].contains(endpoint)) {
@@ -524,30 +578,56 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
       }
 
       final extraStr = filterParam.isNotEmpty ? '?select=count&$filterParam' : '?select=count';
-      final uri = Uri.parse('${config.supabaseUrl}/rest/v1/$endpoint$extraStr');
-      final headers = {
-        'apikey': config.supabaseAnonKey.trim(),
-        'Authorization': 'Bearer ${config.supabaseAnonKey.trim()}',
-        'Prefer': 'count=exact',
-        'Range': '0-0',
-      };
-      var res = await http.get(uri, headers: headers).timeout(const Duration(seconds: 2));
+      final uri = Uri.parse('$cleanUrl/rest/v1/$endpoint$extraStr');
+      final exactHeaders = Map<String, String>.from(headers)
+        ..['Prefer'] = 'count=exact'
+        ..['Range'] = '0-0';
+
+      var res = await http.get(uri, headers: exactHeaders).timeout(const Duration(seconds: 4));
       if (res.statusCode == 200 || res.statusCode == 206) {
         final contentRange = res.headers['content-range'] ?? '';
         if (contentRange.contains('/')) {
           final totalStr = contentRange.split('/').last.trim();
-          return int.tryParse(totalStr) ?? -1;
+          final cnt = int.tryParse(totalStr);
+          if (cnt != null && cnt >= 0) return cnt;
         }
+        try {
+          final bodyJson = jsonDecode(res.body);
+          if (bodyJson is List && bodyJson.isNotEmpty && bodyJson.first is Map) {
+            final dynamic val = bodyJson.first['count'];
+            if (val != null) {
+              final cnt = int.tryParse(val.toString());
+              if (cnt != null && cnt >= 0) return cnt;
+            }
+          }
+        } catch (_) {}
       } else if (filterParam.isNotEmpty) {
         // Fallback to simple count query if custom filter returns HTTP status error
-        final fallbackUri = Uri.parse('${config.supabaseUrl}/rest/v1/$endpoint?select=count&entry_no=not.is.null');
-        res = await http.get(fallbackUri, headers: headers).timeout(const Duration(seconds: 2));
+        final fallbackUri = Uri.parse('$cleanUrl/rest/v1/$endpoint?select=count&entry_no=not.is.null');
+        res = await http.get(fallbackUri, headers: exactHeaders).timeout(const Duration(seconds: 3));
         if (res.statusCode == 200 || res.statusCode == 206) {
           final contentRange = res.headers['content-range'] ?? '';
           if (contentRange.contains('/')) {
             final totalStr = contentRange.split('/').last.trim();
-            return int.tryParse(totalStr) ?? -1;
+            final cnt = int.tryParse(totalStr);
+            if (cnt != null && cnt >= 0) return cnt;
           }
+        }
+      }
+
+      // 3. Resilient Estimated Fallback: Never leave user with a false "Timeout" if server is online
+      final pkCol = (endpoint == 'sales_invoices' || endpoint == 'purchase_entries' || endpoint == 'sales_return_invoices' || endpoint == 'purchase_return_entries' || endpoint == 'stock_adjustments') ? 'entry_no' : 'id';
+      final fallbackHeaders = Map<String, String>.from(headers)
+        ..['Prefer'] = 'count=estimated'
+        ..['Range'] = '0-0';
+      final fallbackUri = Uri.parse('$cleanUrl/rest/v1/$endpoint?select=$pkCol');
+      final fallbackRes = await http.get(fallbackUri, headers: fallbackHeaders).timeout(const Duration(seconds: 3));
+      if (fallbackRes.statusCode == 200 || fallbackRes.statusCode == 206) {
+        final contentRange = fallbackRes.headers['content-range'] ?? '';
+        if (contentRange.contains('/')) {
+          final totalStr = contentRange.split('/').last.trim();
+          final cnt = int.tryParse(totalStr);
+          if (cnt != null && cnt >= 0) return cnt;
         }
       }
     } catch (_) {}
@@ -612,6 +692,7 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
       final wholesAccCnt = localCounts[12];
       final vouchersCnt = localCounts[13];
 
+      // 14 cloud endpoint queries with 15-second aggregate timeout
       final serverCounts = await Future.wait([
         _fetchServerCount('product_master'),
         _fetchServerCount('stock_batches'),
@@ -628,7 +709,7 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
         _fetchServerCount('supplier_payments'),
         _fetchServerCount('supplier_credit_notes'),
       ]).timeout(
-        const Duration(seconds: 8),
+        const Duration(seconds: 15),
         onTimeout: () => List.filled(14, -1),
       );
 
@@ -707,7 +788,7 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
                   Color statusColor;
 
                   if (server < 0) {
-                    statusText = 'Server Unreachable / Offline';
+                    statusText = 'Query Timed Out / Server Offline';
                     statusColor = Colors.grey.shade700;
                   } else if (diff == 0) {
                     statusText = 'In Sync ✅ (Local PC & Cloud Server Match Exactly)';
@@ -783,7 +864,7 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
                                       crossAxisAlignment: CrossAxisAlignment.end,
                                       children: [
                                         const Text('CLOUD SERVER', style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Colors.blueGrey)),
-                                        Text(server >= 0 ? fmt.format(server) : 'N/A', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 12, color: server >= 0 ? numberColor : Colors.grey)),
+                                        Text(server >= 0 ? fmt.format(server) : 'Timeout', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 12, color: server >= 0 ? numberColor : Colors.grey.shade600)),
                                       ],
                                     ),
                                   ),
@@ -800,6 +881,70 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
             ),
           ),
           actions: [
+            if (salServer == 0 && purServer == 0 && (salCnt > 0 || purCnt > 0))
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.blueGrey.shade800,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                ),
+                icon: const Icon(Icons.sync_problem_rounded, size: 16),
+                label: const Text('MATCH ZERO CLOUD (CLEAR LOCAL BILLS)', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)),
+                onPressed: () async {
+                  final messenger = ScaffoldMessenger.of(context);
+                  Navigator.pop(ctx);
+                  final confirm = await showDialog<bool>(
+                    context: context,
+                    builder: (dialogCtx) => AlertDialog(
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                      title: const Row(
+                        children: [
+                          Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 28),
+                          SizedBox(width: 10),
+                          Text('Wipe Local Bills to Match Clean Cloud?', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                        ],
+                      ),
+                      content: const Text(
+                        'Cloud Server has 0 sales invoices and 0 purchase entries (cleared from another PC).\n\nDo you want to purge local sales & purchases on this PC to match the clean cloud?\n\nEntry number will reset to 1. Product master will NOT be deleted.',
+                        style: TextStyle(fontSize: 13),
+                      ),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.pop(dialogCtx, false),
+                          child: const Text('CANCEL'),
+                        ),
+                        ElevatedButton(
+                          style: ElevatedButton.styleFrom(backgroundColor: Colors.red.shade700, foregroundColor: Colors.white),
+                          onPressed: () => Navigator.pop(dialogCtx, true),
+                          child: const Text('YES, CLEAR LOCAL BILLS', style: TextStyle(fontWeight: FontWeight.bold)),
+                        ),
+                      ],
+                    ),
+                  );
+                  if (!mounted) return;
+                  if (confirm == true) {
+                    final p = Provider.of<PharmacyProvider>(context, listen: false);
+                    final db = await DbHelper.instance.database;
+                    await db.transaction((txn) async {
+                      await txn.delete('sales_items');
+                      await txn.delete('sales_invoices');
+                      await txn.delete('purchase_items');
+                      await txn.delete('purchase_entries');
+                      await txn.delete('sales_return_items');
+                      await txn.delete('sales_return_invoices');
+                      await txn.delete('purchase_return_items');
+                      await txn.delete('purchase_return_entries');
+                      await txn.delete('stock_adjustments');
+                      await txn.delete('voucher_sequences');
+                    });
+                    await p.loadFromDatabase();
+                    messenger.showSnackBar(
+                      SnackBar(content: const Text('✅ Local sales & purchases cleared to match clean cloud. Entry No reset to 1!'), backgroundColor: Colors.green.shade800),
+                    );
+                  }
+                },
+              ),
             ElevatedButton.icon(
               style: ElevatedButton.styleFrom(
                 backgroundColor: Colors.red.shade800,
@@ -869,6 +1014,15 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
       );
     } catch (e) {
       debugPrint('Error fetching live system & server counts: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('⚠️ Could not open counts dialog: $e'),
+            backgroundColor: Colors.red.shade800,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
     }
   }
 
@@ -965,23 +1119,27 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
 
             // Last Successful Sync Status Banner
             ListenableBuilder(
-              listenable: syncService,
+              listenable: Listenable.merge([syncService, ServerConfigService.instance]),
               builder: (context, _) {
+                final isServerConnected = ServerConfigService.instance.isConnected;
+                final bool isCloudHealthy = isServerConnected && (syncService.lastSyncTime != null || ServerConfigService.instance.isPureCloud);
+
                 return Container(
                   padding: const EdgeInsets.all(14),
                   decoration: BoxDecoration(
                     color: syncService.isSyncing
                         ? Colors.blue.shade50
-                        : (syncService.lastSyncTime != null
+                        : (isCloudHealthy
                             ? Colors.green.shade50
-                            : Colors.grey.shade100),
+                            : Colors.red.shade50),
                     borderRadius: BorderRadius.circular(12),
                     border: Border.all(
                       color: syncService.isSyncing
                           ? Colors.blue.shade300
-                          : (syncService.lastSyncTime != null
+                          : (isCloudHealthy
                               ? Colors.green.shade300
-                              : Colors.grey.shade300),
+                              : Colors.red.shade400),
+                      width: isCloudHealthy ? 1 : 1.5,
                     ),
                   ),
                   child: Row(
@@ -989,15 +1147,15 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
                       Icon(
                         syncService.isSyncing
                             ? Icons.sync_rounded
-                            : (syncService.lastSyncTime != null
+                            : (isCloudHealthy
                                 ? Icons.check_circle_rounded
-                                : Icons.cloud_off_rounded),
+                                : Icons.cancel_rounded),
                         color: syncService.isSyncing
                             ? Colors.blue.shade800
-                            : (syncService.lastSyncTime != null
+                            : (isCloudHealthy
                                 ? Colors.green.shade800
-                                : Colors.grey.shade700),
-                        size: 24,
+                                : Colors.red.shade700),
+                        size: 26,
                       ),
                       const SizedBox(width: 12),
                       Expanded(
@@ -1007,28 +1165,32 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
                             Text(
                               syncService.isSyncing
                                   ? 'Cloud Syncing in Progress...'
-                                  : (syncService.lastSyncTime != null
+                                  : (isCloudHealthy
                                       ? 'Cloud Status: Connected & Up-to-Date'
-                                      : 'Cloud Status: Disconnected / Local Mode'),
+                                      : 'Cloud Status: Disconnected / Invalid Cloud URL'),
                               style: TextStyle(
                                 fontWeight: FontWeight.bold,
                                 fontSize: 13,
                                 color: syncService.isSyncing
                                     ? Colors.blue.shade900
-                                    : (syncService.lastSyncTime != null
+                                    : (isCloudHealthy
                                         ? Colors.green.shade900
-                                        : Colors.grey.shade800),
+                                        : Colors.red.shade900),
                               ),
                             ),
                             const SizedBox(height: 2),
                             Text(
-                              'Last Successful Sync: ${syncService.lastSyncFormatted}',
+                              isCloudHealthy
+                                  ? 'Last Successful Sync: ${syncService.lastSyncFormatted}'
+                                  : (ServerConfigService.instance.lastErrorMessage.isNotEmpty
+                                      ? 'Error: ${ServerConfigService.instance.lastErrorMessage}'
+                                      : 'Cannot reach Supabase host. Please check Project URL and API Key.'),
                               style: TextStyle(
                                 fontSize: 11,
                                 fontWeight: FontWeight.w600,
-                                color: syncService.lastSyncTime != null
+                                color: isCloudHealthy
                                     ? Colors.green.shade900
-                                    : Colors.grey.shade700,
+                                    : Colors.red.shade700,
                               ),
                             ),
                           ],
@@ -1120,8 +1282,8 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
                           borderRadius: BorderRadius.circular(8),
                           border: Border.all(color: Colors.blue.shade300),
                         ),
-                        child: Row(
-                          children: const [
+                        child: const Row(
+                          children: [
                             Icon(Icons.bolt, color: Colors.blue, size: 20),
                             SizedBox(width: 8),
                             Expanded(
@@ -1157,9 +1319,28 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
                         ServerConfigService.instance.setLanSyncEnabled(val);
                         if (!val) {
                           LanSyncService.instance.stopLanListener();
+                        } else {
+                          LanSyncService.instance.startAutoDiscovery();
                         }
                       },
                     ),
+                    if (_isLanSyncEnabled) ...[
+                      const SizedBox(height: 6),
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: OutlinedButton.icon(
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: Colors.blue.shade800,
+                            side: BorderSide(color: Colors.blue.shade300),
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                          ),
+                          icon: const Icon(Icons.radar_rounded, size: 16),
+                          label: const Text('View LAN Multi-Terminal Live Radar & Connected Counters', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                          onPressed: () => LanTerminalDiscoveryDialog.show(context),
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                    ],
                     const Divider(),
                     SwitchListTile(
                       contentPadding: EdgeInsets.zero,
@@ -1338,7 +1519,7 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
             SizedBox(
               width: double.infinity,
               child: ElevatedButton.icon(
-                onPressed: _saveAndConnect,
+                onPressed: saveAndConnect,
                 icon: const Icon(Icons.save_rounded, size: 20),
                 label: Text(_isServerModeEnabled ? 'SAVE & CONNECT TO SERVER' : 'SAVE LOCAL MODE'),
                 style: ElevatedButton.styleFrom(
@@ -1354,8 +1535,125 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
             const SizedBox(height: 20),
 
             ListenableBuilder(
-              listenable: syncService,
+              listenable: Listenable.merge([syncService, ServerConfigService.instance]),
               builder: (context, _) {
+                // When an active manual transfer is running (even in Pure Cloud mode), show the live progress card!
+                if (syncService.isSyncing && syncService.isManualTransfer && !syncService.isSilentBackgroundSync) {
+                  return _buildLiveTransferMonitorCard(syncService, c);
+                }
+
+                // In Pure Cloud Live mode, show the dedicated seed/pull actions card
+                if (ServerConfigService.instance.isPureCloud) {
+                  return Container(
+                    margin: const EdgeInsets.only(bottom: 14),
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: c.isDark ? const Color(0xFF0F172A) : const Color(0xFFF8FAFC),
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(
+                        color: c.isDark ? Colors.blueGrey.shade800 : Colors.blueGrey.shade200,
+                        width: 1.2,
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                color: Colors.blue.withValues(alpha: 0.12),
+                                shape: BoxShape.circle,
+                              ),
+                              child: const Icon(Icons.cloud_done_rounded, color: Colors.blue, size: 24),
+                            ),
+                            const SizedBox(width: 14),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text(
+                                    'PURE CLOUD LIVE MODE ACTIVE',
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.w900,
+                                      fontSize: 13,
+                                      letterSpacing: 0.5,
+                                      color: Colors.blue,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 3),
+                                  Text(
+                                    'Real-time transaction streaming is active. Use the buttons below if you wish to push local product catalogs or pull cloud data.',
+                                    style: TextStyle(
+                                      fontSize: 11.5,
+                                      color: c.isDark ? Colors.grey.shade400 : Colors.grey.shade600,
+                                      height: 1.3,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: ElevatedButton.icon(
+                                onPressed: () async {
+                                  final selected = await _showCategorySelectionDialog(isExport: true);
+                                  if (selected == null || selected.isEmpty) return;
+                                  await syncService.forcePushAllData(selectedCategories: selected);
+                                  if (!context.mounted) return;
+                                  _showSyncCompletionNotification(context, syncService, isExport: true);
+                                },
+                                icon: const Icon(Icons.cloud_upload_rounded, size: 16),
+                                label: const Text('PUSH MASTER CATALOG TO CLOUD', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.indigo.shade700,
+                                  foregroundColor: Colors.white,
+                                  padding: const EdgeInsets.symmetric(vertical: 10),
+                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: ElevatedButton.icon(
+                                onPressed: () async {
+                                  final selected = await _showCategorySelectionDialog(isExport: false);
+                                  if (selected == null || selected.isEmpty) return;
+                                  final success = await syncService.syncAllPendingData(
+                                    forceFull: true,
+                                    isExportMode: false,
+                                    isManualTransfer: true,
+                                    selectedCategories: selected,
+                                  );
+                                  if (!context.mounted) return;
+                                  if (success) {
+                                    await Provider.of<PharmacyProvider>(context, listen: false).loadFromDatabase();
+                                  }
+                                  if (!context.mounted) return;
+                                  _showSyncCompletionNotification(context, syncService, isExport: false);
+                                },
+                                icon: const Icon(Icons.cloud_download_rounded, size: 16),
+                                label: const Text('PULL CATALOG FROM CLOUD', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.teal.shade700,
+                                  foregroundColor: Colors.white,
+                                  padding: const EdgeInsets.symmetric(vertical: 10),
+                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  );
+                }
+
                 if (syncService.isSyncing && syncService.isManualTransfer && !syncService.isSilentBackgroundSync) {
                   return _buildLiveTransferMonitorCard(syncService, c);
                 }
@@ -1393,7 +1691,7 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
                       ),
                       const SizedBox(height: 16),
 
-                      // Section 1: EXPORT DATA (Send from PC 1)
+                      // Section 1: EXPORT DATA (Push to Cloud)
                       Container(
                         padding: const EdgeInsets.all(12),
                         decoration: BoxDecoration(
@@ -1409,7 +1707,7 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
                                 const Icon(Icons.upload_rounded, color: Colors.indigo, size: 18),
                                 const SizedBox(width: 6),
                                 Text(
-                                  '📤 EXPORT DATA (Send Data from PC 1)',
+                                  '📤 EXPORT DATA (Upload from This Computer ──► Cloud)',
                                   style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: c.isDark ? Colors.indigo.shade200 : Colors.indigo.shade900),
                                 ),
                               ],
@@ -1483,7 +1781,7 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
 
                       const SizedBox(height: 14),
 
-                      // Section 2: IMPORT DATA (Receive on PC 2)
+                      // Section 2: IMPORT DATA (Pull from Cloud)
                       Container(
                         padding: const EdgeInsets.all(12),
                         decoration: BoxDecoration(
@@ -1499,7 +1797,7 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
                                 const Icon(Icons.download_rounded, color: Colors.teal, size: 18),
                                 const SizedBox(width: 6),
                                 Text(
-                                  '📥 IMPORT DATA (Receive Data on PC 2)',
+                                  '📥 IMPORT DATA (Download from Cloud ──► This Computer)',
                                   style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: c.isDark ? Colors.teal.shade200 : Colors.teal.shade900),
                                 ),
                               ],
@@ -1585,26 +1883,29 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
               },
             ),
 
-            const SizedBox(height: 16),
-
-            // Live System Record Statistics Button
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                onPressed: _showLiveSystemCountsDialog,
-                icon: const Icon(Icons.analytics_rounded, size: 20, color: Colors.blue),
-                label: const Text('📊 VIEW LIVE LOCAL vs CLOUD SERVER COUNTS', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.blue)),
-                style: OutlinedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 16),
-                  side: const BorderSide(color: Colors.blue, width: 1.5),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            // Live System Record Statistics Button (Only shown in Hybrid / LAN mode; hidden in Pure Cloud to prevent false alarms)
+            if (!ServerConfigService.instance.isPureCloud) ...[
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: _showLiveSystemCountsDialog,
+                  icon: const Icon(Icons.analytics_rounded, size: 20, color: Colors.blue),
+                  label: const Text('📊 VIEW LIVE LOCAL vs CLOUD SERVER COUNTS', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.blue)),
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    side: const BorderSide(color: Colors.blue, width: 1.5),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                  ),
                 ),
               ),
-            ),
+            ],
 
-            const SizedBox(height: 16),
-
-            _buildInvoiceRecoveryCard(c),
+            // Invoice Recovery Card (Only shown in Hybrid / Offline mode; not used in Pure Cloud Live)
+            if (!ServerConfigService.instance.isPureCloud) ...[
+              const SizedBox(height: 16),
+              _buildInvoiceRecoveryCard(c),
+            ],
 
             const SizedBox(height: 16),
 
@@ -1647,9 +1948,6 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
 
   Widget _buildLiveTransferMonitorCard(SupabaseSyncService syncService, AppThemeColors c) {
     final bool isExport = syncService.isExportMode;
-    final double overallPctDouble = syncService.syncProgress.clamp(0.0, 1.0);
-    final int overallPct = (overallPctDouble * 100).toInt();
-    final int overallRemainingPct = (100 - overallPct).clamp(0, 100);
 
     final categories = syncService.categorySyncStatuses.isNotEmpty
         ? syncService.categorySyncStatuses
@@ -1767,6 +2065,36 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
               ),
             ],
           ),
+
+          if (syncService.lastSyncError.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.red.shade50,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.red.shade300),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.error_outline_rounded, size: 16, color: Colors.red),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      syncService.lastSyncError,
+                      style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.red),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ] else if (syncService.syncStatusMessage.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              'ℹ️ ${syncService.syncStatusMessage}',
+              style: TextStyle(fontSize: 10, fontStyle: FontStyle.italic, color: c.isDark ? Colors.grey.shade400 : Colors.grey.shade700),
+            ),
+          ],
 
           const SizedBox(height: 12),
 
@@ -1930,125 +2258,6 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
         type: NotificationType.backup,
       );
     } catch (_) {}
-  }
-
-  void _showSyncCompletionDialog(BuildContext context, SupabaseSyncService syncService, {required bool isExport}) {
-    final categories = syncService.categorySyncStatuses;
-    final int totalAttempted = categories.fold(0, (sum, c) => sum + c.totalCount);
-    final int totalProcessed = categories.fold(0, (sum, c) => sum + c.processedCount);
-    final bool isFullSuccess = syncService.lastSyncError.isEmpty && (totalAttempted == 0 || totalProcessed >= totalAttempted);
-
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: Row(
-          children: [
-            Icon(
-              isFullSuccess ? Icons.check_circle_rounded : Icons.warning_amber_rounded,
-              color: isFullSuccess ? Colors.green.shade700 : Colors.orange.shade800,
-              size: 28,
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Text(
-                isFullSuccess
-                    ? (isExport ? '🎉 Cloud Export Completed Successfully!' : '🎉 Cloud Import Completed Successfully!')
-                    : (isExport ? '⚠️ Cloud Export Completed with Warnings' : '⚠️ Cloud Import Completed with Warnings'),
-                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-              ),
-            ),
-          ],
-        ),
-        content: Container(
-          width: 480,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: isFullSuccess ? Colors.green.shade50 : Colors.orange.shade50,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: isFullSuccess ? Colors.green.shade200 : Colors.orange.shade300),
-                ),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text('Total Records Processed:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: isFullSuccess ? Colors.green.shade900 : Colors.orange.shade900)),
-                    Text(
-                      '$totalProcessed / ${totalAttempted > 0 ? totalAttempted : totalProcessed}',
-                      style: TextStyle(fontWeight: FontWeight.w900, fontSize: 14, color: isFullSuccess ? Colors.green.shade900 : Colors.orange.shade900),
-                    ),
-                  ],
-                ),
-              ),
-              if (syncService.lastSyncError.isNotEmpty) ...[
-                const SizedBox(height: 10),
-                const Text('Last Sync Status / Notice:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.grey)),
-                const SizedBox(height: 4),
-                Container(
-                  padding: const EdgeInsets.all(8),
-                  decoration: BoxDecoration(color: Colors.red.shade50, borderRadius: BorderRadius.circular(6), border: Border.all(color: Colors.red.shade200)),
-                  child: Text(syncService.lastSyncError, style: TextStyle(fontSize: 11, color: Colors.red.shade900)),
-                ),
-              ],
-              if (syncService.skippedItemLogs.isNotEmpty) ...[
-                const SizedBox(height: 10),
-                Text('Skipped / Isolated Items (${syncService.skippedItemLogs.length}):', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.orange.shade900)),
-                const SizedBox(height: 4),
-                Container(
-                  constraints: const BoxConstraints(maxHeight: 100),
-                  padding: const EdgeInsets.all(8),
-                  decoration: BoxDecoration(color: Colors.orange.shade50, borderRadius: BorderRadius.circular(6), border: Border.all(color: Colors.orange.shade200)),
-                  child: SingleChildScrollView(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: syncService.skippedItemLogs.map((log) => Text('• $log', style: TextStyle(fontSize: 10, color: Colors.orange.shade900))).toList(),
-                    ),
-                  ),
-                ),
-              ],
-              const SizedBox(height: 12),
-              const Text('Category Summary:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-              const SizedBox(height: 6),
-              Container(
-                constraints: const BoxConstraints(maxHeight: 200),
-                child: SingleChildScrollView(
-                  child: Column(
-                    children: categories.map((cat) {
-                      final bool isDone = cat.processedCount >= cat.totalCount && cat.totalCount > 0;
-                      return Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 3),
-                        child: Row(
-                          children: [
-                            Icon(cat.icon, size: 16, color: isDone ? Colors.green : Colors.blueGrey),
-                            const SizedBox(width: 8),
-                            Expanded(child: Text(cat.name, style: const TextStyle(fontSize: 12))),
-                            Text(
-                              '${cat.processedCount} / ${cat.totalCount}',
-                              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: isDone ? Colors.green.shade800 : Colors.orange.shade800),
-                            ),
-                          ],
-                        ),
-                      );
-                    }).toList(),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          ElevatedButton(
-            onPressed: () => Navigator.pop(ctx),
-            style: ElevatedButton.styleFrom(backgroundColor: isFullSuccess ? Colors.green.shade700 : Colors.indigo.shade700, foregroundColor: Colors.white),
-            child: const Text('OK / CLOSE', style: TextStyle(fontWeight: FontWeight.bold)),
-          ),
-        ],
-      ),
-    );
   }
 
   Widget _buildCloudPruningTimerCard() {
@@ -2271,7 +2480,7 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
 
       if (result.success) {
         await prefs.setBool('invoice_5_recovery_completed', true);
-        if (!context.mounted) return;
+        if (!mounted) return;
         setState(() {
           _invoice5Recovered = true;
         });
@@ -2298,7 +2507,7 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
           ),
         );
       } else {
-        if (!context.mounted) return;
+        if (!mounted) return;
         await showDialog(
           context: context,
           builder: (ctx) => AlertDialog(
@@ -2452,6 +2661,35 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
               ),
             ],
           ),
+          if (syncService.lastSyncError.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.red.shade50,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.red.shade300),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.error_outline_rounded, size: 16, color: Colors.red),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      syncService.lastSyncError,
+                      style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.red),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ] else if (syncService.syncStatusMessage.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              'ℹ️ ${syncService.syncStatusMessage}',
+              style: TextStyle(fontSize: 10, fontStyle: FontStyle.italic, color: c.isDark ? Colors.grey.shade400 : Colors.grey.shade700),
+            ),
+          ],
           const SizedBox(height: 12),
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -2578,6 +2816,9 @@ class _ServerSettingsScreenState extends State<ServerSettingsScreen> {
 }
 
 Widget _buildSourceBox(bool isExport, int overallRemainingPct) {
+  final termId = ServerConfigService.instance.terminalId.trim();
+  final localLabel = termId.isNotEmpty ? 'THIS PC ($termId)' : 'THIS PC';
+
   return Container(
     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
     decoration: BoxDecoration(
@@ -2589,7 +2830,7 @@ Widget _buildSourceBox(bool isExport, int overallRemainingPct) {
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
         Text(
-          isExport ? '🔵 SOURCE (PC 1)' : '🔵 SOURCE (CLOUD)',
+          isExport ? '🔵 SOURCE ($localLabel)' : '🔵 SOURCE (CLOUD SERVER)',
           style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.orange.shade900),
         ),
         Text(
@@ -2602,6 +2843,9 @@ Widget _buildSourceBox(bool isExport, int overallRemainingPct) {
 }
 
 Widget _buildTargetBox(bool isExport, int overallPct) {
+  final termId = ServerConfigService.instance.terminalId.trim();
+  final localLabel = termId.isNotEmpty ? 'THIS PC ($termId)' : 'THIS PC';
+
   return Container(
     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
     decoration: BoxDecoration(
@@ -2613,7 +2857,7 @@ Widget _buildTargetBox(bool isExport, int overallPct) {
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
         Text(
-          isExport ? '🟢 TARGET (CLOUD)' : '🟢 TARGET (PC 2)',
+          isExport ? '🟢 TARGET (CLOUD SERVER)' : '🟢 TARGET ($localLabel)',
           style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.green.shade900),
         ),
         Text(

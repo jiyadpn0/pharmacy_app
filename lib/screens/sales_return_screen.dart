@@ -6,7 +6,10 @@ import 'dart:async';
 import 'package:file_picker/file_picker.dart';
 
 import '../providers/pharmacy_provider.dart';
+import '../database/db_helper.dart';
 import '../services/server_config_service.dart';
+import '../services/supabase_sync_service.dart';
+import '../services/pure_cloud_service.dart';
 import '../services/whatsapp_service.dart';
 import '../windows/window_spawner.dart';
 import '../utils/app_dialogs.dart';
@@ -223,6 +226,7 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> implements Unsave
   void initState() {
     super.initState();
     UnsavedChangesRegistry.register("SALES RETURN", this);
+    ServerConfigService.instance.addListener(_onConfigChanged);
     _entryNo = widget.initialReturnNo ?? "...";
     final p = Provider.of<PharmacyProvider>(context, listen: false);
     Future.microtask(() async {
@@ -233,7 +237,6 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> implements Unsave
         if (mounted) setState(() => _entryNo = next);
       }
     });
-    _resetPage();
 
     _footerDiscPctCtrl.addListener(_calculateFooter);
     _footerDiscAmtCtrl.addListener(_calculateFooter);
@@ -258,8 +261,13 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> implements Unsave
     });
   }
 
+  void _onConfigChanged() {
+    if (mounted) setState(() {});
+  }
+
   @override
   void dispose() {
+    ServerConfigService.instance.removeListener(_onConfigChanged);
     UnsavedChangesRegistry.unregister("SALES RETURN");
     _scrollTimer?.cancel();
     _gridScrollCtrl.dispose();
@@ -452,8 +460,9 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> implements Unsave
     if (safeRow >= 0 && !_editableCols.contains(col)) {
       if (col < _editableCols.first) {
         safeCol = _editableCols.first;
-      } else if (col > _editableCols.last) safeCol = _editableCols.last;
-      else {
+      } else if (col > _editableCols.last) {
+        safeCol = _editableCols.last;
+      } else {
         safeCol = _editableCols.reduce((a, b) => (a - col).abs() < (b - col).abs() ? a : b);
       }
     }
@@ -587,9 +596,13 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> implements Unsave
         if (list.isNotEmpty) {
           if (_patientSearchList.value.isNotEmpty) {
             _onNameSelected(_patientCtrl, _patientSearchList, list[_searchIdx.value] as String, _mobileFocus);
-          } else if (_doctorSearchList.value.isNotEmpty) _onNameSelected(_doctorCtrl, _doctorSearchList, list[_searchIdx.value] as String, null);
-          else if (_isSelectingBatch) _finalizeBatchSelection(list[_searchIdx.value] as Product);
-          else _onProductSelected(list[_searchIdx.value] as Product);
+          } else if (_doctorSearchList.value.isNotEmpty) {
+            _onNameSelected(_doctorCtrl, _doctorSearchList, list[_searchIdx.value] as String, null);
+          } else if (_isSelectingBatch) {
+            _finalizeBatchSelection(list[_searchIdx.value] as Product);
+          } else {
+            _onProductSelected(list[_searchIdx.value] as Product);
+          }
           return true;
         }
       }
@@ -606,8 +619,11 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> implements Unsave
           } else {
             _moveFocus(-1, 1);
           }
-        } else if (col < 3) _moveFocus(-1, col + 1);
-        else _moveFocus(0, 1, autoOpen: true);
+        } else if (col < 3) {
+          _moveFocus(-1, col + 1);
+        } else {
+          _moveFocus(0, 1, autoOpen: true);
+        }
         return true;
       }
       return false;
@@ -617,7 +633,9 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> implements Unsave
       int curIdx = _editableCols.indexOf(col);
       if (curIdx > 0) {
         _moveFocus(row, _editableCols[curIdx - 1]);
-      } else if (row > 0) _moveFocus(row - 1, _editableCols.last);
+      } else if (row > 0) {
+        _moveFocus(row - 1, _editableCols.last);
+      }
       return true;
     }
 
@@ -985,15 +1003,131 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> implements Unsave
   }
 
   void _loadOriginalInvoice(String invoiceNo) async {
-    if (invoiceNo.trim().isEmpty || _isLoading) return;
+    final queryNo = invoiceNo.trim();
+    if (queryNo.isEmpty || _isLoading) return;
     setState(() => _isLoading = true);
 
     final provider = Provider.of<PharmacyProvider>(context, listen: false);
-    final originalInvoice = await provider.getSaleInvoiceById(invoiceNo.trim());
+    var originalInvoice = await provider.getSaleInvoiceById(queryNo);
+
+    // Fallback: If not found in local provider cache/database, query Pure Cloud document
+    if (originalInvoice == null && PureCloudService.instance.isActive) {
+      try {
+        final cloudHdr = await PureCloudService.instance.findDocument('sales_invoices', queryNo, fy: provider.selectedFinancialYear);
+        if (cloudHdr != null) {
+          DateTime parsedDate = DateTime.tryParse(cloudHdr['date']?.toString() ?? '') ?? DateTime.now();
+          originalInvoice = SaleInvoice(
+            entryNo: cloudHdr['entry_no']?.toString() ?? queryNo,
+            date: parsedDate,
+            customerAcc: cloudHdr['customer_acc']?.toString() ?? "Cash",
+            patient: cloudHdr['patient']?.toString() ?? "General",
+            mobile: cloudHdr['mobile']?.toString() ?? "",
+            doctor: cloudHdr['doctor']?.toString() ?? "Unknown",
+            doctorRegNo: cloudHdr['doctor_reg_no']?.toString() ?? "",
+            specialOrderJson: cloudHdr['special_order_json']?.toString() ?? "[]",
+            taxType: cloudHdr['tax_type']?.toString() ?? "Non Gst",
+            days: (cloudHdr['days'] as num?)?.toInt() ?? 0,
+            items: [],
+            subTotal: (cloudHdr['sub_total'] as num?)?.toDouble() ?? 0.0,
+            discount: (cloudHdr['discount'] as num?)?.toDouble() ?? 0.0,
+            grandTotal: (cloudHdr['grand_total'] as num?)?.toDouble() ?? 0.0,
+          );
+        }
+      } catch (e) {
+        debugPrint("Error fetching cloud sales invoice: $e");
+      }
+    }
 
     if (originalInvoice != null) {
+      // Robust Line Items Resolution: If items are empty, fetch from getInvoiceItems or PureCloud
+      List<SaleItem> effectiveItems = List.from(originalInvoice.items);
+      if (effectiveItems.isEmpty) {
+        List<Map<String, dynamic>> rawRows = [];
+
+        // 1. Try battle-tested getInvoiceItems with actual entry number and typed number
+        rawRows = await provider.getInvoiceItems(originalInvoice.entryNo, isPurchase: false);
+        if (rawRows.isEmpty && queryNo != originalInvoice.entryNo) {
+          rawRows = await provider.getInvoiceItems(queryNo, isPurchase: false);
+        }
+
+        // 2. Fallback to Pure Cloud line items
+        if (rawRows.isEmpty && PureCloudService.instance.isActive) {
+          rawRows = await PureCloudService.instance.findDocumentItems('sales_items', 'invoice_no', originalInvoice.entryNo);
+          if (rawRows.isEmpty && queryNo != originalInvoice.entryNo) {
+            rawRows = await PureCloudService.instance.findDocumentItems('sales_items', 'invoice_no', queryNo);
+          }
+          if (rawRows.isEmpty) {
+            rawRows = await PureCloudService.instance.findDocumentItems('sales_items', 'invoice_no', cleanEntryNo(queryNo));
+          }
+        }
+
+        // 3. Fallback to direct SQLite wildcard query across sales_items
+        if (rawRows.isEmpty) {
+          try {
+            final db = await DbHelper.instance.database;
+            final clean = cleanEntryNo(queryNo);
+            rawRows = await db.rawQuery('''
+              SELECT s.*, 
+                     COALESCE(s.qty, s.quantity, 1) as qty,
+                     COALESCE(s.s_rate, s.sale_rate, s.unit_price, 0.0) as s_rate,
+                     COALESCE(s.total, s.total_amount, 0.0) as total,
+                     COALESCE(s.batch, s.batch_number, '') as batch_number,
+                     COALESCE(s.expiry, s.expiry_date, '') as expiry_date,
+                     COALESCE(s.packin, s.packing, 1) as packin,
+                     p.name as product_name, p.hsn_code as master_hsn
+              FROM sales_items s
+              LEFT JOIN product_master p ON s.product_id = p.id
+              WHERE s.invoice_no = ? OR s.invoice_no = ? OR s.invoice_no = ? OR s.invoice_no LIKE ? OR s.invoice_no LIKE ?
+            ''', [originalInvoice.entryNo, queryNo, clean, "%_$clean", "%_$queryNo"]);
+          } catch (_) {}
+        }
+
+        if (rawRows.isNotEmpty) {
+          for (var m in rawRows) {
+            final pName = (m['product_name'] ?? m['extra'] ?? m['product_id'] ?? '').toString().trim();
+            final pId = m['product_id']?.toString() ?? '';
+            final bNo = (m['batch_number'] ?? m['batch'] ?? '').toString().trim();
+            final exp = (m['expiry_date'] ?? m['expiry'] ?? '').toString().trim();
+            final hsn = (m['master_hsn'] ?? m['hsn_code'] ?? '').toString().trim();
+            final mrpVal = (m['mrp'] as num?)?.toDouble() ?? 0.0;
+            final sRateVal = (m['s_rate'] as num?)?.toDouble() ?? (m['sale_rate'] as num?)?.toDouble() ?? 0.0;
+            final packVal = (m['packin'] as num?)?.toInt() ?? (m['packing'] as num?)?.toInt() ?? 1;
+            final gstVal = TaxCalculator.roundGstPercent((m['gst_percent'] as num?)?.toDouble() ?? (m['tax_percent'] as num?)?.toDouble() ?? 0.0);
+            final discPercent = (m['disc_percent'] as num?)?.toDouble() ?? 0.0;
+            final discAmt = (m['disc_amt'] as num?)?.toDouble() ?? 0.0;
+            final total = (m['total'] as num?)?.toDouble() ?? (m['total_amount'] as num?)?.toDouble() ?? 0.0;
+            final qty = (m['qty'] as num?)?.toInt() ?? (m['quantity'] as num?)?.toInt() ?? 1;
+
+            final prod = Product(
+              id: pId,
+              name: pName,
+              batch: bNo,
+              expiry: exp,
+              hsnCode: hsn,
+              mrp: mrpVal,
+              salePrice: sRateVal,
+              packSize: packVal,
+              gstPercent: gstVal,
+            );
+
+            effectiveItems.add(SaleItem(
+              product: prod,
+              qty: qty,
+              packin: packVal,
+              mrp: mrpVal,
+              sRate: sRateVal,
+              discPercent: discPercent,
+              discAmt: discAmt,
+              gstPercent: gstVal,
+              gstAmt: (m['gst_amt'] as num?)?.toDouble() ?? 0.0,
+              total: total,
+            ));
+          }
+        }
+      }
+
       setState(() {
-        _salesInvCtrl.text = originalInvoice.entryNo;
+        _salesInvCtrl.text = originalInvoice!.entryNo;
         _patientCtrl.text = originalInvoice.patient;
         _mobileCtrl.text = originalInvoice.mobile;
         _doctorCtrl.text = originalInvoice.doctor;
@@ -1004,15 +1138,11 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> implements Unsave
         _gridCtrls.clear();
         _gridFocusNodes.clear();
 
-        _originalInvoiceItems = originalInvoice.items.map((e) => e.clone()).toList();
+        _originalInvoiceItems = effectiveItems.map((e) => e.clone()).toList();
 
-        // Clear existing return draft lines before populating invoice reference
-        _items.clear();
-        _gridCtrls.clear();
-        _gridFocusNodes.clear();
-        for (var item in originalInvoice.items) {
+        // Populate return draft lines with original invoice items
+        for (var item in effectiveItems) {
           final returnLine = item.clone();
-          // Keep return qty default to original billed qty, capped strictly at original volume
           returnLine.qty = item.qty;
           returnLine.looseQty = item.looseQty;
           _items.add(returnLine);
@@ -1352,21 +1482,25 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> implements Unsave
 
       String targetEntryNo = isEdit ? _entryNo : "";
       if (!isEdit) {
-        final requested = cleanEntryNo(_entryNo);
-        final resolvedNo = await p.resolveGuaranteedNextEntryNo('sales_return_invoices', requested);
-        if (resolvedNo != requested && requested.isNotEmpty) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text("Return #$requested already taken. Automatically saved as Return #$resolvedNo"),
-                backgroundColor: Colors.blueAccent,
-                duration: const Duration(seconds: 4),
-              ),
+        String requested = cleanEntryNo(_entryNo);
+        try {
+          if (ServerConfigService.instance.isConnected) {
+            final allocated = await SupabaseSyncService.instance.allocateRemoteAtomicSequence(
+              'sales_return_invoices',
+              p.selectedFinancialYear,
             );
+            if (allocated != null && allocated > 0) {
+              requested = allocated.toString();
+            }
           }
-        }
-        targetEntryNo = resolvedNo;
-        _entryNo = resolvedNo;
+          final bool taken = await p.isEntryTaken('sales_return_invoices', requested);
+          if (taken || requested.isEmpty || requested == "AUTO") {
+            requested = await p.resolveGuaranteedNextEntryNo('sales_return_invoices', requested.isNotEmpty ? requested : "1", checkCloud: true);
+          }
+        } catch (_) {}
+
+        targetEntryNo = requested;
+        _entryNo = requested;
       }
 
       setState(() => _isLoading = true);
@@ -1429,6 +1563,14 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> implements Unsave
     if (confirmed == true) {
       setState(() => _isLoading = true);
       try {
+        if (PureCloudService.instance.isActive) {
+          await PureCloudService.instance.deleteDocument(
+            table: 'sales_return_invoices',
+            itemsTable: 'sales_return_items',
+            foreignKey: 'return_no',
+            entryNo: _entryNo,
+          );
+        }
         await p.deleteSaleReturn(_entryNo);
         p.logAudit('DELETE_SALE_RETURN', 'Sales Return Entry $_entryNo deleted.');
         if (mounted) {
@@ -1453,7 +1595,7 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> implements Unsave
     if (!mounted) return;
     final p = Provider.of<PharmacyProvider>(context, listen: false);
     _closeAllDropdowns();
-    FocusScope.of(context).unfocus();
+    FocusManager.instance.primaryFocus?.unfocus();
 
     for (var m in _gridCtrls.values) {
       for (var c in m.values) { c.dispose(); }
@@ -1664,8 +1806,12 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> implements Unsave
   }
 
   Widget _buildTopToolbar() {
-    bool canSave = !_isExistingEntry && !_isDeleted;
-    bool canEdit = _isExistingEntry && !_isDeleted;
+    final bool isPureCloud = ServerConfigService.instance.isPureCloud;
+    final bool isCloudConnected = ServerConfigService.instance.isConnected;
+    final bool isOfflineBlocked = isPureCloud && !isCloudConnected;
+
+    bool canSave = !isOfflineBlocked && !_isExistingEntry && !_isDeleted;
+    bool canEdit = !isOfflineBlocked && _isExistingEntry && !_isDeleted;
 
     return Container(
       height: 50,
@@ -1684,8 +1830,8 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> implements Unsave
             ),
           const SizedBox(width: 30),
           _topActionBtn(Icons.add_box_rounded, "New (F2)", Colors.blue, onTap: _resetPage),
-          _topActionBtn(Icons.check_circle_rounded, "Save (F6)", canSave ? Colors.green : Colors.grey.shade400, onTap: canSave ? () => _saveReturn(isEdit: false) : () {}),
-          _topActionBtn(Icons.edit_document, "Edit", canEdit ? Colors.orange : Colors.grey.shade400, onTap: canEdit ? () => _saveReturn(isEdit: true) : () {}),
+          _topActionBtn(Icons.check_circle_rounded, "Save (F6)", canSave ? Colors.green : Colors.grey.shade400, onTap: canSave ? () => _saveReturn(isEdit: false) : null),
+          _topActionBtn(Icons.edit_document, "Edit", canEdit ? Colors.orange : Colors.grey.shade400, onTap: canEdit ? () => _saveReturn(isEdit: true) : null),
           _topActionBtn(Icons.search_rounded, "Find (F3)", const Color(0xFF3F51B5), onTap: _showFindDialog),
           _topActionBtn(Icons.print_rounded, "Print", Colors.blueGrey, onTap: _exportToPdf),
           _topActionBtn(Icons.picture_as_pdf_rounded, "PDF", const Color(0xFFE53935), onTap: _exportToPdf),
@@ -1797,10 +1943,11 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> implements Unsave
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           SizedBox(
-            width: 225,
+            width: 285,
             child: Column(
               children: [
                 _headerRow("Entry No:", Row(
+                  mainAxisSize: MainAxisSize.min,
                   children: [
                     FluentNavButton(
                       icon: Icons.chevron_left_rounded,
@@ -1846,15 +1993,17 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> implements Unsave
                   ],
                 )),
                 const SizedBox(height: 6),
-                _headerRow("Date:", InkWell(
-                  onTap: _isDeleted ? null : () async {
-                    final picked = await showAppDatePicker(context: context, initialDate: _date, firstDate: DateTime(2000), lastDate: DateTime(2100));
-                    if (picked != null) setState(() => _date = picked);
-                  },
-                  child: Container(
-                    height: 22, padding: const EdgeInsets.symmetric(horizontal: 6),
-                    decoration: BoxDecoration(color: Colors.white, border: Border.all(color: Colors.grey.shade400)),
-                    child: Row(children: [Text(DateFormat('dd/MM/yyyy').format(_date), style: const TextStyle(fontSize: 11)), const Spacer(), const Icon(Icons.calendar_month, size: 14)]),
+                _headerRow("Date:", Builder(
+                  builder: (dateCtx) => InkWell(
+                    onTap: _isDeleted ? null : () async {
+                      final picked = await showAppDatePicker(context: dateCtx, initialDate: _date, firstDate: DateTime(2000), lastDate: DateTime(2100));
+                      if (picked != null) setState(() => _date = picked);
+                    },
+                    child: Container(
+                      height: 22, padding: const EdgeInsets.symmetric(horizontal: 6),
+                      decoration: BoxDecoration(color: Colors.white, border: Border.all(color: Colors.grey.shade400)),
+                      child: Row(children: [Text(DateFormat('dd/MM/yyyy').format(_date), style: const TextStyle(fontSize: 11)), const Spacer(), const Icon(Icons.calendar_month, size: 14)]),
+                    ),
                   ),
                 )),
                 const SizedBox(height: 6),
@@ -1983,15 +2132,6 @@ class _SalesReturnScreenState extends State<SalesReturnScreen> implements Unsave
       SizedBox(width: 75, child: Text(label, style: const TextStyle(fontSize: 11, color: Colors.black87))),
       Expanded(child: child),
     ],
-  );
-
-  Widget _entryNavBtn(String txt, {VoidCallback? onTap}) => InkWell(
-    onTap: onTap,
-    child: Container(
-      width: 22, height: 26, alignment: Alignment.center,
-      decoration: BoxDecoration(color: Colors.grey.shade200, border: Border.all(color: Colors.grey.shade400)),
-      child: Text(txt, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-    ),
   );
 
   Widget _buildGridHeader(double dynamicWidth) => Container(

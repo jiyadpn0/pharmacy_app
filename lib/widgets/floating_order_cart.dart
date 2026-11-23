@@ -57,7 +57,7 @@ class _FloatingOrderCartState extends State<FloatingOrderCart> {
 
     // Set default initial position (top-right area, safely below titlebar)
     final double defaultX = (screenSize.width - 210.0).clamp(10.0, screenSize.width - 10.0);
-    final double defaultY = 80.0;
+    const double defaultY = 80.0;
 
     Offset currentPos = _position ?? Offset(defaultX, defaultY);
 

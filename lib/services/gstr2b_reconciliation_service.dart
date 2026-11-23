@@ -49,7 +49,6 @@ class Gstr2bReconciliationService {
         for (var inv in invList) {
           final String inum = inv['inum']?.toString() ?? '';
           final String idt = inv['idt']?.toString() ?? '';
-          final double val = (inv['val'] as num?)?.toDouble() ?? 0.0;
 
           double portalTaxable = 0.0;
           double portalTax = 0.0;

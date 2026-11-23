@@ -23,7 +23,7 @@ class CustomerLedgerScreen extends StatefulWidget {
 }
 
 class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
-  DateTime _startDate = DateTime.now();
+  DateTime _startDate = DateTime.now().subtract(const Duration(days: 30));
   DateTime _endDate = DateTime.now();
   String _patientSearchQuery = "";
   String? _selectedPatient;
@@ -363,7 +363,34 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
                   child: _buildLedgerRows(c, ledgerData, provider),
                 ),
               ),
-              _buildLedgerFooter(c, ledgerData),
+              Builder(
+                builder: (ctx) {
+                  final startOfDay = DateTime(_startDate.year, _startDate.month, _startDate.day, 0, 0, 0);
+                  final endOfDay = DateTime(_endDate.year, _endDate.month, _endDate.day, 23, 59, 59);
+                  double opDeb = 0.0;
+                  double opCred = 0.0;
+                  for (var r in ledgerData) {
+                    if (r.date.isBefore(startOfDay)) {
+                      opDeb += r.debit;
+                      opCred += r.credit;
+                    }
+                  }
+                  double opBal = opDeb - opCred;
+                  List<_LedgerRowData> inRangeList = [];
+                  if (opBal.abs() >= 0.01 || opDeb > 0 || opCred > 0) {
+                    inRangeList.add(_LedgerRowData(
+                      date: startOfDay,
+                      reference: "OPENING B/F",
+                      debit: opBal > 0 ? opBal : 0.0,
+                      credit: opBal < 0 ? opBal.abs() : 0.0,
+                      type: "OPENING",
+                      isOpening: true,
+                    ));
+                  }
+                  inRangeList.addAll(ledgerData.where((r) => !r.date.isBefore(startOfDay) && !r.date.isAfter(endOfDay)));
+                  return _buildLedgerFooter(c, inRangeList);
+                },
+              ),
             ],
           ),
         ),
@@ -779,18 +806,49 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
       }
     }
 
+    final startOfDay = DateTime(_startDate.year, _startDate.month, _startDate.day, 0, 0, 0);
+    final endOfDay = DateTime(_endDate.year, _endDate.month, _endDate.day, 23, 59, 59);
+
+    double openingDebit = 0.0;
+    double openingCredit = 0.0;
+    for (var row in ledgerData) {
+      if (row.date.isBefore(startOfDay)) {
+        openingDebit += row.debit;
+        openingCredit += row.credit;
+      }
+    }
+    double openingBal = openingDebit - openingCredit;
+
     double runningBalance = 0;
     int runningBalancePaise = 0;
     List<Widget> visibleRows = [];
+
+    // Prepend Brought-Forward Opening Balance if transactions occurred before start date
+    if (openingBal.abs() >= 0.01 || openingDebit > 0 || openingCredit > 0) {
+      runningBalance = openingBal;
+      runningBalancePaise = (openingBal * 100).round();
+      final opRow = _LedgerRowData(
+        date: startOfDay,
+        reference: "OPENING B/F",
+        debit: openingBal > 0 ? openingBal : 0.0,
+        credit: openingBal < 0 ? openingBal.abs() : 0.0,
+        type: "OPENING",
+        remarks: "Brought Forward Balance prior to ${DateFormat('dd/MM/yyyy').format(startOfDay)}",
+        isOpening: true,
+      );
+      visibleRows.add(_buildGridRow(c, opRow, runningBalance, provider, openingBal > 0 ? Colors.redAccent : Colors.greenAccent, -1));
+    }
+
     for (int i = 0; i < ledgerData.length; i++) {
       var row = ledgerData[i];
+      if (row.date.isBefore(startOfDay)) continue;
+
       runningBalance += row.debit;
       runningBalance -= row.credit;
       runningBalancePaise += (row.debit * 100).round();
       runningBalancePaise -= (row.credit * 100).round();
 
-      bool inRange = row.date.isAfter(_startDate.subtract(const Duration(seconds: 1))) &&
-          row.date.isBefore(_endDate.add(const Duration(days: 1)));
+      bool inRange = !row.date.isAfter(endOfDay);
       
       if (inRange) {
         Color balColor = c.primaryText; 
@@ -839,7 +897,9 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
       child: Container(
         height: 35,
         decoration: BoxDecoration(
-          color: isSelected ? const Color(0xFFBAE6FD) : (isRecentReturn ? Colors.tealAccent.withValues(alpha: 0.15) 
+          color: isSelected ? const Color(0xFFBAE6FD) 
+               : data.isOpening ? Colors.amber.withValues(alpha: 0.18)
+               : (isRecentReturn ? Colors.tealAccent.withValues(alpha: 0.15) 
                : data.type == 'RECEIPT' ? Colors.green.withValues(alpha: 0.12) 
                : data.type == 'SALE RETURN' ? Colors.orange.withValues(alpha: 0.12)
                : c.cardBg),
@@ -1089,6 +1149,7 @@ class _LedgerRowData {
   final String remarks;
   final String method;
   final String invoice;
+  final bool isOpening;
 
   _LedgerRowData({
     required this.date,
@@ -1099,5 +1160,6 @@ class _LedgerRowData {
     this.remarks = "",
     this.method = "",
     this.invoice = "",
+    this.isOpening = false,
   });
 }

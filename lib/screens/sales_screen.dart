@@ -18,6 +18,9 @@ import '../services/server_config_service.dart';
 import '../services/supabase_sync_service.dart';
 import '../services/delta_sync_service.dart';
 import '../services/app_notification_service.dart';
+import '../services/pure_cloud_service.dart';
+import '../services/stock_outbox_service.dart';
+import '../widgets/live_system_counts_dialog.dart';
 import '../database/db_helper.dart';
 
 // Providers & Controllers
@@ -103,6 +106,13 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   bool _isDirty = false; // NEW: Tracks if any changes were made to an existing entry
   bool _isDeleted = false; // NEW: Tracks if the loaded entry is marked as deleted
   bool _isImported = false; // NEW: Tracks if record was imported from historical data
+  bool get _isBeforeToday {
+    if (!_isExistingEntry) return false;
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final entryDay = DateTime(_date.year, _date.month, _date.day);
+    return entryDay.isBefore(today);
+  }
   bool _isResetting = false; // Prevents recursive re-entrant reset loops
   bool _hasNewMobileOrder = false;
   bool _showProfitColumn = false; 
@@ -406,7 +416,12 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       });
     }
 
-    final nextNo = await p.getNextSaleEntryNo();
+    String nextNo;
+    if (ServerConfigService.instance.isPureCloud) {
+      nextNo = await PureCloudService.instance.getNextSequenceNumber('sales_invoices', p.selectedFinancialYear);
+    } else {
+      nextNo = await p.getNextSaleEntryNo();
+    }
 
     if (mounted && !_isExistingEntry) {
       setState(() {
@@ -423,7 +438,6 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   @override
   void initState() {
     super.initState();
-    DbHelper.setBillingActive(true);
     UnsavedChangesRegistry.register("SALES ENTRY", this);
 
     _loadColumnWidths();
@@ -443,7 +457,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     _watchdogSub = AppNotificationService.instance.watchdogStream.listen((notif) {
       if (!mounted) return;
       final cat = notif.detectedCategory;
-      if (cat == 'STOCK' || cat == 'CATALOG' || cat == 'SALES' || cat == 'PURCHASE') {
+      if (cat == 'STOCK' || cat == 'CATALOG' || cat == 'SALES' || cat == 'PURCHASE' || cat == 'PURCHASES') {
         final prov = Provider.of<PharmacyProvider>(context, listen: false);
         prov.refreshLiveStock();
       }
@@ -454,31 +468,50 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                 notif.actionPayload!['entryNo'].toString().trim() == _entryNo.trim());
 
         if (matchesCurrentEntry) {
-          ScaffoldMessenger.of(context).hideCurrentMaterialBanner();
-          ScaffoldMessenger.of(context).showMaterialBanner(
-            MaterialBanner(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              content: Text(
-                "⚡ Live Notice: Invoice #$_entryNo was updated on another PC (${notif.terminalName ?? 'Cloud Server'}).",
-                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
+          final isDel = notif.operationType == 'DELETE' || notif.message.toLowerCase().contains('deleted');
+          if (isDel) {
+            // Live auto-reset when deleted on another computer
+            ScaffoldMessenger.of(context).hideCurrentMaterialBanner();
+            _resetPage(force: true);
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text("⚡ Sales Invoice #$_entryNo was deleted on ${notif.terminalName ?? 'another PC'}. Screen reset."),
+                backgroundColor: Colors.red.shade800,
+                duration: const Duration(seconds: 4),
               ),
-              leading: const Icon(Icons.bolt_rounded, color: Colors.amberAccent),
-              backgroundColor: Colors.purple.shade900,
-              actions: [
-                TextButton(
-                  onPressed: () {
-                    ScaffoldMessenger.of(context).hideCurrentMaterialBanner();
-                    _loadSaleData(_entryNo);
-                  },
-                  child: const Text("RELOAD INVOICE", style: TextStyle(color: Colors.amberAccent, fontWeight: FontWeight.bold, fontSize: 11)),
+            );
+          } else if (!_isDirty && !hasUnsavedChanges()) {
+            // Live auto-reload when updated on another computer (cashier not currently editing)
+            ScaffoldMessenger.of(context).hideCurrentMaterialBanner();
+            _loadSaleData(_entryNo);
+          } else {
+            // Cashier has unsaved local edits: show polite non-intrusive banner
+            ScaffoldMessenger.of(context).hideCurrentMaterialBanner();
+            ScaffoldMessenger.of(context).showMaterialBanner(
+              MaterialBanner(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                content: Text(
+                  "⚡ Live Notice: Invoice #$_entryNo was updated on another PC (${notif.terminalName ?? 'Cloud Server'}).",
+                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
                 ),
-                IconButton(
-                  icon: const Icon(Icons.close_rounded, color: Colors.white, size: 16),
-                  onPressed: () => ScaffoldMessenger.of(context).hideCurrentMaterialBanner(),
-                ),
-              ],
-            ),
-          );
+                leading: const Icon(Icons.bolt_rounded, color: Colors.amberAccent),
+                backgroundColor: Colors.purple.shade900,
+                actions: [
+                  TextButton(
+                    onPressed: () {
+                      ScaffoldMessenger.of(context).hideCurrentMaterialBanner();
+                      _loadSaleData(_entryNo);
+                    },
+                    child: const Text("RELOAD INVOICE", style: TextStyle(color: Colors.amberAccent, fontWeight: FontWeight.bold, fontSize: 11)),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close_rounded, color: Colors.white, size: 16),
+                    onPressed: () => ScaffoldMessenger.of(context).hideCurrentMaterialBanner(),
+                  ),
+                ],
+              ),
+            );
+          }
         }
       }
     });
@@ -592,6 +625,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   @override
   void dispose() {
     _isDisposed = true;
+    _entryNoDebounceTimer?.cancel();
     _watchdogSub?.cancel();
     ServerConfigService.instance.removeListener(_onConfigChanged);
     _saveColWidthsTimer?.cancel();
@@ -962,45 +996,9 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         }
       }
 
-      // Auto-fill Batch on blur
+      // Batch on blur
       if (col == 4) {
-        if (value.trim().isEmpty && it.product.name.isNotEmpty) {
-          final p = Provider.of<PharmacyProvider>(context, listen: false);
-          final now = DateTime.now();
-
-          // Only auto-fill unexpired batches with stock (O(1) Fast Lookup)
-          final candidateBatches = p.getBatchesForProduct(it.product.id, it.product.name);
-          final availableBatches = candidateBatches.where((prod) {
-            int origQty = _originalInvoiceBatchQtys["${prod.id}|${prod.batch.trim().toUpperCase()}"] ?? 0;
-            int usedInOtherRows = _getCrossRowStockUsed(prod, row);
-            int trueAvailable = prod.stock + origQty - usedInOtherRows;
-            return trueAvailable > 0 && !_parseExpiry(prod.expiry).isBefore(now);
-          }).toList();
-
-          if (availableBatches.isNotEmpty) {
-            availableBatches.sort((a, b) => _parseExpiry(a.expiry).compareTo(_parseExpiry(b.expiry)));
-            final bestBatch = availableBatches.first;
-
-            int pack = bestBatch.packSize > 0 ? bestBatch.packSize : 1;
-            it.product.batch = bestBatch.batch;
-            it.product.expiry = bestBatch.expiry;
-            it.product.stock = bestBatch.stock;
-            it.product.landingCost = bestBatch.landingCost;
-            it.product.purchaseRate = bestBatch.purchaseRate;
-            it.product.mrp = bestBatch.mrp;
-            it.product.salePrice = bestBatch.salePrice > 0 ? bestBatch.salePrice : bestBatch.mrp;
-            it.product.rack = bestBatch.rack;
-            it.packin = pack;
-            it.mrp = bestBatch.mrp / pack.toDouble();
-            it.sRate = (bestBatch.salePrice > 0 ? bestBatch.salePrice : bestBatch.mrp) / pack.toDouble();
-            it.gstPercent = bestBatch.gstPercent;
-
-            _getGridCtrl(row, 3).text = bestBatch.rack;
-            _getGridCtrl(row, 4).text = _cleanBatch(bestBatch.batch);
-            _getGridCtrl(row, 5).text = bestBatch.expiry;
-            _calculateItem(row);
-          }
-        }
+        it.product.batch = value.trim();
       }
 
       if (col == 5) it.product.expiry = value;
@@ -1630,9 +1628,9 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         _openGenericSearchDialog();
         return true;
       }
-      // F6: Save Invoice or Edit
+      // F6: Save Invoice (Always creates a new entry on fresh blank page)
       if (event.logicalKey == LogicalKeyboardKey.f6) {
-        _isExistingEntry && !_isDeleted ? _editSale() : _saveSale(isEdit: false);
+        _saveSale(isEdit: false);
         return true;
       }
       // F7: Focus Customer / Patient Name
@@ -1650,9 +1648,9 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         _exportToPdf();
         return true;
       }
-      // F10: Save Invoice or Edit
+      // F10: Save Invoice (Always creates a new entry on fresh blank page)
       if (event.logicalKey == LogicalKeyboardKey.f10) {
-        _isExistingEntry && !_isDeleted ? _editSale() : _saveSale(isEdit: false);
+        _saveSale(isEdit: false);
         return true;
       }
       // F11: Hold current billing session and switch workspace
@@ -2395,10 +2393,16 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     _productSearchDebouncer.run(() {
       if (!mounted) return;
       final provider = Provider.of<PharmacyProvider>(context, listen: false);
-      final results = provider.searchProducts(query, isSalesWindow: true);
+      final rawResults = provider.searchProducts(query, isSalesWindow: true);
+      final results = Product.deduplicateProducts(rawResults);
 
       List<Product> list = List.from(results.take(50));
-      final bool hasExact = results.any((p) => p.name.trim().toLowerCase() == query.toLowerCase());
+      list.removeWhere((p) => p.id == "NEW");
+
+      final cleanQ = Product.cleanProductName(query).toLowerCase();
+      final bool hasExact = results.any((p) =>
+          p.id != "NEW" && Product.cleanProductName(p.name).toLowerCase() == cleanQ);
+
       if (!hasExact && query.length >= 2) {
         list.add(Product(id: "NEW", name: query));
       }
@@ -2414,6 +2418,92 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         }
       } else {
         _updateFooter(Product(id: "", name: ""));
+      }
+
+      // 1. FAST LOCAL SQLITE FALLBACK: If RAM search found only "NEW", query SQLite product_master immediately (< 5ms)
+      if (query.length >= 2 && (list.isEmpty || list.every((p) => p.id == "NEW"))) {
+        Future.microtask(() async {
+          try {
+            final db = await DbHelper.instance.database;
+            final cleanQ = query.replaceAll("'", "''");
+            final dbRows = await db.rawQuery(
+              "SELECT * FROM product_master WHERE name LIKE ? OR name LIKE ? OR generic_name LIKE ? ORDER BY name ASC LIMIT 50",
+              ['$cleanQ%', '%$cleanQ%', '%$cleanQ%'],
+            );
+            if (dbRows.isNotEmpty && mounted) {
+              bool addedAny = false;
+              for (var row in dbRows) {
+                final p = Product(
+                  id: row['id'].toString(),
+                  name: row['name']?.toString() ?? "UNKNOWN",
+                  hsnCode: row['hsn_code']?.toString() ?? "",
+                  rack: row['rack_id']?.toString() ?? "",
+                  category: row['category_id']?.toString() ?? "General",
+                  subCategory: row['sub_category_id']?.toString() ?? "",
+                  packSize: (row['packing'] as num?)?.toInt() ?? 1,
+                  mrp: (row['mrp'] as num?)?.toDouble() ?? 0.0,
+                  purchaseRate: (row['purchase_rate'] as num?)?.toDouble() ?? 0.0,
+                  salePrice: (row['sale_rate'] as num?)?.toDouble() ?? 0.0,
+                  gstPercent: TaxCalculator.roundGstPercent((row['gst_percent'] as num?)?.toDouble() ?? 12.0),
+                  sDiscPercent: (row['s_disc_percent'] as num?)?.toDouble() ?? 0.0,
+                  patent: row['patent']?.toString() ?? "",
+                  schedule: row['schedule']?.toString() ?? "",
+                  manufacturer: row['manufacturer_id']?.toString() ?? "",
+                  genericName: row['generic_name']?.toString() ?? "",
+                  stock: 0,
+                );
+                if (!provider.productMaster.any((m) => m.id == p.id)) {
+                  provider.productMaster.add(p);
+                  addedAny = true;
+                }
+              }
+              if (addedAny) {
+                provider.invalidateSearchProductsCache();
+                final updatedRaw = provider.searchProducts(query, isSalesWindow: true);
+                final updatedResults = Product.deduplicateProducts(updatedRaw);
+                List<Product> updatedList = List.from(updatedResults.take(50));
+                updatedList.removeWhere((p) => p.id == "NEW");
+                if (!hasExact && query.length >= 2) {
+                  updatedList.add(Product(id: "NEW", name: query));
+                }
+                if (updatedList.any((p) => p.id != "NEW") && mounted) {
+                  _searchList.value = updatedList;
+                  _searchIdx.value = 0;
+                  _updateFooter(updatedList.first);
+                }
+              }
+            }
+          } catch (_) {}
+        });
+      }
+
+      // 2. LIVE CLOUD FALLBACK: If only NEW product is found or results are empty
+      if (PureCloudService.instance.isActive && query.length >= 2 && (list.isEmpty || list.every((p) => p.id == "NEW"))) {
+        PureCloudService.instance.searchLiveProducts(query).then((cloudMatches) {
+          if (!mounted || cloudMatches.isEmpty) return;
+          bool addedAny = false;
+          for (final cp in cloudMatches) {
+            if (!provider.productMaster.any((m) => m.id == cp.id)) {
+              provider.productMaster.add(cp);
+              addedAny = true;
+            }
+          }
+          if (addedAny) {
+            provider.invalidateSearchProductsCache();
+            final updatedRaw = provider.searchProducts(query, isSalesWindow: true);
+            final updatedResults = Product.deduplicateProducts(updatedRaw);
+            List<Product> updatedList = List.from(updatedResults.take(50));
+            updatedList.removeWhere((p) => p.id == "NEW");
+            if (!hasExact && query.length >= 2) {
+              updatedList.add(Product(id: "NEW", name: query));
+            }
+            if (updatedList.any((p) => p.id != "NEW") && mounted) {
+              _searchList.value = updatedList;
+              _searchIdx.value = 0;
+              _updateFooter(updatedList.first);
+            }
+          }
+        });
       }
     });
   }
@@ -2459,7 +2549,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     _productSearchDebouncer.run(() {
       if (!mounted) return;
       final provider = Provider.of<PharmacyProvider>(context, listen: false);
-      final results = provider.searchProducts(query, isSalesWindow: true);
+      final rawResults = provider.searchProducts(query, isSalesWindow: true);
+      final results = Product.deduplicateProducts(rawResults);
       _specialSearchList.value = results.take(20).toList();
       _searchIdx.value = 0;
     });
@@ -3171,12 +3262,21 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
     final p = Provider.of<PharmacyProvider>(context, listen: false);
     try {
-      final data = initialData ?? await p.navigateInvoice(invNo, 'find', isPurchase: false);
+      Map<String, dynamic>? data = initialData;
+      if (data == null) {
+        if (PureCloudService.instance.isActive) {
+          data = await PureCloudService.instance.findDocument('sales_invoices', invNo);
+          data ??= await p.navigateInvoice(invNo, 'find', isPurchase: false);
+        } else {
+          data = await p.navigateInvoice(invNo, 'find', isPurchase: false);
+        }
+      }
       if (!mounted) return false;
 
       // 1. If data is found (active or deleted), load it normally
       if (data != null && mounted) {
-        if (data['is_blank'] == true) {
+        final loadedData = data;
+        if (loadedData['is_blank'] == true) {
           FocusScope.of(context).unfocus();
           setState(() {
             _clearGridMaps();
@@ -3186,7 +3286,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
             _isImported = false;
             _isDirty = false;
             _items.clear();
-            _rawEntryNo = data['entry_no']?.toString() ?? invNo;
+            _rawEntryNo = loadedData['entry_no']?.toString() ?? invNo;
             _entryNo = cleanEntryNo(_rawEntryNo);
             _entryNoCtrl.text = formatSaleDisplayNo(_entryNo);
             _date = DateTime.now();
@@ -3213,9 +3313,17 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         FocusScope.of(context).unfocus();
         if (!mounted) return false;
 
-        final loadedEntryNo = data['entry_no']?.toString() ?? data['invoice_no']?.toString() ?? invNo;
+        final loadedEntryNo = loadedData['entry_no']?.toString() ?? loadedData['invoice_no']?.toString() ?? invNo;
         _rawEntryNo = loadedEntryNo;
-        final items = await p.getInvoiceItems(loadedEntryNo, isPurchase: false, financialYear: p.selectedFinancialYear);
+        List<Map<String, dynamic>> items;
+        if (PureCloudService.instance.isActive) {
+          items = await PureCloudService.instance.findDocumentItems('sales_items', 'invoice_no', loadedEntryNo);
+          if (items.isEmpty) {
+            items = await p.getInvoiceItems(loadedEntryNo, isPurchase: false, financialYear: p.selectedFinancialYear);
+          }
+        } else {
+          items = await p.getInvoiceItems(loadedEntryNo, isPurchase: false, financialYear: p.selectedFinancialYear);
+        }
         if (!mounted) return false;
         if (!mounted) return false;
 
@@ -3230,8 +3338,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           _isExistingEntry = true;
           _isBlankRecord = false;
           _isDirty = false; // Reset dirty flag on load
-          _isDeleted = (data['is_deleted'] == 1 || data['is_deleted'] == true || data['is_deleted'] == '1'); // Check if deleted
-          _isImported = (data['is_imported'] == 1 || data['is_imported'] == true || data['is_imported'] == '1');
+          _isDeleted = (loadedData['is_deleted'] == 1 || loadedData['is_deleted'] == true || loadedData['is_deleted'] == '1'); // Check if deleted
+          _isImported = (loadedData['is_imported'] == 1 || loadedData['is_imported'] == true || loadedData['is_imported'] == '1');
           _orderType = 0;
           _showSpecialOrderSidebar = false;
           _isSpecialOrderMinimized = false;
@@ -3245,48 +3353,48 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           _originalInvoiceBatchQtys.clear();
 
           // LOAD ACTUAL HEADER DATA
-          final actualDbEntry = data['entry_no']?.toString() ?? invNo;
+          final actualDbEntry = loadedData['entry_no']?.toString() ?? invNo;
           _rawEntryNo = actualDbEntry;
           String rawEntry = cleanEntryNo(actualDbEntry);
           _entryNo = rawEntry;
           _entryNoCtrl.text = formatSaleDisplayNo(_entryNo);
-          _date = DateTime.tryParse(data['date'].toString()) ?? DateTime.now();
+          _date = DateTime.tryParse(loadedData['date'].toString()) ?? DateTime.now();
           _timeNotifier.value = DateFormat('hh:mm a').format(_date);
-          _customerAcc = data['customer_acc']?.toString() ?? 'Cash';
+          _customerAcc = loadedData['customer_acc']?.toString() ?? 'Cash';
           _customerAccCtrl.text = _customerAcc;
-          _gstType = (data['tax_type'] == "Gst") ? 1 : 2;
+          _gstType = (loadedData['tax_type'] == "Gst") ? 1 : 2;
 
-          String rawPat = data['patient']?.toString().trim() ?? '';
+          String rawPat = loadedData['patient']?.toString().trim() ?? '';
           if (rawPat.isEmpty || rawPat.toLowerCase() == 'general' || rawPat.toLowerCase() == 'unknown') {
             rawPat = 'P1';
           }
           _patientCtrl.text = rawPat;
-          _mobileCtrl.text = data['mobile']?.toString() ?? '';
+          _mobileCtrl.text = loadedData['mobile']?.toString() ?? '';
 
-          String rawDoc = data['doctor']?.toString().trim() ?? '';
+          String rawDoc = loadedData['doctor']?.toString().trim() ?? '';
           if (rawDoc.isEmpty || rawDoc.toLowerCase() == 'unknown' || rawDoc.toLowerCase() == 'dr. unknown') {
             rawDoc = 'D1';
           }
           _doctorCtrl.text = rawDoc;
-          _doctorRegNoCtrl.text = data['doctor_reg_no']?.toString() ?? '';
-          _daysCtrl.text = data['days']?.toString() ?? "0";
+          _doctorRegNoCtrl.text = loadedData['doctor_reg_no']?.toString() ?? '';
+          _daysCtrl.text = loadedData['days']?.toString() ?? "0";
 
-          _agentCtrl.text = data['agent'] ?? "Admin";
-          _expectingDateCtrl.text = data['expecting_date'] ?? "";
-          _specialCustomerNameCtrl.text = data['special_customer_name'] ?? "";
-          _specialCustomerPhoneCtrl.text = data['special_customer_phone'] ?? "";
-          _salesReturnCtrl.text = (data['sales_return_amt'] ?? 0.0).toStringAsFixed(2);
+          _agentCtrl.text = loadedData['agent'] ?? "Admin";
+          _expectingDateCtrl.text = loadedData['expecting_date'] ?? "";
+          _specialCustomerNameCtrl.text = loadedData['special_customer_name'] ?? "";
+          _specialCustomerPhoneCtrl.text = loadedData['special_customer_phone'] ?? "";
+          _salesReturnCtrl.text = (loadedData['sales_return_amt'] ?? 0.0).toStringAsFixed(2);
 
           // RESTORE FOOTER AMOUNTS, DISCOUNTS & RECEIVED PAYMENTS
-          double savedDiscount = (data['discount'] as num?)?.toDouble() ?? 0.0;
-          double savedDiscPct = (data['discount_percent'] as num?)?.toDouble() ?? 0.0;
-          double savedRcvd = (data['rcvd_amt'] as num?)?.toDouble() ?? 0.0;
+          double savedDiscount = (loadedData['discount'] as num?)?.toDouble() ?? 0.0;
+          double savedDiscPct = (loadedData['discount_percent'] as num?)?.toDouble() ?? 0.0;
+          double savedRcvd = (loadedData['rcvd_amt'] as num?)?.toDouble() ?? 0.0;
 
           _footerDiscAmtCtrl.text = savedDiscount.toStringAsFixed(2);
           _footerDiscPctCtrl.text = savedDiscPct.toStringAsFixed(0);
           _rcvdAmtCtrl.text = savedRcvd > 0 ? savedRcvd.toStringAsFixed(2) : "0";
 
-          String jsonStr = data['special_order_json'] ?? "[]";
+          String jsonStr = loadedData['special_order_json'] ?? "[]";
           try {
             List<dynamic> list = jsonDecode(jsonStr);
             if (list.isNotEmpty) {
@@ -3486,7 +3594,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
             mobile: _mobileCtrl.text,
             doctor: _doctorCtrl.text,
             doctorRegNo: _doctorRegNoCtrl.text,
-            specialOrderJson: data['special_order_json'] ?? "[]",
+            specialOrderJson: loadedData['special_order_json'] ?? "[]",
             taxType: _gstType == 1 ? "Gst" : "Non Gst",
             days: int.tryParse(_daysCtrl.text) ?? 0,
             items: _items.map((it) => it.clone()).toList(),
@@ -3495,12 +3603,12 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
             discountPercent: savedDiscPct,
             grandTotal: double.tryParse(_netTotalCtrl.text) ?? 0,
             rcvdAmt: savedRcvd,
-            secondaryAcc: data['secondary_acc'] ?? "",
-            secondaryAmt: (data['secondary_amt'] as num?)?.toDouble() ?? 0.0,
-            paymentRemarks: data['payment_remarks'] ?? "",
-            isPaid: (data['is_paid'] as int?) == 1,
+            secondaryAcc: loadedData['secondary_acc'] ?? "",
+            secondaryAmt: (loadedData['secondary_amt'] as num?)?.toDouble() ?? 0.0,
+            paymentRemarks: loadedData['payment_remarks'] ?? "",
+            isPaid: (loadedData['is_paid'] as int?) == 1,
           );
-          _loadedInvoiceUpdatedAt = data['updated_at']?.toString() ?? data['date']?.toString() ?? DateTime.now().toIso8601String();
+          _loadedInvoiceUpdatedAt = loadedData['updated_at']?.toString() ?? loadedData['date']?.toString() ?? DateTime.now().toIso8601String();
 
           _highlightedRowIndices.clear();
           if (widget.highlightProduct != null && widget.highlightProduct!.trim().isNotEmpty) {
@@ -3832,13 +3940,30 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       // 2. Database navigation step with exact target financial year
       final String currentNavKey = _rawEntryNo.isNotEmpty ? _rawEntryNo : _entryNo;
       final String targetFy = _originalLoadedInvoice?.financialYear ?? p.selectedFinancialYear;
-      final data = await p.navigateInvoice(
-        currentNavKey, 
-        dir, 
-        isPurchase: false, 
-        targetFinancialYear: targetFy,
-        isExistingEntry: _isExistingEntry,
-      );
+      Map<String, dynamic>? data;
+      if (PureCloudService.instance.isActive) {
+        data = await PureCloudService.instance.navigateCloudDocument(
+          table: 'sales_invoices',
+          currentEntry: currentNavKey,
+          direction: dir,
+          fy: targetFy,
+        );
+        data ??= await p.navigateInvoice(
+          currentNavKey, 
+          dir, 
+          isPurchase: false, 
+          targetFinancialYear: targetFy,
+          isExistingEntry: _isExistingEntry,
+        );
+      } else {
+        data = await p.navigateInvoice(
+          currentNavKey, 
+          dir, 
+          isPurchase: false, 
+          targetFinancialYear: targetFy,
+          isExistingEntry: _isExistingEntry,
+        );
+      }
       if (!mounted) return;
       if (data != null) {
         if (data['is_blank'] == true) {
@@ -3868,12 +3993,24 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   void _editSale() async {
     AppLogger.instance.info("USER_ACTION", "[EDIT_CLICKED] Edit/Update initiated for Sales Entry #${formatSaleDisplayNo(_entryNo)} ($_entryNo)");
 
-    if (!ServerConfigService.instance.isConnected) {
+    if (_isBeforeToday) {
       _showFastDialog(
-        title: "Server Disconnected",
-        content: "SERVER DISCONNECTED — WORKING IN OFFLINE READ-ONLY MODE\n\nCannot update sales invoice while disconnected from Supabase Cloud Server.",
+        title: "Locked Historical Entry",
+        content: "Sales Entry #$_entryNo was created on ${DateFormat('dd/MM/yyyy').format(_date)} (prior to today).\n\nHistorical records are sealed (Read-Only) to protect daily closing, accounting, and GST integrity and cannot be modified.",
       );
       return;
+    }
+
+    if (!ServerConfigService.instance.isConnected) {
+      final recovered = await ServerConfigService.instance.checkConnectionNow();
+      if (!recovered) {
+        _showFastDialog(
+          title: "Server Disconnected",
+          content: "SERVER DISCONNECTED — WORKING IN OFFLINE READ-ONLY MODE\n\nCannot update sales invoice while disconnected from Supabase Cloud Server.",
+        );
+        return;
+      }
+      if (!mounted) return;
     }
 
     final p = Provider.of<PharmacyProvider>(context, listen: false);
@@ -4364,16 +4501,20 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     // 1. Hard Re-entrancy Guard (Stops duplicate saves)
     if (_isSaving || _isLoading) return;
 
-    // === STRICT OFFLINE SAVE BLOCK ===
-    if (!ServerConfigService.instance.isConnected) {
-      _isSaving = false;
-      if (mounted) setState(() {});
-      AppDialogs.showFastDialog(
-        context: context,
-        title: "Server Disconnected",
-        content: "SERVER DISCONNECTED — WORKING IN OFFLINE READ-ONLY MODE\n\nCannot save sales invoice while disconnected from Supabase Cloud Server.",
-      );
-      return;
+    // === STRICT OFFLINE SAVE BLOCK (PURE CLOUD LIVE) ===
+    if (ServerConfigService.instance.isPureCloud && !ServerConfigService.instance.isConnected) {
+      final recovered = await ServerConfigService.instance.checkConnectionNow();
+      if (!mounted) return;
+      if (!recovered) {
+        _isSaving = false;
+        setState(() {});
+        AppDialogs.showFastDialog(
+          context: context,
+          title: "Pure Cloud Disconnected",
+          content: "PURE CLOUD DISCONNECTED — CANNOT SAVE OFFLINE\n\nSaving sales invoices is strictly locked while disconnected from Supabase Cloud Server.",
+        );
+        return;
+      }
     }
 
     _isSaving = true;
@@ -4493,11 +4634,22 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
       int availableStock = 0;
       final matchingProduct = p.products.cast<Product?>().firstWhere(
-        (prod) => prod != null && prod.id == pId && prod.batch.trim().toUpperCase() == batchNo,
+        (prod) => prod != null && (prod.id == pId || prod.name.trim().toLowerCase() == (p.getProductMasterByName(pId)?.name ?? "").trim().toLowerCase()) && prod.batch.trim().toUpperCase() == batchNo,
         orElse: () => null,
       );
       if (matchingProduct != null) {
         availableStock = matchingProduct.stock;
+      } else {
+        final fallbackName = p.getProductMasterByName(pId)?.name ?? "";
+        if (fallbackName.isNotEmpty) {
+          final altProduct = p.products.cast<Product?>().firstWhere(
+            (prod) => prod != null && prod.name.trim().toLowerCase() == fallbackName.trim().toLowerCase() && prod.batch.trim().toUpperCase() == batchNo,
+            orElse: () => null,
+          );
+          if (altProduct != null) {
+            availableStock = altProduct.stock;
+          }
+        }
       }
 
       if (availableStock < requiredQty) {
@@ -4714,8 +4866,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       }
     }
 
-    // 3. PRE-SAVE STOCK COLLISION GUARD
-    if (ServerConfigService.instance.isConnected) {
+    // 3. PRE-SAVE STOCK COLLISION GUARD (In Pure Cloud Live mode, skip redundant pre-save network ping for sub-50ms instant saving)
+    if (ServerConfigService.instance.isConnected && !ServerConfigService.instance.isPureCloud) {
       final verificationFutures = combinedBillBatchUsage.entries.map((entry) async {
         final parts = entry.key.split('|');
         final prodId = parts[0];
@@ -4800,28 +4952,41 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     setState(() => _errorCells.clear());
 
     try {
+      DbHelper.setBillingActive(true);
       final days = int.tryParse(_daysCtrl.text) ?? 0;
+      final db = await DbHelper.instance.database;
       // 1. DYNAMIC NUMBER CLAIMING & OVERWRITE PROTECTION (Only for NEW bills, not when editing)
       String finalEntryNo = isEdit ? _entryNo : "";
       if (!isEdit) {
         _date = DateTime.now();
-        final requested = (_entryNo.isNotEmpty && _entryNo != "...") ? _entryNo : await p.getNextSaleEntryNo();
-        final resolvedNo = await p.resolveGuaranteedNextEntryNo('sales_invoices', requested, excludePrefix: 'SO-');
-        if (resolvedNo != requested && requested.isNotEmpty) {
-          if (mounted) {
-            final dispReq = formatSaleDisplayNo(requested);
-            final dispRes = formatSaleDisplayNo(resolvedNo);
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text("Bill #$dispReq already taken. Automatically saved as Bill #$dispRes"),
-                backgroundColor: Colors.blue.shade800,
-                duration: const Duration(seconds: 4),
-              ),
-            );
-          }
+        String rawText = _entryNo.replaceAll(RegExp(r'^(T\d+-|POS-\d+_)'), '').trim();
+        String requested = cleanEntryNo(rawText);
+
+        final isCleanNum = RegExp(r'^\d+$').hasMatch(requested);
+        final currentNum = int.tryParse(requested) ?? 0;
+        final taken = await db.query('sales_invoices', where: 'entry_no = ?', whereArgs: [requested], limit: 1);
+
+        if (!isCleanNum || taken.isNotEmpty || currentNum == 0 || requested.isEmpty || requested == "AUTO") {
+          try {
+            if (ServerConfigService.instance.isConnected) {
+              final allocated = await SupabaseSyncService.instance.allocateRemoteAtomicSequence(
+                'sales_invoices',
+                p.selectedFinancialYear,
+              );
+              if (allocated != null && allocated > 0) {
+                requested = allocated.toString();
+              }
+            }
+
+            final localTaken = await db.query('sales_invoices', where: 'entry_no = ?', whereArgs: [requested], limit: 1);
+            if (localTaken.isNotEmpty) {
+              requested = await p.resolveGuaranteedNextEntryNo('sales_invoices', requested.isNotEmpty ? requested : "1", checkCloud: false);
+            }
+          } catch (_) {}
         }
-        finalEntryNo = resolvedNo;
-        _entryNo = resolvedNo;
+
+        finalEntryNo = requested;
+        _entryNo = requested;
         _entryNoCtrl.text = formatSaleDisplayNo(_entryNo);
       }
 
@@ -4992,14 +5157,18 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
       final bool bgSyncEnabled = ServerConfigService.instance.bgSyncOnSave;
       if (bgSyncEnabled) {
-        DeltaSyncService.instance.triggerBackgroundSync(forcePostSave: true);
-        SupabaseSyncService.instance.triggerInstantSync();
+        unawaited(() async {
+          DeltaSyncService.instance.triggerBackgroundSync(forcePostSave: true);
+          SupabaseSyncService.instance.triggerInstantSync();
+        }());
       }
 
       if (mounted) {
         _isDirty = false;
         final messenger = ScaffoldMessenger.of(context);
-        await _resetPage(force: true);
+        PureCloudService.recordSavedSequence('sales_invoices', finalEntryNo, fy: p.selectedFinancialYear, prefix: ServerConfigService.instance.terminalPrefix);
+        final optimisticNext = PureCloudService.calculateOptimisticNextNo(finalEntryNo);
+        await _resetPage(force: true, nextEntryNo: optimisticNext);
         if (!mounted) return;
         messenger.showSnackBar(
           SnackBar(
@@ -5019,6 +5188,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         );
       }
     } finally {
+      DbHelper.setBillingActive(false);
       if (mounted) {
         setState(() {
           _isSaving = false;
@@ -5037,6 +5207,16 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     AppLogger.instance.info("USER_ACTION", "[DELETE_CLICKED] Delete requested for Sales Entry #${formatSaleDisplayNo(_entryNo)} ($_entryNo)");
 
     if (_isDeleting || _isSaving || _isLoading) return;
+
+    // === STRICT OFFLINE DELETE BLOCK (PURE CLOUD LIVE) ===
+    if (ServerConfigService.instance.isPureCloud && !ServerConfigService.instance.isConnected) {
+      _showFastDialog(
+        title: "Pure Cloud Disconnected",
+        content: "PURE CLOUD DISCONNECTED — CANNOT DELETE OFFLINE\n\nDeleting transactions is strictly locked while disconnected from Supabase Cloud Server.",
+      );
+      return;
+    }
+
     _isDeleting = true;
 
     try {
@@ -5045,23 +5225,18 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         return;
       }
 
-      final p = Provider.of<PharmacyProvider>(context, listen: false);
-
-      // 1. SECURITY CHECK: PIN for Deleting Sales
-      if (p.securityToggles['require_pin_delete_sales'] == true) {
-        if (!p.isAdminSessionActive()) {
-          bool isUnlocked = await PinUnlockDialog.show(
-              context,
-              p,
-              title: "Confirm Deletion",
-              message: "Enter Master Password to permanently delete Entry $_entryNo."
-          );
-          if (!mounted) return;
-          if (!isUnlocked) return;
-          p.refreshAdminSession();
-        }
+      // 1. Prior-day check: Entries before today are sealed and cannot be deleted
+      if (_isBeforeToday) {
+        _showFastDialog(
+          title: "Locked Historical Entry",
+          content: "Sales Entry #$_entryNo was created on ${DateFormat('dd/MM/yyyy').format(_date)} (prior to today).\n\nHistorical records are sealed to protect daily closing, accounting, and GST integrity and cannot be deleted.",
+        );
+        return;
       }
 
+      final p = Provider.of<PharmacyProvider>(context, listen: false);
+
+      // 2. Same-day entries: Single manual delete is completely FREE without master password
       final confirmed = await _showFastDialog(
           title: "Delete Entry?",
           content: "Are you sure you want to delete Sales Entry $_entryNo? This will restore the stock and mark the entry as deleted.",
@@ -5089,6 +5264,14 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           _isExistingEntry = false;
           _originalLoadedInvoice = null;
           _loadedInvoiceUpdatedAt = "";
+          if (PureCloudService.instance.isActive) {
+            await PureCloudService.instance.deleteDocument(
+              table: 'sales_invoices',
+              itemsTable: 'sales_items',
+              foreignKey: 'invoice_no',
+              entryNo: _entryNo,
+            );
+          }
           await p.deleteSale(_entryNo);
           AppLogger.instance.info("BUSINESS", "[DELETE_COMPLETED] Sales Entry #${formatSaleDisplayNo(_entryNo)} ($_entryNo) marked as DELETED.");
           if (!mounted) return;
@@ -5379,7 +5562,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     _moveFocus(rowToDelete, 1);
   }
 
-  Future<void> _resetPage({bool force = false}) async {
+  Future<void> _resetPage({bool force = false, String? nextEntryNo}) async {
     if (_isResetting) return;
     _isResetting = true;
 
@@ -5463,7 +5646,16 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         _calculateFooter();
       });
 
-      await _initializeNewBillNumber();
+      if (nextEntryNo != null && nextEntryNo.isNotEmpty) {
+        setState(() {
+          _entryNo = cleanEntryNo(nextEntryNo);
+          _rawEntryNo = nextEntryNo;
+          _entryNoCtrl.text = formatSaleDisplayNo(_entryNo);
+        });
+        p.reserveEntryNo(_entryNo);
+      } else {
+        await _initializeNewBillNumber();
+      }
 
       if (mounted) {
         _focusProductFirstBox();
@@ -5575,30 +5767,6 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                     // Top Section: Toolbar, Header & Right Side Order Box / Notification Hub
                     _buildTopSection(),
 
-                    if (!ServerConfigService.instance.isConnected)
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                        color: const Color(0xFF991B1B),
-                        child: Row(
-                          children: [
-                            const Icon(Icons.cloud_off_rounded, color: Colors.amberAccent, size: 20),
-                            const SizedBox(width: 10),
-                            const Expanded(
-                              child: Text(
-                                "SERVER DISCONNECTED — WORKING IN OFFLINE READ-ONLY MODE",
-                                style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13, letterSpacing: 0.5),
-                              ),
-                            ),
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                              decoration: BoxDecoration(color: const Color(0xFF450A0A), borderRadius: BorderRadius.circular(4), border: Border.all(color: Colors.amberAccent)),
-                              child: const Text("OFFLINE", style: TextStyle(color: Colors.amberAccent, fontWeight: FontWeight.bold, fontSize: 11)),
-                            ),
-                          ],
-                        ),
-                      ),
-
                     if (_isImported)
                       Container(
                         width: double.infinity,
@@ -5622,6 +5790,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                           ],
                         ),
                       ),
+
+
 
                     if (_isDeleted)
                       Container(
@@ -5838,14 +6008,16 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   }
 
   Widget _buildTopToolbar() {
-    final bool isConnected = ServerConfigService.instance.isConnected;
-    bool hasEdits = hasUnsavedChanges();
-    bool canSave = isConnected && !_isDeleted && !_isImported && (!_isExistingEntry || hasEdits);
-    bool canEdit = isConnected && _isExistingEntry && !_isDeleted && !_isImported && !hasEdits;
-    bool canDelete = isConnected && _isExistingEntry && !_isDeleted && !_isImported;
+    return ListenableBuilder(
+      listenable: ServerConfigService.instance,
+      builder: (_, __) {
+        final bool isConnected = ServerConfigService.instance.isConnected;
+        bool canSave = isConnected && !_isDeleted && !_isImported && !_isExistingEntry;
+        bool canEdit = isConnected && _isExistingEntry && !_isDeleted && !_isImported;
+        bool canDelete = isConnected && _isExistingEntry && !_isDeleted && !_isImported;
 
-    final c = AppColors.of(context);
-    return Container(
+        final c = AppColors.of(context);
+        return Container(
       height: 38,
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -5914,7 +6086,25 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                       "Save (F6)",
                       canSave ? const Color(0xFF4CAF50) : Colors.grey.shade400,
                       textColor: canSave ? null : Colors.grey.shade400,
-                      onTap: canSave ? () => (_isExistingEntry ? _editSale() : _saveSale(isEdit: false)) : null,
+                      onTap: canSave
+                          ? () => _saveSale(isEdit: false)
+                          : (_isExistingEntry
+                              ? _editSale
+                              : (!isConnected
+                                  ? () async {
+                                      final recovered = await ServerConfigService.instance.checkConnectionNow();
+                                      if (recovered && mounted) {
+                                        _saveSale(isEdit: false);
+                                      } else if (mounted) {
+                                        ScaffoldMessenger.of(context).showSnackBar(
+                                          const SnackBar(
+                                            content: Text("Reconnecting to Cloud... please wait."),
+                                            duration: Duration(seconds: 1),
+                                          ),
+                                        );
+                                      }
+                                    }
+                                  : null)),
                     ),
                     _topActionBtn(
                       Icons.edit_document,
@@ -6034,6 +6224,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
           ),
         ],
       ),
+    );
+      },
     );
   }
 
@@ -7317,15 +7509,29 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     }, notify: notify);
   }
 
+  Timer? _entryNoDebounceTimer;
   bool _isCheckingEntryNo = false;
+
+  void _checkAndRefreshEntryNoDebounced() {
+    _entryNoDebounceTimer?.cancel();
+    _entryNoDebounceTimer = Timer(const Duration(milliseconds: 350), () {
+      if (mounted && !_isDisposed) {
+        _checkAndRefreshEntryNo();
+      }
+    });
+  }
 
   Future<void> _checkAndRefreshEntryNo() async {
     if (_isCheckingEntryNo || _isExistingEntry || _items.isNotEmpty || _isDirty || _isDisposed || !mounted) return;
     _isCheckingEntryNo = true;
     try {
       final p = Provider.of<PharmacyProvider>(context, listen: false);
-      final bool currentTaken = await p.isEntryTaken('sales_invoices', _entryNo);
-      final String freshNext = await p.getNextSaleEntryNo();
+      final bool currentTaken = ServerConfigService.instance.isPureCloud
+          ? false
+          : await p.isEntryTaken('sales_invoices', _entryNo);
+      final String freshNext = ServerConfigService.instance.isPureCloud
+          ? await PureCloudService.instance.getNextSequenceNumber('sales_invoices', p.selectedFinancialYear)
+          : await p.getNextSaleEntryNo();
 
       if (!mounted || _isExistingEntry || _items.isNotEmpty || _isDirty || _isDisposed) return;
 
@@ -7364,7 +7570,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     }
 
     if (!_isExistingEntry && _items.isEmpty && !_isDirty) {
-      _checkAndRefreshEntryNo();
+      _checkAndRefreshEntryNoDebounced();
     }
 
     // ---> ENTERPRISE FIX: WORKSPACE SHIELD <---
@@ -7581,8 +7787,9 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                           crossAxisAlignment: CrossAxisAlignment.end,
                           children: [
                             SizedBox(
-                              width: 165,
+                              width: 255,
                               child: _headerColumn("Entry No:", Row(
+                                mainAxisSize: MainAxisSize.min,
                                 children: [
                                   FluentNavButton(
                                     icon: Icons.chevron_left_rounded,
@@ -7766,6 +7973,9 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                             ),
                           ],
                         ),
+                        const SizedBox(width: 12),
+                        // Real-Time Multi-Terminal Sync & Offline Outbox Status Pill
+                        _buildLiveSyncStatusPill(),
                       ],
                     ),
                   ),
@@ -7774,6 +7984,99 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
             ),
           ],
         ),
+    );
+  }
+
+  Widget _buildLiveSyncStatusPill() {
+    return AnimatedBuilder(
+      animation: Listenable.merge([
+        ServerConfigService.instance,
+        StockOutboxService.instance.pendingCount,
+        SupabaseSyncService.instance,
+      ]),
+      builder: (context, _) {
+        final config = ServerConfigService.instance;
+        final outboxPending = StockOutboxService.instance.pendingCount.value;
+        final syncService = SupabaseSyncService.instance;
+        final isOnline = config.isConnected;
+        final isSyncing = syncService.isSyncing;
+        final terminalId = config.terminalId.isNotEmpty ? config.terminalId : 'POS-01';
+        final lanPeers = LanSyncService.instance.discoveredPeers.length;
+        final lanTag = lanPeers > 0 ? ' [LAN: $lanPeers peer(s)]' : '';
+
+        Color bgColor;
+        Color borderColor;
+        Color textColor;
+        IconData icon;
+        String labelText;
+        String tooltipText;
+
+        if (outboxPending > 0) {
+          bgColor = const Color(0xFFFEF3C7);
+          borderColor = Colors.amber.shade400;
+          textColor = Colors.amber.shade900;
+          icon = Icons.outbox_rounded;
+          labelText = '📦 Queue: $outboxPending Pending$lanTag';
+          tooltipText = '$outboxPending offline bill(s) queued. Will save automatically when online. Click to inspect.';
+        } else if (isSyncing) {
+          bgColor = const Color(0xFFEFF6FF);
+          borderColor = Colors.blue.shade300;
+          textColor = Colors.blue.shade900;
+          icon = Icons.sync_rounded;
+          labelText = '⚡ Syncing (${(syncService.syncProgress * 100).toInt()}%)$lanTag';
+          tooltipText = 'Synchronizing real-time inventory with Cloud server...';
+        } else if (isOnline) {
+          bgColor = const Color(0xFFF0FDF4);
+          borderColor = Colors.green.shade300;
+          textColor = Colors.green.shade800;
+          icon = Icons.cloud_done_rounded;
+          labelText = '⚡ $terminalId$lanTag • Parity OK (${config.lastPingMs}ms)';
+          tooltipText = 'Counters and cloud synchronized. Click to view Live System Data Monitor.';
+        } else {
+          bgColor = const Color(0xFFF3F4F6);
+          borderColor = Colors.grey.shade400;
+          textColor = Colors.grey.shade800;
+          icon = Icons.cloud_off_rounded;
+          labelText = '⚡ $terminalId$lanTag • SQLite Safe';
+          tooltipText = 'Offline mode active. Counter billing continues at 100% speed locally without loss.';
+        }
+
+        return Tooltip(
+          message: tooltipText,
+          child: InkWell(
+            onTap: () => LiveSystemCountsDialog.show(context),
+            borderRadius: BorderRadius.circular(6),
+            child: Container(
+              height: 28,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: bgColor,
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: borderColor, width: 1.2),
+                boxShadow: const [
+                  BoxShadow(color: Colors.black12, blurRadius: 2, offset: Offset(0, 1)),
+                ],
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(icon, size: 14, color: textColor),
+                  const SizedBox(width: 6),
+                  Text(
+                    labelText,
+                    style: TextStyle(
+                      fontSize: 10.5,
+                      fontWeight: FontWeight.bold,
+                      color: textColor,
+                      letterSpacing: 0.2,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 
@@ -9140,11 +9443,15 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         final ctrl = _getGridCtrl(row, col, val);
         
         if (!isFocused && ctrl.text != val) {
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted && !isFocused && ctrl.text != val) {
-              ctrl.text = val;
-            }
-          });
+          if (ctrl.text.trim().isEmpty) {
+            // User intentionally deleted/cleared the cell; do not restore val!
+          } else {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted && !isFocused && ctrl.text != val && ctrl.text.trim().isNotEmpty) {
+                ctrl.text = val;
+              }
+            });
+          }
         }
 
         const bool isEntryLocked = false;
@@ -9347,12 +9654,17 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                   ? Border.all(color: Colors.blue.shade800, width: 2.2)
                   : customBorder,
             ),
-            child: (col == 2 || col == 4)
+            child: (col == 2 && isCurrentSearchTarget)
                 ? CompositedTransformTarget(
-                    link: isCurrentSearchTarget ? _searchLayer : (isCurrentBatchTarget ? _batchLayer : LayerLink()),
+                    link: _searchLayer,
                     child: cellContent,
                   )
-                : cellContent,
+                : ((col == 4 && isCurrentBatchTarget)
+                    ? CompositedTransformTarget(
+                        link: _batchLayer,
+                        child: cellContent,
+                      )
+                    : cellContent),
         );
 
         return GestureDetector(

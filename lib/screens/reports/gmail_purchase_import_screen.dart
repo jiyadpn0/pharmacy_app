@@ -730,12 +730,21 @@ class _GmailPurchaseImportScreenState extends State<GmailPurchaseImportScreen> {
       context: context,
       barrierDismissible: false,
       builder: (context) => const AlertDialog(
-        content: Row(
-          children: [
-            CircularProgressIndicator(),
-            SizedBox(width: 20),
-            Text('Downloading Invoice Attachment...'),
-          ],
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(14))),
+        content: SizedBox(
+          width: 360,
+          child: Row(
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(width: 20),
+              Expanded(
+                child: Text(
+                  'Downloading Invoice Attachment...',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );

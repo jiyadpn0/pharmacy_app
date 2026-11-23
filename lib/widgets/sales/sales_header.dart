@@ -234,32 +234,37 @@ class SalesHeader extends StatelessWidget {
               const SizedBox(width: 10),
 
               // DATE DISPLAY / PICKER
-              InkWell(
-                onTap: () async {
-                  final picked = await showAppDatePicker(
-                    context: context,
-                    initialDate: date,
-                    firstDate: DateTime(2000),
-                    lastDate: DateTime(2100),
-                  );
-                  if (picked != null) onDateChanged(picked);
-                },
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: Colors.blue.withValues(alpha: 0.12),
-                    borderRadius: BorderRadius.circular(6),
-                    border: Border.all(color: Colors.blue.withValues(alpha: 0.3)),
-                  ),
-                  child: Row(
-                    children: [
-                      const Icon(Icons.calendar_today_rounded, size: 14, color: Colors.blueAccent),
-                      const SizedBox(width: 6),
-                      Text(
-                        DateFormat('dd/MM/yyyy').format(date),
-                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.blueAccent),
-                      ),
-                    ],
+              Builder(
+                builder: (dateBoxCtx) => InkWell(
+                  onTap: () async {
+                    final picked = await showAppDatePicker(
+                      context: dateBoxCtx,
+                      initialDate: date,
+                      firstDate: DateTime(2000),
+                      lastDate: DateTime(2100),
+                    );
+                    if (picked != null) onDateChanged(picked);
+                  },
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                    decoration: BoxDecoration(
+                      color: Colors.blue.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: Colors.blue.withValues(alpha: 0.3)),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.calendar_today_rounded, size: 14, color: Colors.blueAccent),
+                        const SizedBox(width: 6),
+                        Text(
+                          DateFormat('dd/MM/yyyy').format(date),
+                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.blueAccent),
+                        ),
+                        const SizedBox(width: 4),
+                        const Icon(Icons.arrow_drop_down, size: 16, color: Colors.blueAccent),
+                      ],
+                    ),
                   ),
                 ),
               ),

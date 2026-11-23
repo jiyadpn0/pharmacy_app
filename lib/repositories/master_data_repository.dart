@@ -68,7 +68,7 @@ class MasterDataRepository {
     final map = patient.toMap();
     map['is_synced'] = 0;
     map['updated_at'] = DateTime.now().toUtc().toIso8601String();
-    await db.insert('patients', map, conflictAlgorithm: ConflictAlgorithm.replace);
+    await db.insert('patients', map, conflictAlgorithm: ConflictAlgorithm.abort);
     try {
       SupabaseSyncService.instance.pushCustomer(map);
     } catch (_) {}
@@ -110,7 +110,7 @@ class MasterDataRepository {
     final map = doctor.toMap();
     map['is_synced'] = 0;
     map['updated_at'] = DateTime.now().toUtc().toIso8601String();
-    await db.insert('doctors', map, conflictAlgorithm: ConflictAlgorithm.replace);
+    await db.insert('doctors', map, conflictAlgorithm: ConflictAlgorithm.abort);
   }
 
   Future<void> updateDoctor(Doctor doctor) async {

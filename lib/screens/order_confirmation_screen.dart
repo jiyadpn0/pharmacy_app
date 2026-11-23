@@ -6,6 +6,7 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 
 import '../providers/pharmacy_provider.dart';
+import '../providers/app_provider.dart';
 import '../utils/app_dialogs.dart';
 import '../utils/theme_constants.dart';
 
@@ -591,12 +592,33 @@ class _OrderConfirmationScreenState extends State<OrderConfirmationScreen> {
               ],
               const Spacer(),
 
+              // Convert to Purchase Entry
+              ElevatedButton.icon(
+                onPressed: () {
+                  final app = Provider.of<AppProvider>(context, listen: false);
+                  app.openPurchaseWithImportFile(
+                    filePath: '',
+                    supplierName: order.supplierName,
+                    invoiceNo: order.orderId,
+                    invDate: DateFormat('yyyy-MM-dd').format(order.orderDate),
+                  );
+                },
+                icon: const Icon(Icons.shopping_cart_checkout, size: 14),
+                label: const Text("CONVERT TO PURCHASE"),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF2563EB),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                ),
+              ),
+              const SizedBox(width: 8),
+
               // Quick Action: Mark Received
               if (order.status != 'RECEIVED') ...[
                 ElevatedButton.icon(
                   onPressed: () => _openMarkReceivedDialog(order),
                   icon: const Icon(Icons.check_circle, size: 14),
-                  label: const Text("MARK RECEIVED / UPDATE STATUS"),
+                  label: const Text("MARK RECEIVED"),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.green.shade700,
                     foregroundColor: Colors.white,

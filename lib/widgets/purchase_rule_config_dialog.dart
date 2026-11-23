@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../providers/pharmacy_provider.dart';
-import '../models/validation_rule.dart';
 import 'draggable_modal.dart';
 
 /// Interactive Manager Widget for Dynamic Color Validation Rules across all Entry screens.

@@ -63,27 +63,6 @@ class _ServerDiscrepancyDialogState extends State<ServerDiscrepancyDialog> {
     return dateStr;
   }
 
-  String _formatValue(dynamic val) {
-    if (val == null) return '-';
-    final str = val.toString().trim();
-    if (str.isEmpty) return '-';
-
-    final n = num.tryParse(str);
-    if (n != null) {
-      if (n == 0) return '0.00';
-      return NumberFormat('#,##,##0.00').format(n);
-    }
-
-    if (str.contains('T') && str.length >= 10) {
-      final dt = DateTime.tryParse(str);
-      if (dt != null) {
-        return DateFormat('dd/MM/yyyy hh:mm a').format(dt);
-      }
-    }
-
-    return str;
-  }
-
   Future<void> _reconcileCategoryBiDirectionally() async {
     setState(() => _isLoading = true);
     final messenger = ScaffoldMessenger.of(context);

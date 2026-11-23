@@ -7,7 +7,9 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import '../utils/app_logger.dart';
 import 'server_config_service.dart';
 import 'delta_sync_service.dart';
+import 'supabase_sync_service.dart';
 import 'app_notification_service.dart';
+import 'update_checker_service.dart';
 
 /// Real-time service utilizing Postgres changes (lightweight WebSocket payloads)
 /// instead of .stream() full table scans.
@@ -37,19 +39,20 @@ class SupabaseRealtimeService {
     final key = "$tableName|$eventTypeStr";
     _eventBuffers.putIfAbsent(key, () => []).add(rowRecord);
 
-    final int batchDelayMs = (tableName == 'sales_invoices' ||
-            tableName == 'sales_items' ||
-            tableName == 'purchase_entries' ||
-            tableName == 'purchase_items' ||
-            tableName == 'sales_return_invoices' ||
-            tableName == 'sales_return_items' ||
-            tableName == 'purchase_return_entries' ||
-            tableName == 'purchase_return_items' ||
-            tableName == 'stock_adjustments' ||
-            tableName == 'stock_batches' ||
-            tableName == 'product_master')
-        ? 300
-        : 400;
+    // High-speed responsiveness for stock and catalog changes (instant local cache & disk sync)
+    final int batchDelayMs = (tableName == 'stock_batches' || tableName == 'product_master')
+        ? 80
+        : ((tableName == 'sales_invoices' ||
+                tableName == 'sales_items' ||
+                tableName == 'purchase_entries' ||
+                tableName == 'purchase_items' ||
+                tableName == 'sales_return_invoices' ||
+                tableName == 'sales_return_items' ||
+                tableName == 'purchase_return_entries' ||
+                tableName == 'purchase_return_items' ||
+                tableName == 'stock_adjustments')
+            ? 300
+            : 400);
 
     _bufferTimers[key]?.cancel();
     _bufferTimers[key] = Timer(Duration(milliseconds: batchDelayMs), () {
@@ -99,7 +102,7 @@ class SupabaseRealtimeService {
           final displayNo = entryNo.isNotEmpty ? '#$entryNo ' : '';
           AppNotificationService.instance.addWatchdogLog(
             title: 'Sales Entry',
-            message: 'Sale Entry ${displayNo}$actionLabel - $pcName',
+            message: 'Sale Entry $displayNo$actionLabel - $pcName',
             terminalName: pcName,
             actionRoute: 'sales',
             badgeColorValue: opType == 'DELETE' ? 0xFFD32F2F : (opType == 'EDIT' ? 0xFF1976D2 : 0xFF2E7D32),
@@ -124,7 +127,7 @@ class SupabaseRealtimeService {
           final displayNo = entryNo.isNotEmpty ? '#$entryNo ' : '';
           AppNotificationService.instance.addWatchdogLog(
             title: 'Purchase Entry',
-            message: 'Purchase Entry ${displayNo}$actionLabel - $pcName',
+            message: 'Purchase Entry $displayNo$actionLabel - $pcName',
             terminalName: pcName,
             actionRoute: 'purchases',
             badgeColorValue: opType == 'DELETE' ? 0xFFD32F2F : 0xFF1565C0,
@@ -150,7 +153,7 @@ class SupabaseRealtimeService {
           final isSaleReturn = tableName == 'sales_return_invoices';
           AppNotificationService.instance.addWatchdogLog(
             title: isSaleReturn ? 'Sales Return' : 'Purchase Return',
-            message: '${isSaleReturn ? "Sales Return" : "Purchase Return"} ${displayNo}$actionLabel - $pcName',
+            message: '${isSaleReturn ? "Sales Return" : "Purchase Return"} $displayNo$actionLabel - $pcName',
             terminalName: pcName,
             actionRoute: isSaleReturn ? 'sales_returns' : 'purchase_returns',
             badgeColorValue: 0xFFC62828,
@@ -242,10 +245,20 @@ class SupabaseRealtimeService {
 
   /// Ensures active WebSocket channel subscriptions exist upon network reconnection.
   Future<void> ensureRealtimeListenersActive() async {
+    if (ServerConfigService.instance.isWiping) {
+      debugPrint('SupabaseRealtimeService: Skipped restoring listeners - System reset in progress.');
+      return;
+    }
+    if (!ServerConfigService.instance.isConnected) {
+      debugPrint('SupabaseRealtimeService: Skipped restoring listeners - Server is disconnected.');
+      return;
+    }
     if (!_isInitialized) {
       await initialize();
     }
+    _isPaused = false;
     if (_isInitialized && _cachedOnRealtimeEvent != null) {
+      if (ServerConfigService.instance.isWiping || !ServerConfigService.instance.isConnected) return;
       debugPrint('SupabaseRealtimeService: Restoring WebSocket channels after reconnect...');
       startAllRealtimeListeners(
         onRealtimeEvent: _cachedOnRealtimeEvent!,
@@ -256,20 +269,25 @@ class SupabaseRealtimeService {
     }
   }
 
+  int _heartbeatCounter = 0;
+
   void startHeartbeat() {
     _heartbeatTimer?.cancel();
     _sendHeartbeatPing();
-    _heartbeatTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+    // 120-second heartbeat (reduces DB write load by 50% while maintaining accurate online status)
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 120), (_) {
       _sendHeartbeatPing();
     });
   }
 
   Future<void> _sendHeartbeatPing() async {
     final config = ServerConfigService.instance;
+    if (!config.isConnected) return;
     final url = ServerConfigService.cleanServerUrl(config.supabaseUrl);
     final key = config.supabaseAnonKey.trim();
     if (url.isEmpty || key.isEmpty) return;
 
+    _heartbeatCounter++;
     final terminalId = config.terminalId;
     final branchId = config.storeBranchId;
     final machineId = config.machineUuid;
@@ -279,7 +297,7 @@ class SupabaseRealtimeService {
       'machine_id': machineId,
       'branch_id': branchId,
       'terminal_id': terminalId,
-      'app_version': '3.3.7',
+      'app_version': UpdateCheckerService.currentVersion,
       'last_seen_at': nowStr,
     };
 
@@ -290,7 +308,11 @@ class SupabaseRealtimeService {
           pingPayload,
           onConflict: 'machine_id',
         );
-        unawaited(config.verifyDistinctTerminalId());
+        // Only run terminal verification & lease check every 5 minutes (every 5th heartbeat)
+        if (_heartbeatCounter % 5 == 0) {
+          unawaited(config.verifyDistinctTerminalId());
+          unawaited(config.autoLeaseTerminalFromServer());
+        }
         return;
       } catch (_) {}
     }
@@ -315,12 +337,17 @@ class SupabaseRealtimeService {
           headers: headers,
           body: jsonEncode({
             'terminal_id': terminalId,
+            'machine_id': machineId,
+            'branch_id': branchId,
             'last_seen_at': nowStr,
           }),
         ).timeout(const Duration(seconds: 5));
       }
 
-      unawaited(config.verifyDistinctTerminalId());
+      if (_heartbeatCounter % 5 == 0) {
+        unawaited(config.verifyDistinctTerminalId());
+        unawaited(config.autoLeaseTerminalFromServer());
+      }
     } catch (e) {
       debugPrint('Supabase heartbeat ping notice: $e');
     }
@@ -363,8 +390,18 @@ class SupabaseRealtimeService {
       _cachedOnTableEvent = onTableEvent;
     }
 
-    if (_isPaused) {
-      debugPrint('SupabaseRealtimeService: Cannot start listeners - Subscriptions are currently paused.');
+    if (ServerConfigService.instance.isWiping) {
+      debugPrint('SupabaseRealtimeService: Cannot start listeners - System is wiping data.');
+      return;
+    }
+
+    if (!ServerConfigService.instance.isConnected) {
+      debugPrint('SupabaseRealtimeService: Cannot start listeners - Server is disconnected.');
+      return;
+    }
+
+    if (_isPaused || SupabaseSyncService.instance.isSyncing) {
+      debugPrint('SupabaseRealtimeService: Cannot start listeners - Subscriptions are currently paused or sync is in progress.');
       return;
     }
 
@@ -373,9 +410,6 @@ class SupabaseRealtimeService {
       return;
     }
 
-    // Clean up existing channels first to prevent duplicate callbacks or channel memory leaks
-    disposeAllChannelsOnly();
-
     final tables = [
       'sales_invoices',
       'sales_items',
@@ -383,7 +417,6 @@ class SupabaseRealtimeService {
       'purchase_items',
       'product_master',
       'stock_batches',
-      'stock_ledger',
       'stock_adjustments',
       'sales_return_invoices',
       'sales_return_items',
@@ -391,9 +424,16 @@ class SupabaseRealtimeService {
       'purchase_return_items',
     ];
 
+    // If all channels are already subscribed and active, skip redundant re-subscription
+    if (_activeChannels.length == tables.length && !_isPaused) {
+      return;
+    }
+
+    // Clean up existing channels first to prevent duplicate callbacks or channel memory leaks
+    disposeAllChannelsOnly();
+
     try {
       final config = ServerConfigService.instance;
-      final localTerminalId = config.terminalId.trim();
       final currentBranch = config.storeBranchId.trim();
 
       for (var tableName in tables) {
@@ -402,15 +442,8 @@ class SupabaseRealtimeService {
           event: PostgresChangeEvent.all,
           schema: 'public',
           table: tableName,
-          filter: (tableName != 'product_master')
-              ? PostgresChangeFilter(
-                  type: PostgresChangeFilterType.eq,
-                  column: 'branch_id',
-                  value: currentBranch,
-                )
-              : null,
           callback: (payload) {
-            if (_isPaused) return;
+            if (_isPaused || SupabaseSyncService.instance.isSyncing) return;
 
             final rowRecord = payload.newRecord.isNotEmpty ? payload.newRecord : payload.oldRecord;
             if (rowRecord.isEmpty) return;
@@ -421,19 +454,14 @@ class SupabaseRealtimeService {
               return; // Ignore other store branches
             }
 
-            // 1. Direct terminal_id filter check
-            final senderTerminal = rowRecord['terminal_id']?.toString().trim() ?? '';
-            if (senderTerminal.isNotEmpty && localTerminalId.isNotEmpty && senderTerminal == localTerminalId) {
-              return; // Ignore self-generated header updates
-            }
-
-            // 2. Document Entry/Invoice self-echo check for child and transaction tables
+            // 1. Document Entry/Invoice self-echo check for child and transaction tables
+            // Uses local in-memory push registry so PC 2 receives updates even if both PCs share default terminal names
             final invNo = (rowRecord['invoice_no'] ?? rowRecord['entry_no'] ?? rowRecord['purchase_no'] ?? '').toString().trim();
             if (invNo.isNotEmpty && _isRecentlyPushed(invNo)) {
-              return; // Ignore recently pushed transaction entries
+              return; // Ignore self-generated transaction echo
             }
 
-            // 3. Stock batch / Product ID self-echo check
+            // 2. Stock batch / Product ID self-echo check
             final pId = (rowRecord['product_id'] ?? rowRecord['id'] ?? '').toString().trim();
             final bNo = (rowRecord['batch_number'] ?? rowRecord['batch'] ?? '').toString().trim();
             if (pId.isNotEmpty) {
@@ -448,8 +476,15 @@ class SupabaseRealtimeService {
           if (status == RealtimeSubscribeStatus.subscribed) {
             AppLogger.instance.supabase("Realtime channel active for '$tableName'");
           } else if (error != null) {
-            final errStr = error.toString();
-            if (!errStr.contains('1006') && !errStr.contains('going away')) {
+            final errStr = error.toString().toLowerCase();
+            // Suppress benign disconnection/reconnect/sleep events (e.g. Code 1000 normal closure, 1006 connection lost)
+            final isBenignOffline = errStr.contains('1000') ||
+                errStr.contains('1006') ||
+                errStr.contains('going away') ||
+                errStr.contains('failed host lookup') ||
+                errStr.contains('socket is not connected') ||
+                errStr.contains('no such host is known');
+            if (!isBenignOffline) {
               AppLogger.instance.error("REALTIME", "Realtime subscription notice [$tableName]", error: error);
             }
           }

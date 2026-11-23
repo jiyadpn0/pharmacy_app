@@ -290,11 +290,17 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
 
             if (condition == 'Equals' && cellStr != filterStr) {
               match = false;
-            } else if (condition == 'Does Not Equal' && cellStr == filterStr) match = false;
-            else if (condition == 'Contains' && !cellStr.contains(filterStr)) match = false;
-            else if (condition == 'Does Not Contain' && cellStr.contains(filterStr)) match = false;
-            else if (condition == 'Begins With' && !cellStr.startsWith(filterStr)) match = false;
-            else if (condition == 'Ends With' && !cellStr.endsWith(filterStr)) match = false;
+            } else if (condition == 'Does Not Equal' && cellStr == filterStr) {
+              match = false;
+            } else if (condition == 'Contains' && !cellStr.contains(filterStr)) {
+              match = false;
+            } else if (condition == 'Does Not Contain' && cellStr.contains(filterStr)) {
+              match = false;
+            } else if (condition == 'Begins With' && !cellStr.startsWith(filterStr)) {
+              match = false;
+            } else if (condition == 'Ends With' && !cellStr.endsWith(filterStr)) {
+              match = false;
+            }
           }
           else if (filter['type'] == ColumnType.numeric) {
             double cellNum = double.tryParse(val?.toString() ?? "0") ?? 0.0;
@@ -302,13 +308,19 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
 
             if (condition == 'Between') {
               double v2 = double.tryParse(filter['value2']?.toString() ?? "0") ?? 0.0;
-              if (cellNum < v1 || cellNum > v2) match = false;
+              if (cellNum < v1 || cellNum > v2) {
+                match = false;
+              }
             } else {
               if (condition == 'Equals' && cellNum != v1) {
                 match = false;
-              } else if (condition == 'Does Not Equal' && cellNum == v1) match = false;
-              else if (condition == 'Greater Than' && cellNum <= v1) match = false;
-              else if (condition == 'Less Than' && cellNum >= v1) match = false;
+              } else if (condition == 'Does Not Equal' && cellNum == v1) {
+                match = false;
+              } else if (condition == 'Greater Than' && cellNum <= v1) {
+                match = false;
+              } else if (condition == 'Less Than' && cellNum >= v1) {
+                match = false;
+              }
             }
           }
           else if (filter['type'] == ColumnType.date) {
@@ -331,12 +343,17 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
               DateTime? d2 = _parseFlexibleDate(filter['value2']?.toString() ?? "");
               if (d2 == null) return;
               d2 = DateTime(d2.year, d2.month, d2.day);
-              if (cellDate.isBefore(d1) || cellDate.isAfter(d2)) match = false;
+              if (cellDate.isBefore(d1) || cellDate.isAfter(d2)) {
+                match = false;
+              }
             } else {
               if (condition == 'Equals' && !cellDate.isAtSameMomentAs(d1)) {
                 match = false;
-              } else if (condition == 'Before' && !cellDate.isBefore(d1)) match = false;
-              else if (condition == 'After' && !cellDate.isAfter(d1)) match = false;
+              } else if (condition == 'Before' && !cellDate.isBefore(d1)) {
+                match = false;
+              } else if (condition == 'After' && !cellDate.isAfter(d1)) {
+                match = false;
+              }
             }
           }
         });
@@ -368,9 +385,13 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
           DateTime? dateB = (b['raw_date'] is DateTime && _sortColumnKey == 'date') ? b['raw_date'] : _parseFlexibleDate(valB?.toString() ?? '');
           if (dateA == null && dateB == null) {
             comp = 0;
-          } else if (dateA == null) comp = -1;
-          else if (dateB == null) comp = 1;
-          else comp = dateA.compareTo(dateB);
+          } else if (dateA == null) {
+            comp = -1;
+          } else if (dateB == null) {
+            comp = 1;
+          } else {
+            comp = dateA.compareTo(dateB);
+          }
         } else {
           String strA = valA?.toString().toLowerCase() ?? '';
           String strB = valB?.toString().toLowerCase() ?? '';
@@ -982,15 +1003,24 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
         barrierDismissible: false,
         builder: (_) => const Center(
           child: Card(
-            child: Padding(
-              padding: EdgeInsets.symmetric(horizontal: 24, vertical: 20),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  CircularProgressIndicator(strokeWidth: 3),
-                  SizedBox(width: 16),
-                  Text("Exporting Sales Report to Excel...", style: TextStyle(fontWeight: FontWeight.bold)),
-                ],
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(14))),
+            elevation: 8,
+            child: SizedBox(
+              width: 380,
+              child: Padding(
+                padding: EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+                child: Row(
+                  children: [
+                    CircularProgressIndicator(strokeWidth: 3),
+                    SizedBox(width: 16),
+                    Expanded(
+                      child: Text(
+                        "Exporting Sales Report to Excel...",
+                        style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -1158,15 +1188,24 @@ class _SalesReportScreenState extends State<SalesReportScreen> {
         barrierDismissible: false,
         builder: (_) => const Center(
           child: Card(
-            child: Padding(
-              padding: EdgeInsets.symmetric(horizontal: 24, vertical: 20),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  CircularProgressIndicator(strokeWidth: 3),
-                  SizedBox(width: 16),
-                  Text("Preparing Complete Report for Print...", style: TextStyle(fontWeight: FontWeight.bold)),
-                ],
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(14))),
+            elevation: 8,
+            child: SizedBox(
+              width: 380,
+              child: Padding(
+                padding: EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+                child: Row(
+                  children: [
+                    CircularProgressIndicator(strokeWidth: 3),
+                    SizedBox(width: 16),
+                    Expanded(
+                      child: Text(
+                        "Preparing Complete Report for Print...",
+                        style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -1905,8 +1944,11 @@ class _GridHeaderCellState extends State<_GridHeaderCell> {
   void _setInitialCondition() {
     if (widget.col.type == ColumnType.text) {
       _quickCondition = 'Contains';
-    } else if (widget.col.type == ColumnType.numeric) _quickCondition = 'Equals';
-    else _quickCondition = 'Equals'; // Date
+    } else if (widget.col.type == ColumnType.numeric) {
+      _quickCondition = 'Equals';
+    } else {
+      _quickCondition = 'Equals'; // Date
+    }
   }
 
   @override

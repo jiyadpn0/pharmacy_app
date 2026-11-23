@@ -436,13 +436,15 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
                 child: Card(
                   elevation: 10,
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 30),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        CircularProgressIndicator(value: _importProgress > 0 ? _importProgress : null, strokeWidth: 5),
-                        const SizedBox(height: 25),
+                  child: SizedBox(
+                    width: 440,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 30),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          CircularProgressIndicator(value: _importProgress > 0 ? _importProgress : null, strokeWidth: 5),
+                          const SizedBox(height: 25),
                         Text(
                           _activeOption < 2
                               ? "Processing Excel File ${_importStatus.isNotEmpty ? '($_importStatus)' : ''}"
@@ -478,6 +480,7 @@ class _StockManagementScreenState extends State<StockManagementScreen> {
                 ),
               ),
             ),
+          ),
         ],
       ),
     );

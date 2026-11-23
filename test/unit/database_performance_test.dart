@@ -227,14 +227,14 @@ void main() {
 
   group('Isolate Compute Engine Tests', () {
     test('IsolateComputeService decodes large JSON arrays without blocking', () async {
-      final jsonPayload = '[{"id": 1, "name": "Item 1"}, {"id": 2, "name": "Item 2"}]';
+      const jsonPayload = '[{"id": 1, "name": "Item 1"}, {"id": 2, "name": "Item 2"}]';
       final list = await IsolateComputeService.instance.parseJsonList(jsonPayload);
       expect(list.length, equals(2));
       expect(list.first['name'], equals('Item 1'));
     });
 
     test('IsolateComputeService decodes dynamic JSON payloads', () async {
-      final mapPayload = '{"status": "success", "count": 100}';
+      const mapPayload = '{"status": "success", "count": 100}';
       final map = await IsolateComputeService.instance.parseJsonDynamic(mapPayload);
       expect(map, isA<Map<String, dynamic>>());
       expect(map['status'], equals('success'));

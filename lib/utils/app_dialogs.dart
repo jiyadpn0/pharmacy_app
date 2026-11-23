@@ -327,17 +327,31 @@ class AppDialogs {
           child: Card(
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
             elevation: 8,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 36, vertical: 28),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const CircularProgressIndicator(),
-                  const SizedBox(height: 20),
-                  Text(message, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-                  const SizedBox(height: 8),
-                  const Text("Press ESC to cancel / go back", style: TextStyle(fontSize: 11, color: Colors.blueGrey)),
-                ],
+            child: SizedBox(
+              width: 380,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 28),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const CircularProgressIndicator(),
+                    const SizedBox(height: 20),
+                    SizedBox(
+                      height: 42,
+                      child: Center(
+                        child: Text(
+                          message,
+                          textAlign: TextAlign.center,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    const Text("Press ESC to cancel / go back", style: TextStyle(fontSize: 11, color: Colors.blueGrey)),
+                  ],
+                ),
               ),
             ),
           ),
@@ -410,13 +424,16 @@ class AppDialogs {
                       path: pathData['path']!,
                     ),
                   )
-                : Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(isSuccess ? "✨" : "❌", style: const TextStyle(fontSize: 20)),
-                      const SizedBox(width: 12),
-                      Expanded(child: Text(cleanContent, style: const TextStyle(fontSize: 14))),
-                    ],
+                : SizedBox(
+                    width: 440,
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(isSuccess ? "✨" : "❌", style: const TextStyle(fontSize: 20)),
+                        const SizedBox(width: 12),
+                        Expanded(child: Text(cleanContent, style: const TextStyle(fontSize: 14))),
+                      ],
+                    ),
                   ),
             actions: [
               ElevatedButton(
@@ -501,13 +518,16 @@ class AppDialogs {
                 Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
               ],
             ),
-            content: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text("❓", style: TextStyle(fontSize: 20)),
-                const SizedBox(width: 12),
-                Expanded(child: Text(content)),
-              ],
+            content: SizedBox(
+              width: 440,
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text("❓", style: TextStyle(fontSize: 20)),
+                  const SizedBox(width: 12),
+                  Expanded(child: Text(content)),
+                ],
+              ),
             ),
             actions: [
               TextButton(

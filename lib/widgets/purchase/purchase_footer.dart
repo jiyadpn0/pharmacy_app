@@ -42,9 +42,10 @@ class PurchaseFooter extends StatelessWidget {
     final c = AppColors.of(context);
     final s1Title = section1Title ?? recentPurchasesTitle ?? "Recent Purchases";
     final s1Headers = section1Headers ?? [
-      {'title': 'Entry', 'flex': 1}, 
-      {'title': 'Supplier', 'flex': 3}, 
-      {'title': 'Amount', 'flex': 2, 'align': Alignment.centerRight}
+      {'title': 'Entry', 'width': 80.0}, 
+      {'title': 'Inv No', 'flex': 1}, 
+      {'title': 'Wholesale', 'width': 70.0}, 
+      {'title': 'Amount', 'width': 50.0, 'align': Alignment.centerRight}
     ];
 
     final s2Title = section2Title ?? (historyProductName.isEmpty ? "Purchase History" : "Purchase History of $historyProductName");

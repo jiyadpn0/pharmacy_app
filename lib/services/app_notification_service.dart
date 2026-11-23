@@ -327,22 +327,60 @@ class AppNotificationService extends ChangeNotifier {
       final now = DateTime.now();
       final startOfDay = DateTime(now.year, now.month, now.day).toIso8601String();
       final headers = config.restHeaders;
+      final client = config.httpClient;
 
       bool addedNew = false;
 
-      // 1. Sales Invoices today
-      final salesUri = Uri.parse('$cleanUrl/rest/v1/sales_invoices?created_at=gte.$startOfDay&select=entry_no,terminal_id,created_at&order=created_at.desc&limit=50');
-      final salesRes = await http.get(salesUri, headers: headers).timeout(const Duration(seconds: 3));
+      // Concurrently query today's cloud events across all counters
+      final futures = await Future.wait([
+        // 1. Sales Invoices today
+        client.get(
+          Uri.parse('$cleanUrl/rest/v1/sales_invoices?created_at=gte.$startOfDay&select=entry_no,terminal_id,created_at,updated_at,is_deleted&order=created_at.desc&limit=75'),
+          headers: headers,
+        ).timeout(const Duration(seconds: 4)).catchError((_) => http.Response('[]', 500)),
+
+        // 2. Purchase Entries today
+        client.get(
+          Uri.parse('$cleanUrl/rest/v1/purchase_entries?created_at=gte.$startOfDay&select=entry_no,terminal_id,created_at,updated_at,is_deleted&order=created_at.desc&limit=75'),
+          headers: headers,
+        ).timeout(const Duration(seconds: 4)).catchError((_) => http.Response('[]', 500)),
+
+        // 3. Sales Return Invoices today
+        client.get(
+          Uri.parse('$cleanUrl/rest/v1/sales_return_invoices?created_at=gte.$startOfDay&select=entry_no,terminal_id,created_at,is_deleted&order=created_at.desc&limit=50'),
+          headers: headers,
+        ).timeout(const Duration(seconds: 4)).catchError((_) => http.Response('[]', 500)),
+
+        // 4. Purchase Return Entries today
+        client.get(
+          Uri.parse('$cleanUrl/rest/v1/purchase_return_entries?created_at=gte.$startOfDay&select=entry_no,terminal_id,created_at,is_deleted&order=created_at.desc&limit=50'),
+          headers: headers,
+        ).timeout(const Duration(seconds: 4)).catchError((_) => http.Response('[]', 500)),
+
+        // 5. Stock Adjustments today
+        client.get(
+          Uri.parse('$cleanUrl/rest/v1/stock_adjustments?created_at=gte.$startOfDay&select=entry_no,terminal_id,created_at&order=created_at.desc&limit=50'),
+          headers: headers,
+        ).timeout(const Duration(seconds: 4)).catchError((_) => http.Response('[]', 500)),
+      ]);
+
+      // Process Sales Invoices
+      final salesRes = futures[0];
       if (salesRes.statusCode == 200) {
         final List rows = jsonDecode(salesRes.body);
         for (var r in rows) {
           final entryNo = (r['entry_no'] ?? '').toString().trim();
           final pcName = (r['terminal_id'] ?? 'Cloud Server').toString().trim();
           final dt = DateTime.tryParse(r['created_at'] ?? '') ?? DateTime.now();
+          final isDel = (r['is_deleted'] == 1 || r['is_deleted'] == true);
+          final updatedStr = r['updated_at']?.toString() ?? '';
+          final isEdited = !isDel && updatedStr.isNotEmpty && updatedStr != r['created_at'];
+
           if (_isToday(dt)) {
-            final id = 'WDOG_SALE_$entryNo';
-            final title = 'Sales Entry';
-            final msg = 'Sale Entry ${entryNo.isNotEmpty ? "#$entryNo " : ""}added - $pcName';
+            final op = isDel ? 'deleted' : (isEdited ? 'edited' : 'added');
+            final id = 'WDOG_SALE_${entryNo}_$op';
+            const title = 'Sales Entry';
+            final msg = 'Sale Entry ${entryNo.isNotEmpty ? "#$entryNo " : ""}$op - $pcName';
             if (!_notifications.any((n) => n.id == id || (n.title == title && n.message == msg))) {
               _notifications.add(AppNotification(
                 id: id,
@@ -352,7 +390,8 @@ class AppNotificationService extends ChangeNotifier {
                 timestamp: dt,
                 terminalName: pcName,
                 actionRoute: 'sales',
-                badgeColorValue: 0xFF2E7D32,
+                badgeColorValue: isDel ? 0xFFD32F2F : (isEdited ? 0xFF1976D2 : 0xFF2E7D32),
+                operationType: isDel ? 'DELETE' : (isEdited ? 'EDIT' : 'ADDITION'),
               ));
               addedNew = true;
             }
@@ -360,19 +399,23 @@ class AppNotificationService extends ChangeNotifier {
         }
       }
 
-      // 2. Purchase Entries today
-      final purUri = Uri.parse('$cleanUrl/rest/v1/purchase_entries?created_at=gte.$startOfDay&select=entry_no,terminal_id,created_at&order=created_at.desc&limit=50');
-      final purRes = await http.get(purUri, headers: headers).timeout(const Duration(seconds: 3));
+      // Process Purchase Entries
+      final purRes = futures[1];
       if (purRes.statusCode == 200) {
         final List rows = jsonDecode(purRes.body);
         for (var r in rows) {
           final entryNo = (r['entry_no'] ?? '').toString().trim();
           final pcName = (r['terminal_id'] ?? 'Cloud Server').toString().trim();
           final dt = DateTime.tryParse(r['created_at'] ?? '') ?? DateTime.now();
+          final isDel = (r['is_deleted'] == 1 || r['is_deleted'] == true);
+          final updatedStr = r['updated_at']?.toString() ?? '';
+          final isEdited = !isDel && updatedStr.isNotEmpty && updatedStr != r['created_at'];
+
           if (_isToday(dt)) {
-            final id = 'WDOG_PUR_$entryNo';
-            final title = 'Purchase Entry';
-            final msg = 'Purchase Entry ${entryNo.isNotEmpty ? "#$entryNo " : ""}added - $pcName';
+            final op = isDel ? 'deleted' : (isEdited ? 'edited' : 'added');
+            final id = 'WDOG_PUR_${entryNo}_$op';
+            const title = 'Purchase Entry';
+            final msg = 'Purchase Entry ${entryNo.isNotEmpty ? "#$entryNo " : ""}$op - $pcName';
             if (!_notifications.any((n) => n.id == id || (n.title == title && n.message == msg))) {
               _notifications.add(AppNotification(
                 id: id,
@@ -382,7 +425,97 @@ class AppNotificationService extends ChangeNotifier {
                 timestamp: dt,
                 terminalName: pcName,
                 actionRoute: 'purchases',
-                badgeColorValue: 0xFF1565C0,
+                badgeColorValue: isDel ? 0xFFD32F2F : 0xFF1565C0,
+                operationType: isDel ? 'DELETE' : (isEdited ? 'EDIT' : 'ADDITION'),
+              ));
+              addedNew = true;
+            }
+          }
+        }
+      }
+
+      // Process Sales Returns
+      final sRetRes = futures[2];
+      if (sRetRes.statusCode == 200) {
+        final List rows = jsonDecode(sRetRes.body);
+        for (var r in rows) {
+          final entryNo = (r['entry_no'] ?? '').toString().trim();
+          final pcName = (r['terminal_id'] ?? 'Cloud Server').toString().trim();
+          final dt = DateTime.tryParse(r['created_at'] ?? '') ?? DateTime.now();
+          if (_isToday(dt)) {
+            final id = 'WDOG_SRET_$entryNo';
+            const title = 'Sales Return';
+            final msg = 'Sales Return ${entryNo.isNotEmpty ? "#$entryNo " : ""}added - $pcName';
+            if (!_notifications.any((n) => n.id == id || (n.title == title && n.message == msg))) {
+              _notifications.add(AppNotification(
+                id: id,
+                title: title,
+                message: msg,
+                type: NotificationType.watchdog,
+                timestamp: dt,
+                terminalName: pcName,
+                actionRoute: 'sales_returns',
+                badgeColorValue: 0xFFC62828,
+                operationType: 'ADDITION',
+              ));
+              addedNew = true;
+            }
+          }
+        }
+      }
+
+      // Process Purchase Returns
+      final pRetRes = futures[3];
+      if (pRetRes.statusCode == 200) {
+        final List rows = jsonDecode(pRetRes.body);
+        for (var r in rows) {
+          final entryNo = (r['entry_no'] ?? '').toString().trim();
+          final pcName = (r['terminal_id'] ?? 'Cloud Server').toString().trim();
+          final dt = DateTime.tryParse(r['created_at'] ?? '') ?? DateTime.now();
+          if (_isToday(dt)) {
+            final id = 'WDOG_PRET_$entryNo';
+            const title = 'Purchase Return';
+            final msg = 'Purchase Return ${entryNo.isNotEmpty ? "#$entryNo " : ""}added - $pcName';
+            if (!_notifications.any((n) => n.id == id || (n.title == title && n.message == msg))) {
+              _notifications.add(AppNotification(
+                id: id,
+                title: title,
+                message: msg,
+                type: NotificationType.watchdog,
+                timestamp: dt,
+                terminalName: pcName,
+                actionRoute: 'purchase_returns',
+                badgeColorValue: 0xFFC62828,
+                operationType: 'ADDITION',
+              ));
+              addedNew = true;
+            }
+          }
+        }
+      }
+
+      // Process Stock Adjustments
+      final adjRes = futures[4];
+      if (adjRes.statusCode == 200) {
+        final List rows = jsonDecode(adjRes.body);
+        for (var r in rows) {
+          final entryNo = (r['entry_no'] ?? '').toString().trim();
+          final pcName = (r['terminal_id'] ?? 'Cloud Server').toString().trim();
+          final dt = DateTime.tryParse(r['created_at'] ?? '') ?? DateTime.now();
+          if (_isToday(dt)) {
+            final id = 'WDOG_ADJ_$entryNo';
+            const title = 'Stock Adjustment';
+            final msg = 'Stock adjustment ${entryNo.isNotEmpty ? "#$entryNo " : ""}adjusted - $pcName';
+            if (!_notifications.any((n) => n.id == id || (n.title == title && n.message == msg))) {
+              _notifications.add(AppNotification(
+                id: id,
+                title: title,
+                message: msg,
+                type: NotificationType.watchdog,
+                timestamp: dt,
+                terminalName: pcName,
+                badgeColorValue: 0xFFEF6C00,
+                operationType: 'STOCK_CHANGE',
               ));
               addedNew = true;
             }

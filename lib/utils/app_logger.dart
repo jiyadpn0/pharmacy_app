@@ -1,10 +1,14 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
+import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:http/http.dart' as http;
+import '../services/server_config_service.dart';
 
 enum LogLevel { info, warning, error, debug }
 
@@ -49,7 +53,6 @@ class LogEntry {
       case LogLevel.debug:
         return "DEBUG";
       case LogLevel.info:
-      default:
         return "INFO";
     }
   }
@@ -103,6 +106,11 @@ class AppLogger extends ChangeNotifier {
         await logDir.create(recursive: true);
       }
       _logFile = File("${logDir.path}${Platform.pathSeparator}app_session.log");
+      // Clean up log files older than 7 days to preserve disk space
+      _cleanupOldLogFiles(logDir);
+
+      final todayStr = DateFormat('yyyy_MM_dd').format(DateTime.now());
+      _logFile = File("${logDir.path}${Platform.pathSeparator}pharma_log_$todayStr.txt");
       _fileSink = _logFile!.openWrite(mode: FileMode.append);
       _fileSink?.writeln("\n==================================================");
       _fileSink?.writeln("SESSION STARTED AT ${DateTime.now().toIso8601String()}");
@@ -110,6 +118,45 @@ class AppLogger extends ChangeNotifier {
     } catch (e) {
       debugPrint("AppLogger failed to initialize file sink: $e");
     }
+  }
+
+  Future<void> _cleanupOldLogFiles(Directory logDir) async {
+    try {
+      final now = DateTime.now();
+      final files = await logDir.list().toList();
+      for (final entity in files) {
+        if (entity is File && entity.path.contains('pharma_log_')) {
+          final stat = await entity.stat();
+          if (now.difference(stat.modified).inDays >= 7) {
+            await entity.delete();
+            debugPrint("AppLogger: Cleaned up old log file: ${entity.path}");
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  void _pushErrorToCloud(LogEntry entry) {
+    unawaited(() async {
+      try {
+        if (!ServerConfigService.instance.isConnected) return;
+        final config = ServerConfigService.instance;
+        final uri = Uri.parse('${config.supabaseUrl}/rest/v1/app_error_logs');
+        await http.post(
+          uri,
+          headers: config.restHeaders,
+          body: jsonEncode({
+            'terminal_id': config.terminalId,
+            'branch_id': config.storeBranchId,
+            'category': entry.category,
+            'message': entry.message,
+            'error_details': entry.error ?? entry.details ?? '',
+            'stack_trace': entry.stackTrace ?? '',
+            'created_at': entry.timestamp.toUtc().toIso8601String(),
+          }),
+        ).timeout(const Duration(seconds: 4));
+      } catch (_) {}
+    }());
   }
 
   String _maskSensitiveData(String input) {
@@ -140,7 +187,7 @@ class AppLogger extends ChangeNotifier {
     final maskedMessage = _maskSensitiveData(message);
     final maskedDetails = details != null ? _maskSensitiveData(details) : null;
     final maskedError = error != null ? _maskSensitiveData(error.toString()) : null;
-    final cleanStack = stackTrace != null ? stackTrace.toString() : null;
+    final cleanStack = stackTrace?.toString();
 
     final entry = LogEntry(
       id: _counter,
@@ -160,6 +207,8 @@ class AppLogger extends ChangeNotifier {
 
     if (level == LogLevel.error) {
       _hasNewErrors = true;
+      // Asynchronously send critical error telemetry to Supabase Cloud
+      _pushErrorToCloud(entry);
     }
 
     // Write to persistent disk log file

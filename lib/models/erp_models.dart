@@ -140,7 +140,7 @@ class ProductMaster {
       genericName: map['generic_name']?.toString() ?? map['genericName']?.toString() ?? '',
       manufacturerId: map['manufacturer_id']?.toString() ?? map['manufacturerId']?.toString() ?? '',
       categoryId: map['category_id']?.toString() ?? map['categoryId']?.toString() ?? '',
-      rackId: map['rack_id']?.toString() ?? map['rackId']?.toString() ?? '',
+      rackId: map['rack_id']?.toString() ?? map['rackId']?.toString() ?? map['rack']?.toString() ?? '',
       hsnCode: map['hsn_code']?.toString() ?? map['hsnCode']?.toString() ?? '',
       gstPercent: _dbl(map, ['gst_percent', 'gstPercent'], 12.0),
       schedule: map['schedule']?.toString() ?? 'H',
@@ -311,6 +311,101 @@ class Product {
       cleaned = cleaned.substring(0, cleaned.length - 1).trim();
     }
     return cleaned;
+  }
+
+  /// Computes a normalized identity key based on cleaned name (including normalized strength formatting) and pack size.
+  static String getNormalizedProductIdentity(Product p) {
+    if (p.id == "NEW") return "NEW_${p.name.trim().toLowerCase()}";
+
+    String cleanName = cleanProductName(p.name).trim().toLowerCase()
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .replaceAllMapped(
+          RegExp(r'(\d+)\s*(mg|g|ml|mcg|iu|l|kg|%)', caseSensitive: false),
+          (match) => '${match[1]}${match[2]?.toLowerCase()}',
+        );
+
+    final int pack = p.packSize > 0 ? p.packSize : 1;
+    return "$cleanName|pack:$pack";
+  }
+
+  /// Compares two product records with the same normalized identity to select the best matching record.
+  /// Prefers active products, products with stock (and higher stock qty), and complete generic info.
+  static int compareProductQuality(Product a, Product b) {
+    // 1. Prefer active product
+    if (a.isActive != b.isActive) {
+      return a.isActive ? -1 : 1;
+    }
+
+    // 2. Prefer product with live stock (> 0)
+    final bool hasStockA = a.stock > 0;
+    final bool hasStockB = b.stock > 0;
+    if (hasStockA != hasStockB) {
+      return hasStockA ? -1 : 1;
+    }
+    // If stock status is identical, prefer higher stock quantity
+    if (a.stock != b.stock) {
+      return b.stock.compareTo(a.stock);
+    }
+
+    // 3. Prefer complete generic information
+    final bool hasGenA = a.genericName.trim().isNotEmpty;
+    final bool hasGenB = b.genericName.trim().isNotEmpty;
+    if (hasGenA != hasGenB) {
+      return hasGenA ? -1 : 1;
+    }
+
+    // 4. Detail richness score (rack, category, manufacturer, use, HSN)
+    int scoreA = (a.rack.trim().isNotEmpty ? 1 : 0) +
+        (a.category.trim().isNotEmpty ? 1 : 0) +
+        (a.manufacturer.trim().isNotEmpty ? 1 : 0) +
+        (a.use.trim().isNotEmpty ? 1 : 0) +
+        (a.hsnCode.trim().isNotEmpty ? 1 : 0);
+    int scoreB = (b.rack.trim().isNotEmpty ? 1 : 0) +
+        (b.category.trim().isNotEmpty ? 1 : 0) +
+        (b.manufacturer.trim().isNotEmpty ? 1 : 0) +
+        (b.use.trim().isNotEmpty ? 1 : 0) +
+        (b.hsnCode.trim().isNotEmpty ? 1 : 0);
+    if (scoreA != scoreB) {
+      return scoreB.compareTo(scoreA);
+    }
+
+    // 5. Stable tie-breaker by ID
+    return a.id.compareTo(b.id);
+  }
+
+  /// Removes duplicate product suggestions sharing normalized identity, keeping the best matching record.
+  /// Preserves initial ranking order and aggregates total available stock across duplicates for display.
+  static List<Product> deduplicateProducts(List<Product> products) {
+    if (products.isEmpty) return [];
+
+    final Map<String, List<Product>> groups = {};
+    final List<String> order = [];
+
+    for (var p in products) {
+      if (p.id == "NEW") continue;
+      final identity = getNormalizedProductIdentity(p);
+      if (!groups.containsKey(identity)) {
+        groups[identity] = [];
+        order.add(identity);
+      }
+      groups[identity]!.add(p);
+    }
+
+    final List<Product> deduplicated = [];
+    for (var identity in order) {
+      final group = groups[identity]!;
+      group.sort((a, b) => compareProductQuality(a, b));
+      final best = group.first;
+
+      int totalStock = group.fold(0, (sum, item) => sum + (item.stock > 0 ? item.stock : 0));
+      if (totalStock > best.stock) {
+        deduplicated.add(best.copyWith(stock: totalStock));
+      } else {
+        deduplicated.add(best);
+      }
+    }
+
+    return deduplicated;
   }
 
   Product({
@@ -1736,6 +1831,7 @@ class StockLedgerItem {
   int purchaseReturn;
   int adjustment;
   int closingStock;
+  int liveStock;
 
   StockLedgerItem({
     required this.productName,
@@ -1756,7 +1852,10 @@ class StockLedgerItem {
     this.purchaseReturn = 0,
     this.adjustment = 0,
     this.closingStock = 0,
+    this.liveStock = 0,
   });
+
+  int get stockDrift => closingStock - liveStock;
 
   double get mrpValue {
     double ps = packin > 0 ? packin.toDouble() : 1.0;

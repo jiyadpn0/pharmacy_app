@@ -84,6 +84,8 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
         _ColDef('damage', 'Damage', width: 60.0, align: TextAlign.right, type: ColType.numeric),
         _ColDef('adjustment', 'Adjustment', width: 70.0, align: TextAlign.right, type: ColType.numeric),
         _ColDef('closing', 'Closing Stock', width: 85.0, align: TextAlign.right, type: ColType.numeric),
+        _ColDef('live_stock', 'Live Stock', width: 85.0, align: TextAlign.right, type: ColType.numeric),
+        _ColDef('drift', 'Discrepancy', width: 90.0, align: TextAlign.center, type: ColType.numeric),
         _ColDef('mrp_val', 'MRP Value', width: 85.0, align: TextAlign.right, type: ColType.numeric),
         _ColDef('lcost_val', 'Lcost Value', width: 85.0, align: TextAlign.right, type: ColType.numeric),
       ];
@@ -99,6 +101,8 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
         _ColDef('inward', 'Inward (+)', width: 80.0, align: TextAlign.right, type: ColType.numeric),
         _ColDef('outward', 'Outward (-)', width: 80.0, align: TextAlign.right, type: ColType.numeric),
         _ColDef('closing', 'Closing Stock', width: 90.0, align: TextAlign.right, type: ColType.numeric),
+        _ColDef('live_stock', 'Live Stock', width: 85.0, align: TextAlign.right, type: ColType.numeric),
+        _ColDef('drift', 'Discrepancy', width: 90.0, align: TextAlign.center, type: ColType.numeric),
         _ColDef('mrp_val', 'MRP Value', width: 90.0, align: TextAlign.right, type: ColType.numeric),
         _ColDef('lcost_val', 'Lcost Value', width: 90.0, align: TextAlign.right, type: ColType.numeric),
       ];
@@ -384,6 +388,10 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
       case 'closing':
       case 'balance':
         return item.closingStock;
+      case 'live_stock':
+        return item.liveStock;
+      case 'drift':
+        return item.stockDrift;
       case 'mrp_val':
         return item.mrpValue;
       case 'lcost_val':
@@ -968,9 +976,13 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
     String conditionSymbol = '=';
     if (cond == 'Contains') {
       conditionSymbol = 'inc';
-    } else if (cond == 'Greater Than') conditionSymbol = '>';
-    else if (cond == 'Less Than') conditionSymbol = '<';
-    else if (cond == 'Does Not Equal') conditionSymbol = '!=';
+    } else if (cond == 'Greater Than') {
+      conditionSymbol = '>';
+    } else if (cond == 'Less Than') {
+      conditionSymbol = '<';
+    } else if (cond == 'Does Not Equal') {
+      conditionSymbol = '!=';
+    }
 
     return _HoverCellWrapper(
       builder: (context, isHovered) {
@@ -1167,6 +1179,19 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
                 } else if (item.closingStock == 0) {
                   textColor = Colors.orange.shade800;
                 }
+              if (col.key == 'live_stock') {
+                fontWeight = FontWeight.bold;
+                textColor = Colors.blueGrey.shade900;
+              } else if (col.key == 'drift') {
+                fontWeight = FontWeight.bold;
+                if (rawVal == 0) {
+                  textStr = 'MATCH';
+                  textColor = Colors.green.shade700;
+                } else {
+                  textStr = rawVal > 0 ? '+$rawVal' : '$rawVal';
+                  textColor = Colors.red.shade700;
+                }
+              }
               }
             } else if (rawVal is int) {
               textStr = rawVal.toString();
@@ -1226,6 +1251,8 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
     int sumPRet = 0;
     int sumAdj = 0;
     int sumClosing = 0;
+    int sumLive = 0;
+    int sumDrift = 0;
     double sumMrpVal = 0.0;
     double sumLCostVal = 0.0;
 
@@ -1238,6 +1265,8 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
       sumPRet += item.purchaseReturn;
       sumAdj += item.adjustment;
       sumClosing += item.closingStock;
+      sumLive += item.liveStock;
+      sumDrift += item.stockDrift;
       sumMrpVal += item.mrpValue;
       sumLCostVal += item.lCostValue;
     }
@@ -1254,19 +1283,37 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
           String valStr = '';
           if (col.key == 'sl') {
             valStr = 'TOTAL';
-          } else if (col.key == 'product' || col.key == 'product_name') valStr = '${_filteredList.length} Items';
-          else if (col.key == 'opening') valStr = '$sumOpen';
-          else if (col.key == 'purchase' || col.key == 'purchase_qty') valStr = '+$sumPur';
-          else if (col.key == 'damage' || col.key == 'damage_qty') valStr = '-$sumDmg';
-          else if (col.key == 'sreturn' || col.key == 'sreturn_qty') valStr = '+$sumSRet';
-          else if (col.key == 'sales' || col.key == 'sales_qty') valStr = '-$sumSal';
-          else if (col.key == 'preturn' || col.key == 'preturn_qty') valStr = '-$sumPRet';
-          else if (col.key == 'adjustment' || col.key == 'adjustment_qty') valStr = '$sumAdj';
-          else if (col.key == 'inward' || col.key == 'in_qty') valStr = '+${sumPur + sumSRet}';
-          else if (col.key == 'outward' || col.key == 'out_qty') valStr = '-${sumSal + sumPRet + sumDmg.abs()}';
-          else if (col.key == 'closing' || col.key == 'balance') valStr = '$sumClosing';
-          else if (col.key == 'mrp_val') valStr = '₹${sumMrpVal.toStringAsFixed(0)}';
-          else if (col.key == 'lcost_val') valStr = '₹${sumLCostVal.toStringAsFixed(0)}';
+          } else if (col.key == 'product' || col.key == 'product_name') {
+            valStr = '${_filteredList.length} Items';
+          } else if (col.key == 'opening') {
+            valStr = '$sumOpen';
+          } else if (col.key == 'purchase' || col.key == 'purchase_qty') {
+            valStr = '+$sumPur';
+          } else if (col.key == 'damage' || col.key == 'damage_qty') {
+            valStr = '-$sumDmg';
+          } else if (col.key == 'sreturn' || col.key == 'sreturn_qty') {
+            valStr = '+$sumSRet';
+          } else if (col.key == 'sales' || col.key == 'sales_qty') {
+            valStr = '-$sumSal';
+          } else if (col.key == 'preturn' || col.key == 'preturn_qty') {
+            valStr = '-$sumPRet';
+          } else if (col.key == 'adjustment' || col.key == 'adjustment_qty') {
+            valStr = '$sumAdj';
+          } else if (col.key == 'inward' || col.key == 'in_qty') {
+            valStr = '+${sumPur + sumSRet}';
+          } else if (col.key == 'outward' || col.key == 'out_qty') {
+            valStr = '-${sumSal + sumPRet + sumDmg.abs()}';
+          } else if (col.key == 'closing' || col.key == 'balance') {
+            valStr = '$sumClosing';
+          } else if (col.key == 'live_stock') {
+            valStr = '$sumLive';
+          } else if (col.key == 'drift') {
+            valStr = sumDrift == 0 ? 'MATCH' : (sumDrift > 0 ? '+$sumDrift' : '$sumDrift');
+          } else if (col.key == 'mrp_val') {
+            valStr = '₹${sumMrpVal.toStringAsFixed(0)}';
+          } else if (col.key == 'lcost_val') {
+            valStr = '₹${sumLCostVal.toStringAsFixed(0)}';
+          }
 
           return Container(
             width: col.width,

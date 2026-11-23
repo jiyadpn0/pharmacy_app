@@ -3,11 +3,46 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
+import 'package:sqflite/sqflite.dart';
 import 'server_config_service.dart';
 import '../database/db_helper.dart';
 
-/// Ultra-low latency LAN Sync Engine combining 1ms UDP Broadcasts (Port 9999)
-/// and Direct TCP Socket Streams (Port 9998) for 1–3ms PC-to-PC shop network sync.
+/// Represents an active POS counter discovered on the local Wi-Fi or Ethernet network
+class DiscoveredTerminalPeer {
+  final String terminalId;
+  final String terminalPrefix;
+  final String machineUuid;
+  final String computerName;
+  final String ipAddress;
+  final int productCount;
+  final DateTime lastSeen;
+  final bool isSelf;
+
+  DiscoveredTerminalPeer({
+    required this.terminalId,
+    required this.terminalPrefix,
+    required this.machineUuid,
+    required this.computerName,
+    required this.ipAddress,
+    required this.productCount,
+    required this.lastSeen,
+    this.isSelf = false,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'terminal_id': terminalId,
+    'terminal_prefix': terminalPrefix,
+    'machine_uuid': machineUuid,
+    'computer_name': computerName,
+    'ip_address': ipAddress,
+    'product_count': productCount,
+    'last_seen': lastSeen.toIso8601String(),
+    'is_self': isSelf,
+  };
+}
+
+/// Ultra-low latency LAN Sync & Auto-Discovery Engine combining 1ms UDP Broadcasts (Port 9999)
+/// and Direct TCP Socket Streams (Port 9998) for 1–3ms PC-to-PC shop network sync and plug-and-play terminal discovery.
 class LanSyncService {
   static final LanSyncService instance = LanSyncService._internal();
   LanSyncService._internal();
@@ -25,12 +60,111 @@ class LanSyncService {
   final List<void Function(Map<String, dynamic> event)> _listeners = [];
   final LinkedHashSet<String> _processedEvents = LinkedHashSet<String>();
 
+  // Plug-and-Play Peer Discovery Registry
+  final Map<String, DiscoveredTerminalPeer> _discoveredPeers = {};
+  final StreamController<List<DiscoveredTerminalPeer>> _peersStreamCtrl = StreamController<List<DiscoveredTerminalPeer>>.broadcast();
+  Timer? _discoveryTimer;
+
   bool get isListening => _isListening;
+  Map<String, DiscoveredTerminalPeer> get discoveredPeers => Map.unmodifiable(_discoveredPeers);
+  Stream<List<DiscoveredTerminalPeer>> get peersStream => _peersStreamCtrl.stream;
+
+  /// Starts periodic LAN auto-discovery broadcast every 20 seconds
+  void startAutoDiscovery() {
+    if (_discoveryTimer != null && _discoveryTimer!.isActive) return;
+
+    // Send immediate announcement
+    unawaited(broadcastDiscoveryPing());
+
+    _discoveryTimer = Timer.periodic(const Duration(seconds: 20), (_) {
+      unawaited(broadcastDiscoveryPing());
+      _pruneStalePeers();
+    });
+    debugPrint("⚡ [LanSyncService]: Plug-and-Play Terminal Auto-Discovery armed (Port $udpPort).");
+  }
+
+  /// Prunes peers not seen in the last 60 seconds
+  void _pruneStalePeers() {
+    final now = DateTime.now();
+    final toRemove = <String>[];
+    _discoveredPeers.forEach((key, peer) {
+      if (!peer.isSelf && now.difference(peer.lastSeen).inSeconds > 60) {
+        toRemove.add(key);
+      }
+    });
+
+    if (toRemove.isNotEmpty) {
+      for (final k in toRemove) {
+        _discoveredPeers.remove(k);
+      }
+      _emitPeers();
+    }
+  }
+
+  void _emitPeers() {
+    if (!_peersStreamCtrl.isClosed) {
+      _peersStreamCtrl.add(_discoveredPeers.values.toList());
+    }
+  }
+
+  /// Broadcasts a lightweight discovery ping announcing terminal ID, sequence prefix, and product count
+  Future<void> broadcastDiscoveryPing({bool isPong = false}) async {
+    if (!ServerConfigService.instance.isLanSyncEnabled) return;
+
+    int pCount = 0;
+    try {
+      final db = await DbHelper.instance.database;
+      pCount = Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM product_master;')) ?? 0;
+    } catch (_) {}
+
+    final config = ServerConfigService.instance;
+    final action = isPong ? 'LAN_DISCOVERY_PONG' : 'LAN_DISCOVERY_PING';
+
+    final payload = {
+      'terminal_id': config.terminalId,
+      'terminal_prefix': config.terminalPrefix,
+      'machine_uuid': config.machineUuid,
+      'computer_name': config.computerName.isNotEmpty ? config.computerName : Platform.localHostname,
+      'product_count': pCount,
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+    };
+
+    broadcastEvent(action, payload);
+  }
+
+  /// Sends a 1ms test broadcast across all counters to verify real-time LAN communication
+  void sendTestPing() {
+    final config = ServerConfigService.instance;
+    broadcastEvent('LAN_TEST_PING', {
+      'from_terminal': config.terminalId,
+      'computer_name': config.computerName.isNotEmpty ? config.computerName : Platform.localHostname,
+      'sent_at': DateTime.now().toIso8601String(),
+    });
+  }
+
+  /// Calculates the next available terminal ID (e.g. POS-02, POS-03) not currently taken by peers
+  String calculateNextAvailableTerminalId() {
+    final takenNumbers = <int>{};
+
+    // Current PC number
+    final curNum = int.tryParse(ServerConfigService.instance.terminalId.replaceAll(RegExp(r'\D'), ''));
+    if (curNum != null) takenNumbers.add(curNum);
+
+    // Peer numbers
+    for (final peer in _discoveredPeers.values) {
+      final pNum = int.tryParse(peer.terminalId.replaceAll(RegExp(r'\D'), ''));
+      if (pNum != null) takenNumbers.add(pNum);
+    }
+
+    int next = 1;
+    while (takenNumbers.contains(next)) {
+      next++;
+    }
+
+    return next < 10 ? 'POS-0$next' : 'POS-$next';
+  }
 
   /// Issue 5.2: LAN + Cloud Deduplication Guard
-  /// Maintains an in-memory LRU cache of up to 1000 processed event IDs
-  /// and persists into SQLite processed_sync_events to prevent duplicate stock deductions
-  /// across restarts and across multiple sync layers.
   void handleIncomingEvent(String eventId, Function() applyAction) {
     final cleanId = eventId.trim();
     if (cleanId.isEmpty) {
@@ -112,13 +246,26 @@ class LanSyncService {
                 final message = utf8.decode(datagram.data);
                 final map = jsonDecode(message) as Map<String, dynamic>;
 
-                // Ignore empty sender IDs or packets sent by this exact computer to prevent self-looping
                 final senderId = (map['sender_id']?.toString() ?? '').toLowerCase().trim();
+                final action = map['action']?.toString() ?? '';
+
+                // Handle Plug-and-Play Discovery Packets
+                if (action == 'LAN_DISCOVERY_PING' || action == 'LAN_DISCOVERY_PONG') {
+                  _handleDiscoveryPacket(map, datagram.address.address, action == 'LAN_DISCOVERY_PING');
+                  return;
+                }
+
+                if (action == 'LAN_TEST_PING') {
+                  debugPrint('⚡ [LAN 1ms Test Ping Received from ${datagram.address.address}]: ${map['payload']}');
+                  return;
+                }
+
+                // Ignore empty sender IDs or packets sent by this exact computer to prevent self-looping
                 if (senderId.isEmpty || senderId == _deviceId) {
                   return;
                 }
 
-                debugPrint('⚡ [1ms LAN UDP Event Received]: ${map['action']} from $senderId');
+                debugPrint('⚡ [1ms LAN UDP Event Received]: $action from $senderId');
                 for (var listener in _listeners) {
                   try {
                     listener(map);
@@ -173,14 +320,69 @@ class LanSyncService {
           );
         });
       } catch (tcpErr) {
-        debugPrint('LanSyncService TCP Server bind note: $tcpErr');
+        debugPrint('LanSyncService: High-speed UDP Broadcast active on Port $udpPort (TCP port $tcpPort reserved or already bound by active host).');
       }
 
-      debugPrint('LanSyncService: High-speed UDP Broadcast (Port $udpPort) & TCP Stream (Port $tcpPort) Active.');
+      if (_tcpServer != null) {
+        debugPrint('LanSyncService: High-speed UDP Broadcast (Port $udpPort) & TCP Stream (Port $tcpPort) Active.');
+      } else {
+        debugPrint('LanSyncService: High-speed UDP Broadcast (Port $udpPort) Active.');
+      }
+      startAutoDiscovery();
     } catch (e) {
       debugPrint('LanSyncService init error: $e');
     } finally {
       _isInitializing = false;
+    }
+  }
+
+  /// Processes incoming peer announcements, resolves terminal collisions automatically, and updates registry
+  void _handleDiscoveryPacket(Map<String, dynamic> map, String senderIp, bool requiresPong) {
+    try {
+      final payload = (map['payload'] as Map<String, dynamic>?) ?? {};
+      final peerTermId = (payload['terminal_id']?.toString() ?? 'POS-01').trim().toUpperCase();
+      final peerTermPrefix = (payload['terminal_prefix']?.toString() ?? '').trim();
+      final peerMachineUuid = (payload['machine_uuid']?.toString() ?? '').trim();
+      final peerCompName = (payload['computer_name']?.toString() ?? 'Unknown PC').trim();
+      final peerProdCount = (payload['product_count'] as num?)?.toInt() ?? 0;
+
+      final config = ServerConfigService.instance;
+      final isSelf = peerMachineUuid == config.machineUuid;
+
+      if (!isSelf && peerMachineUuid.isNotEmpty) {
+        _discoveredPeers[peerMachineUuid] = DiscoveredTerminalPeer(
+          terminalId: peerTermId,
+          terminalPrefix: peerTermPrefix,
+          machineUuid: peerMachineUuid,
+          computerName: peerCompName,
+          ipAddress: senderIp,
+          productCount: peerProdCount,
+          lastSeen: DateTime.now(),
+          isSelf: false,
+        );
+
+        _emitPeers();
+
+        // Zero-Touch Plug & Play Conflict Resolution:
+        // If another active PC is claiming the exact same Terminal ID as this PC:
+        if (peerTermId == config.terminalId.trim().toUpperCase()) {
+          // If this PC has not been explicitly locked/manually set by the user, auto-assign next slot:
+          if (!config.isTerminalConfigured && config.terminalId == 'POS-01') {
+            final nextId = calculateNextAvailableTerminalId();
+            debugPrint("⚡ [Plug & Play Conflict Auto-Resolution]: Existing $peerTermId found on LAN at $senderIp. Auto-assigning this counter to '$nextId' with prefix '${config.terminalPrefix}'.");
+            unawaited(config.setTerminalId(nextId).then((_) {
+              broadcastDiscoveryPing(isPong: true);
+            }));
+          }
+        }
+
+        // If received ping, reply with pong so sender immediately discovers this machine
+        if (requiresPong) {
+          unawaited(broadcastDiscoveryPing(isPong: true));
+        }
+      }
+    } catch (e) {
+      debugPrint("LanSyncService _handleDiscoveryPacket notice: $e");
     }
   }
 
@@ -250,6 +452,9 @@ class LanSyncService {
 
   /// Closes UDP & TCP Sockets
   void dispose() {
+    _discoveryTimer?.cancel();
+    _discoveryTimer = null;
+
     _socket?.close();
     _socket = null;
 

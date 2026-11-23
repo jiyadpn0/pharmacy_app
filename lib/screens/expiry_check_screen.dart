@@ -858,10 +858,14 @@ class _AdvancedFilterPopupState extends State<_AdvancedFilterPopup> {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: 250, height: 350,
-      decoration: BoxDecoration(color: Colors.white, border: Border.all(color: Colors.grey.shade400), borderRadius: BorderRadius.circular(4)),
-      child: Column(
+    return Material(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(4),
+      elevation: 4,
+      child: Container(
+        width: 250, height: 350,
+        decoration: BoxDecoration(border: Border.all(color: Colors.grey.shade400), borderRadius: BorderRadius.circular(4)),
+        child: Column(
         children: [
           Container(
             padding: const EdgeInsets.all(8),
@@ -925,6 +929,7 @@ class _AdvancedFilterPopupState extends State<_AdvancedFilterPopup> {
           )
         ],
       ),
-    );
-  }
+    ),
+  );
+}
 }

@@ -150,23 +150,35 @@ class _SalesReturnReportScreenState extends State<SalesReturnReportScreen> {
           String filterStr = filter['value1']?.toString().toLowerCase() ?? "";
           if (condition == 'Equals' && cellStr != filterStr) {
             match = false;
-          } else if (condition == 'Does Not Equal' && cellStr == filterStr) match = false;
-          else if (condition == 'Contains' && !cellStr.contains(filterStr)) match = false;
-          else if (condition == 'Does Not Contain' && cellStr.contains(filterStr)) match = false;
-          else if (condition == 'Begins With' && !cellStr.startsWith(filterStr)) match = false;
-          else if (condition == 'Ends With' && !cellStr.endsWith(filterStr)) match = false;
+          } else if (condition == 'Does Not Equal' && cellStr == filterStr) {
+            match = false;
+          } else if (condition == 'Contains' && !cellStr.contains(filterStr)) {
+            match = false;
+          } else if (condition == 'Does Not Contain' && cellStr.contains(filterStr)) {
+            match = false;
+          } else if (condition == 'Begins With' && !cellStr.startsWith(filterStr)) {
+            match = false;
+          } else if (condition == 'Ends With' && !cellStr.endsWith(filterStr)) {
+            match = false;
+          }
         } else if (filter['type'] == ColumnType.numeric) {
           double cellNum = double.tryParse(val?.toString() ?? "0") ?? 0.0;
           double v1 = double.tryParse(filter['value1']?.toString() ?? "0") ?? 0.0;
           if (condition == 'Between') {
             double v2 = double.tryParse(filter['value2']?.toString() ?? "0") ?? 0.0;
-            if (cellNum < v1 || cellNum > v2) match = false;
+            if (cellNum < v1 || cellNum > v2) {
+              match = false;
+            }
           } else {
             if (condition == 'Equals' && cellNum != v1) {
               match = false;
-            } else if (condition == 'Does Not Equal' && cellNum == v1) match = false;
-            else if (condition == 'Greater Than' && cellNum <= v1) match = false;
-            else if (condition == 'Less Than' && cellNum >= v1) match = false;
+            } else if (condition == 'Does Not Equal' && cellNum == v1) {
+              match = false;
+            } else if (condition == 'Greater Than' && cellNum <= v1) {
+              match = false;
+            } else if (condition == 'Less Than' && cellNum >= v1) {
+              match = false;
+            }
           }
         }
       });

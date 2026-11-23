@@ -109,7 +109,22 @@ void main(List<String> args) async {
   }
   unawaited(RemoteLoggerService.instance.init().catchError((e, s) => debugPrint("RemoteLogger init error: $e")));
   unawaited(UpdateCheckerService.init().catchError((e, s) => debugPrint("UpdateChecker init error: $e")));
-  unawaited(ServerConfigService.instance.init().catchError((e, s) => debugPrint("ServerConfig init error: $e")));
+  unawaited(ServerConfigService.instance.init().then((_) {
+    if (args.any((a) => a.contains('--secondary') || a.contains('--pos2') || a.contains('POS-02'))) {
+      ServerConfigService.instance.overrideTerminalId('POS-02');
+    } else {
+      for (var arg in args) {
+        if (arg.startsWith('--terminal=')) {
+          final term = arg.split('=').last.trim();
+          if (term.isNotEmpty) {
+            ServerConfigService.instance.overrideTerminalId(term);
+          }
+        }
+      }
+    }
+  }).catchError((e, s) {
+    debugPrint("ServerConfig init error: $e");
+  }));
   unawaited(SupabaseSyncService.instance.init().catchError((e, s) => debugPrint("SupabaseSync init error: $e")));
   unawaited(DbHelper.instance.autoBackupDatabase().catchError((e, s) => debugPrint("AutoBackup init error: $e")));
   try {
@@ -213,7 +228,7 @@ void main(List<String> args) async {
       color: const Color(0xFF0F172A),
       child: Center(
         child: Container(
-          constraints: const BoxConstraints(maxWidth: 600, maxHeight: 380),
+          constraints: const BoxConstraints(maxWidth: 700, maxHeight: 480),
           margin: const EdgeInsets.all(24),
           padding: const EdgeInsets.all(24),
           decoration: BoxDecoration(
@@ -457,6 +472,8 @@ void main(List<String> args) async {
         ChangeNotifierProvider(create: (_) => GstProvider()),
         ChangeNotifierProvider(create: (_) => SalesProvider()),
         ChangeNotifierProvider(create: (_) => PurchaseProvider()),
+        ChangeNotifierProvider.value(value: SupabaseSyncService.instance),
+        ChangeNotifierProvider.value(value: ServerConfigService.instance),
       ],
       child: const PharmacyApp(),
     ),

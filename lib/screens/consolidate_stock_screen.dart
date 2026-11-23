@@ -81,6 +81,8 @@ class _ConsolidateStockScreenState extends State<ConsolidateStockScreen> {
         _ColDef('preturn', 'P.Return', width: 60.0, align: TextAlign.right, type: ColType.numeric),
         _ColDef('adjustment', 'Adjustment', width: 75.0, align: TextAlign.right, type: ColType.numeric),
         _ColDef('closing', 'Closing Stock', width: 90.0, align: TextAlign.right, type: ColType.numeric),
+        _ColDef('live_stock', 'Live Stock', width: 85.0, align: TextAlign.right, type: ColType.numeric),
+        _ColDef('drift', 'Discrepancy', width: 90.0, align: TextAlign.center, type: ColType.numeric),
         _ColDef('mrp_val', 'MRP Value', width: 90.0, align: TextAlign.right, type: ColType.numeric),
         _ColDef('lcost_val', 'Lcost Value', width: 90.0, align: TextAlign.right, type: ColType.numeric),
       ];
@@ -93,7 +95,9 @@ class _ConsolidateStockScreenState extends State<ConsolidateStockScreen> {
         _ColDef('supplier', 'Supplier', width: 140.0, align: TextAlign.left, type: ColType.text),
         _ColDef('inward', 'Inward (+)', width: 85.0, align: TextAlign.right, type: ColType.numeric),
         _ColDef('outward', 'Outward (-)', width: 85.0, align: TextAlign.right, type: ColType.numeric),
-        _ColDef('closing', 'Closing Stock', width: 100.0, align: TextAlign.right, type: ColType.numeric),
+        _ColDef('closing', 'Closing Stock', width: 95.0, align: TextAlign.right, type: ColType.numeric),
+        _ColDef('live_stock', 'Live Stock', width: 85.0, align: TextAlign.right, type: ColType.numeric),
+        _ColDef('drift', 'Discrepancy', width: 90.0, align: TextAlign.center, type: ColType.numeric),
         _ColDef('mrp_val', 'MRP Value', width: 100.0, align: TextAlign.right, type: ColType.numeric),
         _ColDef('lcost_val', 'Lcost Value', width: 100.0, align: TextAlign.right, type: ColType.numeric),
       ];
@@ -361,6 +365,8 @@ class _ConsolidateStockScreenState extends State<ConsolidateStockScreen> {
         int negAdj = item.adjustment < 0 ? item.adjustment.abs() : 0;
         return (item.sales + item.purchaseReturn + item.damage.abs() + negAdj);
       case 'closing': return item.closingStock;
+      case 'live_stock': return item.liveStock;
+      case 'drift': return item.stockDrift;
       case 'mrp_val': return item.mrpValue;
       case 'lcost_val': return item.lCostValue;
       default: return '';
@@ -1180,6 +1186,18 @@ class _ConsolidateStockScreenState extends State<ConsolidateStockScreen> {
               } else if (item.closingStock == 0) {
                 textColor = Colors.orange.shade800;
               }
+            } else if (col.key == 'live_stock') {
+              fontWeight = FontWeight.bold;
+              textColor = Colors.blueGrey.shade900;
+            } else if (col.key == 'drift') {
+              fontWeight = FontWeight.bold;
+              if (rawVal == 0) {
+                textStr = "MATCH";
+                textColor = Colors.green.shade700;
+              } else {
+                textStr = rawVal > 0 ? "+$rawVal" : "$rawVal";
+                textColor = Colors.red.shade700;
+              }
             }
           } else {
             textStr = rawVal?.toString() ?? '';
@@ -1241,6 +1259,10 @@ class _ConsolidateStockScreenState extends State<ConsolidateStockScreen> {
         val = (item.sales + item.purchaseReturn + item.damage.abs() + negAdj).toDouble();
       } else if (colKey == 'closing') {
         val = item.closingStock.toDouble();
+      } else if (colKey == 'live_stock') {
+        val = item.liveStock.toDouble();
+      } else if (colKey == 'drift') {
+        val = item.stockDrift.toDouble();
       } else if (colKey == 'mrp_val') {
         val = item.mrpValue;
       } else if (colKey == 'lcost_val') {
@@ -1349,6 +1371,8 @@ class _ConsolidateStockScreenState extends State<ConsolidateStockScreen> {
     int sumPRet = 0;
     int sumAdj = 0;
     int sumClosing = 0;
+    int sumLive = 0;
+    int sumDrift = 0;
     double sumMrpVal = 0.0;
     double sumLCostVal = 0.0;
 
@@ -1362,6 +1386,8 @@ class _ConsolidateStockScreenState extends State<ConsolidateStockScreen> {
       sumPRet += item.purchaseReturn;
       sumAdj += item.adjustment;
       sumClosing += item.closingStock;
+      sumLive += item.liveStock;
+      sumDrift += item.stockDrift;
       sumMrpVal += item.mrpValue;
       sumLCostVal += item.lCostValue;
     }
@@ -1416,6 +1442,10 @@ class _ConsolidateStockScreenState extends State<ConsolidateStockScreen> {
               valStr = '$sumOutward';
             } else if (col.key == 'closing') {
               valStr = '$sumClosing';
+            } else if (col.key == 'live_stock') {
+              valStr = '$sumLive';
+            } else if (col.key == 'drift') {
+              valStr = sumDrift == 0 ? 'MATCH' : (sumDrift > 0 ? '+$sumDrift' : '$sumDrift');
             } else if (col.key == 'mrp_val') {
               valStr = '₹${sumMrpVal.toStringAsFixed(0)}';
             } else if (col.key == 'lcost_val') {

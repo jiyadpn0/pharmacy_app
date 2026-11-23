@@ -172,24 +172,36 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
 
             if (condition == 'Equals' && cellStr != filterStr) {
               match = false;
-            } else if (condition == 'Does Not Equal' && cellStr == filterStr) match = false;
-            else if (condition == 'Contains' && !cellStr.contains(filterStr)) match = false;
-            else if (condition == 'Does Not Contain' && cellStr.contains(filterStr)) match = false;
-            else if (condition == 'Begins With' && !cellStr.startsWith(filterStr)) match = false;
-            else if (condition == 'Ends With' && !cellStr.endsWith(filterStr)) match = false;
+            } else if (condition == 'Does Not Equal' && cellStr == filterStr) {
+              match = false;
+            } else if (condition == 'Contains' && !cellStr.contains(filterStr)) {
+              match = false;
+            } else if (condition == 'Does Not Contain' && cellStr.contains(filterStr)) {
+              match = false;
+            } else if (condition == 'Begins With' && !cellStr.startsWith(filterStr)) {
+              match = false;
+            } else if (condition == 'Ends With' && !cellStr.endsWith(filterStr)) {
+              match = false;
+            }
           } else if (filter['type'] == ColumnType.numeric) {
             double cellNum = double.tryParse(formatSaleDisplayNo(val?.toString())) ?? 0.0;
             double v1 = double.tryParse(filter['value1']?.toString() ?? "0") ?? 0.0;
 
             if (condition == 'Between') {
               double v2 = double.tryParse(filter['value2']?.toString() ?? "0") ?? 0.0;
-              if (cellNum < v1 || cellNum > v2) match = false;
+              if (cellNum < v1 || cellNum > v2) {
+                match = false;
+              }
             } else {
               if (condition == 'Equals' && cellNum != v1) {
                 match = false;
-              } else if (condition == 'Does Not Equal' && cellNum == v1) match = false;
-              else if (condition == 'Greater Than' && cellNum <= v1) match = false;
-              else if (condition == 'Less Than' && cellNum >= v1) match = false;
+              } else if (condition == 'Does Not Equal' && cellNum == v1) {
+                match = false;
+              } else if (condition == 'Greater Than' && cellNum <= v1) {
+                match = false;
+              } else if (condition == 'Less Than' && cellNum >= v1) {
+                match = false;
+              }
             }
           } else if (filter['type'] == ColumnType.date) {
             DateTime? cellDate = (colKey == 'date' && row['raw_date'] != null)
@@ -211,12 +223,17 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
               DateTime? d2 = _parseFlexibleDate(filter['value2']?.toString() ?? "");
               if (d2 == null) return;
               d2 = DateTime(d2.year, d2.month, d2.day);
-              if (cellDate.isBefore(d1) || cellDate.isAfter(d2)) match = false;
+              if (cellDate.isBefore(d1) || cellDate.isAfter(d2)) {
+                match = false;
+              }
             } else {
               if (condition == 'Equals' && !cellDate.isAtSameMomentAs(d1)) {
                 match = false;
-              } else if (condition == 'Before' && !cellDate.isBefore(d1)) match = false;
-              else if (condition == 'After' && !cellDate.isAfter(d1)) match = false;
+              } else if (condition == 'Before' && !cellDate.isBefore(d1)) {
+                match = false;
+              } else if (condition == 'After' && !cellDate.isAfter(d1)) {
+                match = false;
+              }
             }
           }
         });
@@ -243,9 +260,13 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
           DateTime? dateB = (b['raw_date'] is DateTime && _sortColumnKey == 'date') ? b['raw_date'] : _parseFlexibleDate(valB?.toString() ?? '');
           if (dateA == null && dateB == null) {
             comp = 0;
-          } else if (dateA == null) comp = -1;
-          else if (dateB == null) comp = 1;
-          else comp = dateA.compareTo(dateB);
+          } else if (dateA == null) {
+            comp = -1;
+          } else if (dateB == null) {
+            comp = 1;
+          } else {
+            comp = dateA.compareTo(dateB);
+          }
         } else {
           String strA = valA?.toString().toLowerCase() ?? '';
           String strB = valB?.toString().toLowerCase() ?? '';

@@ -6,6 +6,7 @@ import 'dart:math';
 import 'package:intl/intl.dart';
 import '../../providers/pharmacy_provider.dart';
 import '../../providers/app_provider.dart';
+import '../../services/buy_planning_service.dart';
 import '../../widgets/window_controls_bar.dart';
 import '../../widgets/erp_tooltip.dart';
 
@@ -545,79 +546,48 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
       return;
     }
 
-    final Map<String, List<Map<String, dynamic>>> groupedBySupplier = {};
+    final List<Map<String, dynamic>> itemsToOrder = [];
     for (var item in tickedItems) {
       final dynamic itemId = item['id'];
       String supplier = (_orderedSuppliers[itemId] ?? item['bestProfitWholesale'] ?? item['preferred_wholesale'] ?? "").toString().trim();
       if (supplier.isEmpty || supplier == '-') {
         supplier = "General Wholesale";
       }
-      groupedBySupplier.putIfAbsent(supplier, () => []).add(item);
+
+      double minLvl = double.tryParse(item['minLevel']?.toString() ?? "0") ?? 0.0;
+      double stock = double.tryParse(item['currentBalance']?.toString() ?? "0") ?? 0.0;
+      double rank = double.tryParse(item['rank']?.toString() ?? "0") ?? 0.0;
+      int pack = int.tryParse(item['packSize']?.toString() ?? "1") ?? 1;
+      if (pack <= 0) pack = 1;
+
+      double effMin = minLvl > 0 ? minLvl : (rank > 0 ? rank : 1.0);
+      double stockInPacks = stock / pack.toDouble();
+
+      int defaultReqQty = 1;
+      if (stockInPacks <= effMin) {
+        defaultReqQty = _calculatePendingOrderQty(rank - stockInPacks);
+        if (defaultReqQty <= 0) defaultReqQty = 1;
+      }
+
+      int reqQty = _orderedQtys[itemId] ?? defaultReqQty;
+
+      final enrichedItem = Map<String, dynamic>.from(item);
+      enrichedItem['supplier'] = supplier;
+      enrichedItem['orderQty'] = reqQty;
+      itemsToOrder.add(enrichedItem);
     }
 
-    final provider = Provider.of<PharmacyProvider>(context, listen: false);
     final appProvider = Provider.of<AppProvider>(context, listen: false);
-    int count = 0;
-
-    for (var entry in groupedBySupplier.entries) {
-      String supplier = entry.key;
-      List<Map<String, dynamic>> items = entry.value;
-      String orderId = "ORD-${DateFormat('yyyyMMdd').format(_selectedDate)}-${(DateTime.now().millisecondsSinceEpoch + count).toString().substring(8)}";
-
-      List<OrderConfirmationItem> orderItems = items.map((i) {
-        final dynamic itemId = i['id'];
-        double pRate = double.tryParse(i['pRate']?.toString() ?? "0") ?? 0.0;
-        double minLvl = double.tryParse(i['minLevel']?.toString() ?? "0") ?? 0.0;
-        double stock = double.tryParse(i['currentBalance']?.toString() ?? "0") ?? 0.0;
-        double rank = double.tryParse(i['rank']?.toString() ?? "0") ?? 0.0;
-        int pack = int.tryParse(i['packSize']?.toString() ?? "1") ?? 1;
-        if (pack <= 0) pack = 1;
-
-        double effMin = minLvl > 0 ? minLvl : (rank > 0 ? rank : 1.0);
-        double stockInPacks = stock / pack.toDouble();
-
-        int defaultReqQty = 1;
-        if (stockInPacks <= effMin) {
-          defaultReqQty = _calculatePendingOrderQty(rank - stockInPacks);
-          if (defaultReqQty <= 0) defaultReqQty = 1;
-        }
-
-        int reqQty = _orderedQtys[itemId] ?? defaultReqQty;
-
-        return OrderConfirmationItem(
-          orderId: orderId,
-          productId: i['id']?.toString() ?? "",
-          productName: i['name']?.toString() ?? "",
-          company: i['brand']?.toString() ?? "",
-          orderQty: reqQty,
-          packSize: pack,
-          unitPrice: pRate,
-        );
-      }).toList();
-
-      double totalAmt = orderItems.fold(0.0, (sum, item) => sum + (item.orderQty * item.unitPrice));
-
-      OrderConfirmation order = OrderConfirmation(
-        orderId: orderId,
-        orderDate: _selectedDate,
-        supplierName: supplier,
-        totalItems: orderItems.length,
-        totalAmount: totalAmt,
-        status: 'PENDING',
-        expectedDeliveryDate: DateFormat('dd/MM/yyyy').format(_selectedDate.add(const Duration(days: 2))),
-        notes: "Generated from Order Book on ${DateFormat('dd/MM/yyyy').format(_selectedDate)}",
-        createdAt: DateTime.now(),
-        items: orderItems,
-      );
-
-      await provider.saveOrderConfirmation(order);
-      count++;
-    }
+    final createdOrders = await BuyPlanningService.instance.generatePurchaseOrders(
+      selectedItems: itemsToOrder,
+      orderDate: _selectedDate,
+      customNotes: "Generated from Order Book on ${DateFormat('dd/MM/yyyy').format(_selectedDate)}",
+    );
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text("Saved $count Order Confirmation(s) (${tickedItems.length} items) successfully!"),
+          content: Text("Saved ${createdOrders.length} Order Confirmation(s) (${tickedItems.length} items) successfully!"),
           backgroundColor: Colors.green,
           action: SnackBarAction(
             label: "VIEW TRACKER",
@@ -1055,93 +1025,6 @@ class _SpecialOrdersScreenState extends State<SpecialOrdersScreen> {
       return DateFormat('dd/MM/yy').format(DateTime.parse(d.toString()));
     } catch (_) {
       return d.toString();
-    }
-  }
-
-
-
-  void _showDaysPickerPopup(BuildContext context, String title, int? currentDays, Function(int?) onSelected) async {
-    final TextEditingController customCtrl = TextEditingController();
-    final items = [15, 30, 45, 60, 90, 120, 180, 365];
-
-    final result = await showDialog<int>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: _isDarkMode ? const Color(0xFF1E293B) : Colors.white,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        title: Text("Select Previous Days ($title)", style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: _isDarkMode ? Colors.white : Colors.black87)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text("Quick Presets:", style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: _isDarkMode ? Colors.white70 : Colors.grey.shade700)),
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 6,
-              runSpacing: 6,
-              children: items.map((days) {
-                final isSelected = currentDays == days;
-                return ChoiceChip(
-                  label: Text("$days Days", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: isSelected ? Colors.white : (_isDarkMode ? Colors.white70 : Colors.black87))),
-                  selected: isSelected,
-                  selectedColor: Colors.red.shade600,
-                  backgroundColor: _isDarkMode ? Colors.blueGrey.shade800 : Colors.grey.shade100,
-                  onSelected: (_) => Navigator.pop(ctx, days),
-                );
-              }).toList(),
-            ),
-            const SizedBox(height: 16),
-            const Divider(),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: customCtrl,
-                    keyboardType: TextInputType.number,
-                    style: TextStyle(color: _isDarkMode ? Colors.white : Colors.black),
-                    decoration: InputDecoration(
-                      labelText: "Custom Days",
-                      hintText: "e.g. 60",
-                      isDense: true,
-                      labelStyle: TextStyle(color: _isDarkMode ? Colors.white70 : Colors.grey.shade700),
-                      border: const OutlineInputBorder(),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                ElevatedButton(
-                  style: ElevatedButton.styleFrom(backgroundColor: Colors.red.shade600, foregroundColor: Colors.white),
-                  onPressed: () {
-                    final val = int.tryParse(customCtrl.text);
-                    if (val != null && val > 0) {
-                      Navigator.pop(ctx, val);
-                    }
-                  },
-                  child: const Text("Apply"),
-                ),
-              ],
-            ),
-          ],
-        ),
-        actions: [
-          if (currentDays != null)
-            TextButton(
-              onPressed: () => Navigator.pop(ctx, -1),
-              child: const Text("Clear Highlight", style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold)),
-            ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: Text("Cancel", style: TextStyle(color: _isDarkMode ? Colors.white60 : Colors.blueGrey)),
-          ),
-        ],
-      ),
-    );
-
-    if (result == -1) {
-      onSelected(null);
-    } else if (result != null) {
-      onSelected(result);
     }
   }
 

@@ -555,16 +555,17 @@ class _DatabaseBackupTabState extends State<DatabaseBackupTab> {
                 builder: (_) => const Center(child: CircularProgressIndicator()),
               );
 
-              final success = await provider.restoreFromBackup(file);
+              final bool isSuccess = await provider.restoreFromBackup(file);
+              const String errMsg = "Failed to restore database.";
 
               if (!mounted) return;
               Navigator.pop(context);
 
-              if (success) {
+              if (isSuccess) {
                 widget.showSnackBar("Database restored successfully! Restarting data layers...");
                 await provider.loadFromDatabase();
               } else {
-                widget.showErrorDialog("Restore Failed", "Failed to restore database from backup file.");
+                widget.showErrorDialog("Restore Failed", errMsg);
               }
             },
             child: const Text("OVERWRITE & RESTORE"),

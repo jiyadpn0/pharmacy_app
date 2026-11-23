@@ -14,8 +14,242 @@ import '../widgets/app_date_picker.dart';
 import '../widgets/erp_grid_text_field.dart';
 import '../utils/search_debouncer.dart';
 import '../utils/unsaved_handler.dart';
+import '../database/db_helper.dart';
 
 enum StockViewMode { pendingOnly, discrepancies, twoSide }
+
+/// Parses dual-unit input (Packs/Strips + Loose units) or mathematical expressions into total loose units.
+/// Examples with packSize=10:
+///  "43"   -> 43
+///  "4p3"  -> 43 (4 packs * 10 + 3 loose)
+///  "4/3"  -> 43 (4 packs * 10 + 3 loose)
+///  "4p"   -> 40
+///  "40+3" -> 43
+int? parseSmartPharmacyQty(String input, int packSize) {
+  final clean = input.trim().toLowerCase();
+  if (clean.isEmpty) return null;
+
+  final directInt = int.tryParse(clean);
+  if (directInt != null) return directInt;
+
+  final pSize = packSize > 0 ? packSize : 1;
+
+  final packLooseReg = RegExp(r'^(\d+)[psb](\d*)$');
+  final match = packLooseReg.firstMatch(clean);
+  if (match != null) {
+    int packs = int.tryParse(match.group(1) ?? "0") ?? 0;
+    int loose = int.tryParse(match.group(2)?.isNotEmpty == true ? match.group(2)! : "0") ?? 0;
+    return (packs * pSize) + loose;
+  }
+
+  if (clean.contains('/')) {
+    final parts = clean.split('/');
+    if (parts.length == 2) {
+      int? packs = int.tryParse(parts[0].trim());
+      int? loose = int.tryParse(parts[1].trim());
+      if (packs != null && loose != null) {
+        return (packs * pSize) + loose;
+      }
+    }
+  }
+
+  if (clean.contains('+')) {
+    final parts = clean.split('+');
+    int sum = 0;
+    bool valid = true;
+    for (var part in parts) {
+      final subParsed = parseSmartPharmacyQty(part.trim(), pSize);
+      if (subParsed != null) {
+        sum += subParsed;
+      } else {
+        valid = false;
+        break;
+      }
+    }
+    if (valid) return sum;
+  }
+
+  if (clean.contains('*')) {
+    final parts = clean.split('*');
+    if (parts.length == 2) {
+      int? p1 = int.tryParse(parts[0].trim());
+      int? p2 = int.tryParse(parts[1].trim());
+      if (p1 != null && p2 != null) {
+        return p1 * p2;
+      }
+    }
+  }
+
+  return null;
+}
+
+/// Modal dialog allowing auditors to physically count whole strips/packs + loose units.
+Future<int?> showPackCalculatorDialog(
+  BuildContext context, {
+  required String productName,
+  required int packSize,
+  int? currentTotalQty,
+}) async {
+  final int pSize = packSize > 0 ? packSize : 1;
+  int initialPacks = (currentTotalQty != null && currentTotalQty > 0) ? (currentTotalQty ~/ pSize) : 0;
+  int initialLoose = (currentTotalQty != null && currentTotalQty > 0) ? (currentTotalQty % pSize) : 0;
+
+  final packsCtrl = TextEditingController(text: initialPacks > 0 ? initialPacks.toString() : "");
+  final looseCtrl = TextEditingController(text: initialLoose > 0 ? initialLoose.toString() : "");
+  final packsFocus = FocusNode();
+  final looseFocus = FocusNode();
+
+  return showDialog<int>(
+    context: context,
+    builder: (ctx) {
+      return StatefulBuilder(
+        builder: (context, setDlgState) {
+          int packs = int.tryParse(packsCtrl.text.trim()) ?? 0;
+          int loose = int.tryParse(looseCtrl.text.trim()) ?? 0;
+          int total = (packs * pSize) + loose;
+
+          return AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            title: Row(
+              children: [
+                Icon(Icons.calculate_rounded, color: Colors.indigo.shade700, size: 24),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        productName,
+                        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      Text(
+                        "Pack Size: $pSize units / pack",
+                        style: TextStyle(fontSize: 11, color: Colors.grey.shade600, fontWeight: FontWeight.normal),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            content: SizedBox(
+              width: 340,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.indigo.shade50,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.indigo.shade100),
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text("Calculated Total:", style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+                        Text(
+                          "$total Units",
+                          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.indigo.shade900),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text("Packs / Strips", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                            const SizedBox(height: 4),
+                            TextField(
+                              controller: packsCtrl,
+                              focusNode: packsFocus,
+                              autofocus: true,
+                              keyboardType: TextInputType.number,
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                              decoration: InputDecoration(
+                                hintText: "0",
+                                isDense: true,
+                                border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                                contentPadding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
+                              ),
+                              onChanged: (_) => setDlgState(() {}),
+                              onSubmitted: (_) => looseFocus.requestFocus(),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 8, vertical: 12),
+                        child: Text("+", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.grey)),
+                      ),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text("Loose Tablets", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                            const SizedBox(height: 4),
+                            TextField(
+                              controller: looseCtrl,
+                              focusNode: looseFocus,
+                              keyboardType: TextInputType.number,
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                              decoration: InputDecoration(
+                                hintText: "0",
+                                isDense: true,
+                                border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                                contentPadding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
+                              ),
+                              onChanged: (_) => setDlgState(() {}),
+                              onSubmitted: (_) {
+                                int finalPacks = int.tryParse(packsCtrl.text.trim()) ?? 0;
+                                int finalLoose = int.tryParse(looseCtrl.text.trim()) ?? 0;
+                                Navigator.pop(ctx, (finalPacks * pSize) + finalLoose);
+                              },
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    "Formula: ($packs packs × $pSize) + $loose loose = $total units",
+                    style: TextStyle(fontSize: 10, color: Colors.grey.shade600, fontStyle: FontStyle.italic),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, null),
+                child: const Text("CANCEL"),
+              ),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.indigo.shade700,
+                  foregroundColor: Colors.white,
+                ),
+                onPressed: () {
+                  int finalPacks = int.tryParse(packsCtrl.text.trim()) ?? 0;
+                  int finalLoose = int.tryParse(looseCtrl.text.trim()) ?? 0;
+                  Navigator.pop(ctx, (finalPacks * pSize) + finalLoose);
+                },
+                child: const Text("APPLY"),
+              ),
+            ],
+          );
+        },
+      );
+    },
+  );
+}
 
 class StockCheckingScreen extends StatefulWidget {
   const StockCheckingScreen({super.key});
@@ -38,16 +272,6 @@ class _StockCheckingScreenState extends State<StockCheckingScreen> implements Un
   @override
   void showDifferences() {}
 
-  Future<bool?> _promptDiscardChanges() async {
-    if (!hasUnsavedChanges()) return true;
-
-    final result = await showUnsavedChangesDialog(context);
-    if (result == UnsavedDialogResult.discard) {
-      return true;
-    } else {
-      return false;
-    }
-  }
   // UI State
   bool _batchMode = true;
   int _activeAgentIdx = 0;
@@ -75,7 +299,7 @@ class _StockCheckingScreenState extends State<StockCheckingScreen> implements Un
     "packSize": 50,
     "batch": 100,
     "stock": 60,
-    "physical": 85,
+    "physical": 105,
     "diff": 70,
     "expiry": 80,
     "checked": 60,
@@ -90,10 +314,12 @@ class _StockCheckingScreenState extends State<StockCheckingScreen> implements Un
     "series": 90,
     "stock": 80,
     "adjustment": 90,
-    "final": 75,
+    "final": 95,
     "expiry": 100,
     "lcostChange": 110,
   };
+
+  DateTime _auditStartTime = DateTime.now();
 
   // State Management
   final Map<int, Map<String, Map<String, dynamic>>> _agentFilters = {0: {}};
@@ -166,6 +392,7 @@ class _StockCheckingScreenState extends State<StockCheckingScreen> implements Un
         'agentConfirmedIds': _agentConfirmedIds.map((k, v) => MapEntry(k.toString(), v.toList())),
         'agentFilters': _agentFilters.map((k, v) => MapEntry(k.toString(), v)),
         'syncedKeys': _syncedKeys.toList(),
+        'auditStartTime': _auditStartTime.toIso8601String(),
       };
 
       // Push the heavy encoding off the main UI thread so typing never lags
@@ -227,6 +454,10 @@ class _StockCheckingScreenState extends State<StockCheckingScreen> implements Un
           if (savedSynced != null) {
             _syncedKeys.clear();
             _syncedKeys.addAll(List<String>.from(savedSynced));
+          }
+
+          if (state['auditStartTime'] != null) {
+            _auditStartTime = DateTime.tryParse(state['auditStartTime']) ?? _auditStartTime;
           }
         });
       }
@@ -1352,6 +1583,8 @@ class _StockItemRowState extends State<_StockItemRow> {
     int systemQty = (widget.p.stock as num?)?.toInt() ?? 0;
     int? physicalQty = widget.physicalQty;
     int diff = (physicalQty ?? systemQty) - systemQty;
+    int pSize = (widget.p.packSize as num?)?.toInt() ?? 1;
+    if (pSize <= 0) pSize = 1;
 
                                       final bool isH1 = widget.p.schedule.toUpperCase() == "H1";
                                       return GestureDetector(
@@ -1405,31 +1638,57 @@ class _StockItemRowState extends State<_StockItemRow> {
                                                 child: Text("$systemQty", style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: isH1 ? Colors.red.shade900 : Colors.blueGrey)),
                                               ),
                                               Container(
-                                                width: widget.colWidths["physical"] ?? 85,
-                                                padding: const EdgeInsets.symmetric(horizontal: 8),
+                                                width: widget.colWidths["physical"] ?? 105,
+                                                padding: const EdgeInsets.symmetric(horizontal: 4),
                                                 alignment: Alignment.center,
                                                 child: SizedBox(
                                                   height: 42,
                                                   child: ErpGridTextField(
                                                     controller: _controller,
                                                     focusNode: widget.focusNode,
-                                                    keyboardType: TextInputType.number,
+                                                    keyboardType: TextInputType.text,
                                                     textAlign: TextAlign.center,
-                                                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: isH1 ? Colors.red.shade900 : Colors.black),
+                                                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: isH1 ? Colors.red.shade900 : Colors.black),
                                                     decoration: InputDecoration(
-                                                      contentPadding: const EdgeInsets.only(bottom: 2),
+                                                      contentPadding: const EdgeInsets.only(bottom: 2, left: 4),
                                                       isDense: true,
                                                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: isH1 ? BorderSide(color: Colors.red.shade300) : const BorderSide(color: Colors.grey)),
                                                       focusedBorder: isH1 ? OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: const BorderSide(color: Colors.red, width: 2)) : null,
                                                       fillColor: isH1 ? Colors.red.shade50 : (diff != 0 ? const Color(0xFFFEF3C7) : Colors.white),
                                                       filled: true,
                                                       hintText: "-",
+                                                      suffixIcon: pSize > 1
+                                                          ? Tooltip(
+                                                              message: "Pack: $pSize. Tap for Pack Calculator (or type e.g. 4p3)",
+                                                              child: InkWell(
+                                                                onTap: () async {
+                                                                  int? calc = await showPackCalculatorDialog(
+                                                                    context,
+                                                                    productName: widget.p.name ?? "-",
+                                                                    packSize: pSize,
+                                                                    currentTotalQty: widget.physicalQty,
+                                                                  );
+                                                                  if (calc != null) {
+                                                                    _controller.text = calc.toString();
+                                                                    widget.onQtyChanged(calc);
+                                                                  }
+                                                                },
+                                                                child: Icon(Icons.calculate_outlined, size: 16, color: Colors.indigo.shade700),
+                                                              ),
+                                                            )
+                                                          : null,
                                                     ),
                                                     onChanged: (v) {
-                                                      int? val = int.tryParse(v);
+                                                      int? val = parseSmartPharmacyQty(v, pSize);
                                                       widget.onQtyChanged(val);
                                                     },
-                                                    onSubmitted: (v) => widget.onConfirmed(),
+                                                    onSubmitted: (v) {
+                                                      int? val = parseSmartPharmacyQty(v, pSize);
+                                                      if (val != null) {
+                                                        _controller.text = val.toString();
+                                                      }
+                                                      widget.onConfirmed();
+                                                    },
                                                   ),
                                                 ),
                                               ),
@@ -1944,21 +2203,164 @@ class _AdminAdjustmentPanelState extends State<AdminAdjustmentPanel> {
     setState(() => _isLoading = true);
     try {
       final pharma = Provider.of<PharmacyProvider>(context, listen: false);
-      List<StockAdjustmentItem> adjustmentItems = [];
+      final db = kIsWeb ? null : await DbHelper.instance.database;
+
+      // 1. Live stock drift check: Detect if counter sales or receipts changed DB stock during audit
+      List<Map<String, dynamic>> driftedList = [];
+      Map<String, int> liveStockMap = {};
 
       for (String key in _selectedKeys) {
-        final p = _filteredItems.firstWhere((item) {
+        final p = _filteredItems.where((item) {
           String itemId = (item.id ?? "").toString();
           String itemBatch = (item.batch ?? "").toString();
           String k = widget.batchMode ? "$itemId|$itemBatch" : itemId;
           return k == key;
-        });
+        }).firstOrNull;
+
+        if (p == null) continue;
+
+        int snapshotStock = (p.stock as num?)?.toInt() ?? 0;
+        int liveStock = snapshotStock;
+
+        if (db != null) {
+          if (widget.batchMode) {
+            final res = await db.rawQuery(
+              'SELECT current_stock FROM stock_batches WHERE product_id = ? AND batch_number = ? COLLATE NOCASE LIMIT 1',
+              [p.id?.toString() ?? '', p.batch?.toString() ?? ''],
+            );
+            if (res.isNotEmpty) {
+              liveStock = (res.first['current_stock'] as num?)?.toInt() ?? 0;
+            }
+          } else {
+            final res = await db.rawQuery(
+              'SELECT current_stock FROM product_master WHERE id = ? LIMIT 1',
+              [p.id?.toString() ?? ''],
+            );
+            if (res.isNotEmpty) {
+              liveStock = (res.first['current_stock'] as num?)?.toInt() ?? 0;
+            }
+          }
+        }
+        liveStockMap[key] = liveStock;
+
+        int? finalCount = widget.agentPhysicalQtys[-1]?[key];
+        if (finalCount != null && liveStock != snapshotStock) {
+          driftedList.add({
+            'product': p,
+            'snapshot': snapshotStock,
+            'live': liveStock,
+            'drift': liveStock - snapshotStock,
+            'finalCount': finalCount,
+          });
+        }
+      }
+
+      // If stock drifted while audit was in progress, prompt the user with clear options
+      bool useExactLiveCount = true;
+      if (driftedList.isNotEmpty) {
+        if (!mounted) return;
+        final choice = await showDialog<String>(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) => AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+            title: const Row(
+              children: [
+                Icon(Icons.warning_amber_rounded, color: Colors.amber, size: 28),
+                SizedBox(width: 10),
+                Text("Interim Counter Sales / Stock Drift", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+              ],
+            ),
+            content: SizedBox(
+              width: 560,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    "Stock for ${driftedList.length} item(s) was modified in the database while the audit was underway (e.g. sales billed at the counter).",
+                    style: const TextStyle(fontSize: 13, height: 1.4),
+                  ),
+                  const SizedBox(height: 12),
+                  Container(
+                    constraints: const BoxConstraints(maxHeight: 180),
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.grey.shade300),
+                      borderRadius: BorderRadius.circular(8),
+                      color: Colors.grey.shade50,
+                    ),
+                    child: ListView.separated(
+                      shrinkWrap: true,
+                      itemCount: driftedList.length,
+                      separatorBuilder: (_, __) => const Divider(height: 1),
+                      itemBuilder: (ctx, i) {
+                        final item = driftedList[i];
+                        final prod = item['product'];
+                        final int snap = item['snapshot'];
+                        final int live = item['live'];
+                        final int drift = item['drift'];
+                        final int counted = item['finalCount'];
+                        return ListTile(
+                          dense: true,
+                          title: Text("${prod.name ?? '-'} ${prod.batch != null && prod.batch.isNotEmpty ? '(${prod.batch})' : ''}", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                          subtitle: Text(
+                            "Snapshot: $snap | Live DB: $live (${drift > 0 ? '+$drift' : drift}) | Physical Count: $counted",
+                            style: TextStyle(fontSize: 11, color: Colors.blueGrey.shade800),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  const Text("How would you like to adjust these drifted items?", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                  const SizedBox(height: 6),
+                  const Text(
+                    "• Set Exact Count: Sets database stock to exactly what was counted (choose if physical count took place AFTER counter sales).\n"
+                    "• Preserve Counter Sales: Applies physical variance against snapshot so counter sales are NOT erased (choose if physical count took place BEFORE counter sales).",
+                    style: TextStyle(fontSize: 11, color: Colors.black87, height: 1.4),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, 'cancel'),
+                child: const Text("CANCEL"),
+              ),
+              OutlinedButton(
+                onPressed: () => Navigator.pop(ctx, 'preserve_sales'),
+                child: const Text("Preserve Counter Sales"),
+              ),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.green.shade700, foregroundColor: Colors.white),
+                onPressed: () => Navigator.pop(ctx, 'exact_count'),
+                child: const Text("Set Exact Count"),
+              ),
+            ],
+          ),
+        );
+        if (choice == null || choice == 'cancel') return;
+        useExactLiveCount = (choice == 'exact_count');
+      }
+
+      List<StockAdjustmentItem> adjustmentItems = [];
+
+      for (String key in _selectedKeys) {
+        final p = _filteredItems.where((item) {
+          String itemId = (item.id ?? "").toString();
+          String itemBatch = (item.batch ?? "").toString();
+          String k = widget.batchMode ? "$itemId|$itemBatch" : itemId;
+          return k == key;
+        }).firstOrNull;
+
+        if (p == null) continue;
 
         int systemQty = (p.stock as num?)?.toInt() ?? 0;
+        int liveQty = liveStockMap[key] ?? systemQty;
         int? finalQty = widget.agentPhysicalQtys[-1]?[key];
         
         if (finalQty != null) {
-          int diff = finalQty - systemQty;
+          int diff = useExactLiveCount ? (finalQty - liveQty) : (finalQty - systemQty);
           if (diff != 0) {
             int pSize = (p.packSize as num?)?.toInt() ?? 1;
             if (pSize <= 0) pSize = 1;
@@ -1980,6 +2382,7 @@ class _AdminAdjustmentPanelState extends State<AdminAdjustmentPanel> {
       }
 
       if (adjustmentItems.isNotEmpty) {
+        if (!mounted) return;
         final bool? confirmSave = await showDialog<bool>(
           context: context,
           builder: (ctx) => AlertDialog(
@@ -2639,9 +3042,9 @@ class _AdminTableRowState extends State<_AdminTableRow> {
               child: Text(adjustmentText, style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: adjustmentColor))),
           if (!widget.showCheckedListOnly) ...[
           Container(
-              width: widget.colWidths["final"] ?? 75,
+              width: widget.colWidths["final"] ?? 95,
               alignment: Alignment.center,
-              padding: const EdgeInsets.symmetric(horizontal: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 4),
               decoration: BoxDecoration(border: Border(right: BorderSide(color: Colors.grey.shade100))),
               child: SizedBox(
                 height: 52,
@@ -2651,13 +3054,38 @@ class _AdminTableRowState extends State<_AdminTableRow> {
                   textAlign: TextAlign.center,
                   textAlignVertical: TextAlignVertical.center,
                   style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w900),
-                  keyboardType: TextInputType.number,
+                  keyboardType: TextInputType.text,
                   decoration: InputDecoration(
                     isDense: true,
-                    contentPadding: EdgeInsets.zero,
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 4),
                     border: const OutlineInputBorder(borderRadius: BorderRadius.all(Radius.circular(20))),
                     fillColor: isAgreedFill ? const Color(0xFFE8F5E9) : Colors.white,
                     filled: true,
+                    suffixIcon: pSize > 1
+                        ? Tooltip(
+                            message: "Pack: $pSize. Tap for Pack Calculator",
+                            child: InkWell(
+                              onTap: () async {
+                                String id = widget.p.id?.toString() ?? "";
+                                String b = widget.p.batch?.toString() ?? "";
+                                String key = widget.batchMode ? "$id|$b" : id;
+                                int? currentFinal = widget.agentPhysicalQtys[-1]?[key];
+                                int? calc = await showPackCalculatorDialog(
+                                  context,
+                                  productName: widget.p.name ?? "-",
+                                  packSize: pSize,
+                                  currentTotalQty: currentFinal,
+                                );
+                                if (calc != null) {
+                                  _finalController.text = calc.toString();
+                                  widget.onUpdatePhysical(-1, key, calc);
+                                  setState(() {});
+                                }
+                              },
+                              child: Icon(Icons.calculate_outlined, size: 16, color: Colors.indigo.shade700),
+                            ),
+                          )
+                        : null,
                   ),
                   onChanged: (v) {
                     String id = widget.p.id?.toString() ?? "";
@@ -2668,15 +3096,21 @@ class _AdminTableRowState extends State<_AdminTableRow> {
                       setState(() {});
                       return;
                     }
-                    int? newVal = int.tryParse(v);
+                    int? newVal = parseSmartPharmacyQty(v, pSize);
                     if (newVal != null) {
                       widget.onUpdatePhysical(-1, key, newVal);
                       setState(() {});
                     }
                   },
-                    onSubmitted: (v) => widget.onSubmitted(),
-                  ),
-                )),
+                  onSubmitted: (v) {
+                    int? val = parseSmartPharmacyQty(v, pSize);
+                    if (val != null) {
+                      _finalController.text = val.toString();
+                    }
+                    widget.onSubmitted();
+                  },
+                ),
+              )),
             Container(
                 width: widget.colWidths["expiry"] ?? 100,
                 alignment: Alignment.center,

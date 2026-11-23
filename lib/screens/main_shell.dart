@@ -28,12 +28,14 @@ import '../services/lan_sync_service.dart';
 import '../services/sync_event_bus.dart';
 import '../services/app_notification_service.dart';
 import '../widgets/notification_panel_dialog.dart';
-import '../widgets/watchdog_panel_dialog.dart';
 import '../widgets/pin_unlock_dialog.dart';
 import 'server_settings_screen.dart';
 import '../services/stock_outbox_service.dart';
 import '../utils/unsaved_handler.dart';
 import 'package:window_manager/window_manager.dart';
+import '../widgets/live_system_counts_dialog.dart';
+import '../services/daily_snapshot_service.dart';
+import '../widgets/owner_mobile_pulse_dialog.dart';
 
 class MainShell extends StatefulWidget {
   const MainShell({super.key});
@@ -107,6 +109,14 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
       }
     });
 
+    // Enterprise Midnight Cloud Snapshot & Owner Mobile Pulse
+    DailySnapshotService.instance.startMidnightScheduler();
+
+    // Plug-and-Play Multi-Terminal LAN Auto-Discovery
+    if (ServerConfigService.instance.isLanSyncEnabled) {
+      LanSyncService.instance.startAutoDiscovery();
+    }
+
     // Silent check for software updates on boot
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (mounted) {
@@ -158,6 +168,39 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
 
     // Staggered startup cloud sync on app opening to allow connection health check to stabilize
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      // Automatic Unseeded Cloud Database Health Check
+      Future.delayed(const Duration(seconds: 4), () async {
+        if (!mounted) return;
+        try {
+          final config = ServerConfigService.instance;
+          if (config.isConnected && config.supabaseUrl.isNotEmpty) {
+            final db = await DbHelper.instance.database;
+            final localCount = (await db.rawQuery('SELECT COUNT(*) as cnt FROM product_master')).first['cnt'] as int? ?? 0;
+            if (localCount > 50) {
+              final remoteCount = await SupabaseSyncService.instance.fetchRemoteCount('product_master');
+              if (remoteCount >= 0 && remoteCount < 10) {
+                AppNotificationService.instance.addNotification(
+                  title: "Cloud Database Not Seeded",
+                  message: "Local PC has $localCount products but Cloud Server has only $remoteCount. Click 'PC vs CLOUD' in the top bar to push all data.",
+                  type: NotificationType.backup,
+                  actionRoute: "server_settings",
+                );
+              }
+            } else if (localCount == 0) {
+              final remoteCount = await SupabaseSyncService.instance.fetchRemoteCount('product_master');
+              if (remoteCount > 50) {
+                AppNotificationService.instance.addNotification(
+                  title: "Cloud Catalog Ready to Download",
+                  message: "Cloud Server has $remoteCount products ready. Click 'PC vs CLOUD' to download catalog into this PC.",
+                  type: NotificationType.backup,
+                  actionRoute: "server_settings",
+                );
+              }
+            }
+          }
+        } catch (_) {}
+      });
+
       final mdi = Provider.of<MdiController>(context, listen: false);
       mdi.onPageMovement = () {
         if (mounted) {
@@ -171,7 +214,6 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
           final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
           await pharmacy.loadFromDatabase();
           await pharmacy.fetchAccounts();
-          pharmacy.scheduleDebouncedInventorySync();
         }
       };
 
@@ -249,6 +291,23 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
                         final List<dynamic> batchList = (payload is List) ? List<dynamic>.from(payload) : <dynamic>[payload];
                         await pharmacy.applyRemoteRealtimeUpdate('stock_batches', 'UPDATE', batchList);
                         break;
+                      case 'PURCHASE':
+                      case 'PURCHASE_SAVED':
+                        if (payload is Map<String, dynamic>) {
+                          final inner = (payload['payload'] is Map<String, dynamic>)
+                              ? payload['payload'] as Map<String, dynamic>
+                              : payload;
+                          final header = inner['header'];
+                          final items = inner['items'];
+                          if (header is Map<String, dynamic>) {
+                            await pharmacy.applyRemoteRealtimeUpdate('purchase_entries', 'INSERT', [header]);
+                          }
+                          if (items is List && items.isNotEmpty) {
+                            await pharmacy.applyRemoteRealtimeUpdate('purchase_items', 'INSERT', items);
+                          }
+                        }
+                        triggerDebouncedSync();
+                        break;
                       default:
                         triggerDebouncedSync();
                         break;
@@ -302,29 +361,28 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
     });
 
     // Multi-computer cloud sync loop for real-time multi-counter reflections (Every 2 minutes)
+    // Uses lightweight non-blocking DeltaSyncService instead of blocking full catalog sync
     _cloudSyncTimer = Timer.periodic(const Duration(minutes: 2), (_) async {
       if (!mounted) return;
       final serverConfig = ServerConfigService.instance;
       if (serverConfig.isServerModeEnabled && serverConfig.isConnected && serverConfig.autoSyncEnabled) {
-        if (!serverConfig.isWiping) {
+        if (!serverConfig.isWiping && !DbHelper.isBillingActive) {
           try {
-            final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
-            await SupabaseSyncService.instance.syncPendingCloudSalesAndPurchases(pharmacy: pharmacy);
-            if (!SupabaseSyncService.instance.isSyncing) {
-              await SupabaseSyncService.instance.syncAllPendingData().timeout(const Duration(seconds: 3));
+            if (!DeltaSyncService.instance.isSyncing && !SupabaseSyncService.instance.isSyncing) {
+              await DeltaSyncService.instance.triggerBackgroundSync();
             }
           } catch (_) {}
         }
       }
     });
 
-    // Hourly full data refresh timer
+    // Hourly background refresh timer (only if idle)
     _hourlySyncTimer = Timer.periodic(const Duration(hours: 1), (_) async {
       if (!mounted) return;
       final serverConfig = ServerConfigService.instance;
       if (serverConfig.isServerModeEnabled && serverConfig.isConnected && serverConfig.autoSyncEnabled) {
-        if (!serverConfig.isWiping) {
-          await SupabaseSyncService.instance.syncAllPendingData(forceFull: true);
+        if (!serverConfig.isWiping && !DbHelper.isBillingActive && !SupabaseSyncService.instance.isSyncing) {
+          await DeltaSyncService.instance.triggerBackgroundSync();
         }
       }
     });
@@ -593,22 +651,36 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
           mainAxisSize: MainAxisSize.min,
           children: [
             const Icon(Icons.medical_services_rounded, color: Colors.white, size: 16),
-            const SizedBox(width: 8),
-            const Text(
-              "PHARMA PRO",
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 13,
-                fontWeight: FontWeight.bold,
-                letterSpacing: 1.0,
+            const SizedBox(width: 6),
+            const Flexible(
+              fit: FlexFit.loose,
+              child: Text(
+                "PHARMA PRO",
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1.0,
+                ),
               ),
             ),
-            const SizedBox(width: 16),
-            Container(height: 16, width: 1, color: Colors.white24),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Consumer<PharmacyProvider>(
-                builder: (_, pharma, __) => _buildActiveStaffBar(app, pharma),
+            const SizedBox(width: 10),
+            Flexible(
+              fit: FlexFit.loose,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(height: 16, width: 1, color: Colors.white24),
+                  const SizedBox(width: 8),
+                  Flexible(
+                    fit: FlexFit.loose,
+                    child: Consumer<PharmacyProvider>(
+                      builder: (_, pharma, __) => _buildActiveStaffBar(app, pharma),
+                    ),
+                  ),
+                ],
               ),
             ),
           ],
@@ -616,78 +688,13 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
         trailingActions: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            IconButton(
-              icon: ListenableBuilder(
-                listenable: SupabaseSyncService.instance,
-                builder: (context, _) {
-                  final syncService = SupabaseSyncService.instance;
-                  final bool showSpinner = syncService.isSyncing && syncService.isManualTransfer && !ServerConfigService.instance.isPureCloud;
-                  return showSpinner
-                      ? const SizedBox(
-                          width: 14,
-                          height: 14,
-                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.cyanAccent),
-                        )
-                      : const Icon(Icons.sync_rounded, color: Colors.cyanAccent, size: 16);
-                },
-              ),
-              onPressed: _triggerManualCloudSync,
-              tooltip: "Pull Latest Server Entries (Ctrl+R / F9)",
-              constraints: const BoxConstraints(maxHeight: 28, maxWidth: 28),
-              padding: const EdgeInsets.all(4),
-            ),
-            const SizedBox(width: 4),
-            _buildUnsyncedIndicatorButton(context),
+            _buildUnsyncedIndicatorButton(context, app),
             const SizedBox(width: 4),
             _buildNotificationBellButton(context, app),
-            const SizedBox(width: 4),
-            _buildWatchdogHeaderButton(context, app),
-            const SizedBox(width: 4),
-            _buildThemeToggleButton(app),
             const SizedBox(width: 4),
             _buildLogConsoleHeaderButton(context, app),
             const SizedBox(width: 8),
             _buildFinancialYearSelector(context),
-            const SizedBox(width: 4),
-            ListenableBuilder(
-              listenable: ServerConfigService.instance,
-              builder: (context, _) {
-                final config = ServerConfigService.instance;
-                IconData icon = Icons.cloud_off_rounded;
-                Color color = Colors.white54;
-                String tooltip = "Server Mode: Disabled (Local Mode)";
-
-                if (config.isPureCloud) {
-                  if (config.isConnected) {
-                    icon = Icons.bolt_rounded;
-                    color = Colors.cyanAccent;
-                    tooltip = "Pure Cloud Live Mode: Active (${config.storeBranchId})";
-                  } else {
-                    icon = Icons.cloud_off_rounded;
-                    color = Colors.orangeAccent;
-                    tooltip = "Pure Cloud Live: Disconnected";
-                  }
-                } else if (config.isServerModeEnabled) {
-                  if (config.isConnected) {
-                    icon = Icons.cloud_done_rounded;
-                    color = Colors.lightGreenAccent;
-                    tooltip = "Server Mode: Connected (${config.storeBranchId})";
-                  } else {
-                    icon = Icons.cloud_off_rounded;
-                    color = Colors.orangeAccent;
-                    tooltip = "Server Mode: Connection Error";
-                  }
-                }
-
-                return IconButton(
-                  icon: Icon(icon, color: color, size: 16),
-                  onPressed: () => app.addTab("Server Settings", const ServerSettingsScreen()),
-                  tooltip: tooltip,
-                  constraints: const BoxConstraints(maxHeight: 28, maxWidth: 28),
-                  padding: const EdgeInsets.all(4),
-                );
-              },
-            ),
             const SizedBox(width: 4),
             IconButton(
               icon: const Icon(Icons.security_outlined, color: Colors.white70, size: 16),
@@ -704,6 +711,8 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
               constraints: const BoxConstraints(maxHeight: 28, maxWidth: 28),
               padding: const EdgeInsets.all(4),
             ),
+            const SizedBox(width: 4),
+            _buildThemeToggleButton(app),
             const SizedBox(width: 4),
             const CircleAvatar(
               radius: 10,
@@ -974,103 +983,6 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
                   ),
                 ),
             ],
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _buildWatchdogHeaderButton(BuildContext context, AppProvider app) {
-    final service = AppNotificationService.instance;
-    final serverConfig = ServerConfigService.instance;
-    return ListenableBuilder(
-      listenable: Listenable.merge([service, serverConfig]),
-      builder: (context, _) {
-        final watchdogNotifs = service.getNotificationsByType(NotificationType.watchdog);
-        final int unreadWatchdog = watchdogNotifs.where((n) => !n.isRead).length;
-        final bool isSynced = serverConfig.isConnected;
-
-        return Tooltip(
-          message: unreadWatchdog > 0
-              ? "Multi-PC Watchdog Feed ($unreadWatchdog new events)"
-              : (isSynced ? "Multi-PC Watchdog Live (System Synced 🟢)" : "Multi-PC Watchdog Live (Offline 🟠)"),
-          child: InkWell(
-            onTap: () {
-              WatchdogPanelDialog.show(context, onNavigate: (route) {
-                if (route == 'settings') {
-                  app.openSettings(tab: "Security & Backup");
-                } else if (route == 'server') {
-                  app.addTab("Server Settings", const ServerSettingsScreen());
-                } else if (route == 'expiry') {
-                  app.addTab("Current Stock", const CurrentStockScreen());
-                }
-              });
-            },
-            borderRadius: BorderRadius.circular(4),
-            child: Container(
-              height: 22,
-              padding: const EdgeInsets.symmetric(horizontal: 6),
-              decoration: BoxDecoration(
-                color: unreadWatchdog > 0
-                    ? Colors.purple.shade900.withValues(alpha: 0.5)
-                    : Colors.white10,
-                borderRadius: BorderRadius.circular(4),
-                border: Border.all(
-                  color: unreadWatchdog > 0
-                      ? Colors.purpleAccent
-                      : (isSynced ? Colors.green.shade600 : Colors.white24),
-                ),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    Icons.visibility_rounded,
-                    size: 12,
-                    color: unreadWatchdog > 0 ? Colors.purpleAccent : (isSynced ? Colors.greenAccent : Colors.white70),
-                  ),
-                  const SizedBox(width: 4),
-                  Text(
-                    "WATCHDOG 🐕",
-                    style: TextStyle(
-                      color: unreadWatchdog > 0 ? Colors.purpleAccent : Colors.white,
-                      fontSize: 9,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 0.5,
-                    ),
-                  ),
-                  if (isSynced) ...[
-                    const SizedBox(width: 4),
-                    Container(
-                      width: 6,
-                      height: 6,
-                      decoration: const BoxDecoration(
-                        color: Colors.greenAccent,
-                        shape: BoxShape.circle,
-                      ),
-                    ),
-                  ],
-                  if (unreadWatchdog > 0) ...[
-                    const SizedBox(width: 4),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-                      decoration: BoxDecoration(
-                        color: Colors.purpleAccent,
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Text(
-                        "$unreadWatchdog",
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 8,
-                          fontWeight: FontWeight.w900,
-                        ),
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
           ),
         );
       },
@@ -1899,57 +1811,148 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
     );
   }
 
-  Widget _buildUnsyncedIndicatorButton(BuildContext context) {
+  Widget _buildUnsyncedIndicatorButton(BuildContext context, AppProvider app) {
     return ListenableBuilder(
       listenable: ServerConfigService.instance,
       builder: (context, _) {
         final config = ServerConfigService.instance;
-        if (config.isPureCloud) {
-          final isOnline = config.isConnected;
-          return Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Tooltip(
-                message: isOnline
-                    ? "Pure Cloud Live Mode: Connected (${config.storeBranchId})"
-                    : "Pure Cloud Live Mode: Disconnected (Entries saved inside local storage)",
+        final isPureCloud = config.isPureCloud;
+        final isOnline = config.isConnected;
+
+        String serverLabel = isPureCloud ? "Pure Cloud Live" : (config.isServerModeEnabled ? "Server Live" : "Local Mode");
+        if ((isPureCloud || config.isServerModeEnabled) && !isOnline) {
+          final err = config.lastErrorMessage.toLowerCase();
+          if (err.contains("internet") || err.contains("socketexception") || err.contains("host lookup") || err.contains("11001")) {
+            serverLabel = "NO INTERNET";
+          } else if (err.contains("timeout")) {
+            serverLabel = "TIMEOUT";
+          } else {
+            serverLabel = "OFFLINE";
+          }
+        }
+
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // 1. LIVE PC vs CLOUD STOCK COMPARISON BUTTON
+            InkWell(
+              onTap: () => LiveSystemCountsDialog.show(context),
+              borderRadius: BorderRadius.circular(6),
+              child: Tooltip(
+                message: "Compare Live PC Stock vs Supabase Cloud Inventory Counts",
                 child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
                   decoration: BoxDecoration(
-                    color: isOnline
-                        ? Colors.cyan.shade900.withValues(alpha: 0.5)
-                        : Colors.red.shade900.withValues(alpha: 0.5),
+                    color: Colors.teal.shade900.withValues(alpha: 0.6),
                     borderRadius: BorderRadius.circular(6),
-                    border: Border.all(color: isOnline ? Colors.cyan.shade300 : Colors.red.shade300),
+                    border: Border.all(color: Colors.tealAccent, width: 1.0),
                   ),
-                  child: Row(
+                  child: const Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(
-                        isOnline ? Icons.bolt_rounded : Icons.wifi_off_rounded,
-                        color: isOnline ? Colors.cyanAccent : Colors.orangeAccent,
-                        size: 14,
-                      ),
-                      const SizedBox(width: 4),
+                      Icon(Icons.compare_arrows_rounded, color: Colors.tealAccent, size: 13),
+                      SizedBox(width: 4),
                       Text(
-                        isOnline ? "Pure Cloud Live" : "Cloud Offline",
-                        style: TextStyle(
-                          color: isOnline ? Colors.cyanAccent : Colors.orangeAccent,
-                          fontSize: 11,
-                          fontWeight: FontWeight.bold,
-                        ),
+                        "PC vs CLOUD",
+                        style: TextStyle(color: Colors.tealAccent, fontSize: 10, fontWeight: FontWeight.bold),
                       ),
                     ],
                   ),
                 ),
               ),
-              const SizedBox(width: 4),
-              _buildUnsyncedBoxButton(context),
-            ],
-          );
-        }
+            ),
+            const SizedBox(width: 4),
 
-        return _buildUnsyncedBoxButton(context);
+            // 1.5 OWNER MOBILE PULSE & DAILY SNAPSHOT BUTTON
+            InkWell(
+              onTap: () => OwnerMobilePulseDialog.show(context),
+              borderRadius: BorderRadius.circular(6),
+              child: Tooltip(
+                message: "Owner Mobile Pulse & Midnight Cloud Snapshot",
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: Colors.indigo.shade900.withValues(alpha: 0.6),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: Colors.indigoAccent.shade100, width: 1.0),
+                  ),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.insights_rounded, color: Colors.indigoAccent, size: 13),
+                      SizedBox(width: 4),
+                      Text(
+                        "OWNER PULSE",
+                        style: TextStyle(color: Colors.indigoAccent, fontSize: 10, fontWeight: FontWeight.bold),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 4),
+
+            // 2. UNIFIED SERVER PILL (Status + Ping + Click to open Server Settings)
+            InkWell(
+              onTap: () => app.addTab("Server Settings", const ServerSettingsScreen()),
+              borderRadius: BorderRadius.circular(6),
+              child: Tooltip(
+                message: isOnline
+                    ? "${isPureCloud ? 'Pure Cloud' : 'Server'}: Connected (${config.storeBranchId}) • Click to configure"
+                    : "Server: Disconnected (${config.lastErrorMessage.isNotEmpty ? config.lastErrorMessage : 'Check Internet / Server'}) • Click to configure",
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: isOnline
+                        ? Colors.cyan.shade900.withValues(alpha: 0.5)
+                        : Colors.red.shade900.withValues(alpha: 0.8),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                      color: isOnline ? Colors.cyan.shade300 : const Color(0xFFEF4444),
+                      width: isOnline ? 1.0 : 1.5,
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        isOnline ? Icons.bolt_rounded : Icons.cancel_rounded,
+                        color: isOnline ? Colors.cyanAccent : Colors.white,
+                        size: 14,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        serverLabel,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      if (isOnline && config.lastPingMs > 0) ...[
+                        const SizedBox(width: 4),
+                        Text(
+                          "• ${config.lastPingMs}ms",
+                          style: TextStyle(
+                            color: config.lastPingMs < 100
+                                ? Colors.cyanAccent
+                                : (config.lastPingMs < 250 ? Colors.amberAccent : Colors.orangeAccent),
+                            fontSize: 10,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 4),
+
+            // 3. Unsynced pending queue indicator (only appears when local SQLite has pending unsynced queue)
+            if (!isPureCloud) _buildUnsyncedBoxButton(context),
+          ],
+        );
       },
     );
   }
@@ -1970,11 +1973,24 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
           color: AppColors.primary,
           child: Row(
             children: [
-              const Icon(Icons.dns, size: 12, color: Colors.green),
-              const SizedBox(width: 4),
-              const Text(
-                "CONNECTED",
-                style: TextStyle(color: Colors.white70, fontSize: 10, fontWeight: FontWeight.bold),
+              InkWell(
+                onTap: () => LiveSystemCountsDialog.show(context),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.dns, size: 12, color: Colors.green),
+                    SizedBox(width: 4),
+                    Text(
+                      "CONNECTED",
+                      style: TextStyle(color: Colors.white70, fontSize: 10, fontWeight: FontWeight.bold),
+                    ),
+                    SizedBox(width: 8),
+                    Text(
+                      "[☁️ CHECK CLOUD vs PC]",
+                      style: TextStyle(color: Colors.tealAccent, fontSize: 10, fontWeight: FontWeight.bold),
+                    ),
+                  ],
+                ),
               ),
               const Expanded(child: SizedBox()),
               Flexible(

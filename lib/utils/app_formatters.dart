@@ -150,10 +150,22 @@ String formatSaleDisplayNo(String? entryNo) {
   clean = clean.replaceAll(RegExp(r'^(T\d+|POS[-_]?\d+|SALE|PUR|SO|ORD|SRET|PRET|ADJ)[-_]', caseSensitive: false), '');
   final match = RegExp(r'(\d+)$').firstMatch(clean);
   if (match != null) {
-    return match.group(1)!;
+    String res = match.group(1)!;
+    // Strip accidental 6-digit financial year prefix (e.g. 2026272 -> 2)
+    if (res.length > 6 && RegExp(r'^20\d{4}').hasMatch(res)) {
+      final stripped = res.replaceFirst(RegExp(r'^20\d{4}'), '');
+      if (stripped.isNotEmpty) return stripped;
+    }
+    return res;
   }
   final digits = clean.replaceAll(RegExp(r'^\D+'), '').replaceAll(RegExp(r'\D+$'), '');
-  if (digits.isNotEmpty) return digits;
+  if (digits.isNotEmpty) {
+    if (digits.length > 6 && RegExp(r'^20\d{4}').hasMatch(digits)) {
+      final stripped = digits.replaceFirst(RegExp(r'^20\d{4}'), '');
+      if (stripped.isNotEmpty) return stripped;
+    }
+    return digits;
+  }
   return clean;
 }
 
@@ -161,25 +173,30 @@ String cleanEntryNo(String entryNo) {
   String clean = entryNo.trim();
   if (clean.isEmpty) return "";
 
-  // Handle financial year underscores (e.g., '2026-27_T2-1' -> 'T2-1')
   if (clean.contains('_')) {
-    clean = clean.substring(clean.indexOf('_') + 1);
+    clean = clean.substring(clean.lastIndexOf('_') + 1);
   }
 
-  // Preserve canonical sales key prefixes like T1-1, T2-15, T01-5
-  if (RegExp(r'^T\d+[-_]\d+$', caseSensitive: false).hasMatch(clean)) {
-    return clean;
+  // Strip all module & terminal prefixes (T1-, T2-, T3-, POS-01-, SO-, SALE-, PUR-, SRET-, PRET-, ADJ-)
+  clean = clean.replaceAll(RegExp(r'^(T\d+|POS[-_]?\d+|SALE|PUR|SO|ORD|SRET|PRET|ADJ)[-_]', caseSensitive: false), '');
+
+  final match = RegExp(r'(\d+)$').firstMatch(clean);
+  if (match != null) {
+    String res = match.group(1)!;
+    if (res.length > 6 && RegExp(r'^20\d{4}').hasMatch(res)) {
+      final stripped = res.replaceFirst(RegExp(r'^20\d{4}'), '');
+      if (stripped.isNotEmpty) return stripped;
+    }
+    return res;
   }
-
-  // Remove standard module prefixes
-  clean = clean.replaceAll(RegExp(r'^(SO|ORD|SRET|PRET|ADJ|SALE|PUR)-', caseSensitive: false), '');
-
-  // Strip non-canonical terminal / station / computer name prefix (e.g., 'main-1', 'pos-01-1')
-  clean = clean.replaceAll(RegExp(r'^[a-zA-Z0-9_\s]+[-_](?=\d+$)'), '');
-
-  // Catch remaining non-digits at start/end
-  clean = clean.replaceAll(RegExp(r'^\D+'), '').replaceAll(RegExp(r'\D+$'), '');
-
+  final digits = clean.replaceAll(RegExp(r'^\D+'), '').replaceAll(RegExp(r'\D+$'), '');
+  if (digits.isNotEmpty) {
+    if (digits.length > 6 && RegExp(r'^20\d{4}').hasMatch(digits)) {
+      final stripped = digits.replaceFirst(RegExp(r'^20\d{4}'), '');
+      if (stripped.isNotEmpty) return stripped;
+    }
+    return digits;
+  }
   return clean;
 }
 

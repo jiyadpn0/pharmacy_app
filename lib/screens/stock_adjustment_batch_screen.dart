@@ -4,6 +4,8 @@ import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import '../providers/pharmacy_provider.dart';
 import '../services/server_config_service.dart';
+import '../services/supabase_sync_service.dart';
+import '../services/pure_cloud_service.dart';
 import '../utils/app_dialogs.dart';
 import '../widgets/pin_unlock_dialog.dart';
 import '../utils/app_formatters.dart';
@@ -163,6 +165,7 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
   void initState() {
     super.initState();
     UnsavedChangesRegistry.register("STOCK ADJUSTMENT", this);
+    ServerConfigService.instance.addListener(_onConfigChanged);
     _dateCtrl.text = DateFormat('dd/MM/yyyy').format(DateTime.now());
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -170,8 +173,13 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
     });
   }
 
+  void _onConfigChanged() {
+    if (mounted) setState(() {});
+  }
+
   @override
   void dispose() {
+    ServerConfigService.instance.removeListener(_onConfigChanged);
     UnsavedChangesRegistry.unregister("STOCK ADJUSTMENT");
     _entryNoCtrl.dispose();
     _dateCtrl.dispose();
@@ -348,129 +356,6 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
     }
   }
 
-  // --- GENERATE DETAILED EDIT DIFF SPANS FOR RE-WRITE DIALOG ---
-  List<InlineSpan> _generateDiffSpans() {
-    final List<InlineSpan> diffSpans = [];
-
-    if (!_isExistingEntry || _originalLoadedAdj == null) {
-      return diffSpans;
-    }
-
-    const redStyle = TextStyle(color: Colors.red, fontWeight: FontWeight.bold, fontSize: 13);
-    const normalStyle = TextStyle(color: Colors.black87, fontSize: 13, height: 1.5);
-
-    void addDiffLine(List<InlineSpan> parts) {
-      diffSpans.add(const TextSpan(text: "• ", style: normalStyle));
-      diffSpans.addAll(parts);
-      diffSpans.add(const TextSpan(text: "\n", style: normalStyle));
-    }
-
-    // 1. HEADER COMPARISONS
-    // Reason
-    final currentReason = _reasonCtrl.text.trim();
-    final origReason = _originalLoadedAdj!.reason.trim();
-    if (currentReason.toUpperCase() != origReason.toUpperCase()) {
-      addDiffLine([
-        const TextSpan(text: "reason ", style: normalStyle),
-        TextSpan(text: origReason.isEmpty ? "(blank)" : origReason, style: redStyle),
-        const TextSpan(text: " to ", style: normalStyle),
-        TextSpan(text: currentReason.isEmpty ? "(blank)" : currentReason, style: redStyle),
-        const TextSpan(text: ".", style: normalStyle),
-      ]);
-    }
-
-    // Done By
-    final currentDoneBy = _doneByCtrl.text.trim();
-    final origDoneBy = _originalLoadedAdj!.doneBy.trim();
-    if (currentDoneBy.toUpperCase() != origDoneBy.toUpperCase()) {
-      addDiffLine([
-        const TextSpan(text: "done by ", style: normalStyle),
-        TextSpan(text: origDoneBy.isEmpty ? "(blank)" : origDoneBy, style: redStyle),
-        const TextSpan(text: " to ", style: normalStyle),
-        TextSpan(text: currentDoneBy.isEmpty ? "(blank)" : currentDoneBy, style: redStyle),
-        const TextSpan(text: ".", style: normalStyle),
-      ]);
-    }
-
-    // 2. ITEM COMPARISONS
-    final origItems = _originalLoadedAdj!.items;
-    final currentValidRows = _rows.where((r) => r.selectedBatch != null && r.physicalCtrl.text.trim().isNotEmpty).toList();
-
-    int maxLen = origItems.length > currentValidRows.length ? origItems.length : currentValidRows.length;
-
-    for (int i = 0; i < maxLen; i++) {
-      if (i < origItems.length && i < currentValidRows.length) {
-        final orig = origItems[i];
-        final currRow = currentValidRows[i];
-        final currProduct = currRow.selectedBatch!;
-        final currPhysical = int.tryParse(currRow.physicalCtrl.text.trim()) ?? currProduct.stock;
-
-        // Product Name
-        final origName = orig.product.name.trim();
-        final currName = currProduct.name.trim();
-        if (origName.toUpperCase() != currName.toUpperCase()) {
-          addDiffLine([
-            const TextSpan(text: "product name ", style: normalStyle),
-            TextSpan(text: origName, style: redStyle),
-            const TextSpan(text: " to ", style: normalStyle),
-            TextSpan(text: currName, style: redStyle),
-            const TextSpan(text: ".", style: normalStyle),
-          ]);
-        }
-
-        // Batch Number
-        final origBatch = orig.product.batch.trim();
-        final currBatch = currProduct.batch.trim();
-        if (origBatch.toUpperCase() != currBatch.toUpperCase()) {
-          addDiffLine([
-            TextSpan(text: "batch ($currName) changed from ", style: normalStyle),
-            TextSpan(text: '"$origBatch"', style: redStyle),
-            const TextSpan(text: " to ", style: normalStyle),
-            TextSpan(text: '"$currBatch"', style: redStyle),
-            const TextSpan(text: ".", style: normalStyle),
-          ]);
-        }
-
-        // Physical Stock Count / Variance
-        int origPhysical = orig.product.stock;
-        if (origPhysical != currPhysical) {
-          addDiffLine([
-            TextSpan(text: "physical stock ($currName) changed from ", style: normalStyle),
-            TextSpan(text: "$origPhysical", style: redStyle),
-            const TextSpan(text: " to ", style: normalStyle),
-            TextSpan(text: "$currPhysical", style: redStyle),
-            const TextSpan(text: ".", style: normalStyle),
-          ]);
-        }
-      } else if (i < currentValidRows.length) {
-        final currRow = currentValidRows[i];
-        final currProduct = currRow.selectedBatch!;
-        final currPhysical = int.tryParse(currRow.physicalCtrl.text.trim()) ?? currProduct.stock;
-        addDiffLine([
-          const TextSpan(text: "added adjustment product ", style: normalStyle),
-          TextSpan(text: currProduct.name.trim(), style: redStyle),
-          const TextSpan(text: " (physical stock: ", style: normalStyle),
-          TextSpan(text: "$currPhysical", style: redStyle),
-          if (currProduct.batch.isNotEmpty) ...[
-            const TextSpan(text: ', batch: "', style: normalStyle),
-            TextSpan(text: currProduct.batch.trim(), style: redStyle),
-            const TextSpan(text: '"', style: normalStyle),
-          ],
-          const TextSpan(text: ").", style: normalStyle),
-        ]);
-      } else if (i < origItems.length) {
-        final orig = origItems[i];
-        addDiffLine([
-          const TextSpan(text: "removed adjustment product ", style: normalStyle),
-          TextSpan(text: orig.product.name.trim(), style: redStyle),
-          const TextSpan(text: ").", style: normalStyle),
-        ]);
-      }
-    }
-
-    return diffSpans;
-  }
-
   bool _isSaving = false;
   bool _isDeleting = false;
 
@@ -625,21 +510,25 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
 
       String targetEntryNo = isEdit ? _entryNoCtrl.text : "";
       if (!isEdit) {
-        final rawNo = cleanEntryNo(_entryNoCtrl.text);
-        final resolvedNo = await provider.resolveGuaranteedNextEntryNo('stock_adjustments', rawNo);
-        if (resolvedNo != rawNo && rawNo.isNotEmpty) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text("Adjustment #$rawNo already taken. Automatically saved as Adjustment #$resolvedNo"),
-                backgroundColor: Colors.blueAccent,
-                duration: const Duration(seconds: 4),
-              ),
+        String requested = cleanEntryNo(_entryNoCtrl.text);
+        try {
+          if (ServerConfigService.instance.isConnected) {
+            final allocated = await SupabaseSyncService.instance.allocateRemoteAtomicSequence(
+              'stock_adjustments',
+              provider.selectedFinancialYear,
             );
-            _entryNoCtrl.text = formatSaleDisplayNo(resolvedNo);
+            if (allocated != null && allocated > 0) {
+              requested = allocated.toString();
+            }
           }
-        }
-        targetEntryNo = resolvedNo;
+          final bool taken = await provider.isEntryTaken('stock_adjustments', requested);
+          if (taken || requested.isEmpty || requested == "AUTO") {
+            requested = await provider.resolveGuaranteedNextEntryNo('stock_adjustments', requested.isNotEmpty ? requested : "1", checkCloud: true);
+          }
+        } catch (_) {}
+
+        targetEntryNo = requested;
+        _entryNoCtrl.text = formatSaleDisplayNo(requested);
       }
 
       setState(() => _isLoading = true);
@@ -721,9 +610,13 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
   }
 
   Widget _buildToolbar() {
-    bool canSave = !_isExistingEntry && !_isDeleted;
-    bool canEdit = _isExistingEntry && !_isDeleted;
-    bool canDelete = _isExistingEntry && !_isDeleted;
+    final bool isPureCloud = ServerConfigService.instance.isPureCloud;
+    final bool isCloudConnected = ServerConfigService.instance.isConnected;
+    final bool isOfflineBlocked = isPureCloud && !isCloudConnected;
+
+    bool canSave = !isOfflineBlocked && !_isExistingEntry && !_isDeleted;
+    bool canEdit = !isOfflineBlocked && _isExistingEntry && !_isDeleted;
+    bool canDelete = !isOfflineBlocked && _isExistingEntry && !_isDeleted;
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -810,9 +703,18 @@ class _StockAdjustmentBatchScreenState extends State<StockAdjustmentBatchScreen>
             ElevatedButton(
               onPressed: () async {
                 Navigator.pop(ctx);
+                final pharmacyProvider = Provider.of<PharmacyProvider>(context, listen: false);
                 setState(() => _isLoading = true);
                 try {
-                  await Provider.of<PharmacyProvider>(context, listen: false).deleteStockAdjustment(entryNo);
+                  if (PureCloudService.instance.isActive) {
+                    await PureCloudService.instance.deleteDocument(
+                      table: 'stock_adjustments',
+                      itemsTable: 'stock_adjustment_items',
+                      foreignKey: 'adjustment_no',
+                      entryNo: entryNo,
+                    );
+                  }
+                  await pharmacyProvider.deleteStockAdjustment(entryNo);
                   if (mounted) {
                     ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(content: Text("Adjustment deleted and inventory stock restored!"))
@@ -1424,14 +1326,14 @@ class _Hdr extends StatelessWidget {
 }
 
 class _Cell extends StatelessWidget {
-  final String text; final double? width; final int? flex; final TextAlign align; final Color? color; final FontWeight fontWeight; final Color? bg;
-  const _Cell(this.text, {this.width, this.flex, this.align = TextAlign.left, this.color, this.fontWeight = FontWeight.w600, this.bg});
+  final String text; final double? width; final int? flex; final TextAlign align; final Color? color; final FontWeight fontWeight;
+  const _Cell(this.text, {this.width, this.flex, this.align = TextAlign.left, this.color, this.fontWeight = FontWeight.w600});
   @override Widget build(BuildContext context) {
     Widget child = Container(
       width: width, 
       padding: const EdgeInsets.symmetric(horizontal: 8), 
       alignment: align == TextAlign.left ? Alignment.centerLeft : (align == TextAlign.right ? Alignment.centerRight : Alignment.center), 
-      decoration: BoxDecoration(color: bg, border: Border(right: BorderSide(color: Colors.grey.shade200))), 
+      decoration: BoxDecoration(border: Border(right: BorderSide(color: Colors.grey.shade200))), 
       child: Text(text, style: TextStyle(fontSize: 11, color: color ?? Colors.black87, fontWeight: fontWeight), overflow: TextOverflow.ellipsis)
     );
     return flex != null ? Expanded(flex: flex!, child: child) : child;

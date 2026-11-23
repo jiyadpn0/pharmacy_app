@@ -3,7 +3,7 @@
 ; =====================================================================
 
 #define MyAppName "Pharmacy ERP & POS"
-#define MyAppVersion "3.4.0"
+#define MyAppVersion "3.6.2"
 #define MyAppPublisher "Pharmacy Systems Ltd."
 #define MyAppURL "https://example.com"
 #define MyAppExeName "pharmacy_app.exe"

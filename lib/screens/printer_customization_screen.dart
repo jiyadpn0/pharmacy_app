@@ -27,6 +27,7 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
 
   DotMatrixPaperSize _paperSize = DotMatrixPaperSize.inch8x11Standard;
   String _selectedPrinterName = "TVS MSP 250 (80 Col)";
+  final TextEditingController _thermalIpCtrl = TextEditingController(text: "192.168.1.100");
   int _columns = 80;
   int _linesPerPage = 66;
 
@@ -51,6 +52,7 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
       _storeAddressCtrl.text = prefs.getString('store_address') ?? "KALPETTA TOWN, WAYANAD";
       _headerTitleCtrl.text = prefs.getString('header_title') ?? "TAX INVOICE / CASH MEMO";
       _returnPolicyCtrl.text = prefs.getString('return_policy_text') ?? "Medicines once sold will not be taken back";
+      _thermalIpCtrl.text = prefs.getString('thermal_printer_ip') ?? "192.168.1.100";
       _showReturnPolicy = prefs.getBool('show_return_policy') ?? true;
       _printMode = prefs.getString('printer_mode') ?? "dialog";
     });
@@ -62,6 +64,7 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
     await prefs.setInt('printer_columns', _columns);
     await prefs.setInt('printer_lines', _linesPerPage);
     await prefs.setInt('printer_paper_size', _paperSize.index);
+    await prefs.setString('thermal_printer_ip', _thermalIpCtrl.text.trim());
     await prefs.setString('store_name', _storeNameCtrl.text);
     await prefs.setString('store_address', _storeAddressCtrl.text);
     await prefs.setString('header_title', _headerTitleCtrl.text);
@@ -81,7 +84,13 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
     if (printerName == null) return;
     setState(() {
       _selectedPrinterName = printerName;
-      if (printerName.contains("TVS MSP 250") || printerName.contains("Epson FX-890") || printerName.contains("Epson LQ-310")) {
+      if (printerName.contains("ESC/POS Thermal (80mm)")) {
+        _columns = 48;
+        _linesPerPage = 999;
+      } else if (printerName.contains("ESC/POS Thermal (58mm)")) {
+        _columns = 32;
+        _linesPerPage = 999;
+      } else if (printerName.contains("TVS MSP 250") || printerName.contains("Epson FX-890") || printerName.contains("Epson LQ-310")) {
         _paperSize = DotMatrixPaperSize.inch8x11Standard;
         _columns = 80;
         _linesPerPage = 66;
@@ -120,6 +129,7 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
     _storeAddressCtrl.dispose();
     _headerTitleCtrl.dispose();
     _returnPolicyCtrl.dispose();
+    _thermalIpCtrl.dispose();
     super.dispose();
   }
 
@@ -234,6 +244,8 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
                       initialValue: _selectedPrinterName,
                       decoration: _inputDecoration("Printer Model"),
                       items: const [
+                        DropdownMenuItem(value: "ESC/POS Thermal (80mm)", child: Text("ESC/POS Thermal (80mm)", style: TextStyle(fontSize: 12))),
+                        DropdownMenuItem(value: "ESC/POS Thermal (58mm)", child: Text("ESC/POS Thermal (58mm)", style: TextStyle(fontSize: 12))),
                         DropdownMenuItem(value: "TVS MSP 250 (80 Col)", child: Text("TVS MSP 250", style: TextStyle(fontSize: 12))),
                         DropdownMenuItem(value: "Epson LQ-310 (80 Col)", child: Text("Epson LQ-310", style: TextStyle(fontSize: 12))),
                         DropdownMenuItem(value: "Epson FX-890 (80 Col)", child: Text("Epson FX-890", style: TextStyle(fontSize: 12))),
@@ -245,6 +257,13 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
                   ),
                 ],
               ),
+              if (_selectedPrinterName.contains("Thermal")) ...[
+                const SizedBox(height: 16),
+                TextFormField(
+                  controller: _thermalIpCtrl,
+                  decoration: _inputDecoration("Thermal Printer Network IP (Port 9100)"),
+                ),
+              ],
               const SizedBox(height: 16),
               Row(
                 children: [

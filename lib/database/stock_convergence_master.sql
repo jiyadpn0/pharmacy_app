@@ -6,88 +6,68 @@
 -- =========================================================================
 
 -- -------------------------------------------------------------------------
--- 1. EXTEND CORE TABLES WITH ENTERPRISE CONVERGENCE COLUMNS & INDEXES
+-- 1. EXTEND CORE TABLES WITH ENTERPRISE CONVERGENCE COLUMNS
 -- -------------------------------------------------------------------------
 
 -- stock_batches
-ALTER TABLE public.stock_batches ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
-ALTER TABLE public.stock_batches ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
-ALTER TABLE public.stock_batches ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
-
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.table_constraints
-        WHERE constraint_name = 'chk_stock_non_negative' AND table_name = 'stock_batches'
-    ) THEN
-        ALTER TABLE public.stock_batches ADD CONSTRAINT chk_stock_non_negative CHECK (current_quantity >= 0);
-    END IF;
-END $$;
-
-CREATE INDEX IF NOT EXISTS idx_stock_batches_branch_prod_batch
-ON public.stock_batches(branch_id, product_id, batch_number);
-
-CREATE INDEX IF NOT EXISTS idx_stock_batches_branch_updated
-ON public.stock_batches(branch_id, updated_at DESC);
+ALTER TABLE IF EXISTS public.stock_batches ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
+ALTER TABLE IF EXISTS public.stock_batches ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
+ALTER TABLE IF EXISTS public.stock_batches ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
 
 -- Ensure transaction tables have branch_id & terminal_id
-ALTER TABLE public.sales_invoices ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
-ALTER TABLE public.sales_invoices ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
-ALTER TABLE public.sales_invoices ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
+ALTER TABLE IF EXISTS public.sales_invoices ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
+ALTER TABLE IF EXISTS public.sales_invoices ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
+ALTER TABLE IF EXISTS public.sales_invoices ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
 
-ALTER TABLE public.sales_items ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
-ALTER TABLE public.sales_items ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
+ALTER TABLE IF EXISTS public.sales_items ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
+ALTER TABLE IF EXISTS public.sales_items ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
 
-ALTER TABLE public.purchase_entries ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
-ALTER TABLE public.purchase_entries ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
-ALTER TABLE public.purchase_entries ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
+ALTER TABLE IF EXISTS public.purchase_entries ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
+ALTER TABLE IF EXISTS public.purchase_entries ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
+ALTER TABLE IF EXISTS public.purchase_entries ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
 
-ALTER TABLE public.purchase_items ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
-ALTER TABLE public.purchase_items ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
+ALTER TABLE IF EXISTS public.purchase_items ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
+ALTER TABLE IF EXISTS public.purchase_items ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
 
-ALTER TABLE public.sales_return_invoices ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
-ALTER TABLE public.sales_return_invoices ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
-ALTER TABLE public.sales_return_invoices ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
+ALTER TABLE IF EXISTS public.sales_return_invoices ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
+ALTER TABLE IF EXISTS public.sales_return_invoices ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
+ALTER TABLE IF EXISTS public.sales_return_invoices ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
 
-ALTER TABLE public.sales_return_items ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
-ALTER TABLE public.sales_return_items ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
+ALTER TABLE IF EXISTS public.sales_return_items ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
+ALTER TABLE IF EXISTS public.sales_return_items ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
 
-ALTER TABLE public.purchase_return_entries ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
-ALTER TABLE public.purchase_return_entries ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
-ALTER TABLE public.purchase_return_entries ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
+ALTER TABLE IF EXISTS public.purchase_return_entries ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
+ALTER TABLE IF EXISTS public.purchase_return_entries ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
+ALTER TABLE IF EXISTS public.purchase_return_entries ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
 
-ALTER TABLE public.purchase_return_items ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
-ALTER TABLE public.purchase_return_items ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
+ALTER TABLE IF EXISTS public.purchase_return_items ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
+ALTER TABLE IF EXISTS public.purchase_return_items ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
 
-ALTER TABLE public.stock_adjustments ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
-ALTER TABLE public.stock_adjustments ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
-ALTER TABLE public.stock_adjustments ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
+ALTER TABLE IF EXISTS public.stock_adjustments ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
+ALTER TABLE IF EXISTS public.stock_adjustments ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
+ALTER TABLE IF EXISTS public.stock_adjustments ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
 
-ALTER TABLE public.stock_adjustment_items ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
-ALTER TABLE public.stock_adjustment_items ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
+ALTER TABLE IF EXISTS public.stock_adjustment_items ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
+ALTER TABLE IF EXISTS public.stock_adjustment_items ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
 
-ALTER TABLE public.stock_write_offs ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
-ALTER TABLE public.stock_write_offs ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
-ALTER TABLE public.stock_write_offs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
+ALTER TABLE IF EXISTS public.stock_write_offs ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
+ALTER TABLE IF EXISTS public.stock_write_offs ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
+ALTER TABLE IF EXISTS public.stock_write_offs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
 
 -- -------------------------------------------------------------------------
 -- 2. CREATE IDEMPOTENCY KEYS TABLE
 -- -------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.idempotency_keys (
     idempotency_key TEXT PRIMARY KEY,
-    branch_id TEXT NOT NULL,
-    terminal_id TEXT NOT NULL,
+    branch_id TEXT NOT NULL DEFAULT 'MAIN_STORE',
+    terminal_id TEXT NOT NULL DEFAULT 'POS-01',
     operation_type TEXT NOT NULL,
     reference_no TEXT NOT NULL,
     response_payload JSONB NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
-
-CREATE INDEX IF NOT EXISTS idx_idemp_keys_lookup
-ON public.idempotency_keys(branch_id, operation_type, reference_no);
-
-CREATE INDEX IF NOT EXISTS idx_idemp_keys_created
-ON public.idempotency_keys(created_at);
+ALTER TABLE IF EXISTS public.idempotency_keys ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
+ALTER TABLE IF EXISTS public.idempotency_keys ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
 
 -- -------------------------------------------------------------------------
 -- 3. AUDITABLE STOCK LEDGER TABLE
@@ -99,7 +79,7 @@ CREATE TABLE IF NOT EXISTS public.stock_ledger (
     reference_no TEXT NOT NULL,
     product_id TEXT NOT NULL,
     batch_number TEXT NOT NULL,
-    quantity_delta INT NOT NULL, -- Negative for deductions, positive for additions
+    quantity_delta INT NOT NULL DEFAULT 0, -- Negative for deductions, positive for additions
     qty_in INT DEFAULT 0,
     qty_out INT DEFAULT 0,
     closing_balance INT DEFAULT 0,
@@ -111,15 +91,11 @@ CREATE TABLE IF NOT EXISTS public.stock_ledger (
     user_id TEXT DEFAULT 'Admin',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
-
-CREATE INDEX IF NOT EXISTS idx_stock_ledger_batch_hist
-ON public.stock_ledger(branch_id, product_id, batch_number, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_stock_ledger_ref
-ON public.stock_ledger(branch_id, operation_type, reference_no);
-
-CREATE INDEX IF NOT EXISTS idx_stock_ledger_idemp
-ON public.stock_ledger(branch_id, idempotency_key);
+ALTER TABLE IF EXISTS public.stock_ledger ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
+ALTER TABLE IF EXISTS public.stock_ledger ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
+ALTER TABLE IF EXISTS public.stock_ledger ADD COLUMN IF NOT EXISTS user_id TEXT DEFAULT 'Admin';
+ALTER TABLE IF EXISTS public.stock_ledger ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+ALTER TABLE IF EXISTS public.stock_ledger ADD COLUMN IF NOT EXISTS quantity_delta INT DEFAULT 0;
 
 -- -------------------------------------------------------------------------
 -- 4. ACTIVE COMPUTERS / TERMINAL IDENTITY VERIFICATION TABLE
@@ -131,9 +107,66 @@ CREATE TABLE IF NOT EXISTS public.active_computers (
     app_version TEXT,
     last_seen_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+ALTER TABLE IF EXISTS public.active_computers ADD COLUMN IF NOT EXISTS branch_id TEXT DEFAULT 'MAIN_STORE';
+ALTER TABLE IF EXISTS public.active_computers ADD COLUMN IF NOT EXISTS terminal_id TEXT DEFAULT 'POS-01';
 
-CREATE INDEX IF NOT EXISTS idx_active_computers_term
-ON public.active_computers(branch_id, terminal_id, last_seen_at DESC);
+-- -------------------------------------------------------------------------
+-- 5. SAFE INDEX & CONSTRAINT CREATION (DYNAMIC SQL)
+-- -------------------------------------------------------------------------
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE constraint_name = 'chk_stock_non_negative' AND table_name = 'stock_batches'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.stock_batches ADD CONSTRAINT chk_stock_non_negative CHECK (current_quantity >= 0);
+        EXCEPTION WHEN OTHERS THEN
+            NULL;
+        END;
+    END IF;
+
+    -- Dynamic index executions prevent parse-time missing column errors
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_stock_batches_branch_prod_batch ON public.stock_batches(branch_id, product_id, batch_number)';
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_stock_batches_branch_updated ON public.stock_batches(branch_id, updated_at DESC)';
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_idemp_keys_lookup ON public.idempotency_keys(branch_id, operation_type, reference_no)';
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_idemp_keys_created ON public.idempotency_keys(created_at)';
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_stock_ledger_batch_hist ON public.stock_ledger(branch_id, product_id, batch_number, created_at DESC)';
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_stock_ledger_ref ON public.stock_ledger(branch_id, operation_type, reference_no)';
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_stock_ledger_idemp ON public.stock_ledger(branch_id, idempotency_key)';
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_active_computers_term ON public.active_computers(branch_id, terminal_id, last_seen_at DESC)';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Index execution notice: %', SQLERRM;
+END $$;
+
+-- -------------------------------------------------------------------------
+-- 4.5 CLEANLY DROP EXISTING OVERLOADS TO PREVENT PARAMETER DEFAULT CONFLICTS (42P13)
+-- -------------------------------------------------------------------------
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN (
+        SELECT p.proname, oidvectortypes(p.proargtypes) as argtypes
+        FROM pg_proc p
+        JOIN pg_namespace n ON p.pronamespace = n.oid
+        WHERE n.nspname = 'public'
+          AND p.proname IN (
+              'fn_heartbeat_and_check_terminal',
+              'fn_process_sale_atomic',
+              'fn_process_purchase_atomic',
+              'fn_process_sales_return_atomic',
+              'fn_process_purchase_return_atomic',
+              'fn_process_stock_adjustment_atomic',
+              'fn_process_stock_write_off_atomic',
+              'fn_void_sale_atomic',
+              'fn_void_purchase_atomic',
+              'fn_reconcile_branch_stock_from_ledger'
+          )
+    ) LOOP
+        EXECUTE 'DROP FUNCTION IF EXISTS public.' || quote_ident(r.proname) || '(' || r.argtypes || ') CASCADE';
+    END LOOP;
+END $$;
 
 -- -------------------------------------------------------------------------
 -- 5. ATOMIC RPC FUNCTION: fn_heartbeat_and_check_terminal
@@ -242,6 +275,9 @@ DECLARE
     v_deduct_this_batch INT;
     v_closing_stock INT;
     v_response JSONB;
+    v_old_item RECORD;
+    v_reversal_qty INT;
+    v_is_deleted INT;
 BEGIN
     -- 1. Idempotency Check
     IF p_idempotency_key IS NOT NULL AND p_idempotency_key <> '' THEN
@@ -259,6 +295,7 @@ BEGIN
     v_branch_id := TRIM(COALESCE(p_invoice->>'branch_id', 'MAIN_STORE'));
     v_terminal_id := TRIM(COALESCE(p_invoice->>'terminal_id', 'POS-01'));
     v_user_id := TRIM(COALESCE(p_invoice->>'done_by', p_invoice->>'agent', 'Cashier'));
+    v_is_deleted := COALESCE(NULLIF(p_invoice->>'is_deleted', '')::INT, 0);
 
     IF v_entry_no = '' OR v_branch_id = '' OR v_terminal_id = '' THEN
         RETURN jsonb_build_object(
@@ -266,6 +303,65 @@ BEGIN
             'reason', 'INVALID_INPUT',
             'message', 'Missing required entry_no, branch_id, or terminal_id'
         );
+    END IF;
+
+    -- 2b. Invoice Edit / Void Restoral: If invoice already exists, reverse prior stock deductions
+    IF EXISTS (SELECT 1 FROM public.sales_invoices WHERE entry_no = v_entry_no AND COALESCE(is_deleted, 0) = 0) THEN
+        FOR v_old_item IN
+            SELECT product_id, batch_number, quantity, f_qty
+            FROM public.sales_items
+            WHERE invoice_no = v_entry_no
+        LOOP
+            v_reversal_qty := COALESCE(v_old_item.quantity, 0) + COALESCE(v_old_item.f_qty, 0);
+            IF v_reversal_qty > 0 THEN
+                UPDATE public.stock_batches
+                SET current_quantity = current_quantity + v_reversal_qty,
+                    updated_at = NOW()
+                WHERE branch_id = v_branch_id
+                  AND product_id = v_old_item.product_id
+                  AND LOWER(TRIM(batch_number)) = LOWER(TRIM(v_old_item.batch_number));
+
+                INSERT INTO public.stock_ledger (
+                    idempotency_key, operation_type, reference_no, product_id, batch_number,
+                    quantity_delta, qty_in, qty_out, closing_balance,
+                    branch_id, terminal_id, user_id, created_at
+                ) VALUES (
+                    COALESCE(p_idempotency_key, '') || '_REV',
+                    CASE WHEN v_is_deleted = 1 THEN 'SALE_VOID_REVERSAL' ELSE 'SALE_EDIT_REVERSAL' END,
+                    v_entry_no, v_old_item.product_id, v_old_item.batch_number,
+                    v_reversal_qty, v_reversal_qty, 0,
+                    COALESCE((SELECT current_quantity FROM public.stock_batches WHERE branch_id = v_branch_id AND product_id = v_old_item.product_id AND LOWER(TRIM(batch_number)) = LOWER(TRIM(v_old_item.batch_number)) LIMIT 1), 0),
+                    v_branch_id, v_terminal_id, v_user_id, NOW()
+                );
+            END IF;
+        END LOOP;
+    END IF;
+
+    -- If this is a void/cancellation operation, update status and return immediately
+    IF v_is_deleted = 1 THEN
+        UPDATE public.sales_invoices
+        SET is_deleted = 1, updated_at = NOW()
+        WHERE entry_no = v_entry_no;
+
+        DELETE FROM public.sales_items WHERE invoice_no = v_entry_no;
+
+        v_response := jsonb_build_object(
+            'success', true,
+            'entry_no', v_entry_no,
+            'is_deleted', 1,
+            'message', 'Invoice successfully voided and stock restored.'
+        );
+
+        IF p_idempotency_key IS NOT NULL AND p_idempotency_key <> '' THEN
+            INSERT INTO public.idempotency_keys (
+                idempotency_key, branch_id, terminal_id, operation_type, reference_no, response_payload, created_at
+            ) VALUES (
+                p_idempotency_key, v_branch_id, v_terminal_id, 'SALE_VOID', v_entry_no, v_response, NOW()
+            )
+            ON CONFLICT (idempotency_key) DO NOTHING;
+        END IF;
+
+        RETURN v_response;
     END IF;
 
     IF p_items IS NULL OR jsonb_array_length(p_items) = 0 THEN
@@ -287,12 +383,17 @@ BEGIN
 
         IF v_total_deduct > 0 THEN
             -- Check total available stock across locked matching batch rows in this branch
+            -- Uses CTE subquery to lock individual rows first, then sums valid quantities (PostgreSQL compliant)
+            WITH locked_batches AS (
+                SELECT current_quantity
+                FROM public.stock_batches
+                WHERE branch_id = v_branch_id
+                  AND product_id = v_prod_id
+                  AND LOWER(TRIM(batch_number)) = LOWER(v_batch_no)
+                FOR UPDATE
+            )
             SELECT COALESCE(SUM(current_quantity), 0) INTO v_avail_qty
-            FROM public.stock_batches
-            WHERE branch_id = v_branch_id
-              AND product_id = v_prod_id
-              AND LOWER(TRIM(batch_number)) = LOWER(v_batch_no)
-            FOR UPDATE;
+            FROM locked_batches;
 
             IF v_avail_qty < v_total_deduct THEN
                 RETURN jsonb_build_object(
@@ -358,64 +459,41 @@ BEGIN
         END LOOP;
     END LOOP;
 
-    -- 5. Upsert Sales Invoice Header & Replace Line Items
+    -- 5. Upsert Sales Invoice Header & Replace Line Items (matches actual Supabase sales_invoices columns)
     INSERT INTO public.sales_invoices (
-        entry_no, invoice_no, financial_year, date, customer_acc, customer_name, patient,
-        customer_phone, mobile, doctor, doctor_reg_no, done_by, terminal_id, shift_id,
-        patient_age, patient_gender, patient_address, gstin_number, place_of_supply,
-        subtotal, sub_total, discount_amount, discount, discount_percent, additional_discount,
-        other_charge, tax_amount, tax, round_off, net_amount, grand_total, total_amount,
-        rcvd_amt, payment_mode, payment_remarks, secondary_acc, secondary_amt,
-        is_deleted, is_paid, tax_type, agent, sales_return_amt, order_type,
+        entry_no, invoice_no, financial_year, date, customer_name, patient,
+        customer_phone, mobile, done_by, terminal_id,
+        subtotal, sub_total, discount_amount, discount,
+        tax_amount, net_amount, grand_total, total_amount,
+        payment_mode, is_deleted, is_paid, agent,
         branch_id, updated_at
     ) VALUES (
         v_entry_no,
         COALESCE(p_invoice->>'invoice_no', v_entry_no),
         COALESCE(p_invoice->>'financial_year', ''),
         COALESCE(p_invoice->>'date', NOW()::TEXT),
-        COALESCE(p_invoice->>'customer_acc', p_invoice->>'payment_mode', 'Cash'),
         COALESCE(p_invoice->>'customer_name', p_invoice->>'patient', ''),
         COALESCE(p_invoice->>'patient', p_invoice->>'customer_name', ''),
         COALESCE(p_invoice->>'customer_phone', p_invoice->>'mobile', ''),
         COALESCE(p_invoice->>'mobile', p_invoice->>'customer_phone', ''),
-        COALESCE(p_invoice->>'doctor', ''),
-        COALESCE(p_invoice->>'doctor_reg_no', ''),
         v_user_id,
         v_terminal_id,
-        COALESCE(p_invoice->>'shift_id', 'SHIFT-01'),
-        COALESCE(NULLIF(p_invoice->>'patient_age', '')::INT, 0),
-        COALESCE(p_invoice->>'patient_gender', ''),
-        COALESCE(p_invoice->>'patient_address', ''),
-        COALESCE(p_invoice->>'gstin_number', ''),
-        COALESCE(p_invoice->>'place_of_supply', ''),
         COALESCE(NULLIF(p_invoice->>'subtotal', '')::NUMERIC, NULLIF(p_invoice->>'sub_total', '')::NUMERIC, 0.0),
         COALESCE(NULLIF(p_invoice->>'sub_total', '')::NUMERIC, NULLIF(p_invoice->>'subtotal', '')::NUMERIC, 0.0),
         COALESCE(NULLIF(p_invoice->>'discount_amount', '')::NUMERIC, NULLIF(p_invoice->>'discount', '')::NUMERIC, 0.0),
         COALESCE(NULLIF(p_invoice->>'discount', '')::NUMERIC, NULLIF(p_invoice->>'discount_amount', '')::NUMERIC, 0.0),
-        COALESCE(NULLIF(p_invoice->>'discount_percent', '')::NUMERIC, 0.0),
-        COALESCE(NULLIF(p_invoice->>'additional_discount', '')::NUMERIC, 0.0),
-        COALESCE(NULLIF(p_invoice->>'other_charge', '')::NUMERIC, 0.0),
         COALESCE(NULLIF(p_invoice->>'tax_amount', '')::NUMERIC, NULLIF(p_invoice->>'tax', '')::NUMERIC, 0.0),
-        COALESCE(NULLIF(p_invoice->>'tax', '')::NUMERIC, NULLIF(p_invoice->>'tax_amount', '')::NUMERIC, 0.0),
-        COALESCE(NULLIF(p_invoice->>'round_off', '')::NUMERIC, 0.0),
         COALESCE(NULLIF(p_invoice->>'net_amount', '')::NUMERIC, NULLIF(p_invoice->>'grand_total', '')::NUMERIC, NULLIF(p_invoice->>'total_amount', '')::NUMERIC, 0.0),
         COALESCE(NULLIF(p_invoice->>'grand_total', '')::NUMERIC, NULLIF(p_invoice->>'net_amount', '')::NUMERIC, NULLIF(p_invoice->>'total_amount', '')::NUMERIC, 0.0),
         COALESCE(NULLIF(p_invoice->>'total_amount', '')::NUMERIC, NULLIF(p_invoice->>'grand_total', '')::NUMERIC, NULLIF(p_invoice->>'net_amount', '')::NUMERIC, 0.0),
-        COALESCE(NULLIF(p_invoice->>'rcvd_amt', '')::NUMERIC, 0.0),
-        COALESCE(p_invoice->>'payment_mode', 'CASH'),
-        COALESCE(p_invoice->>'payment_remarks', ''),
-        COALESCE(p_invoice->>'secondary_acc', ''),
-        COALESCE(NULLIF(p_invoice->>'secondary_amt', '')::NUMERIC, 0.0),
+        COALESCE(p_invoice->>'payment_mode', p_invoice->>'customer_acc', 'CASH'),
         COALESCE(NULLIF(p_invoice->>'is_deleted', '')::INT, 0),
         COALESCE(NULLIF(p_invoice->>'is_paid', '')::INT, 1),
-        COALESCE(p_invoice->>'tax_type', 'Non Gst'),
         COALESCE(p_invoice->>'agent', 'Admin'),
-        COALESCE(NULLIF(p_invoice->>'sales_return_amt', '')::NUMERIC, 0.0),
-        COALESCE(NULLIF(p_invoice->>'order_type', '')::INT, 0),
         v_branch_id,
         NOW()
     )
-    ON CONFLICT (entry_no) DO UPDATE SET
+    ON CONFLICT (entry_no, terminal_id) DO UPDATE SET
         invoice_no = EXCLUDED.invoice_no,
         date = EXCLUDED.date,
         customer_name = EXCLUDED.customer_name,
@@ -432,40 +510,25 @@ BEGIN
     DELETE FROM public.sales_items WHERE invoice_no = v_entry_no;
 
     INSERT INTO public.sales_items (
-        invoice_no, product_id, product_name, extra, batch_number, expiry_date,
-        quantity, f_qty, hsn_code, schedule, packing, mrp, purchase_rate, landing_cost,
-        taxable_sp, unit_price, disc_percent, disc_amt, gst_percent, gst_amt,
-        cgst_amt, sgst_amt, igst_amt, total_amount, profit, supplier_name, rack, branch_id,
-        terminal_id, created_at
+        invoice_no, product_id, product_name, batch_number,
+        quantity, qty, mrp, purchase_rate, landing_cost,
+        taxable_sp, unit_price, total, total_amount, branch_id,
+        terminal_id, updated_at
     )
     SELECT
         v_entry_no,
         COALESCE(item->>'product_id', ''),
         COALESCE(item->>'product_name', ''),
-        COALESCE(item->>'extra', ''),
         COALESCE(item->>'batch_number', item->>'batch', ''),
-        COALESCE(item->>'expiry_date', item->>'expiry', ''),
         COALESCE(NULLIF(item->>'quantity', '')::INT, NULLIF(item->>'qty', '')::INT, 1),
-        COALESCE(NULLIF(item->>'f_qty', '')::INT, 0),
-        COALESCE(item->>'hsn_code', ''),
-        COALESCE(item->>'schedule', 'H'),
-        COALESCE(NULLIF(item->>'packing', '')::INT, 1),
+        COALESCE(NULLIF(item->>'qty', '')::INT, NULLIF(item->>'quantity', '')::INT, 1),
         COALESCE(NULLIF(item->>'mrp', '')::NUMERIC, 0.0),
         COALESCE(NULLIF(item->>'purchase_rate', '')::NUMERIC, NULLIF(item->>'p_rate', '')::NUMERIC, 0.0),
         COALESCE(NULLIF(item->>'landing_cost', '')::NUMERIC, NULLIF(item->>'l_cost', '')::NUMERIC, 0.0),
         COALESCE(NULLIF(item->>'taxable_sp', '')::NUMERIC, NULLIF(item->>'unit_price', '')::NUMERIC, 0.0),
         COALESCE(NULLIF(item->>'unit_price', '')::NUMERIC, NULLIF(item->>'s_rate', '')::NUMERIC, 0.0),
-        COALESCE(NULLIF(item->>'disc_percent', '')::NUMERIC, 0.0),
-        COALESCE(NULLIF(item->>'disc_amt', '')::NUMERIC, 0.0),
-        COALESCE(NULLIF(item->>'gst_percent', '')::NUMERIC, 12.0),
-        COALESCE(NULLIF(item->>'gst_amt', '')::NUMERIC, 0.0),
-        COALESCE(NULLIF(item->>'cgst_amt', '')::NUMERIC, 0.0),
-        COALESCE(NULLIF(item->>'sgst_amt', '')::NUMERIC, 0.0),
-        COALESCE(NULLIF(item->>'igst_amt', '')::NUMERIC, 0.0),
+        COALESCE(NULLIF(item->>'total', '')::NUMERIC, NULLIF(item->>'total_amount', '')::NUMERIC, 0.0),
         COALESCE(NULLIF(item->>'total_amount', '')::NUMERIC, NULLIF(item->>'total', '')::NUMERIC, 0.0),
-        COALESCE(NULLIF(item->>'profit', '')::NUMERIC, 0.0),
-        COALESCE(item->>'supplier_name', ''),
-        COALESCE(item->>'rack', ''),
         v_branch_id,
         v_terminal_id,
         NOW()
@@ -529,6 +592,8 @@ DECLARE
     v_supplier TEXT;
     v_closing_stock INT;
     v_response JSONB;
+    v_is_edit BOOLEAN;
+    v_max_seq INT;
 BEGIN
     -- 1. Idempotency Check
     IF p_idempotency_key IS NOT NULL AND p_idempotency_key <> '' THEN
@@ -546,6 +611,7 @@ BEGIN
     v_branch_id := TRIM(COALESCE(p_purchase->>'branch_id', 'MAIN_STORE'));
     v_terminal_id := TRIM(COALESCE(p_purchase->>'terminal_id', 'POS-01'));
     v_user_id := TRIM(COALESCE(p_purchase->>'done_by', 'Admin'));
+    v_is_edit := COALESCE((p_purchase->>'is_edit')::BOOLEAN, false);
 
     IF v_entry_no = '' OR v_branch_id = '' THEN
         RETURN jsonb_build_object(
@@ -553,6 +619,15 @@ BEGIN
             'reason', 'INVALID_INPUT',
             'message', 'Missing required entry_no or branch_id'
         );
+    END IF;
+
+    -- Strict Anti-Collision Safety: If this is a NEW entry (Save button) and entry_no is already taken,
+    -- NEVER overwrite an existing entry! Automatically allocate the next global sequence number.
+    IF NOT v_is_edit AND EXISTS (SELECT 1 FROM public.purchase_entries WHERE entry_no = v_entry_no) THEN
+        SELECT COALESCE(MAX(NULLIF(regexp_replace(entry_no, '\D', '', 'g'), '')::INT), 0) + 1
+        INTO v_max_seq
+        FROM public.purchase_entries;
+        v_entry_no := v_max_seq::TEXT;
     END IF;
 
     -- 3. Upsert Purchase Entry Header
@@ -585,7 +660,7 @@ BEGIN
         v_terminal_id,
         NOW()
     )
-    ON CONFLICT (entry_no) DO UPDATE SET
+    ON CONFLICT (entry_no, terminal_id) DO UPDATE SET
         supplier_name = EXCLUDED.supplier_name,
         sup_inv_no = EXCLUDED.sup_inv_no,
         grand_total = EXCLUDED.grand_total,
@@ -619,11 +694,14 @@ BEGIN
             INSERT INTO public.purchase_items (
                 entry_no, product_id, product_name, batch, expiry,
                 qty, loose_qty, f_qty, packin, mrp, p_rate, l_cost, s_rate,
-                gst_percent, total, supplier, branch_id, terminal_id, created_at
+                gst_percent, total, supplier, hsn_code, rack, branch_id, terminal_id, created_at
             ) VALUES (
                 v_entry_no, v_prod_id, COALESCE(v_item->>'product_name', ''), v_batch_no, v_exp_date,
                 v_qty, v_loose_qty, v_f_qty, v_packing, v_mrp, v_p_rate, v_l_cost, v_s_rate,
-                v_gst_pct, COALESCE(NULLIF(v_item->>'total', '')::NUMERIC, 0.0), v_supplier, v_branch_id, v_terminal_id, NOW()
+                v_gst_pct, COALESCE(NULLIF(v_item->>'total', '')::NUMERIC, 0.0), v_supplier,
+                COALESCE(v_item->>'hsn_code', v_item->>'hsn', ''),
+                COALESCE(v_item->>'rack', ''),
+                v_branch_id, v_terminal_id, NOW()
             );
 
             -- Inward delta to stock_batches
@@ -713,6 +791,8 @@ DECLARE
     v_batch_key TEXT;
     v_closing_stock INT;
     v_response JSONB;
+    v_old_item RECORD;
+    v_reversal_qty INT;
 BEGIN
     IF p_idempotency_key IS NOT NULL AND p_idempotency_key <> '' THEN
         SELECT response_payload INTO v_cached_response
@@ -737,6 +817,38 @@ BEGIN
         );
     END IF;
 
+    -- Return Edit Restoral: If this return was previously saved, reverse the previous additions before applying new ones
+    IF EXISTS (SELECT 1 FROM public.sales_return_invoices WHERE entry_no = v_entry_no) THEN
+        FOR v_old_item IN
+            SELECT product_id, batch_number, expiry_date, quantity
+            FROM public.sales_return_items
+            WHERE return_no = v_entry_no
+        LOOP
+            v_reversal_qty := COALESCE(v_old_item.quantity, 0);
+            IF v_reversal_qty > 0 THEN
+                UPDATE public.stock_batches
+                SET current_quantity = GREATEST(0, current_quantity - v_reversal_qty),
+                    updated_at = NOW()
+                WHERE branch_id = v_branch_id
+                  AND product_id = v_old_item.product_id
+                  AND LOWER(TRIM(batch_number)) = LOWER(TRIM(v_old_item.batch_number));
+
+                INSERT INTO public.stock_ledger (
+                    idempotency_key, operation_type, reference_no, product_id, batch_number,
+                    quantity_delta, qty_in, qty_out, closing_balance,
+                    branch_id, terminal_id, user_id, created_at
+                ) VALUES (
+                    COALESCE(p_idempotency_key, '') || '_REV',
+                    'SALES_RETURN_EDIT_REVERSAL',
+                    v_entry_no, v_old_item.product_id, v_old_item.batch_number,
+                    -v_reversal_qty, 0, v_reversal_qty,
+                    COALESCE((SELECT current_quantity FROM public.stock_batches WHERE branch_id = v_branch_id AND product_id = v_old_item.product_id AND LOWER(TRIM(batch_number)) = LOWER(TRIM(v_old_item.batch_number)) LIMIT 1), 0),
+                    v_branch_id, v_terminal_id, v_user_id, NOW()
+                );
+            END IF;
+        END LOOP;
+    END IF;
+
     -- Upsert header
     INSERT INTO public.sales_return_invoices (
         entry_no, date, customer_acc, patient, original_invoice_no,
@@ -758,7 +870,7 @@ BEGIN
         v_terminal_id,
         NOW()
     )
-    ON CONFLICT (entry_no) DO UPDATE SET
+    ON CONFLICT (entry_no, terminal_id) DO UPDATE SET
         grand_total = EXCLUDED.grand_total,
         branch_id = EXCLUDED.branch_id,
         updated_at = NOW();
@@ -860,6 +972,8 @@ DECLARE
     v_deduct INT;
     v_closing_stock INT;
     v_response JSONB;
+    v_old_item RECORD;
+    v_reversal_qty INT;
 BEGIN
     IF p_idempotency_key IS NOT NULL AND p_idempotency_key <> '' THEN
         SELECT response_payload INTO v_cached_response
@@ -884,6 +998,38 @@ BEGIN
         );
     END IF;
 
+    -- Purchase Return Edit Restoral: If this debit note was previously saved, restore previously deducted stock
+    IF EXISTS (SELECT 1 FROM public.purchase_return_entries WHERE entry_no = v_entry_no) THEN
+        FOR v_old_item IN
+            SELECT product_id, batch, qty
+            FROM public.purchase_return_items
+            WHERE entry_no = v_entry_no
+        LOOP
+            v_reversal_qty := COALESCE(v_old_item.qty, 0);
+            IF v_reversal_qty > 0 THEN
+                UPDATE public.stock_batches
+                SET current_quantity = current_quantity + v_reversal_qty,
+                    updated_at = NOW()
+                WHERE branch_id = v_branch_id
+                  AND (product_id = v_old_item.product_id OR v_old_item.product_id IS NULL)
+                  AND LOWER(TRIM(batch_number)) = LOWER(TRIM(v_old_item.batch));
+
+                INSERT INTO public.stock_ledger (
+                    idempotency_key, operation_type, reference_no, product_id, batch_number,
+                    quantity_delta, qty_in, qty_out, closing_balance,
+                    branch_id, terminal_id, user_id, created_at
+                ) VALUES (
+                    COALESCE(p_idempotency_key, '') || '_REV',
+                    'PURCHASE_RETURN_EDIT_REVERSAL',
+                    v_entry_no, COALESCE(v_old_item.product_id, ''), v_old_item.batch,
+                    v_reversal_qty, v_reversal_qty, 0,
+                    COALESCE((SELECT current_quantity FROM public.stock_batches WHERE branch_id = v_branch_id AND LOWER(TRIM(batch_number)) = LOWER(TRIM(v_old_item.batch)) LIMIT 1), 0),
+                    v_branch_id, v_terminal_id, v_user_id, NOW()
+                );
+            END IF;
+        END LOOP;
+    END IF;
+
     -- Pre-flight verification with FOR UPDATE lock
     IF p_items IS NOT NULL AND jsonb_array_length(p_items) > 0 THEN
         FOR v_item IN SELECT * FROM jsonb_array_elements(p_items)
@@ -892,12 +1038,16 @@ BEGIN
             v_batch_no := TRIM(COALESCE(v_item->>'batch', v_item->>'batch_number', ''));
             v_qty := COALESCE(NULLIF(v_item->>'qty', '')::INT, NULLIF(v_item->>'quantity', '')::INT, 1);
 
+            WITH locked_batches AS (
+                SELECT current_quantity
+                FROM public.stock_batches
+                WHERE branch_id = v_branch_id
+                  AND product_id = v_prod_id
+                  AND LOWER(TRIM(batch_number)) = LOWER(v_batch_no)
+                FOR UPDATE
+            )
             SELECT COALESCE(SUM(current_quantity), 0) INTO v_avail_qty
-            FROM public.stock_batches
-            WHERE branch_id = v_branch_id
-              AND product_id = v_prod_id
-              AND LOWER(TRIM(batch_number)) = LOWER(v_batch_no)
-            FOR UPDATE;
+            FROM locked_batches;
 
             IF v_avail_qty < v_qty THEN
                 RETURN jsonb_build_object(
@@ -925,7 +1075,7 @@ BEGIN
         v_terminal_id,
         NOW()
     )
-    ON CONFLICT (entry_no) DO UPDATE SET
+    ON CONFLICT (entry_no, terminal_id) DO UPDATE SET
         grand_total = EXCLUDED.grand_total,
         branch_id = EXCLUDED.branch_id,
         updated_at = NOW();
@@ -1069,12 +1219,16 @@ BEGIN
             v_qty := COALESCE(NULLIF(v_item->>'qty', '')::INT, 0);
 
             IF v_qty < 0 THEN
+                WITH locked_batches AS (
+                    SELECT current_quantity
+                    FROM public.stock_batches
+                    WHERE branch_id = v_branch_id
+                      AND product_id = v_prod_id
+                      AND LOWER(TRIM(batch_number)) = LOWER(v_batch_no)
+                    FOR UPDATE
+                )
                 SELECT COALESCE(SUM(current_quantity), 0) INTO v_avail_qty
-                FROM public.stock_batches
-                WHERE branch_id = v_branch_id
-                  AND product_id = v_prod_id
-                  AND LOWER(TRIM(batch_number)) = LOWER(v_batch_no)
-                FOR UPDATE;
+                FROM locked_batches;
 
                 IF v_avail_qty + v_qty < 0 THEN
                     RETURN jsonb_build_object(
@@ -1101,7 +1255,7 @@ BEGIN
         v_terminal_id,
         NOW()
     )
-    ON CONFLICT (entry_no) DO UPDATE SET
+    ON CONFLICT (entry_no, terminal_id) DO UPDATE SET
         reason = EXCLUDED.reason,
         grand_total = EXCLUDED.grand_total,
         branch_id = EXCLUDED.branch_id,
@@ -1234,12 +1388,16 @@ BEGIN
     END IF;
 
     -- Pre-flight lock & check
+    WITH locked_batches AS (
+        SELECT current_quantity
+        FROM public.stock_batches
+        WHERE branch_id = v_branch_id
+          AND product_id = v_prod_id
+          AND LOWER(TRIM(batch_number)) = LOWER(v_batch_no)
+        FOR UPDATE
+    )
     SELECT COALESCE(SUM(current_quantity), 0) INTO v_avail_qty
-    FROM public.stock_batches
-    WHERE branch_id = v_branch_id
-      AND product_id = v_prod_id
-      AND LOWER(TRIM(batch_number)) = LOWER(v_batch_no)
-    FOR UPDATE;
+    FROM locked_batches;
 
     IF v_avail_qty < v_qty THEN
         RETURN jsonb_build_object(
@@ -1494,12 +1652,16 @@ BEGIN
     LOOP
         v_req_deduct := (v_item.qty * COALESCE(v_item.packin, 1)) + COALESCE(v_item.loose_qty, 0) + (v_item.f_qty * COALESCE(v_item.packin, 1));
 
+        WITH locked_batches AS (
+            SELECT current_quantity
+            FROM public.stock_batches
+            WHERE branch_id = v_clean_branch
+              AND product_id = v_item.product_id
+              AND LOWER(TRIM(batch_number)) = LOWER(TRIM(v_item.batch))
+            FOR UPDATE
+        )
         SELECT COALESCE(SUM(current_quantity), 0) INTO v_avail_qty
-        FROM public.stock_batches
-        WHERE branch_id = v_clean_branch
-          AND product_id = v_item.product_id
-          AND LOWER(TRIM(batch_number)) = LOWER(TRIM(v_item.batch))
-        FOR UPDATE;
+        FROM locked_batches;
 
         IF v_avail_qty < v_req_deduct THEN
             RETURN jsonb_build_object(
@@ -1626,3 +1788,16 @@ BEGIN
         END IF;
     END LOOP;
 END $$;
+
+-- Grant execution to client applications (anon), authenticated users, and service_role
+GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated, service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated, service_role;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO anon, authenticated, service_role;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, service_role;
+
+NOTIFY pgrst, 'reload schema';
+

@@ -7,6 +7,7 @@ import '../providers/app_provider.dart';
 import '../providers/pharmacy_provider.dart';
 import '../services/server_config_service.dart';
 import '../services/supabase_sync_service.dart';
+import '../services/pure_cloud_service.dart';
 import '../utils/theme_constants.dart';
 import 'server_settings_screen.dart';
 
@@ -250,6 +251,61 @@ class DashboardScreen extends StatelessWidget {
   }
 
   Widget _buildStatCardsRow(BuildContext context, AppThemeColors c, PharmacyProvider pharmacy, double width) {
+    // In Pure Cloud Live mode, query store-wide live sales and purchases directly from Supabase
+    // so that all counters (POS-01, POS-02, POS-03) display 100% identical, live store revenue
+    if (PureCloudService.instance.isActive) {
+      return FutureBuilder<Map<String, num>>(
+        future: PureCloudService.instance.fetchTodayStoreStats(),
+        builder: (context, snapshot) {
+          final stats = snapshot.data ?? {};
+          final double rev = (stats['today_revenue'] ?? pharmacy.todayRevenue).toDouble();
+          final int salesCnt = (stats['today_sales_count'] ?? pharmacy.todaySalesCount).toInt();
+          final double pur = (stats['today_purchase'] ?? pharmacy.todayPurchase).toDouble();
+          final int purCnt = (stats['today_purchases_count'] ?? pharmacy.todayPurchasesCount).toInt();
+
+          final card1 = _buildStatCard(
+            context,
+            c,
+            "Today's Sales",
+            "₹ ${rev.toStringAsFixed(0)}",
+            "$salesCnt Sales • Store-Wide",
+            "Live Cloud",
+            Icons.assessment_outlined,
+            Colors.blue,
+            isCompact: width < 1100,
+          );
+
+          final card2 = _buildStatCard(
+            context,
+            c,
+            "Today's Purchases",
+            "₹ ${pur.toStringAsFixed(0)}",
+            "$purCnt Orders • Store-Wide",
+            "Live Cloud",
+            Icons.shopping_bag_outlined,
+            Colors.green,
+            isCompact: width < 1100,
+          );
+
+          final card3 = _buildStatCard(
+            context,
+            c,
+            "Stock Value",
+            pharmacy.totalStockValue > 1000
+                ? "${(pharmacy.totalStockValue / 1000).toStringAsFixed(1)}K+"
+                : "₹ ${pharmacy.totalStockValue.toStringAsFixed(0)}",
+            "${pharmacy.totalStockCount} Items",
+            "Across ${pharmacy.racks.length} Racks",
+            Icons.inventory_2_outlined,
+            Colors.teal,
+            isCompact: width < 1100,
+          );
+
+          return _layoutStatCards(width, card1, card2, card3);
+        },
+      );
+    }
+
     final card1 = _buildStatCard(
       context,
       c,
@@ -288,6 +344,10 @@ class DashboardScreen extends StatelessWidget {
       isCompact: width < 1100,
     );
 
+    return _layoutStatCards(width, card1, card2, card3);
+  }
+
+  Widget _layoutStatCards(double width, Widget card1, Widget card2, Widget card3) {
     if (width < 700) {
       return Column(
         children: [
@@ -1336,7 +1396,17 @@ class _SystemStatusPillWidgetState extends State<_SystemStatusPillWidget>
         String statusTitle = "System Status";
         String statusSubtitle;
 
-        if (!isServerMode) {
+        if (serverConfig.isPureCloud) {
+          if (isConnected) {
+            statusColor = activeGreen;
+            statusTitle = "Pure Cloud Live";
+            statusSubtitle = "Connected • ${serverConfig.storeBranchId}";
+          } else {
+            statusColor = disconnectedRed;
+            statusTitle = "Pure Cloud Live";
+            statusSubtitle = "Cloud Disconnected (Offline)";
+          }
+        } else if (!isServerMode) {
           statusColor = offlineBlue;
           statusSubtitle = "Local Standalone Mode";
         } else if (isConnected) {

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import '../app_date_picker.dart';
 import '../../providers/app_provider.dart';
@@ -182,7 +183,31 @@ class PurchaseHeader extends StatelessWidget {
                   ),
                   const SizedBox(width: 20),
                   _label(c, "Inv Total:"),
-                  _headerField(c, invTotalCtrl, invTotalFocus, width: 100, bgColor: c.isDark ? Colors.amber.shade900.withValues(alpha: 0.2) : const Color(0xFFFFFDE7), isNumeric: true, onSubmitted: (_) => onHeaderSubmitted?.call(-1, 3)),
+                  _headerField(
+                    c,
+                    invTotalCtrl,
+                    invTotalFocus,
+                    width: 100,
+                    bgColor: c.isDark ? Colors.amber.shade900.withValues(alpha: 0.2) : const Color(0xFFFFFDE7),
+                    isNumeric: true,
+                    inputFormatters: [
+                      TextInputFormatter.withFunction((oldValue, newValue) {
+                        if (newValue.text.contains('.')) {
+                          final intPart = newValue.text.split('.').first.replaceAll(RegExp(r'[^0-9]'), '');
+                          return TextEditingValue(
+                            text: intPart,
+                            selection: TextSelection.collapsed(offset: intPart.length),
+                          );
+                        }
+                        final cleaned = newValue.text.replaceAll(RegExp(r'[^0-9]'), '');
+                        return TextEditingValue(
+                          text: cleaned,
+                          selection: TextSelection.collapsed(offset: cleaned.length),
+                        );
+                      }),
+                    ],
+                    onSubmitted: (_) => onHeaderSubmitted?.call(-1, 3),
+                  ),
                 ]),
               ]),
             ),
@@ -222,13 +247,14 @@ class PurchaseHeader extends StatelessWidget {
     Text(label, style: TextStyle(fontSize: 11, color: c.primaryText)),
   ]);
 
-  Widget _headerField(AppThemeColors c, TextEditingController ctrl, FocusNode fn, {double width = 150, LayerLink? link, Color? bgColor, Color? borderColor, Color? textColor, bool isNumeric = false, ValueChanged<String>? onChanged, ValueChanged<String>? onSubmitted}) {
+  Widget _headerField(AppThemeColors c, TextEditingController ctrl, FocusNode fn, {double width = 150, LayerLink? link, Color? bgColor, Color? borderColor, Color? textColor, bool isNumeric = false, List<TextInputFormatter>? inputFormatters, ValueChanged<String>? onChanged, ValueChanged<String>? onSubmitted}) {
     Widget field = TextField(
       controller: ctrl,
       focusNode: fn,
       onChanged: onChanged,
       onSubmitted: onSubmitted,
-      keyboardType: isNumeric ? const TextInputType.numberWithOptions(decimal: true) : null,
+      inputFormatters: inputFormatters,
+      keyboardType: isNumeric ? TextInputType.number : null,
       style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: textColor ?? c.primaryText),
       decoration: InputDecoration(
         isDense: true,
@@ -247,19 +273,33 @@ class PurchaseHeader extends StatelessWidget {
     return SizedBox(width: width, child: field);
   }
 
-  Widget _dateBox(BuildContext context, AppThemeColors c, DateTime dt, ValueChanged<DateTime> onPicked) => InkWell(
-    onTap: () async {
-      final d = await showAppDatePicker(context: context, initialDate: dt, firstDate: DateTime(2000), lastDate: DateTime(2100));
-      if (d != null) onPicked(d);
-    },
-    child: Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-      decoration: BoxDecoration(border: Border.all(color: c.border), borderRadius: BorderRadius.circular(4), color: c.inputBg),
-      child: Row(children: [
-        Text(DateFormat('dd/MM/yyyy').format(dt), style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: c.primaryText)),
-        const SizedBox(width: 4),
-        Icon(Icons.calendar_today, size: 12, color: c.secondaryText),
-      ]),
+  Widget _dateBox(BuildContext context, AppThemeColors c, DateTime dt, ValueChanged<DateTime> onPicked) => Builder(
+    builder: (boxCtx) => InkWell(
+      onTap: () async {
+        final d = await showAppDatePicker(
+          context: boxCtx,
+          initialDate: dt,
+          firstDate: DateTime(2000),
+          lastDate: DateTime(2100),
+        );
+        if (d != null) onPicked(d);
+      },
+      child: Container(
+        height: 28,
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        decoration: BoxDecoration(border: Border.all(color: c.border), borderRadius: BorderRadius.circular(4), color: c.inputBg),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Text(DateFormat('dd/MM/yyyy').format(dt), style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: c.primaryText)),
+            const SizedBox(width: 4),
+            Icon(Icons.calendar_today_outlined, size: 12, color: c.secondaryText),
+            const SizedBox(width: 2),
+            Icon(Icons.arrow_drop_down, size: 14, color: c.secondaryText),
+          ],
+        ),
+      ),
     ),
   );
 

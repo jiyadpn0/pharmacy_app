@@ -837,14 +837,8 @@ class SupabaseSyncService extends ChangeNotifier {
         onDataPulled?.call();
         if (pharmacy != null) {
           pharmacy.invalidateSearchProductsCache();
-          await pharmacy.recalculateAllStockFromLedgerInternal(db);
-          await pharmacy.loadFromDatabase();
           await pharmacy.recalculateTodayStatsFromDb();
           pharmacy.notifyListeners();
-        } else {
-          try {
-            await recalculateStockFromLedgerDirect(db);
-          } catch (_) {}
         }
       }
     } catch (e) {
@@ -1027,7 +1021,6 @@ class SupabaseSyncService extends ChangeNotifier {
     }
   }
 
-  final Map<String, int> _lastReservedSequences = {};
   Timer? _realtimeStreamTimer;
   Timer? _instantSyncDebounceTimer;
   DateTime? _lastStreamPollTime;
@@ -1436,6 +1429,7 @@ class SupabaseSyncService extends ChangeNotifier {
 
       final headerPayload = Map<String, dynamic>.from(purchaseHeader);
       headerPayload['branch_id'] = branchId;
+      headerPayload['is_edit'] = true;
       headerPayload['terminal_id'] = (headerPayload['terminal_id']?.toString().trim().isNotEmpty == true)
           ? headerPayload['terminal_id'].toString().trim()
           : config.terminalId;
@@ -1907,7 +1901,7 @@ class SupabaseSyncService extends ChangeNotifier {
                 'category_id': item['category_id']?.toString() ?? '',
                 'sub_category_id': item['sub_category_id']?.toString() ?? '',
                 'manufacturer_id': item['manufacturer_id']?.toString() ?? '',
-                'rack_id': item['rack_id']?.toString() ?? '',
+                'rack_id': (item['rack_id'] ?? item['rack'])?.toString() ?? '',
                 'hsn_code': item['hsn_code']?.toString() ?? '',
                 'gst_percent': _parseGstPercent(item, 12.0),
                 's_disc_percent': _parseDiscPercent(item, 0.0),
@@ -1950,6 +1944,195 @@ class SupabaseSyncService extends ChangeNotifier {
     }
   }
 
+  /// Pre-save cloud atomic sequence lock: atomically claims and increments the next available sequence number on Supabase.
+  /// Guarantees that concurrent machines can never claim the same entry number simultaneously.
+  Future<int?> allocateRemoteAtomicSequence(String table, String fy, {String? prefix}) async {
+    if (!_isReady) return null;
+    try {
+      final config = ServerConfigService.instance;
+      final cleanUrl = ServerConfigService.cleanServerUrl(config.supabaseUrl);
+      final rpcUri = Uri.parse('$cleanUrl/rest/v1/rpc/allocate_entry_sequence');
+      final res = await config.httpClient.post(
+        rpcUri,
+        headers: config.restHeaders,
+        body: jsonEncode({
+          'p_table': table,
+          'p_fy': fy,
+          'p_prefix': prefix?.trim() ?? '',
+        }),
+      ).timeout(const Duration(milliseconds: 2500));
+
+      if (res.statusCode == 200) {
+        final val = int.tryParse(res.body.trim());
+        if (val != null && val > 0) {
+          int cleanVal = val;
+          // Strip accidental 6-digit financial year prefix (e.g. 2026275 -> 5)
+          if (cleanVal >= 2000000 && cleanVal < 21000000) {
+            final s = cleanVal.toString();
+            if (RegExp(r'^20\d{4}').hasMatch(s)) {
+              cleanVal = int.tryParse(s.replaceFirst(RegExp(r'^20\d{4}'), '')) ?? cleanVal;
+            }
+          }
+          AppLogger.instance.sequence(
+            'SUPABASE',
+            'Pre-save Cloud Atomic Sequence Locked: table=$table, fy=$fy -> Allocated: $cleanVal',
+          );
+          return cleanVal;
+        }
+      } else {
+        debugPrint('allocateRemoteAtomicSequence HTTP ${res.statusCode}: ${res.body}');
+      }
+    } catch (e) {
+      debugPrint('allocateRemoteAtomicSequence error: $e');
+    }
+    return null;
+  }
+
+  /// Pure Cloud Live: Directly fetches a single document header from Supabase (Sales, Purchases, Returns)
+  Future<Map<String, dynamic>?> fetchRemoteDocumentHeader(String table, String entryNo, {String? fy}) async {
+    if (_isWiping || !_isReady) return null;
+    try {
+      final config = ServerConfigService.instance;
+      final cleanUrl = ServerConfigService.cleanServerUrl(config.supabaseUrl);
+      final rawNo = entryNo.trim();
+      final cleanNo = rawNo.contains('_') ? rawNo.substring(rawNo.indexOf('_') + 1) : rawNo;
+      final termPrefix = config.terminalPrefix;
+      final prefixedNo = (termPrefix.isNotEmpty && !cleanNo.toUpperCase().startsWith(termPrefix.toUpperCase())) ? "$termPrefix$cleanNo" : cleanNo;
+
+      String delFilter = (table == 'purchase_entries' || table == 'purchase_return_entries' || table == 'stock_adjustments')
+          ? '&or=(is_deleted.eq.0,is_deleted.is.null)'
+          : '&or=(is_deleted.eq.false,is_deleted.is.null,is_deleted.eq.0)';
+      final uri = Uri.parse('$cleanUrl/rest/v1/$table?or=(entry_no.eq.${Uri.encodeComponent(rawNo)},entry_no.eq.${Uri.encodeComponent(cleanNo)},entry_no.eq.${Uri.encodeComponent(prefixedNo)})$delFilter&limit=1');
+      final res = await config.httpClient.get(uri, headers: config.restHeaders).timeout(const Duration(seconds: 4));
+      if (res.statusCode == 200) {
+        final List<dynamic> data = await _safeParseJsonList(res.body);
+        if (data.isNotEmpty && data.first is Map) {
+          final m = Map<String, dynamic>.from(data.first);
+          if (table == 'purchase_entries') {
+            final rawSup = (m['sup_inv_no'] ?? m['invoice_no'] ?? '').toString().trim();
+            m['sup_inv_no'] = rawSup.isNotEmpty ? cleanInvoiceNo(rawSup) : '';
+            m['invoice_no'] = m['sup_inv_no'];
+          }
+          return m;
+        }
+      }
+    } catch (e) {
+      debugPrint('fetchRemoteDocumentHeader error: $e');
+    }
+    return null;
+  }
+
+  /// Pure Cloud Live: Directly fetches child line items from Supabase
+  Future<List<Map<String, dynamic>>> fetchRemoteDocumentItems(String itemsTable, String foreignKey, String entryNo) async {
+    if (_isWiping || !_isReady) return [];
+    try {
+      final config = ServerConfigService.instance;
+      final cleanUrl = ServerConfigService.cleanServerUrl(config.supabaseUrl);
+      final rawNo = entryNo.trim();
+      final cleanNo = rawNo.contains('_') ? rawNo.substring(rawNo.indexOf('_') + 1) : rawNo;
+      final uri = Uri.parse('$cleanUrl/rest/v1/$itemsTable?or=($foreignKey.eq.${Uri.encodeComponent(rawNo)},$foreignKey.eq.${Uri.encodeComponent(cleanNo)})&select=*');
+      final res = await config.httpClient.get(uri, headers: config.restHeaders).timeout(const Duration(seconds: 4));
+      if (res.statusCode == 200) {
+        final List<dynamic> data = await _safeParseJsonList(res.body);
+        return data.whereType<Map<String, dynamic>>().toList();
+      }
+    } catch (e) {
+      debugPrint('fetchRemoteDocumentItems error: $e');
+    }
+    return [];
+  }
+
+  /// Fetches the set of primary keys currently present on Supabase Cloud for a given table.
+  Future<Set<String>> fetchRemoteKeys(String table, String keyColumn) async {
+    try {
+      final config = ServerConfigService.instance;
+      if (!config.isConnected || config.supabaseUrl.isEmpty || config.supabaseAnonKey.isEmpty) {
+        return {};
+      }
+      final cleanUrl = ServerConfigService.cleanServerUrl(config.supabaseUrl);
+      final uri = Uri.parse('$cleanUrl/rest/v1/$table?select=$keyColumn&limit=2000');
+      final res = await config.httpClient.get(uri, headers: config.restHeaders).timeout(const Duration(seconds: 5));
+      if (res.statusCode == 200) {
+        final List<dynamic> rows = await _safeParseJsonList(res.body);
+        return rows.map((r) => r[keyColumn]?.toString().trim() ?? '').where((k) => k.isNotEmpty).toSet();
+      }
+    } catch (_) {}
+    return {};
+  }
+
+  /// Pure Cloud Live: Fetches all sequence/entry keys for navigation (Prev, Next, First, Last)
+  Future<List<String>> fetchRemoteNavigationKeys(String table, {String keyColumn = 'entry_no', String? fy, String? prefix}) async {
+    try {
+      final config = ServerConfigService.instance;
+      if (!config.isConnected || config.supabaseUrl.isEmpty || config.supabaseAnonKey.isEmpty) return [];
+      final cleanUrl = ServerConfigService.cleanServerUrl(config.supabaseUrl);
+      String query = '$cleanUrl/rest/v1/$table?select=$keyColumn&order=$keyColumn.asc&limit=5000';
+      if (fy != null && fy.isNotEmpty) {
+        query += '&financial_year=eq.${Uri.encodeComponent(fy)}';
+      }
+      final uri = Uri.parse(query);
+      final res = await config.httpClient.get(uri, headers: config.restHeaders).timeout(const Duration(seconds: 3));
+      if (res.statusCode == 200) {
+        final List<dynamic> rows = await _safeParseJsonList(res.body);
+        return rows.map((r) => r[keyColumn]?.toString().trim() ?? '').where((k) => k.isNotEmpty).toList();
+      }
+    } catch (_) {}
+    return [];
+  }
+
+  /// Deletes a document header and its line items from Supabase Cloud
+  Future<bool> deleteRemoteDocument({
+    required String table,
+    String? itemsTable,
+    String? foreignKey,
+    required String entryNo,
+    String? keyColumn,
+  }) async {
+    try {
+      final config = ServerConfigService.instance;
+      if (!config.isConnected || config.supabaseUrl.isEmpty || config.supabaseAnonKey.isEmpty) return false;
+      final cleanUrl = ServerConfigService.cleanServerUrl(config.supabaseUrl);
+
+      if (itemsTable != null && foreignKey != null) {
+        final itemsUri = Uri.parse('$cleanUrl/rest/v1/$itemsTable?$foreignKey=eq.${Uri.encodeComponent(entryNo)}');
+        await config.httpClient.delete(itemsUri, headers: config.restHeaders).timeout(const Duration(seconds: 4)).catchError((_) => http.Response('', 500));
+      }
+
+      final col = keyColumn ?? 'entry_no';
+      final uri = Uri.parse('$cleanUrl/rest/v1/$table?$col=eq.${Uri.encodeComponent(entryNo)}');
+      final res = await config.httpClient.delete(uri, headers: config.restHeaders).timeout(const Duration(seconds: 4));
+      return res.statusCode >= 200 && res.statusCode < 300;
+    } catch (_) {}
+    return false;
+  }
+
+  /// Resets only local transactional database tables without touching cloud records
+  Future<Map<String, dynamic>> wipeOnlyLocalDatabase({
+    Set<String>? selectedCategoryIds,
+    Function(double, String)? onProgress,
+    PharmacyProvider? pharmacy,
+  }) async {
+    final db = await DbHelper.instance.database;
+    int deletedCount = 0;
+    onProgress?.call(0.1, "Cleaning local transaction tables...");
+    await db.transaction((txn) async {
+      deletedCount += await txn.delete('sales_invoices');
+      await txn.delete('sales_items');
+      deletedCount += await txn.delete('purchase_entries');
+      await txn.delete('purchase_items');
+      deletedCount += await txn.delete('sales_return_invoices');
+      await txn.delete('sales_return_items');
+      deletedCount += await txn.delete('purchase_return_entries');
+      await txn.delete('purchase_return_items');
+      deletedCount += await txn.delete('stock_adjustments');
+      await txn.delete('stock_adjustment_items');
+    });
+    if (pharmacy != null) {
+      await pharmacy.loadFromDatabase();
+    }
+    return {'success': true, 'deleted': deletedCount};
+  }
+
   Future<void> _safeChunkedSnapshotInsert(
     sql.Database db,
     String tableName,
@@ -1989,6 +2172,9 @@ class SupabaseSyncService extends ChangeNotifier {
               }
               if (!cleanRow.containsKey('gst_percent') && cleanRow.containsKey('gst_rate')) {
                 cleanRow['gst_percent'] = cleanRow['gst_rate'];
+              }
+              if ((!cleanRow.containsKey('rack_id') || cleanRow['rack_id'] == null || cleanRow['rack_id'].toString().isEmpty) && (row['rack'] != null || row['rack_id'] != null)) {
+                cleanRow['rack_id'] = (row['rack_id'] ?? row['rack'])?.toString() ?? '';
               }
             } else if (tableName == 'stock_batches') {
               if (!cleanRow.containsKey('sale_rate') && cleanRow.containsKey('selling_rate')) {
@@ -2408,7 +2594,7 @@ class SupabaseSyncService extends ChangeNotifier {
   }
 
   /// Force pushes local SQLite records to cloud for selected categories by resetting synced flags and running full sync.
-  Future<bool> forcePushAllData({Set<String>? selectedCategories}) async {
+  Future<bool> forcePushAllData({Set<String>? selectedCategories, bool forceFull = false}) async {
     try {
       _lastSyncError = '';
       _isManualTransfer = true;
@@ -2423,8 +2609,6 @@ class SupabaseSyncService extends ChangeNotifier {
       // 1. Immediately initialize category trackers so exact row counts render on UI on Frame 1
       await initCategoryTracker(isExport: true, selectedCategories: selectedCategories);
       notifyListeners(); // Instant UI Response with populated trackers!
-
-      final db = await DbHelper.instance.database;
 
       final Map<String, List<String>> categoryTableMap = {
         'products': ['product_master', 'categories', 'manufacturers', 'racks', 'generics'],
@@ -2592,7 +2776,7 @@ class SupabaseSyncService extends ChangeNotifier {
         'category_id': productData['category_id']?.toString() ?? '',
         'sub_category_id': productData['sub_category_id']?.toString() ?? '',
         'manufacturer_id': productData['manufacturer_id']?.toString() ?? '',
-        'rack_id': productData['rack_id']?.toString() ?? '',
+        'rack': (productData['rack'] ?? productData['rack_id'])?.toString() ?? '',
         'hsn_code': productData['hsn_code']?.toString() ?? '',
         'gst_rate': gstVal,
         's_disc_percent': _toDouble(productData['s_disc_percent']),
@@ -2664,13 +2848,15 @@ class SupabaseSyncService extends ChangeNotifier {
       final config = ServerConfigService.instance;
       final branchId = config.storeBranchId;
       final sellRate = _toDouble(batchData['selling_rate'] ?? batchData['sale_rate'], 0.0);
-      final qty = _toInt(batchData['current_quantity'] ?? batchData['current_stock'], 0);
+      final int localStock = _toInt(batchData['current_stock'], 0);
+      final int localQty = _toInt(batchData['current_quantity'], 0);
+      final qty = localStock > 0 ? localStock : localQty;
       final prodId = batchData['product_id']?.toString() ?? '';
       final batchNo = batchData['batch_number']?.toString() ?? '';
       final expiryStr = batchData['expiry_date']?.toString() ?? '';
       if (prodId.isEmpty || batchNo.isEmpty) return;
 
-      final cleanKeyStr = '${prodId}_${batchNo}_$expiryStr'.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+      final cleanKeyStr = '${branchId}_${prodId}_${batchNo}_$expiryStr'.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
 
       final payload = {
         'id': cleanKeyStr,
@@ -2736,16 +2922,35 @@ class SupabaseSyncService extends ChangeNotifier {
     try {
       final config = ServerConfigService.instance;
       final branchId = config.storeBranchId;
-      final payload = Map<String, dynamic>.from(customerData);
-      payload['branch_id'] = branchId;
+      final patId = customerData['id']?.toString() ?? '';
+      if (patId.isEmpty) return;
 
-      final uri = Uri.parse('${config.supabaseUrl}/rest/v1/patients');
-      await _safePostSingle(
+      final payload = {
+        'id': patId,
+        'name': customerData['name']?.toString() ?? '',
+        'mobile': customerData['mobile']?.toString() ?? '',
+        'address': customerData['address']?.toString() ?? '',
+        'branch_id': branchId,
+        'terminal_id': (customerData['terminal_id']?.toString().trim().isNotEmpty == true)
+            ? customerData['terminal_id'].toString().trim()
+            : config.terminalId,
+        'updated_at': DateTime.now().toUtc().toIso8601String(),
+      };
+
+      final uri = Uri.parse('${config.supabaseUrl}/rest/v1/patients?on_conflict=id');
+      final headers = Map<String, String>.from(config.restHeaders)
+        ..['Prefer'] = 'resolution=merge-duplicates';
+
+      final res = await config.httpClient.post(
         uri,
-        headers: config.restHeaders,
-        payload: payload,
-        tableName: 'patients',
-      );
+        headers: headers,
+        body: jsonEncode(payload),
+      ).timeout(const Duration(seconds: 8));
+
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        final db = await DbHelper.instance.database;
+        await db.rawUpdate('UPDATE patients SET is_synced = 1, is_cloud_synced = 1 WHERE id = ?', [patId]);
+      }
     } catch (e, stack) {
       debugPrint('Failed to push customer to Supabase: $e');
       RemoteLoggerService.instance.logError(e, stackTrace: stack, library: 'SupabaseSyncService', context: 'pushCustomer');
@@ -2844,7 +3049,6 @@ class SupabaseSyncService extends ChangeNotifier {
         'discount_amount': discAmt,
         'discount': discAmt,
         'discount_percent': _toDouble(invoice['discount_percent'] ?? invoice['disc_percent']),
-        'additional_discount': _toDouble(invoice['additional_discount']),
         'other_charge': _toDouble(invoice['other_charge']),
         'tax_amount': taxAmt,
         'tax': taxAmt,
@@ -3007,11 +3211,41 @@ class SupabaseSyncService extends ChangeNotifier {
     required ServerConfigService config,
     required String cleanUrl,
   }) async {
+    final invNo = (invoicePayload['invoice_no']?.toString().trim().isNotEmpty == true)
+        ? invoicePayload['invoice_no'].toString().trim()
+        : entryNo;
+    final termId = (invoicePayload['terminal_id']?.toString().trim().isNotEmpty == true)
+        ? invoicePayload['terminal_id'].toString().trim()
+        : config.terminalId;
+
+    final sanitizedInvoice = {
+      'entry_no': entryNo,
+      'invoice_no': invNo,
+      'financial_year': invoicePayload['financial_year']?.toString() ?? '2026-27',
+      'date': invoicePayload['date']?.toString() ?? DateTime.now().toIso8601String(),
+      'patient': invoicePayload['patient']?.toString() ?? invoicePayload['customer_name']?.toString() ?? 'Cash',
+      'mobile': invoicePayload['mobile']?.toString() ?? invoicePayload['customer_phone']?.toString() ?? '',
+      'sub_total': _toDouble(invoicePayload['sub_total'] ?? invoicePayload['subtotal']),
+      'discount': _toDouble(invoicePayload['discount'] ?? invoicePayload['discount_amount']),
+      'grand_total': _toDouble(invoicePayload['grand_total'] ?? invoicePayload['net_amount']),
+      'net_amount': _toDouble(invoicePayload['net_amount'] ?? invoicePayload['grand_total']),
+      'agent': invoicePayload['agent']?.toString() ?? 'Admin',
+      'payment_mode': invoicePayload['payment_mode']?.toString() ?? 'Cash',
+      'is_paid': _toInt(invoicePayload['is_paid'], 1),
+      'is_deleted': _toInt(invoicePayload['is_deleted'], 0),
+      'branch_id': config.storeBranchId,
+      'terminal_id': termId,
+      'updated_at': DateTime.now().toUtc().toIso8601String(),
+    };
+
+    final headers = Map<String, String>.from(config.restHeaders)
+      ..['Prefer'] = 'resolution=merge-duplicates';
+
     final invUri = Uri.parse('$cleanUrl/rest/v1/sales_invoices?on_conflict=entry_no,terminal_id');
     final invRes = await http.post(
       invUri,
-      headers: config.restHeaders,
-      body: jsonEncode(invoicePayload),
+      headers: headers,
+      body: jsonEncode(sanitizedInvoice),
     ).timeout(const Duration(seconds: 8));
 
     if (invRes.statusCode < 200 || invRes.statusCode >= 300) {
@@ -3020,14 +3254,42 @@ class SupabaseSyncService extends ChangeNotifier {
     }
 
     if (itemPayloads.isNotEmpty) {
-      final delUri = Uri.parse('$cleanUrl/rest/v1/sales_items?invoice_no=eq.${Uri.encodeComponent(entryNo)}');
+      final delUri = Uri.parse('$cleanUrl/rest/v1/sales_items?invoice_no=eq.${Uri.encodeComponent(invNo)}');
       await http.delete(delUri, headers: config.restHeaders).timeout(const Duration(seconds: 2)).catchError((_) => http.Response('', 500));
+
+      final sanitizedItems = itemPayloads.map((it) {
+        final qty = _toInt(it['quantity'] ?? it['qty'], 1);
+        final mrp = _toDouble(it['mrp']);
+        final sRate = _toDouble(it['s_rate'] ?? it['unit_price'] ?? it['taxable_sp'], mrp);
+        final pRate = _toDouble(it['purchase_rate'] ?? it['p_rate']);
+        final lCost = _toDouble(it['landing_cost'] ?? it['l_cost'], pRate);
+        final total = _toDouble(it['total_amount'] ?? it['total'] ?? it['net_amount'], qty * sRate);
+
+        return {
+          'invoice_no': invNo,
+          'product_id': it['product_id']?.toString() ?? '',
+          'product_name': it['product_name']?.toString() ?? '',
+          'batch_number': it['batch_number']?.toString() ?? it['batch']?.toString() ?? '',
+          'quantity': qty,
+          'qty': qty,
+          'mrp': mrp,
+          'purchase_rate': pRate,
+          'landing_cost': lCost,
+          'taxable_sp': sRate,
+          'unit_price': sRate,
+          'total_amount': total,
+          'total': total,
+          'branch_id': config.storeBranchId,
+          'terminal_id': termId,
+          'updated_at': DateTime.now().toUtc().toIso8601String(),
+        };
+      }).toList();
 
       final itemsUri = Uri.parse('$cleanUrl/rest/v1/sales_items');
       final itemsRes = await http.post(
         itemsUri,
         headers: config.restHeaders,
-        body: jsonEncode(itemPayloads),
+        body: jsonEncode(sanitizedItems),
       ).timeout(const Duration(seconds: 8));
 
       if (itemsRes.statusCode < 200 || itemsRes.statusCode >= 300) {
@@ -3203,6 +3465,254 @@ class SupabaseSyncService extends ChangeNotifier {
     }
   }
 
+  /// Pushes a sales return receipt and its line items to Supabase via resilient REST engine.
+  Future<bool> pushSalesReturn(Map<String, dynamic> header, List<Map<String, dynamic>> items) async {
+    if (_isRecoveryLocked || _syncPaused || !_isReady) return false;
+    final entryNo = header['entry_no']?.toString() ?? '';
+    if (entryNo.isEmpty) return false;
+
+    try {
+      final config = ServerConfigService.instance;
+      final branchId = config.storeBranchId;
+      final cleanUrl = ServerConfigService.cleanServerUrl(config.supabaseUrl);
+      final terminalId = (header['terminal_id']?.toString().trim().isNotEmpty == true)
+          ? header['terminal_id'].toString().trim()
+          : config.terminalId;
+
+      final payload = {
+        'entry_no': entryNo,
+        'original_invoice_no': header['original_invoice_no']?.toString() ?? '',
+        'date': header['date']?.toString() ?? DateTime.now().toIso8601String(),
+        'customer_acc': header['customer_acc']?.toString() ?? 'Cash',
+        'patient': header['patient']?.toString() ?? '',
+        'doctor': header['doctor']?.toString() ?? '',
+        'sub_total': _toDouble(header['sub_total']),
+        'discount': _toDouble(header['discount']),
+        'tax': _toDouble(header['tax']),
+        'grand_total': _toDouble(header['grand_total']),
+        'narration': header['narration']?.toString() ?? '',
+        'financial_year': header['financial_year']?.toString() ?? '2026-27',
+        'branch_id': branchId,
+        'terminal_id': terminalId,
+        'updated_at': DateTime.now().toUtc().toIso8601String(),
+      };
+
+      Uri uri = Uri.parse('$cleanUrl/rest/v1/sales_return_invoices?on_conflict=entry_no');
+      final headers = Map<String, String>.from(config.restHeaders)..['Prefer'] = 'resolution=merge-duplicates';
+
+      var res = await _safePostSingle(
+        uri,
+        headers: headers,
+        payload: payload,
+        tableName: 'sales_return_invoices',
+        timeout: const Duration(seconds: 10),
+      );
+
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        if (items.isNotEmpty) {
+          final delUri = Uri.parse('$cleanUrl/rest/v1/sales_return_items?return_no=eq.${Uri.encodeComponent(entryNo)}');
+          await config.httpClient.delete(delUri, headers: config.restHeaders).timeout(const Duration(seconds: 4)).catchError((_) => http.Response('', 500));
+
+          final itemPayloads = items.map((it) {
+            return {
+              'return_no': entryNo,
+              'product_id': it['product_id']?.toString() ?? '',
+              'product_name': it['product_name']?.toString() ?? '',
+              'batch_number': it['batch_number']?.toString() ?? it['batch']?.toString() ?? '',
+              'expiry_date': it['expiry_date']?.toString() ?? it['expiry']?.toString() ?? '',
+              'quantity': _toInt(it['quantity'] ?? it['qty'], 1),
+              'mrp': _toDouble(it['mrp']),
+              'total': _toDouble(it['total_amount'] ?? it['total']),
+              'branch_id': branchId,
+              'terminal_id': terminalId,
+              'updated_at': DateTime.now().toUtc().toIso8601String(),
+            };
+          }).toList();
+
+          final itemsUri = Uri.parse('$cleanUrl/rest/v1/sales_return_items');
+          await _safePost(
+            itemsUri,
+            headers: config.restHeaders,
+            payloads: itemPayloads,
+            tableName: 'sales_return_items',
+          );
+        }
+
+        final db = await DbHelper.instance.database;
+        await db.rawUpdate('UPDATE sales_return_invoices SET is_synced = 1, is_cloud_synced = 1 WHERE entry_no = ?', [entryNo]);
+        await db.rawUpdate("UPDATE stock_outbox SET status = 'accepted', updated_at = ? WHERE operation_type = 'SALES_RETURN' AND reference_no = ?", [DateTime.now().toIso8601String(), entryNo]);
+        unawaited(StockOutboxService.instance.refreshCounts());
+        AppLogger.instance.supabase("Cloud Sync: Sales Return $entryNo saved successfully via REST.");
+        notifyListeners();
+        return true;
+      }
+    } catch (e) {
+      debugPrint('pushSalesReturn error: $e');
+    }
+    return false;
+  }
+
+  /// Pushes a purchase return entry and its line items to Supabase via resilient REST engine.
+  Future<bool> pushPurchaseReturn(Map<String, dynamic> header, List<Map<String, dynamic>> items) async {
+    if (_isRecoveryLocked || _syncPaused || !_isReady) return false;
+    final entryNo = header['entry_no']?.toString() ?? '';
+    if (entryNo.isEmpty) return false;
+
+    try {
+      final config = ServerConfigService.instance;
+      final branchId = config.storeBranchId;
+      final cleanUrl = ServerConfigService.cleanServerUrl(config.supabaseUrl);
+      final terminalId = (header['terminal_id']?.toString().trim().isNotEmpty == true)
+          ? header['terminal_id'].toString().trim()
+          : config.terminalId;
+
+      final payload = {
+        'entry_no': entryNo,
+        'date': header['date']?.toString() ?? DateTime.now().toIso8601String(),
+        'supplier_name': header['supplier_name']?.toString() ?? '',
+        'original_purchase_no': header['original_purchase_no']?.toString() ?? '',
+        'done_by': header['done_by']?.toString() ?? 'Admin',
+        'grand_total': _toDouble(header['grand_total']),
+        'financial_year': header['financial_year']?.toString() ?? '2026-27',
+        'branch_id': branchId,
+        'terminal_id': terminalId,
+        'updated_at': DateTime.now().toUtc().toIso8601String(),
+      };
+
+      Uri uri = Uri.parse('$cleanUrl/rest/v1/purchase_return_entries?on_conflict=entry_no');
+      final headers = Map<String, String>.from(config.restHeaders)..['Prefer'] = 'resolution=merge-duplicates';
+
+      var res = await _safePostSingle(
+        uri,
+        headers: headers,
+        payload: payload,
+        tableName: 'purchase_return_entries',
+        timeout: const Duration(seconds: 10),
+      );
+
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        if (items.isNotEmpty) {
+          final delUri = Uri.parse('$cleanUrl/rest/v1/purchase_return_items?entry_no=eq.${Uri.encodeComponent(entryNo)}');
+          await config.httpClient.delete(delUri, headers: config.restHeaders).timeout(const Duration(seconds: 4)).catchError((_) => http.Response('', 500));
+
+          final itemPayloads = items.map((it) {
+            return {
+              'entry_no': entryNo,
+              'product_name': it['product_name']?.toString() ?? '',
+              'batch': it['batch']?.toString() ?? it['batch_number']?.toString() ?? '',
+              'expiry': it['expiry']?.toString() ?? it['expiry_date']?.toString() ?? '',
+              'qty': _toInt(it['qty'] ?? it['quantity'], 1),
+              'p_rate': _toDouble(it['p_rate'] ?? it['purchase_rate']),
+              'landing_cost': _toDouble(it['landing_cost'] ?? it['l_cost']),
+              'total': _toDouble(it['total'] ?? it['total_amount']),
+              'branch_id': branchId,
+              'terminal_id': terminalId,
+              'updated_at': DateTime.now().toUtc().toIso8601String(),
+            };
+          }).toList();
+
+          final itemsUri = Uri.parse('$cleanUrl/rest/v1/purchase_return_items');
+          await _safePost(
+            itemsUri,
+            headers: config.restHeaders,
+            payloads: itemPayloads,
+            tableName: 'purchase_return_items',
+          );
+        }
+
+        final db = await DbHelper.instance.database;
+        await db.rawUpdate('UPDATE purchase_return_entries SET is_synced = 1, is_cloud_synced = 1 WHERE entry_no = ?', [entryNo]);
+        await db.rawUpdate("UPDATE stock_outbox SET status = 'accepted', updated_at = ? WHERE operation_type = 'PURCHASE_RETURN' AND reference_no = ?", [DateTime.now().toIso8601String(), entryNo]);
+        unawaited(StockOutboxService.instance.refreshCounts());
+        AppLogger.instance.supabase("Cloud Sync: Purchase Return $entryNo saved successfully via REST.");
+        notifyListeners();
+        return true;
+      }
+    } catch (e) {
+      debugPrint('pushPurchaseReturn error: $e');
+    }
+    return false;
+  }
+
+  /// Pushes a stock adjustment entry and its line items to Supabase via resilient REST engine.
+  Future<bool> pushStockAdjustment(Map<String, dynamic> header, List<Map<String, dynamic>> items) async {
+    if (_isRecoveryLocked || _syncPaused || !_isReady) return false;
+    final entryNo = header['entry_no']?.toString() ?? '';
+    if (entryNo.isEmpty) return false;
+
+    try {
+      final config = ServerConfigService.instance;
+      final branchId = config.storeBranchId;
+      final cleanUrl = ServerConfigService.cleanServerUrl(config.supabaseUrl);
+
+      final payload = Map<String, dynamic>.from(header);
+      payload['branch_id'] = branchId;
+      payload['terminal_id'] = (payload['terminal_id']?.toString().trim().isNotEmpty == true)
+          ? payload['terminal_id'].toString().trim()
+          : config.terminalId;
+      payload.remove('is_synced');
+      payload.remove('id');
+
+      Uri uri = Uri.parse('$cleanUrl/rest/v1/stock_adjustments?on_conflict=entry_no,terminal_id');
+      final headers = Map<String, String>.from(config.restHeaders)..['Prefer'] = 'resolution=merge-duplicates';
+
+      var res = await _safePostSingle(
+        uri,
+        headers: headers,
+        payload: payload,
+        tableName: 'stock_adjustments',
+        timeout: const Duration(seconds: 10),
+      );
+
+      if (res.statusCode >= 400 && res.body.contains('42P10')) {
+        uri = Uri.parse('$cleanUrl/rest/v1/stock_adjustments?on_conflict=entry_no');
+        res = await _safePostSingle(
+          uri,
+          headers: headers,
+          payload: payload,
+          tableName: 'stock_adjustments',
+          timeout: const Duration(seconds: 10),
+        );
+      }
+
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        if (items.isNotEmpty) {
+          final delUri = Uri.parse('$cleanUrl/rest/v1/stock_adjustment_items?adjustment_no=eq.${Uri.encodeComponent(entryNo)}');
+          await config.httpClient.delete(delUri, headers: config.restHeaders).timeout(const Duration(seconds: 4)).catchError((_) => http.Response('', 500));
+
+          final itemPayloads = items.map((it) {
+            final m = Map<String, dynamic>.from(it);
+            m['branch_id'] = branchId;
+            m['terminal_id'] = payload['terminal_id'];
+            m['adjustment_no'] = entryNo;
+            m.remove('id');
+            m.remove('is_synced');
+            return m;
+          }).toList();
+
+          final itemsUri = Uri.parse('$cleanUrl/rest/v1/stock_adjustment_items');
+          await _safePost(
+            itemsUri,
+            headers: config.restHeaders,
+            payloads: itemPayloads,
+            tableName: 'stock_adjustment_items',
+          );
+        }
+
+        final db = await DbHelper.instance.database;
+        await db.rawUpdate('UPDATE stock_adjustments SET is_synced = 1 WHERE entry_no = ?', [entryNo]);
+        await db.rawUpdate("UPDATE stock_outbox SET status = 'accepted', updated_at = ? WHERE operation_type = 'ADJUSTMENT' AND reference_no = ?", [DateTime.now().toIso8601String(), entryNo]);
+        unawaited(StockOutboxService.instance.refreshCounts());
+        AppLogger.instance.supabase("Cloud Sync: Stock Adjustment $entryNo saved successfully via REST.");
+        notifyListeners();
+        return true;
+      }
+    } catch (e) {
+      debugPrint('pushStockAdjustment error: $e');
+    }
+    return false;
+  }
+
   // --- Private Helpers ---
 
   static final Set<String> _missingCloudTables = <String>{};
@@ -3327,8 +3837,8 @@ class SupabaseSyncService extends ChangeNotifier {
         int colRetries = 0;
         while (res.statusCode >= 400 && colRetries < 15 && (res.body.contains('PGRST204') || res.body.contains('column'))) {
           colRetries++;
-          final match = RegExp(r"Could not find the '([^']+)' column|column '([^']+)' does not exist", caseSensitive: false).firstMatch(res.body);
-          final missingCol = match?.group(1) ?? match?.group(2);
+          final match = RegExp(r"Could not find the '([^']+)' column|column (?:[a-zA-Z0-9_]+\.)?([a-zA-Z0-9_]+) does not exist|column '([^']+)' does not exist", caseSensitive: false).firstMatch(res.body);
+          final missingCol = match?.group(1) ?? match?.group(2) ?? match?.group(3);
 
           if (missingCol != null && missingCol.isNotEmpty) {
             markColumnUnmapped(tableName, missingCol);
@@ -3514,7 +4024,6 @@ class SupabaseSyncService extends ChangeNotifier {
 
       final config = ServerConfigService.instance;
       final branchId = config.storeBranchId;
-      final terminalId = config.terminalId;
       final uri = Uri.parse('${config.supabaseUrl}/rest/v1/product_master?on_conflict=id');
       final exportHeaders = Map<String, String>.from(config.restHeaders)
         ..['Prefer'] = 'resolution=merge-duplicates, return=minimal';
@@ -3577,7 +4086,7 @@ class SupabaseSyncService extends ChangeNotifier {
               'category_id': _cleanString(p['category_id']),
               'sub_category_id': _cleanString(p['sub_category_id']),
               'manufacturer_id': _cleanString(p['manufacturer_id']),
-              'rack_id': _cleanString(p['rack_id']),
+              'rack': _cleanString(p['rack_id'] ?? p['rack']),
               'hsn_code': _cleanString(p['hsn_code']),
               'gst_rate': gstVal,
               's_disc_percent': _toDouble(p['s_disc_percent']),
@@ -3802,9 +4311,11 @@ class SupabaseSyncService extends ChangeNotifier {
             final purchaseRate = _toDouble(b['purchase_rate'], 0.0);
             final landingCost = _toDouble(b['landing_cost'], purchaseRate);
             final mrpVal = _toDouble(b['mrp'], 0.0);
-            final qty = _toInt(b['current_quantity'] ?? b['current_stock'], 0);
+            final int localStock = _toInt(b['current_stock'], 0);
+            final int localQty = _toInt(b['current_quantity'], 0);
+            final qty = localStock > 0 ? localStock : localQty;
 
-            final cleanKeyStr = '${prodId}_${batchNo}_$expiryStr'.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+            final cleanKeyStr = '${branchId}_${prodId}_${batchNo}_$expiryStr'.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
             if (uniqueBatchesMap.containsKey(cleanKeyStr)) {
               uniqueBatchesMap[cleanKeyStr]!['current_quantity'] = (uniqueBatchesMap[cleanKeyStr]!['current_quantity'] as int) + qty;
             } else {
@@ -3990,8 +4501,6 @@ class SupabaseSyncService extends ChangeNotifier {
 
     try {
       final db = await DbHelper.instance.database;
-      final config = ServerConfigService.instance;
-      final branchId = config.storeBranchId;
 
       final totalInvoices = forceFull
           ? ((await db.rawQuery('SELECT COUNT(*) as cnt FROM sales_invoices')).first['cnt'] as int? ?? 0)
@@ -4141,8 +4650,8 @@ class SupabaseSyncService extends ChangeNotifier {
           final fyStr = (pur['financial_year'] != null && pur['financial_year'].toString().isNotEmpty)
               ? pur['financial_year'].toString()
               : computedFy;
-          final cleanNo = rawEntryNo.contains('_') ? rawEntryNo.substring(rawEntryNo.indexOf('_') + 1) : rawEntryNo;
-          final entryNo = rawEntryNo.contains('_') ? rawEntryNo : "${fyStr}_$cleanNo";
+          final cleanNo = cleanEntryNo(rawEntryNo);
+          final entryNo = cleanNo.isNotEmpty ? cleanNo : rawEntryNo;
 
           return {
             'entry_no': entryNo,
@@ -4930,7 +5439,7 @@ class SupabaseSyncService extends ChangeNotifier {
           'category_id': item['category_id']?.toString() ?? '',
           'sub_category_id': item['sub_category_id']?.toString() ?? '',
           'manufacturer_id': item['manufacturer_id']?.toString() ?? '',
-          'rack_id': item['rack_id']?.toString() ?? '',
+          'rack_id': (item['rack_id'] ?? item['rack'])?.toString() ?? '',
           'hsn_code': item['hsn_code']?.toString() ?? '',
           'gst_percent': _parseGstPercent(item, 12.0),
           's_disc_percent': _parseDiscPercent(item, 0.0),
@@ -5024,7 +5533,6 @@ class SupabaseSyncService extends ChangeNotifier {
     if (!_isReady) return false;
     bool pulledNewData = false;
     try {
-      final config = ServerConfigService.instance;
       final db = await DbHelper.instance.database;
 
       final String timeFilter = (!forceFull && _lastSyncTime != null)
@@ -5368,7 +5876,6 @@ class SupabaseSyncService extends ChangeNotifier {
                   'grand_total': _toDouble(item['net_amount'] ?? item['grand_total'] ?? item['total_amount']),
                   'discount': _toDouble(item['discount'] ?? item['discount_amount'] ?? item['disc_amt'] ?? item['dis_amt']),
                   'discount_percent': _toDouble(item['discount_percent'] ?? item['disc_percent'] ?? item['disc_per']),
-                  'additional_discount': _toDouble(item['additional_discount']),
                   'other_charge': _toDouble(item['other_charge']),
                   'tax': _toDouble(item['tax_amount'] ?? item['tax']),
                   'round_off': _toDouble(item['round_off']),
@@ -5698,8 +6205,8 @@ class SupabaseSyncService extends ChangeNotifier {
                 final fyStr = (item['financial_year'] != null && item['financial_year'].toString().isNotEmpty)
                     ? item['financial_year'].toString()
                     : computedFy;
-                final cleanNo = rawEntryNo.contains('_') ? rawEntryNo.substring(rawEntryNo.indexOf('_') + 1) : rawEntryNo;
-                final entryNo = rawEntryNo.contains('_') ? rawEntryNo : "${fyStr}_$cleanNo";
+                final cleanNo = cleanEntryNo(rawEntryNo);
+                final entryNo = cleanNo.isNotEmpty ? cleanNo : rawEntryNo;
 
                 final pendingDel = await txn.query(
                   'pending_deletions',

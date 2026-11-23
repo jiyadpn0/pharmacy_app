@@ -54,7 +54,6 @@ class _NotificationPanelDialogState extends State<NotificationPanelDialog> with 
       case NotificationType.security:
         return Icons.shield_rounded;
       case NotificationType.watchdog:
-      default:
         return Icons.visibility_rounded;
     }
   }
@@ -71,7 +70,6 @@ class _NotificationPanelDialogState extends State<NotificationPanelDialog> with 
       case NotificationType.security:
         return Colors.indigo.shade700;
       case NotificationType.watchdog:
-      default:
         return Colors.purple.shade700;
     }
   }
@@ -89,7 +87,6 @@ class _NotificationPanelDialogState extends State<NotificationPanelDialog> with 
         final stockNotifs = service.getNotificationsByType(NotificationType.stock);
         final syncNotifs = service.getNotificationsByType(NotificationType.backup);
         final securityNotifs = service.getNotificationsByType(NotificationType.security);
-        final watchdogNotifs = service.getNotificationsByType(NotificationType.watchdog);
 
         return ClipRRect(
           borderRadius: BorderRadius.circular(16),

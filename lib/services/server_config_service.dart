@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show Platform;
 import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
@@ -41,9 +42,10 @@ class ServerConfigService extends ChangeNotifier {
 
   static const String _keyMachineUuid = 'machine_unique_uuid';
   static const String _keyTerminalConfigured = 'terminal_id_configured';
+  static const String _keyComputerName = 'computer_registered_name';
 
-  static const String _defaultSupabaseUrl = 'https://megmcfgqaosmqzvlirbt.supabase.co';
-  static const String _defaultSupabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1lZ21jZmdxYW9zbXF6dmxpcmJ0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE4MTI4NzgsImV4cCI6MjEwNzM4ODg3OH0.GfO9G4-OUBS3t6j_VcCt6aRBsIMu_tXMVSzENPLsPIo';
+  static const String _defaultSupabaseUrl = 'https://awnfbjvvvtdzcluekwjl.supabase.co';
+  static const String _defaultSupabaseAnonKey = 'sb_publishable_VVg6DhhXbaRjytujA0dkEw_BBg7BYWS';
 
   bool _isServerModeEnabled = true;
   bool _isLanSyncEnabled = true;
@@ -53,25 +55,29 @@ class ServerConfigService extends ChangeNotifier {
   String _supabaseAnonKey = _defaultSupabaseAnonKey;
   String _storeBranchId = 'MAIN_STORE';
   String _terminalId = 'POS-01';
+  String _computerName = '';
   String _machineUuid = '';
   bool _isTerminalConfigured = false;
   String _lastKnownEpoch = '';
   int _cloudDataPruningTimerYears = 3;
   bool _autoSyncEnabled = true;
   bool _isWiping = false;
+  int _lastPingMs = 0;
   ServerConnectionStatus _status = ServerConnectionStatus.disconnected;
   String _lastErrorMessage = '';
 
+  int get lastPingMs => _lastPingMs;
   bool get isServerModeEnabled => _isServerModeEnabled;
   bool get isLanSyncEnabled => _isLanSyncEnabled;
   bool get bgSyncOnSave => _bgSyncOnSave;
   String get lastKnownEpoch => _lastKnownEpoch;
   AppSyncMode get syncMode => _syncMode;
   bool get isPureCloud => _syncMode == AppSyncMode.pureCloud;
-  String get supabaseUrl => _supabaseUrl;
+  String get supabaseUrl => cleanServerUrl(_supabaseUrl);
   String get supabaseAnonKey => _supabaseAnonKey;
   String get storeBranchId => _storeBranchId;
   String get terminalId => _terminalId;
+  String get computerName => _computerName;
   String get machineUuid {
     if (_machineUuid.isEmpty) {
       _machineUuid = "MACH_${DateTime.now().microsecondsSinceEpoch}_${Random().nextInt(100000)}";
@@ -88,7 +94,30 @@ class ServerConfigService extends ChangeNotifier {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_keyTerminalId, _terminalId);
       await prefs.setBool(_keyTerminalConfigured, true);
+
+      // Keep Supabase registered_terminals updated with the user's manual terminal assignment
+      if (_supabaseUrl.isNotEmpty && _supabaseAnonKey.isNotEmpty) {
+        final cleanUrl = cleanServerUrl(_supabaseUrl);
+        final regUri = Uri.parse('$cleanUrl/rest/v1/registered_terminals?machine_id=eq.$machineUuid');
+        unawaited(http.patch(
+          regUri,
+          headers: restHeaders,
+          body: jsonEncode({
+            'terminal_id': _terminalId,
+            'branch_id': _storeBranchId,
+            'last_seen_at': DateTime.now().toUtc().toIso8601String(),
+          }),
+        ).timeout(const Duration(seconds: 4)).catchError((_) => http.Response('', 500)));
+      }
     } catch (_) {}
+    notifyListeners();
+  }
+
+  void overrideTerminalId(String id) {
+    if (id.trim().isEmpty) return;
+    _terminalId = id.trim().toUpperCase();
+    _machineUuid = "MACH_VIRTUAL_$_terminalId";
+    _isTerminalConfigured = true;
     notifyListeners();
   }
 
@@ -131,20 +160,20 @@ class ServerConfigService extends ChangeNotifier {
     }
   }
 
-  /// Formatted entry prefix derived from terminal ID (e.g., T1-, T2-, T3-).
-  /// Ensures PC 1, PC 2, and PC 3 never generate overlapping invoice numbers.
+  /// Dynamic terminal sequence prefix:
+  /// Single terminal (POS-01) produces clean numeric entries (1, 2, 3...).
+  /// Multi-terminal setups (POS-02, POS-03, etc.) automatically prefix entries (T2-, T3-) to guarantee zero collision.
   String get terminalPrefix {
-    final cleanId = _terminalId.replaceAll(RegExp(r'[^0-9]'), '');
-    final numId = int.tryParse(cleanId);
-    if (numId != null) return 'T$numId-';
-
-    final upper = _terminalId.trim().toUpperCase();
-    if (upper.contains('PC2') || upper.contains('PC-2') || upper.contains('TERM2') || upper.contains('TERMINAL2')) return 'T2-';
-    if (upper.contains('PC3') || upper.contains('PC-3') || upper.contains('TERM3') || upper.contains('TERMINAL3')) return 'T3-';
-    if (upper.contains('PC1') || upper.contains('PC-1') || upper.contains('TERM1') || upper.contains('TERMINAL1')) return 'T1-';
-
-    final trimmed = upper.replaceAll(RegExp(r'[^A-Z0-9-]'), '');
-    return trimmed.isNotEmpty ? '$trimmed-' : 'T1-';
+    final term = _terminalId.trim().toUpperCase();
+    if (term.isEmpty || term == 'POS-01' || term == 'POS-1' || term == 'SERVER' || term == 'COUNTER-01') {
+      return '';
+    }
+    final digits = term.replaceAll(RegExp(r'\D'), '');
+    final num = int.tryParse(digits);
+    if (num != null && num > 1) {
+      return 'T$num-';
+    }
+    return '$term-';
   }
 
   String? _duplicateTerminalWarning;
@@ -185,7 +214,8 @@ class ServerConfigService extends ChangeNotifier {
 
       for (var item in list) {
         final otherMachine = item['machine_id']?.toString().trim() ?? '';
-        if (otherMachine.isNotEmpty && otherMachine == _machineUuid) continue;
+        // Skip this PC's own records and skip stale/legacy unmapped entries with missing machine_id
+        if (otherMachine.isEmpty || otherMachine == _machineUuid) continue;
 
         final lastSeenStr = item['last_seen_at']?.toString() ?? item['last_seen']?.toString() ?? '';
         final lastSeen = DateTime.tryParse(lastSeenStr);
@@ -194,9 +224,13 @@ class ServerConfigService extends ChangeNotifier {
         final otherTerm = item['terminal_id']?.toString().trim().toUpperCase() ?? '';
         if (otherTerm.isEmpty) continue;
 
-        // 1. Exact Duplicate Terminal ID Check
+        // 1. Exact Duplicate Terminal ID Check (Auto-Resolve to POS-02 / POS-03)
         if (otherTerm == currentTerm) {
-          _duplicateTerminalWarning = "CRITICAL SETUP CONFLICT: Another computer ($otherMachine) is actively using the identical Terminal ID '$currentTerm' in branch '$_storeBranchId'. Please assign a distinct Terminal ID (e.g. POS-02) in Server Settings.";
+          final curNum = int.tryParse(currentTerm.replaceAll(RegExp(r'\D'), '')) ?? 1;
+          final nextTermNum = curNum + 1;
+          final newTermId = "POS-0$nextTermNum";
+          await setTerminalId(newTermId);
+          _duplicateTerminalWarning = "TERMINAL CONFLICT AUTO-RESOLVED: Another PC is using '$currentTerm'. Automatically assigned '$newTermId' to this PC.";
           notifyListeners();
           return _duplicateTerminalWarning;
         }
@@ -227,11 +261,92 @@ class ServerConfigService extends ChangeNotifier {
     return _duplicateTerminalWarning;
   }
 
+  /// Automatically requests, leases, or synchronizes this PC's Terminal ID and Computer Name
+  /// with Supabase `registered_terminals`. If the server administrator edited this PC's
+  /// assigned terminal ID or name on the server, this pulls and applies the update locally.
+  Future<void> autoLeaseTerminalFromServer() async {
+    final cleanUrl = cleanServerUrl(_supabaseUrl);
+    final cleanKey = _supabaseAnonKey.trim();
+    if (cleanUrl.isEmpty || cleanKey.isEmpty) return;
+
+    final mId = machineUuid;
+    String hostName = '';
+    if (!kIsWeb) {
+      try {
+        hostName = Platform.localHostname;
+      } catch (_) {}
+    }
+    if (hostName.isEmpty) {
+      final safeEnd = mId.length > 6 ? mId.substring(mId.length - 6) : mId;
+      hostName = 'PC-$safeEnd';
+    }
+
+    final uri = Uri.parse('$cleanUrl/rest/v1/rpc/fn_auto_lease_terminal');
+    try {
+      final response = await http.post(
+        uri,
+        headers: restHeaders,
+        body: jsonEncode({
+          'p_machine_id': mId,
+          'p_computer_name': hostName,
+          'p_branch_id': _storeBranchId,
+        }),
+      ).timeout(const Duration(seconds: 6));
+
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        final data = jsonDecode(response.body);
+        if (data is Map && data['success'] == true) {
+          final serverTerm = data['terminal_id']?.toString().trim().toUpperCase() ?? '';
+          final serverName = data['computer_name']?.toString().trim() ?? '';
+
+          bool hasChanges = false;
+          // Only auto-assign terminal from server if this PC has not been explicitly configured by user
+          if (!_isTerminalConfigured && serverTerm.isNotEmpty && serverTerm != _terminalId) {
+            _terminalId = serverTerm;
+            _isTerminalConfigured = true;
+            hasChanges = true;
+          }
+          if (serverName.isNotEmpty && serverName != _computerName) {
+            _computerName = serverName;
+            hasChanges = true;
+          }
+
+          if (hasChanges) {
+            final prefs = await SharedPreferences.getInstance();
+            await prefs.setString(_keyTerminalId, _terminalId);
+            await prefs.setString(_keyComputerName, _computerName);
+            await prefs.setBool(_keyTerminalConfigured, true);
+            AppLogger.instance.supabase("AUTO-LEASED TERMINAL FROM SERVER: $_terminalId (${_computerName.isNotEmpty ? _computerName : hostName})");
+            notifyListeners();
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('autoLeaseTerminalFromServer notice: $e');
+    }
+  }
+
   int get cloudDataPruningTimerYears => _cloudDataPruningTimerYears;
   bool get autoSyncEnabled => _autoSyncEnabled;
   ServerConnectionStatus get status => _status;
   String get lastErrorMessage => _lastErrorMessage;
   bool get isConnected => _status == ServerConnectionStatus.connected;
+
+  http.Client? _persistentClient;
+
+  /// High-performance persistent HTTP client for REST operations with Keep-Alive enabled
+  http.Client get httpClient {
+    _persistentClient ??= http.Client();
+    return _persistentClient!;
+  }
+
+  /// Resets the persistent HTTP client (e.g. on URL change or network reset)
+  void resetHttpClient() {
+    try {
+      _persistentClient?.close();
+    } catch (_) {}
+    _persistentClient = null;
+  }
 
   /// Standard HTTP headers for Supabase REST API requests
   Map<String, String> get restHeaders {
@@ -239,14 +354,30 @@ class ServerConfigService extends ChangeNotifier {
       'apikey': _supabaseAnonKey.trim(),
       'Authorization': 'Bearer ${_supabaseAnonKey.trim()}',
       'Content-Type': 'application/json',
-      'Prefer': 'resolution=merge-duplicates',
+      'Accept-Encoding': 'gzip, deflate',
+    };
+  }
+
+  /// Headers optimized for REST inserts and updates
+  Map<String, String> get restMutationHeaders {
+    return {
+      'apikey': _supabaseAnonKey.trim(),
+      'Authorization': 'Bearer ${_supabaseAnonKey.trim()}',
+      'Content-Type': 'application/json',
+      'Prefer': 'return=minimal,resolution=merge-duplicates',
       'Accept-Encoding': 'gzip, deflate',
     };
   }
 
   static String cleanServerUrl(String rawUrl) {
     var clean = rawUrl.trim();
-    while (clean.endsWith('/') || clean.endsWith('.')) {
+    // Strip accidental surrounding quotes
+    if ((clean.startsWith('"') && clean.endsWith('"')) ||
+        (clean.startsWith("'") && clean.endsWith("'"))) {
+      clean = clean.substring(1, clean.length - 1).trim();
+    }
+    // Strip trailing slashes, backslashes, dots, and whitespace
+    while (clean.endsWith('/') || clean.endsWith(r'\') || clean.endsWith('.')) {
       clean = clean.substring(0, clean.length - 1).trim();
     }
     // Remove accidentally pasted paths like /rest/v1 or /auth/v1
@@ -255,11 +386,8 @@ class ServerConfigService extends ChangeNotifier {
     } else if (clean.toLowerCase().endsWith('/auth/v1')) {
       clean = clean.substring(0, clean.length - 8).trim();
     }
-    while (clean.endsWith('/') || clean.endsWith('.')) {
+    while (clean.endsWith('/') || clean.endsWith(r'\') || clean.endsWith('.')) {
       clean = clean.substring(0, clean.length - 1).trim();
-    }
-    if (clean.toLowerCase().endsWith('.supabase.c')) {
-      clean = '${clean}o';
     }
     return clean;
   }
@@ -270,7 +398,12 @@ class ServerConfigService extends ChangeNotifier {
       final prefs = await SharedPreferences.getInstance();
       _supabaseUrl = cleanServerUrl(prefs.getString(_keySupabaseUrl) ?? _defaultSupabaseUrl);
       _supabaseAnonKey = prefs.getString(_keySupabaseAnonKey) ?? _defaultSupabaseAnonKey;
-      if (_supabaseUrl.isEmpty) _supabaseUrl = _defaultSupabaseUrl;
+      if (_supabaseUrl.isEmpty || _supabaseUrl.contains('megmcfgqaosmqzvlirbt')) {
+        _supabaseUrl = _defaultSupabaseUrl;
+        _supabaseAnonKey = _defaultSupabaseAnonKey;
+        await prefs.setString(_keySupabaseUrl, _supabaseUrl);
+        await prefs.setString(_keySupabaseAnonKey, _supabaseAnonKey);
+      }
       if (_supabaseAnonKey.isEmpty) _supabaseAnonKey = _defaultSupabaseAnonKey;
       _storeBranchId = prefs.getString(_keyStoreBranchId) ?? 'MAIN_STORE';
       _machineUuid = prefs.getString(_keyMachineUuid) ?? '';
@@ -279,6 +412,7 @@ class ServerConfigService extends ChangeNotifier {
         await prefs.setString(_keyMachineUuid, _machineUuid);
       }
       _isTerminalConfigured = prefs.getBool(_keyTerminalConfigured) ?? false;
+      _computerName = prefs.getString(_keyComputerName) ?? '';
       var savedTerminal = prefs.getString(_keyTerminalId) ?? '';
       if (savedTerminal.isEmpty) {
         savedTerminal = 'POS-01';
@@ -398,48 +532,88 @@ class ServerConfigService extends ChangeNotifier {
   }
 
   Timer? _reconnectWatchdogTimer;
+  Future<bool>? _inFlightCheck;
+
+  /// Fast manual / on-demand probe that checks connection immediately without waiting for watchdog
+  Future<bool> checkConnectionNow({Duration timeout = const Duration(seconds: 3)}) async {
+    if (_isWiping) return false;
+    if (!isPureCloud && !_isServerModeEnabled) return false;
+    if (_supabaseUrl.isEmpty || _supabaseAnonKey.isEmpty) return false;
+
+    if (_inFlightCheck != null) {
+      return _inFlightCheck!;
+    }
+
+    _inFlightCheck = _runProbe(timeout: timeout);
+    try {
+      return await _inFlightCheck!;
+    } finally {
+      _inFlightCheck = null;
+    }
+  }
+
+  Future<bool> _runProbe({required Duration timeout}) async {
+    final wasConnected = _status == ServerConnectionStatus.connected;
+    final isAlive = await testConnection(_supabaseUrl, _supabaseAnonKey, timeout: timeout);
+    if (isAlive) {
+      if (!wasConnected) {
+        _status = ServerConnectionStatus.connected;
+        _lastErrorMessage = '';
+        notifyListeners();
+        SupabaseRealtimeService.instance.resumeSubscriptions();
+        SupabaseSyncService.instance.initRealtimeListeners();
+        unawaited(SupabaseRealtimeService.instance.ensureRealtimeListenersActive());
+        SupabaseSyncService.instance.triggerInstantSync();
+        unawaited(DeltaSyncService.instance.triggerReconnectionCatchupSync());
+      }
+    } else {
+      if (wasConnected) {
+        _status = ServerConnectionStatus.error;
+        notifyListeners();
+      }
+    }
+    _scheduleWatchdogTick();
+    return isAlive;
+  }
+
+  void _scheduleWatchdogTick() {
+    _reconnectWatchdogTimer?.cancel();
+    if (_isWiping) return;
+    if (!isPureCloud && !_isServerModeEnabled) return;
+    if (_supabaseUrl.isEmpty || _supabaseAnonKey.isEmpty) return;
+
+    // Ultra-fast recovery watchdog:
+    // When offline/disconnected, check every 1.5 seconds with a tight 2s timeout so the moment internet
+    // is back, the app recovers in ~1.5s instead of waiting 6-10s!
+    // Once connected, relax to 6 seconds to avoid unnecessary network overhead.
+    final Duration interval = (_status == ServerConnectionStatus.connected)
+        ? const Duration(seconds: 6)
+        : const Duration(milliseconds: 1500);
+
+    _reconnectWatchdogTimer = Timer(interval, () async {
+      final probeTimeout = (_status == ServerConnectionStatus.connected)
+          ? const Duration(seconds: 4)
+          : const Duration(milliseconds: 2000);
+      await checkConnectionNow(timeout: probeTimeout);
+    });
+  }
 
   void _startConnectionWatchdog() {
     _reconnectWatchdogTimer?.cancel();
 
-    // Quick startup retries at 5s and 15s if initial connection attempt didn't succeed immediately
-    for (var delaySeconds in [5, 15]) {
+    // Quick startup retries at 2s and 6s if initial connection attempt didn't succeed immediately
+    for (var delaySeconds in [2, 6]) {
       Future.delayed(Duration(seconds: delaySeconds), () async {
         if (_isWiping || !_isServerModeEnabled) return;
         if (_supabaseUrl.isNotEmpty && _supabaseAnonKey.isNotEmpty) {
           if (_status != ServerConnectionStatus.connected) {
-            final isAlive = await testConnection(_supabaseUrl, _supabaseAnonKey);
-            if (isAlive) {
-              _status = ServerConnectionStatus.connected;
-              _lastErrorMessage = '';
-              notifyListeners();
-              SupabaseSyncService.instance.initRealtimeListeners();
-              unawaited(SupabaseRealtimeService.instance.ensureRealtimeListenersActive());
-              SupabaseSyncService.instance.triggerInstantSync();
-              unawaited(DeltaSyncService.instance.triggerReconnectionCatchupSync());
-            }
+            await checkConnectionNow(timeout: const Duration(seconds: 2));
           }
         }
       });
     }
 
-    _reconnectWatchdogTimer = Timer.periodic(const Duration(seconds: 30), (_) async {
-      if (_isWiping || !_isServerModeEnabled) return;
-      if (_supabaseUrl.isNotEmpty && _supabaseAnonKey.isNotEmpty) {
-        if (_status != ServerConnectionStatus.connected) {
-          final isAlive = await testConnection(_supabaseUrl, _supabaseAnonKey);
-          if (isAlive) {
-            _status = ServerConnectionStatus.connected;
-            _lastErrorMessage = '';
-            notifyListeners();
-            SupabaseSyncService.instance.initRealtimeListeners();
-            unawaited(SupabaseRealtimeService.instance.ensureRealtimeListenersActive());
-            SupabaseSyncService.instance.triggerInstantSync();
-            unawaited(DeltaSyncService.instance.triggerReconnectionCatchupSync());
-          }
-        }
-      }
-    });
+    _scheduleWatchdogTick();
   }
 
   /// Sets the cloud data retention / pruning timer in years (0 = disabled/keep all).
@@ -493,6 +667,7 @@ class ServerConfigService extends ChangeNotifier {
       _supabaseUrl = cleanUrl;
       _supabaseAnonKey = cleanKey;
       _storeBranchId = cleanBranch;
+      resetHttpClient();
 
       if (!enableMode || cleanUrl.isEmpty || cleanKey.isEmpty) {
         _status = ServerConnectionStatus.disconnected;
@@ -505,17 +680,25 @@ class ServerConfigService extends ChangeNotifier {
       if (isAlive) {
         _status = ServerConnectionStatus.connected;
         _lastErrorMessage = '';
+        SupabaseRealtimeService.instance.resumeSubscriptions();
         AppLogger.instance.supabase("SERVER CONNECTED successfully. Branch: $_storeBranchId, URL: $cleanUrl");
+        unawaited(autoLeaseTerminalFromServer());
       } else {
         _status = ServerConnectionStatus.error;
-        _lastErrorMessage = 'Server reached, but returned invalid response.';
-        AppLogger.instance.supabase("SERVER DISCONNECTED / ERROR: Invalid ping response from $cleanUrl", level: LogLevel.error);
+        if (_lastErrorMessage.isEmpty) {
+          _lastErrorMessage = 'Server reached, but returned invalid response.';
+        }
+        AppLogger.instance.supabase("SERVER DISCONNECTED / ERROR: $_lastErrorMessage ($cleanUrl)", level: LogLevel.error);
+        SupabaseRealtimeService.instance.pauseSubscriptions();
+        SupabaseRealtimeService.instance.disposeAllChannelsOnly();
       }
     } catch (e) {
       _status = ServerConnectionStatus.error;
       _lastErrorMessage = 'Failed to connect: $e';
       AppLogger.instance.supabase("SERVER DISCONNECTED / CONNECTION ERROR", details: e.toString(), level: LogLevel.error);
       debugPrint('Supabase connection error: $e');
+      SupabaseRealtimeService.instance.pauseSubscriptions();
+      SupabaseRealtimeService.instance.disposeAllChannelsOnly();
     }
 
     notifyListeners();
@@ -533,7 +716,11 @@ class ServerConfigService extends ChangeNotifier {
   }
 
   /// Tests connection latency and health for a given Supabase URL and Key.
-  Future<bool> testConnection(String url, String anonKey) async {
+  Future<bool> testConnection(
+    String url,
+    String anonKey, {
+    Duration timeout = const Duration(seconds: 4),
+  }) async {
     if (_isWiping) return true;
     _lastErrorMessage = '';
     final cleanUrl = cleanServerUrl(url);
@@ -560,17 +747,20 @@ class ServerConfigService extends ChangeNotifier {
     }
 
     try {
+      final sw = Stopwatch()..start();
       // Ping Supabase Gateway auth settings endpoint to verify URL reachability and API key validity
       // without depending on business table RLS permissions
       var uri = Uri.parse('$cleanUrl/auth/v1/settings');
       var res = await http.get(uri, headers: {
         'apikey': cleanKey,
         'Authorization': 'Bearer $cleanKey',
-      }).timeout(const Duration(seconds: 10));
+      }).timeout(timeout);
+      sw.stop();
 
-      debugPrint('Supabase connection check status code: ${res.statusCode}');
+      debugPrint('Supabase connection check status code: ${res.statusCode} (${sw.elapsedMilliseconds}ms)');
 
       if (res.statusCode >= 200 && res.statusCode < 300) {
+        _lastPingMs = sw.elapsedMilliseconds;
         if (_status != ServerConnectionStatus.connected || _lastErrorMessage.isNotEmpty) {
           _status = ServerConnectionStatus.connected;
           _lastErrorMessage = '';
@@ -581,13 +771,16 @@ class ServerConfigService extends ChangeNotifier {
 
       // Fallback check to table REST endpoint if GoTrue auth service is disabled or self-hosted
       if (res.statusCode == 404) {
+        final fbSw = Stopwatch()..start();
         final tableUri = Uri.parse('$cleanUrl/rest/v1/sales_invoices?select=entry_no&limit=1');
         final tableRes = await http.get(tableUri, headers: {
           'apikey': cleanKey,
           'Authorization': 'Bearer $cleanKey',
-        }).timeout(const Duration(seconds: 10));
+        }).timeout(timeout);
+        fbSw.stop();
 
         if (tableRes.statusCode >= 200 && tableRes.statusCode < 300) {
+          _lastPingMs = fbSw.elapsedMilliseconds;
           if (_status != ServerConnectionStatus.connected || _lastErrorMessage.isNotEmpty) {
             _status = ServerConnectionStatus.connected;
             _lastErrorMessage = '';
@@ -621,10 +814,13 @@ class ServerConfigService extends ChangeNotifier {
     } catch (e) {
       debugPrint('Supabase connection attempt error: $e');
       String newError = 'Connection Failed: $e';
-      if (e.toString().contains('11001') || e.toString().contains('Failed host lookup') || e.toString().contains('SocketException')) {
-        newError = 'Offline Mode: Unable to resolve host or no Internet connection.';
-      } else if (e is TimeoutException) {
-        newError = 'Connection Timeout: Server did not respond in time.';
+      final eStr = e.toString().toLowerCase();
+      if (eStr.contains('11001') || eStr.contains('failed host lookup') || eStr.contains('socketexception') || eStr.contains('network is unreachable')) {
+        newError = 'Internet Disconnected: Unable to reach host or no internet connection.';
+      } else if (e is TimeoutException || eStr.contains('timeout')) {
+        newError = 'Server Timeout: Cloud server is taking too long to respond.';
+      } else {
+        newError = 'Server Connection Error: $e';
       }
 
       if (_status != ServerConnectionStatus.error || _lastErrorMessage != newError) {

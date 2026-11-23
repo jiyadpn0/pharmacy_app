@@ -4,6 +4,8 @@ import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import '../providers/pharmacy_provider.dart';
 import '../services/server_config_service.dart';
+import '../services/supabase_sync_service.dart';
+import '../services/pure_cloud_service.dart';
 
 import '../utils/app_dialogs.dart';
 import '../widgets/pin_unlock_dialog.dart';
@@ -170,6 +172,7 @@ class _DamageEntryScreenState extends State<DamageEntryScreen> implements Unsave
   void initState() {
     super.initState();
     UnsavedChangesRegistry.register("DAMAGE ENTRY", this);
+    ServerConfigService.instance.addListener(_onConfigChanged);
     _reasonCtrl.text = widget.initialReason?.toUpperCase() ?? "DAMAGED";
     _dateCtrl.text = DateFormat('dd/MM/yyyy').format(DateTime.now());
 
@@ -188,8 +191,13 @@ class _DamageEntryScreenState extends State<DamageEntryScreen> implements Unsave
     });
   }
 
+  void _onConfigChanged() {
+    if (mounted) setState(() {});
+  }
+
   @override
   void dispose() {
+    ServerConfigService.instance.removeListener(_onConfigChanged);
     UnsavedChangesRegistry.unregister("DAMAGE ENTRY");
     _entryNoCtrl.dispose();
     _dateCtrl.dispose();
@@ -496,21 +504,25 @@ class _DamageEntryScreenState extends State<DamageEntryScreen> implements Unsave
 
       String targetEntryNo = isEdit ? _entryNoCtrl.text : "";
       if (!isEdit) {
-        final rawNo = cleanEntryNo(_entryNoCtrl.text);
-        final resolvedNo = await provider.resolveGuaranteedNextEntryNo('stock_adjustments', rawNo);
-        if (resolvedNo != rawNo && rawNo.isNotEmpty) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text("Entry #$rawNo already taken. Automatically saved as Entry #$resolvedNo"),
-                backgroundColor: Colors.blueAccent,
-                duration: const Duration(seconds: 4),
-              ),
+        String requested = cleanEntryNo(_entryNoCtrl.text);
+        try {
+          if (ServerConfigService.instance.isConnected) {
+            final allocated = await SupabaseSyncService.instance.allocateRemoteAtomicSequence(
+              'stock_adjustments',
+              provider.selectedFinancialYear,
             );
-            _entryNoCtrl.text = resolvedNo;
+            if (allocated != null && allocated > 0) {
+              requested = allocated.toString();
+            }
           }
-        }
-        targetEntryNo = resolvedNo;
+          final bool taken = await provider.isEntryTaken('stock_adjustments', requested);
+          if (taken || requested.isEmpty || requested == "AUTO") {
+            requested = await provider.resolveGuaranteedNextEntryNo('stock_adjustments', requested.isNotEmpty ? requested : "1", checkCloud: true);
+          }
+        } catch (_) {}
+
+        targetEntryNo = requested;
+        _entryNoCtrl.text = requested;
       }
 
       final adj = StockAdjustment(
@@ -645,8 +657,12 @@ class _DamageEntryScreenState extends State<DamageEntryScreen> implements Unsave
   }
 
   Widget _buildToolbar() {
-    bool canSave = !_isExistingEntry && !_isDeleted;
-    bool canEdit = _isExistingEntry && !_isDeleted;
+    final bool isPureCloud = ServerConfigService.instance.isPureCloud;
+    final bool isCloudConnected = ServerConfigService.instance.isConnected;
+    final bool isOfflineBlocked = isPureCloud && !isCloudConnected;
+
+    bool canSave = !isOfflineBlocked && !_isExistingEntry && !_isDeleted;
+    bool canEdit = !isOfflineBlocked && _isExistingEntry && !_isDeleted;
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -701,11 +717,61 @@ class _DamageEntryScreenState extends State<DamageEntryScreen> implements Unsave
                   }
               ),
               _actionBtn(Icons.print, "Print", Colors.blueGrey, onTap: _printDamageReport),
+              _actionBtn(
+                Icons.delete_forever_rounded,
+                "Del",
+                canEdit ? Colors.red : Colors.grey.shade400,
+                textColor: canEdit ? Colors.black87 : Colors.grey.shade400,
+                onTap: canEdit ? _confirmDeleteCurrentEntry : null,
+              ),
             ],
           ),
         ),
       ],
     );
+  }
+
+  void _confirmDeleteCurrentEntry() async {
+    if (_isLoading) return;
+    final entryNo = _entryNoCtrl.text.trim();
+    if (entryNo.isEmpty || !_isExistingEntry || _isDeleted) {
+      _showDialog("Delete", "No saved damage entry loaded to delete.");
+      return;
+    }
+
+    final confirmed = await AppDialogs.showConfirmDialog(
+      context: context,
+      title: "Delete Damage Entry?",
+      content: "Are you sure you want to delete Damage Entry #$entryNo? This will restore the written-off stock back into inventory.",
+      isDangerous: true,
+    );
+
+    if (confirmed == true) {
+      setState(() => _isLoading = true);
+      try {
+        if (PureCloudService.instance.isActive) {
+          await PureCloudService.instance.deleteDocument(
+            table: 'stock_adjustments',
+            itemsTable: 'stock_adjustment_items',
+            foreignKey: 'adjustment_no',
+            entryNo: entryNo,
+          );
+        }
+        if (!mounted) return;
+        final provider = Provider.of<PharmacyProvider>(context, listen: false);
+        await provider.deleteStockAdjustment(entryNo);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Damage entry deleted and stock restored!"), backgroundColor: Colors.red),
+          );
+          _resetPage();
+        }
+      } catch (e) {
+        if (mounted) _showDialog("Delete Failed", e.toString());
+      } finally {
+        if (mounted) setState(() => _isLoading = false);
+      }
+    }
   }
 
   void _printDamageReport() async {

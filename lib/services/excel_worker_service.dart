@@ -444,8 +444,11 @@ class ExcelWorkerService {
     for (int code in sample.codeUnits) {
       if (code == 9) {
         tabCount++;
-      } else if (code == 59) semiCount++;
-      else if (code == 44) commaCount++;
+      } else if (code == 59) {
+        semiCount++;
+      } else if (code == 44) {
+        commaCount++;
+      }
     }
 
     int delimiterCode = 44; // ','

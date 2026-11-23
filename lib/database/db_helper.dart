@@ -11,6 +11,18 @@ import '../utils/app_formatters.dart';
 import '../services/server_config_service.dart';
 import '../services/supabase_sync_service.dart';
 
+class DatabaseRestoreResult {
+  final bool success;
+  final String message;
+  final List<String> recoveryPaths;
+
+  const DatabaseRestoreResult({required this.success, required this.message, this.recoveryPaths = const []});
+
+  String get userMessage => recoveryPaths.isEmpty
+      ? message
+      : '$message\nRecovery files:\n${recoveryPaths.join('\n')}';
+}
+
 class DbHelper {
   static final DbHelper instance = DbHelper._init();
   static Database? _database;
@@ -24,6 +36,29 @@ class DbHelper {
       _isBillingActive = active;
       debugPrint("DbHelper: Billing active mode set to $active");
     }
+  }
+
+  /// Executes any SQLite transaction or write query inside a global FIFO queue
+  /// with automatic SQLite lock retry tolerance to guarantee 0 database locks.
+  static Future<T> executeSerializedWrite<T>(Future<T> Function(Database db) action) async {
+    final db = await DbHelper.instance.database;
+    return await _writeQueue.enqueue(() async {
+      int attempts = 0;
+      while (true) {
+        try {
+          return await action(db);
+        } catch (e) {
+          final errStr = e.toString().toLowerCase();
+          if (errStr.contains('database is locked') || errStr.contains('code 5') || errStr.contains('sqliteexception(5)')) {
+            attempts++;
+            if (attempts >= 6) rethrow;
+            await Future.delayed(Duration(milliseconds: 250 * attempts));
+          } else {
+            rethrow;
+          }
+        }
+      }
+    });
   }
 
   DbHelper._init();
@@ -45,6 +80,10 @@ class DbHelper {
       }
       _database = null;
     }
+  }
+
+  void setMockDatabase(Database? db) {
+    _database = db;
   }
 
   /// Safely verifies and adds a column to a table if it does not already exist
@@ -264,12 +303,17 @@ class DbHelper {
     await _ensureFtsSearch(db);
     await ensureStockConvergenceTables(db);
     await _ensurePerformanceIndexes(db);
-    await cleanDuplicateLineItems(db);
+    unawaited(cleanDuplicateLineItems(db));
     return db;
   }
 
   Future<void> cleanDuplicateLineItems(Database db) async {
     try {
+      final prefs = await SharedPreferences.getInstance();
+      if (prefs.getBool('db_line_items_cleaned_v1') == true) {
+        return; // Skip on boot: deduplication already verified once
+      }
+
       // 1. Deduplicate sales_items: keep lowest rowid for same (normalized invoice_no, product_id, batch_number, qty)
       await db.execute('''
         DELETE FROM sales_items 
@@ -325,12 +369,16 @@ class DbHelper {
             qty
         );
       ''');
+
+      await prefs.setBool('db_line_items_cleaned_v1', true);
     } catch (e) {
       debugPrint('cleanDuplicateLineItems error: $e');
     }
   }
 
   /// Ensures SQLite FTS5 (Full-Text Search) virtual table and triggers exist for instant sub-5ms search
+  Future<void> ensureFtsSearch(Database db) async => _ensureFtsSearch(db);
+
   Future<void> _ensureFtsSearch(Database db) async {
     try {
       await ensureColumnExists(db, 'product_master', 'sku', 'TEXT');
@@ -594,6 +642,15 @@ class DbHelper {
         }
       } catch (_) {}
     }
+
+    // Ensure product_master has the alias column
+    try {
+      final pmCols = await db.rawQuery('PRAGMA table_info(product_master)');
+      final pmColNames = pmCols.map((c) => c['name']?.toString()).toSet();
+      if (!pmColNames.contains('alias')) {
+        await db.execute('ALTER TABLE product_master ADD COLUMN alias TEXT');
+      }
+    } catch (_) {}
 
     try {
       final salesCols = await db.rawQuery('PRAGMA table_info(sales_invoices)');
@@ -874,6 +931,21 @@ class DbHelper {
     } catch (e) {
       debugPrint("DB Check PM Note: $e");
     }
+
+    try {
+      // Auto-clean any legacy corrupted FY-prefixed purchase sequences (e.g., 2026275 -> 5)
+      final dirtyPurchases = await db.rawQuery("SELECT entry_no FROM purchase_entries WHERE entry_no GLOB '20[0-9][0-9][0-9][0-9]*' AND LENGTH(entry_no) > 6");
+      for (var r in dirtyPurchases) {
+        final badNo = r['entry_no']?.toString() ?? '';
+        final cleanNo = cleanEntryNo(badNo);
+        if (cleanNo.isNotEmpty && cleanNo != badNo) {
+          await db.rawUpdate("UPDATE purchase_entries SET entry_no = ? WHERE entry_no = ?", [cleanNo, badNo]);
+          await db.rawUpdate("UPDATE purchase_items SET entry_no = ? WHERE entry_no = ?", [cleanNo, badNo]);
+        }
+      }
+      // Clean voucher_sequences table for sequences >= 1000000
+      await db.rawUpdate("DELETE FROM voucher_sequences WHERE last_sequence >= 1000000");
+    } catch (_) {}
 
     if (prefs.getBool('schema_v75_migrated_done') == true) {
       return; // Skip on startup once migrated. Prevents 15-second DB write lock!
@@ -1891,7 +1963,7 @@ class DbHelper {
 
         if (batchId.isNotEmpty && currentStock > 0) {
           final ledgerCheck = await db.rawQuery(
-            'SELECT ledger_id FROM stock_ledger WHERE batch_id = ? LIMIT 1',
+            'SELECT rowid FROM stock_ledger WHERE batch_id = ? LIMIT 1',
             [batchId],
           );
           if (ledgerCheck.isEmpty) {
@@ -1928,13 +2000,6 @@ class DbHelper {
 
   Future<String> createLocalBackup() async {
     final db = await database;
-    try {
-      // PASSIVE checkpoints the WAL log without blocking active transactions
-      await db.execute('PRAGMA wal_checkpoint(PASSIVE)');
-    } catch (e) {
-      debugPrint("WAL Checkpoint Error: $e");
-    }
-
     final dbPath = await getDatabasesPath();
     final sourcePath = join(dbPath, 'pharmacy.db');
 
@@ -1945,17 +2010,65 @@ class DbHelper {
 
     final now = DateTime.now();
     final timestamp = DateFormat('yyyy_MM_dd_HHmmss').format(now);
-    final backupFileName = 'pharmacy_backup_$timestamp.db';
-    final targetPath = join(backupDir.path, backupFileName);
+    final targetFile = File(join(backupDir.path, 'pharmacy_backup_$timestamp.db'));
+    final escapedPath = targetFile.path.replaceAll("'", "''");
 
-    final sourceFile = File(sourcePath);
-    if (await sourceFile.exists()) {
-      final targetFile = File(targetPath);
-      await sourceFile.openRead().pipe(targetFile.openWrite());
-      await cleanupOldBackups(keepDays: 30);
-      return targetPath;
-    } else {
-      throw "Source database file not found at $sourcePath";
+    var snapshotCreated = false;
+    try {
+      await db.execute("VACUUM INTO '$escapedPath';");
+      snapshotCreated = await targetFile.exists();
+    } catch (e) {
+      debugPrint("VACUUM INTO failed for manual backup: $e");
+    }
+
+    if (!snapshotCreated) {
+      if (await targetFile.exists()) await targetFile.delete();
+
+      final checkpointResult = await db.rawQuery('PRAGMA wal_checkpoint(FULL);');
+      if (checkpointResult.isEmpty) {
+        throw StateError("WAL checkpoint returned no status; backup was not created.");
+      }
+      final checkpoint = checkpointResult.first;
+      final busy = checkpoint['busy'];
+      final logFrames = checkpoint['log'];
+      final checkpointedFrames = checkpoint['checkpointed'];
+      if (busy is! num ||
+          logFrames is! num ||
+          checkpointedFrames is! num ||
+          busy.toInt() != 0 ||
+          (logFrames.toInt() >= 0 && checkpointedFrames.toInt() < logFrames.toInt())) {
+        throw StateError("WAL checkpoint did not complete; backup was not created.");
+      }
+
+      final sourceFile = File(sourcePath);
+      if (!await sourceFile.exists()) {
+        throw StateError("Source database file not found at $sourcePath");
+      }
+      await sourceFile.copy(targetFile.path);
+    }
+
+    if (!await _isDatabaseIntegrityValid(targetFile)) {
+      if (await targetFile.exists()) await targetFile.delete();
+      throw StateError("Backup failed SQLite integrity check.");
+    }
+
+    await cleanupOldBackups(keepDays: 30);
+    return targetFile.path;
+  }
+
+  Future<bool> _isDatabaseIntegrityValid(File backupFile) async {
+    Database? verificationDb;
+    try {
+      if (!await backupFile.exists()) return false;
+      verificationDb = await openDatabase(backupFile.path, readOnly: true);
+      final result = await verificationDb.rawQuery('PRAGMA quick_check;');
+      return result.isNotEmpty &&
+          result.first.values.first.toString().toLowerCase() == 'ok';
+    } catch (e) {
+      debugPrint("Backup integrity check failed for ${backupFile.path}: $e");
+      return false;
+    } finally {
+      await verificationDb?.close();
     }
   }
 
@@ -2032,24 +2145,149 @@ class DbHelper {
     return results;
   }
 
-  Future<bool> restoreBackupFile(File backupFile) async {
+  Future<DatabaseRestoreResult> restoreBackupFile(File backupFile) async {
+    final dbPath = await getDatabasesPath();
+    final targetFile = File(join(dbPath, 'pharmacy.db'));
+    final timestamp = DateTime.now().microsecondsSinceEpoch;
+    final preRestoreFile = File(join(dbPath, 'pharmacy_pre_restore_$timestamp.db'));
+    final stagedFile = File(join(dbPath, 'pharmacy_restore_stage_$timestamp.db'));
+    final rollbackFile = File(join(dbPath, 'pharmacy_restore_rollback_$timestamp.db'));
+    final sidecarFiles = ['-wal', '-shm'].map((suffix) => File('${targetFile.path}$suffix')).toList();
+    final savedSidecars = <File>{};
+    var preRestoreVerified = false;
+    var liveDatabaseClosed = false;
+    var originalMoved = false;
+    var restoreError = 'Database restore failed.';
+
     try {
-      if (!await backupFile.exists()) throw "Backup file does not exist.";
+      if (!await backupFile.exists()) throw StateError("Selected backup file does not exist.");
+      if (!await targetFile.exists()) throw StateError("Live database does not exist; restore aborted.");
 
-      final dbPath = await getDatabasesPath();
-      final targetPath = join(dbPath, 'pharmacy.db');
-
-      if (_database != null) {
-        await _database!.close();
-        _database = null;
+      final db = await database;
+      final checkpointRows = await db.rawQuery('PRAGMA wal_checkpoint(FULL);');
+      if (checkpointRows.isEmpty) throw StateError("WAL checkpoint returned no status.");
+      final checkpoint = checkpointRows.first;
+      final busy = checkpoint['busy'];
+      final logFrames = checkpoint['log'];
+      final checkpointedFrames = checkpoint['checkpointed'];
+      if (busy is! num || logFrames is! num || checkpointedFrames is! num ||
+          busy.toInt() != 0 ||
+          (logFrames.toInt() >= 0 && checkpointedFrames.toInt() < logFrames.toInt())) {
+        throw StateError("WAL checkpoint did not complete successfully.");
       }
 
-      await backupFile.copy(targetPath);
-      _database = await _initDB('pharmacy.db');
-      return true;
+      final escapedSnapshotPath = preRestoreFile.path.replaceAll("'", "''");
+      await db.execute("VACUUM INTO '$escapedSnapshotPath';");
+      preRestoreVerified = await _isDatabaseIntegrityValid(preRestoreFile);
+      if (!preRestoreVerified) throw StateError("Pre-restore snapshot failed SQLite integrity check.");
+
+      await backupFile.copy(stagedFile.path);
+      if (!await _isDatabaseIntegrityValid(stagedFile)) {
+        throw StateError("Selected backup failed staged SQLite integrity check.");
+      }
+
+      await db.close();
+      if (db.isOpen) throw StateError("Database connection did not close.");
+      _database = null;
+      liveDatabaseClosed = true;
+
+      // Preserve any sidecars beside the rollback database so they cannot be read with the replacement.
+      for (var sidecar in sidecarFiles) {
+        if (await sidecar.exists()) {
+          final saved = File('${rollbackFile.path}${sidecar.path.substring(targetFile.path.length)}');
+          await sidecar.rename(saved.path);
+          savedSidecars.add(saved);
+        }
+      }
+
+      await targetFile.rename(rollbackFile.path);
+      originalMoved = true;
+      try {
+        await stagedFile.rename(targetFile.path);
+      } catch (installError) {
+        restoreError = "Could not install staged backup: $installError";
+        await rollbackFile.rename(targetFile.path);
+        originalMoved = false;
+        for (final saved in savedSidecars) {
+          final suffix = saved.path.substring(rollbackFile.path.length);
+          await saved.rename('${targetFile.path}$suffix');
+        }
+        savedSidecars.clear();
+        rethrow;
+      }
+
+      try {
+        _database = await _initDB('pharmacy.db');
+      } catch (initError) {
+        restoreError = "Restored database could not be initialized: $initError";
+        _database = null;
+        await File(targetFile.path).delete();
+        await rollbackFile.rename(targetFile.path);
+        originalMoved = false;
+        for (final saved in savedSidecars) {
+          final suffix = saved.path.substring(rollbackFile.path.length);
+          await saved.rename('${targetFile.path}$suffix');
+        }
+        savedSidecars.clear();
+        _database = await _initDB('pharmacy.db');
+        rethrow;
+      }
+
+      // Installation is now committed; old sidecars are retained with the recovery copy.
+      debugPrint("Database restored successfully from ${backupFile.path}");
+      return const DatabaseRestoreResult(success: true, message: 'Database restored successfully.');
     } catch (e) {
-      debugPrint("Error restoring database: $e");
-      rethrow;
+      restoreError = "$restoreError $e";
+      debugPrint("Error restoring database: $restoreError");
+      if (!originalMoved && savedSidecars.isNotEmpty) {
+        for (final saved in savedSidecars.toList()) {
+          final suffix = saved.path.substring(rollbackFile.path.length);
+          try {
+            await saved.rename('${targetFile.path}$suffix');
+            savedSidecars.remove(saved);
+          } catch (sidecarRollbackError) {
+            restoreError = "$restoreError Could not restore sidecar; recovery copy remains at ${saved.path}: $sidecarRollbackError";
+            debugPrint(restoreError);
+          }
+        }
+      }
+      if (originalMoved && await rollbackFile.exists()) {
+        try {
+          if (await targetFile.exists()) await targetFile.delete();
+          await rollbackFile.rename(targetFile.path);
+          originalMoved = false;
+          for (final saved in savedSidecars) {
+            final suffix = saved.path.substring(rollbackFile.path.length);
+            await saved.rename('${targetFile.path}$suffix');
+          }
+          savedSidecars.clear();
+        } catch (rollbackError) {
+          restoreError = "$restoreError Rollback failed; recovery file preserved at ${rollbackFile.path}: $rollbackError";
+          debugPrint(restoreError);
+        }
+      }
+      if (liveDatabaseClosed && _database == null && await targetFile.exists()) {
+        try {
+          _database = await _initDB('pharmacy.db');
+        } catch (reopenError) {
+          debugPrint("Could not reopen database after failed restore: $reopenError");
+        }
+      }
+      final recoveryPaths = <String>[];
+      if (await rollbackFile.exists()) recoveryPaths.add(rollbackFile.path);
+      for (final saved in savedSidecars) {
+        if (await saved.exists()) recoveryPaths.add(saved.path);
+      }
+      if (preRestoreVerified && await preRestoreFile.exists()) recoveryPaths.add(preRestoreFile.path);
+      return DatabaseRestoreResult(success: false, message: restoreError, recoveryPaths: recoveryPaths);
+    } finally {
+      if (await stagedFile.exists()) {
+        try { await stagedFile.delete(); } catch (e) { debugPrint("Could not remove staging file: $e"); }
+      }
+      if (!preRestoreVerified && await preRestoreFile.exists()) {
+        try { await preRestoreFile.delete(); } catch (e) { debugPrint("Could not remove invalid pre-restore snapshot: $e"); }
+      }
+      // Saved sidecars are never deleted here; failed rollback copies remain recoverable.
     }
   }
 
@@ -2732,6 +2970,55 @@ class DbHelper {
         )
       ''');
 
+      // Drop legacy foreign key constraints on stock_ledger that caused SQLite 787 aborts
+      try {
+        final fkList = await db.rawQuery("PRAGMA foreign_key_list('stock_ledger')");
+        if (fkList.isNotEmpty) {
+          await db.execute('PRAGMA foreign_keys = OFF;');
+          await db.execute('''
+            CREATE TABLE stock_ledger_clean (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              timestamp TEXT,
+              created_at TEXT,
+              batch_id TEXT,
+              batch_number TEXT,
+              product_id TEXT,
+              voucher_type TEXT,
+              voucher_no TEXT,
+              qty_in INTEGER DEFAULT 0,
+              qty_out INTEGER DEFAULT 0,
+              quantity_delta INTEGER DEFAULT 0,
+              closing_balance INTEGER DEFAULT 0,
+              purchase_rate REAL DEFAULT 0.0,
+              mrp REAL DEFAULT 0.0,
+              supplier_name TEXT,
+              remarks TEXT,
+              user_id TEXT,
+              financial_year TEXT,
+              branch_id TEXT DEFAULT 'MAIN_STORE',
+              terminal_id TEXT DEFAULT 'POS-01',
+              idempotency_key TEXT
+            );
+          ''');
+          await db.execute('''
+            INSERT INTO stock_ledger_clean (
+              timestamp, created_at, batch_id, batch_number, product_id, voucher_type, voucher_no,
+              qty_in, qty_out, quantity_delta, closing_balance, purchase_rate, mrp,
+              supplier_name, remarks, user_id, financial_year, branch_id, terminal_id, idempotency_key
+            )
+            SELECT timestamp, timestamp, batch_id, batch_id, product_id, voucher_type, voucher_no,
+                   qty_in, qty_out, 0, 0, purchase_rate, mrp,
+                   supplier_name, remarks, user_id, financial_year, 'MAIN_STORE', 'POS-01', ''
+            FROM stock_ledger;
+          ''');
+          await db.execute('DROP TABLE stock_ledger;');
+          await db.execute('ALTER TABLE stock_ledger_clean RENAME TO stock_ledger;');
+          await db.execute('PRAGMA foreign_keys = ON;');
+        }
+      } catch (e) {
+        debugPrint("stock_ledger FK cleanup notice: $e");
+      }
+
       final ledgerCols = await db.rawQuery('PRAGMA table_info(stock_ledger)');
       final colNames = ledgerCols.map((c) => c['name']?.toString()).toSet();
       if (!colNames.contains('batch_number')) {
@@ -2827,27 +3114,31 @@ class DbHelper {
     final config = ServerConfigService.instance;
     final vType = voucherType ?? entryType ?? 'STOCK_MOVE';
     final vNo = voucherNo ?? referenceNo ?? '';
-    await txn.insert('stock_ledger', {
-      'timestamp': DateTime.now().toIso8601String(),
-      'batch_id': batchNumber,
-      'batch_number': batchNumber,
-      'product_id': productId,
-      'voucher_type': vType,
-      'voucher_no': vNo,
-      'qty_in': qtyIn > 0 ? qtyIn : (quantityDelta > 0 ? quantityDelta : 0),
-      'qty_out': qtyOut > 0 ? qtyOut : (quantityDelta < 0 ? quantityDelta.abs() : 0),
-      'quantity_delta': quantityDelta,
-      'closing_balance': closingBalance,
-      'purchase_rate': purchaseRate,
-      'mrp': mrp,
-      'supplier_name': supplierName,
-      'remarks': remarks,
-      'user_id': userId ?? 'Admin',
-      'financial_year': '',
-      'branch_id': branchId ?? config.storeBranchId,
-      'terminal_id': terminalId ?? config.terminalId,
-      'idempotency_key': idempotencyKey,
-    });
+    try {
+      await txn.insert('stock_ledger', {
+        'timestamp': DateTime.now().toIso8601String(),
+        'batch_id': batchNumber,
+        'batch_number': batchNumber,
+        'product_id': productId,
+        'voucher_type': vType,
+        'voucher_no': vNo,
+        'qty_in': qtyIn > 0 ? qtyIn : (quantityDelta > 0 ? quantityDelta : 0),
+        'qty_out': qtyOut > 0 ? qtyOut : (quantityDelta < 0 ? quantityDelta.abs() : 0),
+        'quantity_delta': quantityDelta,
+        'closing_balance': closingBalance,
+        'purchase_rate': purchaseRate,
+        'mrp': mrp,
+        'supplier_name': supplierName,
+        'remarks': remarks,
+        'user_id': userId ?? 'Admin',
+        'financial_year': '',
+        'branch_id': branchId ?? config.storeBranchId,
+        'terminal_id': terminalId ?? config.terminalId,
+        'idempotency_key': idempotencyKey,
+      });
+    } catch (e) {
+      debugPrint('stock_ledger audit entry non-blocking warning: $e');
+    }
   }
 }
 

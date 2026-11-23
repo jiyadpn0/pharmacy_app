@@ -14,6 +14,7 @@ import '../widgets/erp_tooltip.dart';
 import '../utils/app_formatters.dart';
 import '../utils/app_dialogs.dart';
 import '../services/gst_export_service.dart';
+import '../services/gstr2b_reconciliation_service.dart';
 import '../utils/theme_constants.dart';
 
 class GstReportScreen extends StatefulWidget {
@@ -365,6 +366,111 @@ class _GstReportScreenState extends State<GstReportScreen> {
     }
   }
 
+  void _reconcileGstr2b() async {
+    FilePickerResult? result = await FilePicker.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['json'],
+      dialogTitle: 'Select Government GSTR-2B JSON File',
+    );
+
+    if (result != null && result.files.single.path != null) {
+      final file = File(result.files.single.path!);
+      final content = await file.readAsString();
+
+      if (!mounted) return;
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => const Center(child: CircularProgressIndicator()),
+      );
+
+      final items = await Gstr2bReconciliationService.instance.reconcileGstr2bJson(content);
+      if (!mounted) return;
+      Navigator.pop(context); // Dismiss spinner
+
+      final matched = items.where((it) => it.status == Gstr2bMatchStatus.matched).length;
+      final missing = items.where((it) => it.status == Gstr2bMatchStatus.missingInBooks).length;
+      final mismatch = items.where((it) => it.status == Gstr2bMatchStatus.taxMismatch).length;
+
+      showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Row(
+            children: [
+              Icon(Icons.compare_arrows_rounded, color: Colors.blue),
+              SizedBox(width: 8),
+              Text("GSTR-2B Auto-Reconciliation Summary", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+            ],
+          ),
+          content: SizedBox(
+            width: 600,
+            height: 400,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    _reconcileBadge("Matched: $matched", Colors.green),
+                    const SizedBox(width: 8),
+                    _reconcileBadge("Missing in Books: $missing", Colors.red),
+                    const SizedBox(width: 8),
+                    _reconcileBadge("Tax Mismatch (>₹2): $mismatch", Colors.orange),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                const Divider(),
+                Expanded(
+                  child: ListView.separated(
+                    itemCount: items.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (_, idx) {
+                      final item = items[idx];
+                      Color badgeColor = Colors.green;
+                      String statusText = "MATCHED";
+                      if (item.status == Gstr2bMatchStatus.missingInBooks) {
+                        badgeColor = Colors.red;
+                        statusText = "MISSING IN BOOKS";
+                      } else if (item.status == Gstr2bMatchStatus.taxMismatch) {
+                        badgeColor = Colors.orange;
+                        statusText = "TAX MISMATCH";
+                      }
+
+                      return ListTile(
+                        dense: true,
+                        title: Text("${item.supplierName} (${item.supplierGstin})", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                        subtitle: Text("Inv: ${item.invoiceNo} | Date: ${item.invoiceDate} | Portal Tax: ₹${item.portalTaxAmt.toStringAsFixed(2)} | Books Tax: ₹${item.booksTaxAmt.toStringAsFixed(2)}", style: const TextStyle(fontSize: 11)),
+                        trailing: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(color: badgeColor.withValues(alpha: 0.15), borderRadius: BorderRadius.circular(4), border: Border.all(color: badgeColor)),
+                          child: Text(statusText, style: TextStyle(color: badgeColor, fontSize: 10, fontWeight: FontWeight.bold)),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            ElevatedButton(
+              onPressed: () => Navigator.pop(ctx),
+              style: ElevatedButton.styleFrom(backgroundColor: AppColors.primary),
+              child: const Text("CLOSE", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+      );
+    }
+  }
+
+  Widget _reconcileBadge(String text, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(color: color.withValues(alpha: 0.1), borderRadius: BorderRadius.circular(6), border: Border.all(color: color)),
+      child: Text(text, style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 11)),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
@@ -415,6 +521,18 @@ class _GstReportScreenState extends State<GstReportScreen> {
             ],
           ),
           const Spacer(),
+          ElevatedButton.icon(
+            onPressed: _reconcileGstr2b,
+            icon: const Icon(Icons.sync_alt_rounded, size: 16),
+            label: const Text("IMPORT GSTR-2B (.JSON)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.blue.shade700,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+          ),
+          const SizedBox(width: 12),
           PopupMenuButton<String>(
             onSelected: (val) {
               if (val == 'excel') _exportToExcel();
@@ -469,6 +587,7 @@ class _GstReportScreenState extends State<GstReportScreen> {
           const SizedBox(height: 10),
           _filterOption('B2C_SALES', 'GSTR-1 (B2C Retail)', Icons.storefront),
           _filterOption('B2B_SALES', 'GSTR-1 (B2B Credit)', Icons.business),
+          _filterOption('HSN_SUMMARY', 'HSN / SAC Summary', Icons.format_list_numbered),
           _filterOption('PURCHASES', 'GSTR-2 (ITC Inward)', Icons.shopping_cart),
           _filterOption('GSTR_3B', 'GSTR-3B Tax Summary', Icons.analytics_outlined),
         ],

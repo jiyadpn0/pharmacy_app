@@ -80,7 +80,13 @@ class _PatientRegistrationScreenState extends State<PatientRegistrationScreen> {
     );
 
     if (_editingPatient == null) {
-      await provider.registerPatient(patient);
+      try {
+        await provider.registerPatient(patient);
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Patient ID already exists. Registration failed."), backgroundColor: Colors.red));
+        return;
+      }
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Patient Registered Successfully"), backgroundColor: Colors.green));
     } else {
@@ -631,10 +637,21 @@ class _PatientRegistrationScreenState extends State<PatientRegistrationScreen> {
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("CANCEL")),
           ElevatedButton(
-            onPressed: () {
-              Provider.of<PharmacyProvider>(context, listen: false).deletePatient(p.id);
-              Navigator.pop(ctx);
-              if (_editingPatient?.id == p.id) _clear();
+            onPressed: () async {
+              final provider = Provider.of<PharmacyProvider>(context, listen: false);
+              if (provider.securityToggles['require_pin_edit_master'] == true) {
+                final isUnlocked = await PinUnlockDialog.show(
+                  context, provider,
+                  title: "Master Data Lock",
+                  message: "Enter Master PIN to modify patient master data.",
+                );
+                if (!isUnlocked || !mounted) return;
+              }
+              await provider.deletePatient(p.id);
+              if (ctx.mounted) {
+                Navigator.pop(ctx);
+              }
+              if (mounted && _editingPatient?.id == p.id) _clear();
             },
             style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
             child: const Text("DELETE", style: TextStyle(color: Colors.white)),

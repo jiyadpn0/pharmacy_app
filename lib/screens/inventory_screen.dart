@@ -98,7 +98,7 @@ class _InventoryScreenState extends State<InventoryScreen> {
     final allProducts = pharmacy.productMaster;
 
     int allCount = allProducts.length;
-    int lowStockCount = allProducts.where((p) => p.stock < 10 && p.stock >= 0).length;
+    int lowStockCount = allProducts.where((p) => p.stock > 0 && p.stock <= p.reorderLevel).length;
     int expiredCount = allProducts.where((p) => _isExpired(p.expiry)).length;
 
     List<Product> allOtherFilteredProducts = allProducts.where((item) {
