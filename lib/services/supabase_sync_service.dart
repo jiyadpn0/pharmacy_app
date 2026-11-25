@@ -2106,31 +2106,207 @@ class SupabaseSyncService extends ChangeNotifier {
     return false;
   }
 
-  /// Resets only local transactional database tables without touching cloud records
+  /// Resets selected local SQLite database tables without touching cloud records
   Future<Map<String, dynamic>> wipeOnlyLocalDatabase({
     Set<String>? selectedCategoryIds,
     Function(double, String)? onProgress,
     PharmacyProvider? pharmacy,
   }) async {
-    final db = await DbHelper.instance.database;
-    int deletedCount = 0;
-    onProgress?.call(0.1, "Cleaning local transaction tables...");
-    await db.transaction((txn) async {
-      deletedCount += await txn.delete('sales_invoices');
-      await txn.delete('sales_items');
-      deletedCount += await txn.delete('purchase_entries');
-      await txn.delete('purchase_items');
-      deletedCount += await txn.delete('sales_return_invoices');
-      await txn.delete('sales_return_items');
-      deletedCount += await txn.delete('purchase_return_entries');
-      await txn.delete('purchase_return_items');
-      deletedCount += await txn.delete('stock_adjustments');
-      await txn.delete('stock_adjustment_items');
-    });
-    if (pharmacy != null) {
-      await pharmacy.loadFromDatabase();
+    _isWiping = true;
+    _cancelRequested = true;
+    ServerConfigService.instance.setWiping(true);
+
+    // Stop background periodic delta sync and realtime listeners during reset to eliminate SQLite lock contention
+    DeltaSyncService.instance.stopPeriodicSync();
+    SupabaseRealtimeService.instance.disposeAll();
+
+    // Wait briefly for any in-flight background operations to release SQLite locks
+    int waitCount = 0;
+    while (_isSyncing && waitCount < 20) {
+      waitCount++;
+      await Future.delayed(const Duration(milliseconds: 100));
     }
-    return {'success': true, 'deleted': deletedCount};
+    await Future.delayed(const Duration(milliseconds: 300));
+
+    bool localSuccess = false;
+    int deletedCount = 0;
+
+    try {
+      onProgress?.call(0.1, "Preparing local SQLite tables for reset...");
+
+      final db = await DbHelper.instance.database;
+      final List<String> endpoints = _getEndpointsForCategories(selectedCategoryIds);
+      final Set<String> localTablesToClear = Set<String>.from(endpoints);
+
+      if (selectedCategoryIds == null || selectedCategoryIds.isEmpty || selectedCategoryIds.length >= 14) {
+        localTablesToClear.addAll([
+          'sales_drafts',
+          'purchase_drafts',
+          'stock_ledger',
+          'batch_master',
+          'rack_history',
+          'edit_history_logs',
+          'stock_enquiries',
+          'monthly_closing_balances',
+          'order_confirmations',
+          'order_confirmation_items',
+          'pending_deletions',
+          'voucher_sequences',
+        ]);
+      } else {
+        if (selectedCategoryIds.contains('sales')) {
+          localTablesToClear.add('sales_drafts');
+          localTablesToClear.add('edit_history_logs');
+        }
+        if (selectedCategoryIds.contains('purchases')) {
+          localTablesToClear.add('purchase_drafts');
+        }
+        if (selectedCategoryIds.contains('batches')) {
+          localTablesToClear.add('batch_master');
+          localTablesToClear.add('stock_ledger');
+        }
+      }
+
+      final List<String> allLocalTables = localTablesToClear.toList();
+
+      // Disable foreign keys so SQLite can truncate without FK locks
+      try {
+        await db.execute('PRAGMA foreign_keys = OFF;');
+      } catch (_) {}
+
+      bool ftsTriggersDropped = false;
+      if (allLocalTables.contains('product_master')) {
+        try {
+          await db.execute('DROP TRIGGER IF EXISTS ad_product_master_fts;');
+          await db.execute('DROP TRIGGER IF EXISTS au_product_master_fts;');
+          await db.execute('DROP TRIGGER IF EXISTS ai_product_master_fts;');
+          ftsTriggersDropped = true;
+        } catch (_) {}
+      }
+
+      try {
+        await db.execute('BEGIN IMMEDIATE;');
+
+        for (int i = 0; i < allLocalTables.length; i++) {
+          final tbl = allLocalTables[i];
+          double pct = 0.15 + (((i + 1) / allLocalTables.length) * 0.75);
+          onProgress?.call(pct, 'Resetting Local Table (${i + 1}/${allLocalTables.length}): $tbl...');
+
+          try {
+            deletedCount += await db.delete(tbl);
+          } catch (_) {
+            // Table might not exist in SQLite
+          }
+        }
+
+        if (allLocalTables.contains('product_master')) {
+          try { await db.execute('DELETE FROM product_search_fts;'); } catch (_) {}
+        }
+        try { await db.execute('DELETE FROM sqlite_sequence;'); } catch (_) {}
+
+        if (selectedCategoryIds != null && selectedCategoryIds.isNotEmpty && selectedCategoryIds.length < 14) {
+          for (final cat in selectedCategoryIds) {
+            if (cat == 'sales') {
+              try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'sales_invoices%';"); } catch (_) {}
+            } else if (cat == 'purchases') {
+              try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'purchase_entries%' OR voucher_type LIKE 'purchase_invoices%';"); } catch (_) {}
+            } else if (cat == 'sales_returns') {
+              try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'sales_return_invoices%';"); } catch (_) {}
+            } else if (cat == 'purchase_returns') {
+              try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'purchase_return_entries%';"); } catch (_) {}
+            } else if (cat == 'prescriptions_adjustments') {
+              try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'stock_adjustments%' OR voucher_type LIKE 'prescriptions%';"); } catch (_) {}
+            } else if (cat == 'damages') {
+              try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'stock_write_offs%';"); } catch (_) {}
+            }
+          }
+        }
+
+        await db.execute('COMMIT;');
+      } catch (e) {
+        debugPrint('Bulk transaction local wipe error, fallback table-by-table: $e');
+        try { await db.execute('ROLLBACK;'); } catch (_) {}
+        for (int i = 0; i < allLocalTables.length; i++) {
+          final tbl = allLocalTables[i];
+          try { deletedCount += await db.delete(tbl); } catch (_) {}
+        }
+      }
+
+      // Re-create FTS triggers if dropped
+      if (ftsTriggersDropped) {
+        try {
+          await db.execute('''
+            CREATE TRIGGER IF NOT EXISTS ai_product_master_fts AFTER INSERT ON product_master BEGIN
+              INSERT INTO product_search_fts(id, name, generic_name, barcode, hsn_code, rack_id)
+              VALUES (new.id, new.name, IFNULL(new.generic_name, ''), IFNULL(new.barcode, ''), IFNULL(new.hsn_code, ''), IFNULL(new.rack_id, ''));
+            END;
+          ''');
+          await db.execute('''
+            CREATE TRIGGER IF NOT EXISTS au_product_master_fts AFTER UPDATE OF name, generic_name, barcode, hsn_code, rack_id ON product_master BEGIN
+              DELETE FROM product_search_fts WHERE id = old.id;
+              INSERT INTO product_search_fts(id, name, generic_name, barcode, hsn_code, rack_id)
+              VALUES (new.id, new.name, IFNULL(new.generic_name, ''), IFNULL(new.barcode, ''), IFNULL(new.hsn_code, ''), IFNULL(new.rack_id, ''));
+            END;
+          ''');
+          await db.execute('''
+            CREATE TRIGGER IF NOT EXISTS ad_product_master_fts AFTER DELETE ON product_master BEGIN
+              DELETE FROM product_search_fts WHERE id = old.id;
+            END;
+          ''');
+        } catch (_) {}
+      }
+
+      try {
+        await db.execute('PRAGMA foreign_keys = ON;');
+      } catch (_) {}
+
+      localSuccess = true;
+      try {
+        await db.rawQuery('PRAGMA wal_checkpoint(TRUNCATE);');
+      } catch (_) {}
+
+      onProgress?.call(0.95, "Reloading local state...");
+      if (pharmacy != null) {
+        await pharmacy.loadFromDatabase();
+      }
+
+      onProgress?.call(1.0, "Local PC Reset Completed!");
+      return {
+        'success': localSuccess,
+        'cloudSuccessCount': 0,
+        'cloudTotalCount': 0,
+        'localSuccess': localSuccess,
+        'deleted': deletedCount,
+        'failedEndpoints': <String>[],
+      };
+    } catch (e) {
+      debugPrint("wipeOnlyLocalDatabase error: $e");
+      return {
+        'success': false,
+        'cloudSuccessCount': 0,
+        'cloudTotalCount': 0,
+        'localSuccess': false,
+        'deleted': deletedCount,
+        'failedEndpoints': <String>[],
+        'error': e.toString(),
+      };
+    } finally {
+      _isWiping = false;
+      _cancelRequested = false;
+      ServerConfigService.instance.setWiping(false);
+
+      if (ServerConfigService.instance.isServerModeEnabled && ServerConfigService.instance.isConnected) {
+        if (ServerConfigService.instance.autoSyncEnabled) {
+          DeltaSyncService.instance.startPeriodicSync();
+        }
+        unawaited(Future.delayed(const Duration(milliseconds: 500), () async {
+          try {
+            await SupabaseRealtimeService.instance.initialize();
+            SupabaseRealtimeService.instance.startAllRealtimeListeners();
+          } catch (_) {}
+        }));
+      }
+    }
   }
 
   Future<void> _safeChunkedSnapshotInsert(

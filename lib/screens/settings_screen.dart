@@ -2333,7 +2333,7 @@ class _SettingsScreenState extends State<SettingsScreen> with WatchdogMixin<Sett
       if (context.mounted) {
         final bool isSuccess = result['success'] == true;
         final int cloudSuccess = result['cloudSuccessCount'] as int? ?? 0;
-        final int cloudTotal = result['cloudTotalCount'] as int? ?? 13;
+        final int cloudTotal = result['cloudTotalCount'] as int? ?? (cloudWipe ? 13 : 0);
         final bool localSuccess = result['localSuccess'] == true;
         final List failedList = (result['failedEndpoints'] as List?) ?? [];
 
@@ -2350,13 +2350,15 @@ class _SettingsScreenState extends State<SettingsScreen> with WatchdogMixin<Sett
                 ),
                 const SizedBox(width: 10),
                 Text(
-                  isSuccess ? 'Full Reset Completed (100%)' : 'Reset Finished with Warnings',
+                  cloudWipe
+                      ? (isSuccess ? 'Full Reset Completed (100%)' : 'Reset Finished with Warnings')
+                      : (localSuccess ? 'Local PC Reset Completed (100%)' : 'Local Reset Failed'),
                   style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
                 ),
               ],
             ),
             content: SizedBox(
-              width: 400,
+              width: 420,
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -2374,9 +2376,13 @@ class _SettingsScreenState extends State<SettingsScreen> with WatchdogMixin<Sett
                         const SizedBox(width: 10),
                         Expanded(
                           child: Text(
-                            isSuccess
-                                ? 'All local SQLite tables and Supabase cloud tables reset to 0.'
-                                : 'Local database reset successfully. Some cloud endpoints requires attention.',
+                            cloudWipe
+                                ? (isSuccess
+                                    ? 'All local SQLite tables and Supabase cloud tables reset to 0.'
+                                    : 'Local database reset successfully. Some cloud endpoints require attention.')
+                                : (localSuccess
+                                    ? 'Selected data on this Local PC has been reset to 0. Cloud data remains safe and untouched.'
+                                    : 'Local database reset failed: ${result['error'] ?? 'Unknown error'}'),
                             style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: isSuccess ? Colors.green.shade900 : Colors.orange.shade900),
                           ),
                         ),
@@ -2391,16 +2397,25 @@ class _SettingsScreenState extends State<SettingsScreen> with WatchdogMixin<Sett
                     contentPadding: EdgeInsets.zero,
                     leading: Icon(localSuccess ? Icons.check_circle : Icons.cancel, color: localSuccess ? Colors.green : Colors.red, size: 20),
                     title: const Text('Local SQLite Database', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                    subtitle: Text(localSuccess ? 'All local tables cleared to 0 rows' : 'Local wipe failed', style: const TextStyle(fontSize: 11)),
+                    subtitle: Text(localSuccess ? 'All selected local tables cleared to 0 rows' : 'Local wipe failed', style: const TextStyle(fontSize: 11)),
                   ),
                   const Divider(height: 8),
-                  ListTile(
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                    leading: Icon(cloudSuccess == cloudTotal ? Icons.check_circle : Icons.warning_rounded, color: cloudSuccess == cloudTotal ? Colors.green : Colors.orange, size: 20),
-                    title: const Text('Supabase Cloud REST Tables', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                    subtitle: Text('$cloudSuccess / $cloudTotal Cloud Tables Wiped Successfully', style: const TextStyle(fontSize: 11)),
-                  ),
+                  if (cloudWipe)
+                    ListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      leading: Icon(cloudSuccess == cloudTotal ? Icons.check_circle : Icons.warning_rounded, color: cloudSuccess == cloudTotal ? Colors.green : Colors.orange, size: 20),
+                      title: const Text('Supabase Cloud REST Tables', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                      subtitle: Text('$cloudSuccess / $cloudTotal Cloud Tables Wiped Successfully', style: const TextStyle(fontSize: 11)),
+                    )
+                  else
+                    const ListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      leading: Icon(Icons.cloud_done_rounded, color: Colors.blue, size: 20),
+                      title: Text('Supabase Cloud Server', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                      subtitle: Text('Preserved intact (Cloud data untouched)', style: TextStyle(fontSize: 11)),
+                    ),
                   if (failedList.isNotEmpty) ...[
                     const SizedBox(height: 8),
                     Container(

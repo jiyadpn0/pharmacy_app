@@ -18436,6 +18436,7 @@ class PharmacyProvider extends ChangeNotifier {
     final result = await SupabaseSyncService.instance.wipeOnlyLocalDatabase(
       selectedCategoryIds: selectedCategories,
       onProgress: onProgress,
+      pharmacy: this,
     );
     onProgress?.call(0.98, "Reloading database state...");
     await loadFromDatabase();
