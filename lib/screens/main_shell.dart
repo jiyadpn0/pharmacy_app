@@ -847,17 +847,18 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
   }
 
   Widget _buildActiveStaffBar(AppProvider app, PharmacyProvider pharma) {
-    // Get staff list: Most active saved names on left, generic "Staff #" names at maximum right
     List<String> activeStaff = pharma.staffNames;
-
     if (activeStaff.isEmpty) {
       activeStaff = ["Admin"];
     }
 
-    // 2. Currently selected sales agent
+    // 2. Currently selected sales agent / staff
     String currentAgent = "";
     if (pharma.salesSessions.isNotEmpty && pharma.activeSessionIdx < pharma.salesSessions.length) {
       currentAgent = pharma.salesSessions[pharma.activeSessionIdx]['agent']?.toString().trim() ?? "";
+    }
+    if (currentAgent.isEmpty && activeStaff.isNotEmpty) {
+      currentAgent = activeStaff.first;
     }
 
     // Helper to select an agent
@@ -875,134 +876,68 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
       app.switchToSalesTab();
     }
 
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final double availableWidth = constraints.maxWidth;
+    final Color agentColor = _getAgentColor(currentAgent);
 
-        // Estimate width needed per button (~68px for average staff name, ~78px for overflow dropdown)
-        const double approxItemWidth = 68.0;
-        const double overflowBtnWidth = 78.0;
-
-        int maxVisible = activeStaff.length;
-        if (availableWidth.isFinite && availableWidth > 0) {
-          final double totalRequiredWidth = activeStaff.length * approxItemWidth;
-          if (totalRequiredWidth > availableWidth) {
-            final double spaceForVisible = availableWidth - overflowBtnWidth;
-            maxVisible = (spaceForVisible / approxItemWidth).floor().clamp(1, activeStaff.length);
-          }
-        }
-
-        final bool hasOverflow = activeStaff.length > maxVisible;
-        final List<String> visibleStaff = hasOverflow ? activeStaff.sublist(0, maxVisible) : activeStaff;
-        final List<String> overflowStaff = hasOverflow ? activeStaff.sublist(maxVisible) : [];
-
-        bool isCurrentInOverflow = overflowStaff.any((s) => s.toLowerCase() == currentAgent.toLowerCase());
-
-        return SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
+    // HIDE OTHER STAFF NAMES: Only show the single active staff name
+    return PopupMenuButton<String>(
+      tooltip: "Active Staff: $currentAgent (Click to switch staff)",
+      color: const Color(0xFF1E293B),
+      elevation: 8,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      onSelected: selectAgent,
+      itemBuilder: (context) => activeStaff.map((name) {
+        final bool isSel = currentAgent.toLowerCase() == name.toLowerCase();
+        return PopupMenuItem<String>(
+          value: name,
+          height: 32,
           child: Row(
-            mainAxisSize: MainAxisSize.min,
             children: [
-              ...visibleStaff.map((name) {
-                final bool isSelected = currentAgent.toLowerCase() == name.toLowerCase();
-                return Container(
-                  margin: const EdgeInsets.only(right: 3),
-                  child: InkWell(
-                    onTap: () => selectAgent(name),
-                    borderRadius: BorderRadius.circular(4),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                      decoration: BoxDecoration(
-                        color: isSelected ? _getAgentColor(name) : Colors.white12,
-                        borderRadius: BorderRadius.circular(4),
-                        border: Border.all(
-                          color: isSelected ? _getAgentColor(name).withValues(alpha: 0.9) : Colors.white24,
-                          width: isSelected ? 1.5 : 1.0,
-                        ),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            Icons.person,
-                            size: 11,
-                            color: isSelected ? Colors.white : Colors.white70,
-                          ),
-                          const SizedBox(width: 4),
-                          Text(
-                            name,
-                            style: TextStyle(
-                              color: isSelected ? Colors.white : Colors.white.withValues(alpha: 0.9),
-                              fontSize: 10,
-                              fontWeight: isSelected ? FontWeight.bold : FontWeight.w600,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                );
-              }),
-              if (hasOverflow)
-                PopupMenuButton<String>(
-                  color: const Color(0xFF1E293B),
-                  elevation: 8,
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                  onSelected: selectAgent,
-                  itemBuilder: (context) => overflowStaff.map((name) {
-                    final bool isSel = currentAgent.toLowerCase() == name.toLowerCase();
-                    return PopupMenuItem<String>(
-                      value: name,
-                      height: 32,
-                      child: Row(
-                        children: [
-                          Icon(
-                            Icons.person,
-                            size: 13,
-                            color: isSel ? Colors.amberAccent : Colors.white70,
-                          ),
-                          const SizedBox(width: 8),
-                          Text(
-                            name,
-                            style: TextStyle(
-                              color: isSel ? Colors.amberAccent : Colors.white,
-                              fontSize: 11,
-                              fontWeight: isSel ? FontWeight.bold : FontWeight.normal,
-                            ),
-                          ),
-                        ],
-                      ),
-                    );
-                  }).toList(),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                    decoration: BoxDecoration(
-                      color: isCurrentInOverflow ? Colors.amber.shade700 : Colors.white10,
-                      borderRadius: BorderRadius.circular(4),
-                      border: Border.all(
-                        color: isCurrentInOverflow ? Colors.amberAccent : Colors.white24,
-                      ),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          isCurrentInOverflow ? "Other: $currentAgent" : "Other...",
-                          style: TextStyle(
-                            color: isCurrentInOverflow ? Colors.white : Colors.white70,
-                            fontSize: 10,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        const Icon(Icons.arrow_drop_down, color: Colors.white70, size: 14),
-                      ],
-                    ),
-                  ),
+              Icon(
+                Icons.person,
+                size: 13,
+                color: isSel ? Colors.amberAccent : Colors.white70,
+              ),
+              const SizedBox(width: 8),
+              Text(
+                name,
+                style: TextStyle(
+                  color: isSel ? Colors.amberAccent : Colors.white,
+                  fontSize: 11,
+                  fontWeight: isSel ? FontWeight.bold : FontWeight.normal,
                 ),
+              ),
             ],
           ),
         );
-      },
+      }).toList(),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration: BoxDecoration(
+          color: agentColor.withValues(alpha: 0.25),
+          borderRadius: BorderRadius.circular(5),
+          border: Border.all(
+            color: agentColor.withValues(alpha: 0.8),
+            width: 1.0,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.person, size: 12, color: agentColor),
+            const SizedBox(width: 4),
+            Text(
+              currentAgent,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(width: 3),
+            const Icon(Icons.arrow_drop_down, color: Colors.white70, size: 14),
+          ],
+        ),
+      ),
     );
   }
 
