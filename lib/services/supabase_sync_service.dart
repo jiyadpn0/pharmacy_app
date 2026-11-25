@@ -2169,13 +2169,14 @@ class SupabaseSyncService extends ChangeNotifier {
 
       final List<String> allLocalTables = localTablesToClear.toList();
 
-      // Disable foreign keys so SQLite can truncate without FK locks
+      onProgress?.call(0.12, "Disabling foreign key constraints...");
       try {
         await db.execute('PRAGMA foreign_keys = OFF;');
       } catch (_) {}
 
       bool ftsTriggersDropped = false;
       if (allLocalTables.contains('product_master')) {
+        onProgress?.call(0.14, "Detaching search indexes...");
         try {
           await db.execute('DROP TRIGGER IF EXISTS ad_product_master_fts;');
           await db.execute('DROP TRIGGER IF EXISTS au_product_master_fts;');
@@ -2184,51 +2185,38 @@ class SupabaseSyncService extends ChangeNotifier {
         } catch (_) {}
       }
 
-      try {
-        await db.execute('BEGIN IMMEDIATE;');
+      for (int i = 0; i < allLocalTables.length; i++) {
+        final tbl = allLocalTables[i];
+        double pct = 0.15 + (((i + 1) / allLocalTables.length) * 0.75);
+        onProgress?.call(pct, 'Resetting Local Table (${i + 1}/${allLocalTables.length}): $tbl...');
 
-        for (int i = 0; i < allLocalTables.length; i++) {
-          final tbl = allLocalTables[i];
-          double pct = 0.15 + (((i + 1) / allLocalTables.length) * 0.75);
-          onProgress?.call(pct, 'Resetting Local Table (${i + 1}/${allLocalTables.length}): $tbl...');
+        try {
+          deletedCount += await db.delete(tbl);
+        } catch (_) {
+          // Table might not exist in SQLite
+        }
+      }
 
-          try {
-            deletedCount += await db.delete(tbl);
-          } catch (_) {
-            // Table might not exist in SQLite
+      if (allLocalTables.contains('product_master')) {
+        try { await db.execute('DELETE FROM product_search_fts;'); } catch (_) {}
+      }
+      try { await db.execute('DELETE FROM sqlite_sequence;'); } catch (_) {}
+
+      if (selectedCategoryIds != null && selectedCategoryIds.isNotEmpty && selectedCategoryIds.length < 14) {
+        for (final cat in selectedCategoryIds) {
+          if (cat == 'sales') {
+            try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'sales_invoices%';"); } catch (_) {}
+          } else if (cat == 'purchases') {
+            try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'purchase_entries%' OR voucher_type LIKE 'purchase_invoices%';"); } catch (_) {}
+          } else if (cat == 'sales_returns') {
+            try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'sales_return_invoices%';"); } catch (_) {}
+          } else if (cat == 'purchase_returns') {
+            try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'purchase_return_entries%';"); } catch (_) {}
+          } else if (cat == 'prescriptions_adjustments') {
+            try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'stock_adjustments%' OR voucher_type LIKE 'prescriptions%';"); } catch (_) {}
+          } else if (cat == 'damages') {
+            try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'stock_write_offs%';"); } catch (_) {}
           }
-        }
-
-        if (allLocalTables.contains('product_master')) {
-          try { await db.execute('DELETE FROM product_search_fts;'); } catch (_) {}
-        }
-        try { await db.execute('DELETE FROM sqlite_sequence;'); } catch (_) {}
-
-        if (selectedCategoryIds != null && selectedCategoryIds.isNotEmpty && selectedCategoryIds.length < 14) {
-          for (final cat in selectedCategoryIds) {
-            if (cat == 'sales') {
-              try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'sales_invoices%';"); } catch (_) {}
-            } else if (cat == 'purchases') {
-              try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'purchase_entries%' OR voucher_type LIKE 'purchase_invoices%';"); } catch (_) {}
-            } else if (cat == 'sales_returns') {
-              try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'sales_return_invoices%';"); } catch (_) {}
-            } else if (cat == 'purchase_returns') {
-              try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'purchase_return_entries%';"); } catch (_) {}
-            } else if (cat == 'prescriptions_adjustments') {
-              try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'stock_adjustments%' OR voucher_type LIKE 'prescriptions%';"); } catch (_) {}
-            } else if (cat == 'damages') {
-              try { await db.execute("DELETE FROM voucher_sequences WHERE voucher_type LIKE 'stock_write_offs%';"); } catch (_) {}
-            }
-          }
-        }
-
-        await db.execute('COMMIT;');
-      } catch (e) {
-        debugPrint('Bulk transaction local wipe error, fallback table-by-table: $e');
-        try { await db.execute('ROLLBACK;'); } catch (_) {}
-        for (int i = 0; i < allLocalTables.length; i++) {
-          final tbl = allLocalTables[i];
-          try { deletedCount += await db.delete(tbl); } catch (_) {}
         }
       }
 

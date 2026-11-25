@@ -508,24 +508,31 @@ class UpdateCheckerService {
         final scriptFile = File('${tempDir.path}${Platform.pathSeparator}apply_pharmacy_update.bat');
         final scriptContent = '''
 @echo off
+setlocal
 set "EXE_NAME=$exeName"
+set "SRC=$sourceFolderPath"
+set "DEST=$appDir"
+set "TARGET_EXE=$appExePath"
 
 timeout /t 2 /nobreak > nul
-taskkill /F /IM %EXE_NAME% > nul 2>&1
+taskkill /F /IM "%EXE_NAME%" > nul 2>&1
 
 :wait_loop
 timeout /t 1 /nobreak > nul
-tasklist /FI "IMAGENAME eq %EXE_NAME%" 2>NUL | find /I /N "%EXE_NAME%" >NUL
+tasklist /FI "IMAGENAME eq %EXE_NAME%" 2>NUL | find /I "%EXE_NAME%" >NUL
 if "%ERRORLEVEL%"=="0" goto wait_loop
 
 timeout /t 1 /nobreak > nul
-xcopy /E /Y /I /Q "$sourceFolderPath\\*" "$appDir\\"
 
-if %ERRORLEVEL% NEQ 0 (
-    powershell -Command "Start-Process cmd -ArgumentList '/c xcopy /E /Y /I /Q "$sourceFolderPath\\*" "$appDir\\"' -Verb RunAs -Wait"
-)
+:: Use robocopy for robust replacement of files and directories
+robocopy "%SRC%" "%DEST%" /E /IS /IT /NP /NJH /NJS /R:3 /W:1 > nul
+if %ERRORLEVEL% LEQ 7 goto start_app
 
-start "" "$appExePath"
+:: Fallback using PowerShell Copy-Item with Administrator elevation
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile -Command Copy-Item -Path ''%SRC%\\*'' -Destination ''%DEST%'' -Recurse -Force'"
+
+:start_app
+start "" "%TARGET_EXE%"
 del "%~f0"
 ''';
         await scriptFile.writeAsString(scriptContent);
