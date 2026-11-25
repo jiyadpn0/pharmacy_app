@@ -59,6 +59,38 @@ class CompanyProfile {
     this.upiVpaId = "sahakarmedicals@upi",
     this.upiPayeeName = "Sahakar Medicals",
   });
+
+  Map<String, dynamic> toMap() {
+    return {
+      'name': name,
+      'address': address,
+      'phone': phone,
+      'email': email,
+      'gst_in': gstIn,
+      'dl_number': dlNumber,
+      'tagline': tagline,
+      'upi_vpa_id': upiVpaId,
+      'upi_payee_name': upiPayeeName,
+    };
+  }
+
+  Map<String, dynamic> toJson() => toMap();
+
+  factory CompanyProfile.fromMap(Map<String, dynamic> map) {
+    return CompanyProfile(
+      name: map['name']?.toString() ?? 'SAHAKAR MEDICALS & SURGICALS',
+      address: map['address']?.toString() ?? 'KALPETTA TOWN, WAYANAD',
+      phone: map['phone']?.toString() ?? '+91 0000000000',
+      email: map['email']?.toString() ?? 'sahakar@gmail.com',
+      gstIn: map['gst_in']?.toString() ?? map['gstIn']?.toString() ?? '32AAAAA0000A1Z5',
+      dlNumber: map['dl_number']?.toString() ?? map['dlNumber']?.toString() ?? 'DL/123/2024',
+      tagline: map['tagline']?.toString() ?? 'Professional Pharmacy Care',
+      upiVpaId: map['upi_vpa_id']?.toString() ?? map['upiVpaId']?.toString() ?? 'sahakarmedicals@upi',
+      upiPayeeName: map['upi_payee_name']?.toString() ?? map['upiPayeeName']?.toString() ?? 'Sahakar Medicals',
+    );
+  }
+
+  factory CompanyProfile.fromJson(Map<String, dynamic> json) => CompanyProfile.fromMap(json);
 }
 
 class ProductMaster {

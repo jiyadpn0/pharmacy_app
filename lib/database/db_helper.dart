@@ -2053,6 +2053,30 @@ class DbHelper {
     }
 
     await cleanupOldBackups(keepDays: 30);
+
+    // Automated Physical USB Mirroring Sentinel
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final secPath = prefs.getString('secondary_backup_path') ?? '';
+      if (secPath.isNotEmpty) {
+        final secDir = Directory(secPath);
+        if (await secDir.exists()) {
+          final secFile = File(join(secDir.path, basename(targetFile.path)));
+          final tempSecFile = File(join(secDir.path, '${basename(targetFile.path)}.tmp'));
+          await targetFile.copy(tempSecFile.path);
+          if (await _isDatabaseIntegrityValid(tempSecFile)) {
+            if (await secFile.exists()) await secFile.delete();
+            await tempSecFile.rename(secFile.path);
+            debugPrint("Secondary USB/External backup mirror created: ${secFile.path}");
+          } else {
+            if (await tempSecFile.exists()) await tempSecFile.delete();
+          }
+        }
+      }
+    } catch (secErr) {
+      debugPrint("Secondary USB mirror notice in DbHelper: $secErr");
+    }
+
     return targetFile.path;
   }
 

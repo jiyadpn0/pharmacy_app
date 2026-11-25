@@ -5,6 +5,7 @@ import 'package:intl/intl.dart';
 import '../providers/pharmacy_provider.dart';
 import '../providers/app_provider.dart';
 import '../services/server_config_service.dart';
+import '../services/supplier_ledger_service.dart';
 import '../services/sync_event_bus.dart';
 import '../utils/search_debouncer.dart';
 import '../utils/theme_constants.dart';
@@ -107,8 +108,7 @@ class _SupplierLedgerScreenState extends State<SupplierLedgerScreen> {
   void _fetchLedgerData() async {
     if (_selectedSupplier == null || !mounted) return;
     setState(() => _isLoadingLedger = true);
-    final p = Provider.of<PharmacyProvider>(context, listen: false);
-    final data = await p.fetchSupplierLedger(_selectedSupplier!);
+    final data = await SupplierLedgerService.instance.fetchSupplierLedger(_selectedSupplier!);
     if (!mounted) return;
     setState(() {
       _ledgerData = data.map((m) => _SupplierLedgerRowData(
@@ -697,6 +697,8 @@ class _SupplierLedgerScreenState extends State<SupplierLedgerScreen> {
           _lastTapIndex = null;
           if (data.type == 'PURCHASE') {
             Provider.of<AppProvider>(context, listen: false).openPurchase(entryNo: data.reference);
+          } else if (data.type == 'PURCHASE RETURN') {
+            Provider.of<AppProvider>(context, listen: false).openPurchaseReturn(entryNo: data.reference);
           }
         } else {
           _lastTapIndex = index;
@@ -710,6 +712,7 @@ class _SupplierLedgerScreenState extends State<SupplierLedgerScreen> {
                : data.isOpening ? Colors.amber.withValues(alpha: 0.18)
                : data.type == 'PAYMENT' ? Colors.green.withValues(alpha: 0.12)
                : data.type == 'PURCHASE RETURN' ? Colors.orange.withValues(alpha: 0.12)
+               : data.type == 'CREDIT NOTE' ? Colors.purple.withValues(alpha: 0.12)
                : c.cardBg,
           border: Border(bottom: BorderSide(color: isSelected ? Colors.blue.shade300 : c.border)),
         ),

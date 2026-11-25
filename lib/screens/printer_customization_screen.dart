@@ -1,11 +1,16 @@
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:printing/printing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../models/erp_models.dart';
+import '../services/esc_pos_printer_service.dart';
 import '../utils/theme_constants.dart';
+import '../utils/thermal_receipt_generator.dart';
 
 enum DotMatrixPaperSize {
-  inch8x11Standard,  // 8.5" x 11" Full Sheet
-  inch8x6Half,       // 8.5" x 6" Half Sheet
-  inch136Wide,       // 136-Column Wide Sheet
+  inch8x11Standard, // 8.5" x 11" Full Sheet
+  inch8x6Half, // 8.5" x 6" Half Sheet
+  inch136Wide, // 136-Column Wide Sheet
 }
 
 class PrinterCustomizationScreen extends StatefulWidget {
@@ -31,10 +36,43 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
   int _columns = 80;
   int _linesPerPage = 66;
 
+  // Real Windows installed printers
+  List<Printer> _windowsPrinters = [];
+  String? _selectedWindowsPrinter;
+  bool _isLoadingPrinters = false;
+
+  // Barcode Scanner Calibration
+  final TextEditingController _barcodeScanCtrl = TextEditingController();
+  final FocusNode _barcodeScanFocus = FocusNode();
+  String _barcodeFeedback = "";
+  DateTime? _firstCharTime;
+  DateTime? _lastCharTime;
+  int _charCount = 0;
+  bool _isHardwareScanner = false;
+
   @override
   void initState() {
     super.initState();
     _loadPrinterPreferences();
+    _fetchWindowsPrinters();
+  }
+
+  Future<void> _fetchWindowsPrinters() async {
+    setState(() => _isLoadingPrinters = true);
+    try {
+      final printers = await Printing.listPrinters();
+      if (!mounted) return;
+      setState(() {
+        _windowsPrinters = printers;
+        _isLoadingPrinters = false;
+        if (_selectedWindowsPrinter == null && printers.isNotEmpty) {
+          final def = printers.where((p) => p.isDefault).firstOrNull ?? printers.first;
+          _selectedWindowsPrinter = def.name;
+        }
+      });
+    } catch (e) {
+      if (mounted) setState(() => _isLoadingPrinters = false);
+    }
   }
 
   Future<void> _loadPrinterPreferences() async {
@@ -42,6 +80,7 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
     if (!mounted) return;
     setState(() {
       _selectedPrinterName = prefs.getString('printer_model') ?? "TVS MSP 250 (80 Col)";
+      _selectedWindowsPrinter = prefs.getString('preferred_printer_name');
       _columns = prefs.getInt('printer_columns') ?? 80;
       _linesPerPage = prefs.getInt('printer_lines') ?? 66;
       int paperSizeIndex = prefs.getInt('printer_paper_size') ?? DotMatrixPaperSize.inch8x11Standard.index;
@@ -61,6 +100,9 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
   Future<void> _savePrinterPreferences() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('printer_model', _selectedPrinterName);
+    if (_selectedWindowsPrinter != null) {
+      await prefs.setString('preferred_printer_name', _selectedWindowsPrinter!);
+    }
     await prefs.setInt('printer_columns', _columns);
     await prefs.setInt('printer_lines', _linesPerPage);
     await prefs.setInt('printer_paper_size', _paperSize.index);
@@ -74,12 +116,11 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Printer profile saved successfully!"), backgroundColor: Colors.green),
+        const SnackBar(content: Text("Printer profile and hardware mappings saved successfully!"), backgroundColor: Colors.green),
       );
     }
   }
 
-  // Mapping common Kerala pharmacy printers to specs
   void _onPrinterSelected(String? printerName) {
     if (printerName == null) return;
     setState(() {
@@ -123,6 +164,177 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
     });
   }
 
+  void _onBarcodeScanChanged(String val) {
+    if (val.isEmpty) {
+      _firstCharTime = null;
+      _lastCharTime = null;
+      _charCount = 0;
+      return;
+    }
+    final now = DateTime.now();
+    _firstCharTime ??= now;
+    _lastCharTime = now;
+    _charCount = val.length;
+  }
+
+  void _onBarcodeSubmitted(String barcode) {
+    if (barcode.trim().isEmpty) return;
+    final totalDurationMs = _lastCharTime != null && _firstCharTime != null
+        ? _lastCharTime!.difference(_firstCharTime!).inMilliseconds
+        : 999;
+    final avgPerChar = _charCount > 1 ? (totalDurationMs / _charCount).round() : totalDurationMs;
+    final isWedge = avgPerChar < 60;
+
+    setState(() {
+      _isHardwareScanner = isWedge;
+      if (isWedge) {
+        _barcodeFeedback = "✅ Hardware Scanner Verified: '$barcode' ($totalDurationMs ms, ~$avgPerChar ms/char) with [Enter] suffix.\nIdeal for hands-free 0-click POS barcode billing!";
+      } else {
+        _barcodeFeedback = "ℹ️ Scanned: '$barcode' in $totalDurationMs ms (~$avgPerChar ms/char).\nNote: If this was a hardware scanner, ensure USB HID high-speed burst mode is active.";
+      }
+    });
+    _barcodeScanCtrl.clear();
+    _firstCharTime = null;
+    _lastCharTime = null;
+    _barcodeScanFocus.requestFocus();
+  }
+
+  Future<void> _testPrintReceipt() async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final sampleInvoice = SaleInvoice(
+        entryNo: "TEST-001",
+        date: DateTime.now(),
+        customerAcc: "Counter Test Patient",
+        patient: "Counter Test Patient",
+        doctor: "Dr. General Test",
+        subTotal: 100.0,
+        grandTotal: 112.0,
+        items: [
+          SaleItem(
+            product: Product(
+              id: "P1",
+              name: "Paracetamol 650mg",
+              batch: "TEST-B1",
+              expiry: "2027-12",
+              mrp: 20.0,
+              salePrice: 20.0,
+              gstPercent: 12.0,
+            ),
+            qty: 5,
+            packin: 1,
+            mrp: 20.0,
+            sRate: 20.0,
+            total: 100.0,
+            gstPercent: 12.0,
+            gstAmt: 12.0,
+          ),
+        ],
+      );
+
+      final company = CompanyProfile(
+        name: _storeNameCtrl.text.trim().isNotEmpty ? _storeNameCtrl.text.trim() : "SAHAKAR MEDICALS",
+        address: _storeAddressCtrl.text.trim(),
+        tagline: _headerTitleCtrl.text.trim(),
+      );
+
+      // Direct TCP Socket if Network Thermal IP is specified
+      if (_thermalIpCtrl.text.trim().isNotEmpty && _thermalIpCtrl.text.contains('.')) {
+        final bytes = EscPosPrinterService.instance.generateReceiptBytes(
+          company: company,
+          invoiceNo: sampleInvoice.entryNo,
+          dateStr: "24/11/2026",
+          patientName: sampleInvoice.customerAcc,
+          doctorName: "Dr. Store Test",
+          items: [
+            {'name': 'Paracetamol 650mg', 'batch': 'TEST-B1', 'qty': '5', 'rate': 20.0, 'amount': 100.0}
+          ],
+          totalAmount: 112.0,
+          totalDiscount: 0.0,
+          gstTotal: 12.0,
+          paymentMode: "Cash",
+        );
+        final success = await EscPosPrinterService.instance.printDirectTcp(
+          bytes: bytes,
+          ipAddress: _thermalIpCtrl.text.trim(),
+        );
+        if (success && mounted) {
+          messenger.showSnackBar(
+            const SnackBar(content: Text("✅ Direct TCP receipt sent to thermal printer!"), backgroundColor: Colors.green),
+          );
+          return;
+        }
+      }
+
+      // Windows Printer Spooler Fallback
+      Printer? targetPrinter;
+      if (_selectedWindowsPrinter != null && _windowsPrinters.isNotEmpty) {
+        try {
+          targetPrinter = _windowsPrinters.firstWhere((p) => p.name == _selectedWindowsPrinter);
+        } catch (_) {}
+      }
+
+      final bytes = await ThermalReceiptGenerator.buildThermalReceipt(sampleInvoice, company);
+      if (targetPrinter != null) {
+        await Printing.directPrintPdf(
+          printer: targetPrinter,
+          onLayout: (_) async => bytes,
+          name: 'Test_Receipt',
+        );
+      } else {
+        await Printing.layoutPdf(
+          onLayout: (_) async => bytes,
+          name: 'Test_Receipt',
+        );
+      }
+
+      if (mounted) {
+        messenger.showSnackBar(
+          const SnackBar(content: Text("✅ Test print dispatched to printer queue!"), backgroundColor: Colors.green),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        messenger.showSnackBar(
+          SnackBar(content: Text("Test print failed: $e"), backgroundColor: Colors.red),
+        );
+      }
+    }
+  }
+
+  Future<void> _testCashDrawerPulse() async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      if (_thermalIpCtrl.text.trim().isNotEmpty && _thermalIpCtrl.text.contains('.')) {
+        final success = await EscPosPrinterService.instance.printDirectTcp(
+          bytes: Uint8List.fromList(EscPosPrinterService.cmdCashDrawer),
+          ipAddress: _thermalIpCtrl.text.trim(),
+        );
+        if (success && mounted) {
+          messenger.showSnackBar(
+            const SnackBar(content: Text("✅ Cash drawer pulse command sent via TCP!"), backgroundColor: Colors.green),
+          );
+          return;
+        }
+      }
+
+      if (mounted) {
+        messenger.showSnackBar(
+          const SnackBar(
+            content: Text("ℹ️ Note: Standard Windows receipt printers automatically trigger the cash drawer kick via RJ11 pulse upon printing an invoice."),
+            backgroundColor: Colors.teal,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        messenger.showSnackBar(
+          SnackBar(content: Text("Cash drawer test failed: $e"), backgroundColor: Colors.red),
+        );
+      }
+    }
+  }
+
   @override
   void dispose() {
     _storeNameCtrl.dispose();
@@ -130,6 +342,8 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
     _headerTitleCtrl.dispose();
     _returnPolicyCtrl.dispose();
     _thermalIpCtrl.dispose();
+    _barcodeScanCtrl.dispose();
+    _barcodeScanFocus.dispose();
     super.dispose();
   }
 
@@ -139,7 +353,7 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
       return Scaffold(
         backgroundColor: AppColors.of(context).background,
         appBar: AppBar(
-          title: const Text("Universal Printer Customization Hub", style: TextStyle(fontWeight: FontWeight.bold)),
+          title: const Text("Hardware & Peripheral Calibration Hub", style: TextStyle(fontWeight: FontWeight.bold)),
           backgroundColor: AppColors.primary,
           foregroundColor: Colors.white,
         ),
@@ -152,12 +366,151 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
   Widget _buildBody() {
     return Row(
       children: [
-        // LEFT PANEL: Configuration & Dynamic Headers
+        // LEFT PANEL: Hardware Configuration & Testing
         Expanded(
           flex: 2,
           child: ListView(
             padding: const EdgeInsets.all(24),
             children: [
+              _sectionTitle("Windows Installed Printers (Auto-Detected)"),
+              Row(
+                children: [
+                  Expanded(
+                    child: DropdownButtonFormField<String>(
+                      initialValue: _selectedWindowsPrinter,
+                      decoration: _inputDecoration("Primary Counter Printer"),
+                      items: _windowsPrinters.map((p) {
+                        return DropdownMenuItem<String>(
+                          value: p.name,
+                          child: Text(
+                            "${p.name}${p.isDefault ? ' (Default)' : ''}",
+                            style: const TextStyle(fontSize: 12),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        );
+                      }).toList(),
+                      onChanged: (v) => setState(() => _selectedWindowsPrinter = v),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton(
+                    onPressed: _isLoadingPrinters ? null : _fetchWindowsPrinters,
+                    icon: _isLoadingPrinters
+                        ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Icon(Icons.refresh, color: AppColors.primary),
+                    tooltip: "Rescan Connected Printers",
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+
+              _sectionTitle("Hardware Diagnostics & Peripheral Testing"),
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.blueGrey.shade50,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.blueGrey.shade200),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      "Instant Hardware Verification:",
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.blueGrey),
+                    ),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 12,
+                      runSpacing: 12,
+                      children: [
+                        ElevatedButton.icon(
+                          onPressed: _testPrintReceipt,
+                          icon: const Icon(Icons.print, size: 16),
+                          label: const Text("TEST PRINT RECEIPT"),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.teal,
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                          ),
+                        ),
+                        ElevatedButton.icon(
+                          onPressed: _testCashDrawerPulse,
+                          icon: const Icon(Icons.meeting_room_rounded, size: 16),
+                          label: const Text("TEST CASH DRAWER"),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.indigo,
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 24),
+
+              _sectionTitle("USB Barcode Scanner Calibration"),
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.amber.shade50,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.amber.shade300),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(Icons.qr_code_scanner_rounded, color: Colors.amber.shade900, size: 20),
+                        const SizedBox(width: 8),
+                        Text(
+                          "Scan any medicine barcode below to verify wedge burst speed:",
+                          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.amber.shade900),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: _barcodeScanCtrl,
+                      focusNode: _barcodeScanFocus,
+                      decoration: InputDecoration(
+                        hintText: "Click here & scan barcode with USB scanner...",
+                        filled: true,
+                        fillColor: Colors.white,
+                        isDense: true,
+                        prefixIcon: const Icon(Icons.barcode_reader, size: 20),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                      ),
+                      onChanged: _onBarcodeScanChanged,
+                      onSubmitted: _onBarcodeSubmitted,
+                    ),
+                    if (_barcodeFeedback.isNotEmpty) ...[
+                      const SizedBox(height: 10),
+                      Container(
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: _isHardwareScanner ? Colors.green.shade50 : Colors.blue.shade50,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: _isHardwareScanner ? Colors.green.shade300 : Colors.blue.shade300),
+                        ),
+                        child: Text(
+                          _barcodeFeedback,
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            color: _isHardwareScanner ? Colors.green.shade900 : Colors.blue.shade900,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(height: 24),
+
               _sectionTitle("Pharmacy Header Customization (White-Label)"),
               TextFormField(
                 controller: _storeNameCtrl,
@@ -293,7 +646,7 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
               ElevatedButton.icon(
                 onPressed: _savePrinterPreferences,
                 icon: const Icon(Icons.save),
-                label: const Text("Save Printer Profile"),
+                label: const Text("Save Hardware Configuration"),
                 style: ElevatedButton.styleFrom(backgroundColor: AppColors.primary, foregroundColor: Colors.white, padding: const EdgeInsets.all(16)),
               ),
             ],
@@ -370,7 +723,7 @@ class _PrinterCustomizationScreenState extends State<PrinterCustomizationScreen>
     String storeName = _storeNameCtrl.text.toUpperCase();
     String storeAddress = _storeAddressCtrl.text.toUpperCase();
     String headerTitle = _headerTitleCtrl.text.toUpperCase();
-    
+
     return """
 $line
 ${storeName.padLeft((cols + storeName.length) ~/ 2)}

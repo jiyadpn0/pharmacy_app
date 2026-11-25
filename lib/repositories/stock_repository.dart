@@ -1,6 +1,7 @@
 import 'package:sqflite/sqflite.dart' as sql;
 import '../database/db_helper.dart';
 import '../models/erp_models.dart';
+import '../utils/app_validators.dart';
 
 /// Repository responsible for direct SQLite queries on [batch_master] and [stock_ledger].
 class StockRepository {
@@ -86,7 +87,7 @@ class StockRepository {
       return BatchMaster.fromMap(existing.first, currentLooseStock: stock);
     }
 
-    // Secondary fallback matching by product_id + batch_number
+    // Secondary fallback matching by product_id + batch_number only when expiry and MRP are compatible
     final existingBatchOnly = await executor.rawQuery('''
       SELECT * FROM batch_master
       WHERE product_id = ? 
@@ -95,9 +96,16 @@ class StockRepository {
     ''', [cleanProdId, cleanBatch]);
 
     if (existingBatchOnly.isNotEmpty) {
-      final String existingId = existingBatchOnly.first['batch_id'].toString();
-      final int stock = await getLiveStockForBatch(existingId, txn: txn);
-      return BatchMaster.fromMap(existingBatchOnly.first, currentLooseStock: stock);
+      final existingExp = existingBatchOnly.first['expiry_date']?.toString().trim() ?? '';
+      final existingMrp = (existingBatchOnly.first['mrp'] as num?)?.toDouble() ?? 0.0;
+      final bool isExpiryCompatible = expiryDate.isEmpty || existingExp.isEmpty || existingExp == expiryDate;
+      final bool isMrpCompatible = mrp == 0.0 || existingMrp == 0.0 || (existingMrp - mrp).abs() < 0.05;
+
+      if (isExpiryCompatible && isMrpCompatible) {
+        final String existingId = existingBatchOnly.first['batch_id'].toString();
+        final int stock = await getLiveStockForBatch(existingId, txn: txn);
+        return BatchMaster.fromMap(existingBatchOnly.first, currentLooseStock: stock);
+      }
     }
 
     // Create a new batch
@@ -125,7 +133,14 @@ class StockRepository {
 
   /// Returns all active available batches for a product ordered by FEFO (First-Expiry-First-Out).
   /// Only returns batches with positive live stock (> 0).
-  Future<List<BatchMaster>> getAvailableBatchesForProduct(String productId, {sql.Transaction? txn}) async {
+  ///
+  /// If [excludeExpired] is true (default: false), filters out batches whose expiry date has passed as of [asOf].
+  Future<List<BatchMaster>> getAvailableBatchesForProduct(
+    String productId, {
+    bool excludeExpired = false,
+    DateTime? asOf,
+    sql.Transaction? txn,
+  }) async {
     if (productId.isEmpty) return [];
     final executor = txn ?? await _db;
 
@@ -144,6 +159,9 @@ class StockRepository {
                        THEN '20' || substr(bm.expiry_date, instr(bm.expiry_date, '/') + 1) 
                        ELSE substr(bm.expiry_date, instr(bm.expiry_date, '/') + 1) END) AS INTEGER) * 100 
             + CAST(substr(bm.expiry_date, 1, instr(bm.expiry_date, '/') - 1) AS INTEGER)
+          WHEN bm.expiry_date LIKE '____-__%' THEN
+            CAST(substr(bm.expiry_date, 1, 4) AS INTEGER) * 100 
+            + CAST(substr(bm.expiry_date, 6, 2) AS INTEGER)
           ELSE 999999 
         END ASC,
         bm.expiry_date ASC
@@ -154,6 +172,25 @@ class StockRepository {
       int liveStock = (r['live_stock'] as num?)?.toInt() ?? 0;
       batches.add(BatchMaster.fromMap(r, currentLooseStock: liveStock));
     }
+
+    // Exact deterministic FEFO date sort handling both slash and ISO formats
+    batches.sort((a, b) {
+      final dateA = AppValidators.parseExpiryToDate(a.expiryDate);
+      final dateB = AppValidators.parseExpiryToDate(b.expiryDate);
+      if (dateA == null && dateB == null) return 0;
+      if (dateA == null) return 1;
+      if (dateB == null) return -1;
+      return dateA.compareTo(dateB);
+    });
+
+    if (excludeExpired) {
+      final now = asOf ?? DateTime.now();
+      batches = batches.where((b) {
+        final exp = AppValidators.parseExpiryToDate(b.expiryDate);
+        return exp == null || !exp.isBefore(now);
+      }).toList();
+    }
+
     return batches;
   }
 

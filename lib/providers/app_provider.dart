@@ -48,6 +48,7 @@ import '../screens/consolidate_stock_screen.dart';
 import '../screens/reports/product_mapping_report_screen.dart';
 import '../screens/reports/product_ranking_screen.dart';
 import '../screens/customer_ledger_screen.dart';
+import '../screens/opening_stock_screen.dart';
 import '../screens/supplier_ledger_screen.dart';
 import '../screens/gst_report_screen.dart';
 import '../screens/sales_return_report_screen.dart';
@@ -56,6 +57,8 @@ import '../screens/reports/schedule_h1_register_screen.dart';
 import '../screens/reports/reorder_assistant_screen.dart';
 import '../screens/reports/order_book_screen.dart';
 import '../screens/order_confirmation_screen.dart';
+import '../screens/reports/day_closing_screen.dart';
+import '../screens/reports/supplier_expiry_return_screen.dart';
 
 class TabItem {
   final String title;
@@ -165,6 +168,7 @@ class AppProvider extends ChangeNotifier {
   void openSales3() => addTab("SALES ENGINE PRO", const SalesScreen());
   void openPurchaseHistory() => addTab("PURCHASE HISTORY", const PurchaseReportScreen());
   void openAllStockDetails() => addTab("INVENTORY", const StockListScreen());
+  void openOpeningStock() => addTab("OPENING STOCK ENTRY", const OpeningStockScreen());
   void openInventory() => addTab("INVENTORY", const StockListReportScreen());
   void openRealtimeStock() => addTab("REALTIME STOCK QTY", const RealtimeStockScreen());
   void openProductMasterList() => openAllStockDetails();
@@ -228,6 +232,8 @@ class AppProvider extends ChangeNotifier {
   void openDoctorList() => addTab("Doctor Registration", const DoctorRegistrationScreen());
   void openExpiryList() => addTab("Expiry / Non Moving", const ExpiryCheckScreen());
   void openDailyReport() => addTab("Daily Report", const DailyReportScreen());
+  void openDayClosing() => addTab("DAY-END SHIFT SETTLEMENT", const DayClosingScreen());
+  void openSupplierExpiryReturn() => addTab("SUPPLIER EXPIRY CLAIMS", const SupplierExpiryReturnScreen());
   void openConsolidateStock() => addTab("Consolidate Stock Position", const ConsolidateStockScreen());
   void openWholesaleStockDirectory() => addTab("Wholesale Stock Directory", const WholesaleStockDirectoryScreen());
   void openDamageEntry() => addTab("Damage Entry", const DamageEntryScreen(initialReason: "damage"));

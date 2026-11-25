@@ -29,6 +29,7 @@ import '../utils/tax_calculator.dart';
 import '../widgets/erp_tooltip.dart';
 
 import '../utils/app_formatters.dart';
+import '../utils/app_validators.dart';
 import '../utils/app_logger.dart';
 import '../utils/theme_constants.dart';
 import '../utils/search_debouncer.dart';
@@ -4121,17 +4122,12 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> implements Un
         it.expiry = exp;
         _getGridCtrl(i, 5, exp).text = exp;
 
-        if (exp.isEmpty || exp == "--/--" || !exp.contains('/')) {
+        if (!AppValidators.isValidExpiry(exp)) {
           _errorCells.putIfAbsent(i, () => {}).add(5); // Column 5: Expiry
-          validationErrors.add("Row ${i + 1}: Expiry date must follow MM/YY format (e.g., 06/28).");
-        } else {
-          final parts = exp.split('/');
-          int? month = int.tryParse(parts[0]);
-          int? year = int.tryParse(parts[1]);
-          if (month == null || month < 1 || month > 12 || year == null) {
-            _errorCells.putIfAbsent(i, () => {}).add(5); // Column 5: Expiry
-            validationErrors.add("Row ${i + 1}: Invalid expiry month ($exp). Must be between 01 and 12.");
-          }
+          validationErrors.add("Row ${i + 1}: Expiry date must follow MM/YY or YYYY-MM format (e.g., 06/28).");
+        } else if (AppValidators.isExpired(exp, asOf: _date)) {
+          _errorCells.putIfAbsent(i, () => {}).add(5); // Column 5: Expiry
+          validationErrors.add("Row ${i + 1}: '${it.productName}' (Batch: ${it.batch}) is ALREADY EXPIRED ($exp). Inward receipt of expired goods is prohibited.");
         }
 
         // 3. Verify Quantity Constraint (Qty + F.Qty > 0)
@@ -4629,11 +4625,16 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> implements Un
         doneBy: _doneByCtrl.text,
         invTotal: double.tryParse(_invTotalCtrl.text) ?? 0.0,
         remarks: _remarksCtrl.text,
+        days: _dueDate.difference(_date).inDays > 0 ? _dueDate.difference(_date).inDays : 0,
         subTotal: double.tryParse(_subTotalCtrl.text) ?? 0.0,
         discount: double.tryParse(_footerDiscAmtCtrl.text) ?? 0.0,
         otherCharge: double.tryParse(_otherChargeAmtCtrl.text) ?? 0.0,
         roundOff: double.tryParse(_roundOffCtrl.text) ?? 0.0,
         taxType: taxType,
+        paymentMode: _paymentMode == 2 ? "CASH" : "CREDIT",
+        paymentStatus: _paymentMode == 2 ? 1 : 0,
+        paidAmount: _paymentMode == 2 ? _grandTotalNotifier.value : 0.0,
+        paymentDate: _paymentMode == 2 ? _date : null,
         items: _items.map((it) => PurchaseItem(
           id: it.productId,
           productName: it.productName, batch: it.batch, expiry: it.expiry,
@@ -5939,6 +5940,8 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> implements Un
           _invTotalCtrl.clear();
           _remarksCtrl.clear();
           _poNoCtrl.clear();
+          _paymentMode = 1;
+          _dueDate = DateTime.now().add(const Duration(days: 30));
 
           _footerDiscPctCtrl.text = "0";
           _footerDiscAmtCtrl.text = "0.00";
@@ -6055,6 +6058,9 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> implements Un
           String rawEntry = cleanEntryNo(data['entry_no']?.toString() ?? invNo);
           _entryNoCtrl.text = formatSaleDisplayNo(rawEntry);
           _date = DateTime.tryParse(data['date']) ?? DateTime.now();
+          _paymentMode = (data['payment_mode'] == 'CASH' || data['payment_status'] == 1) ? 2 : 1;
+          int days = (data['days'] as num?)?.toInt() ?? 0;
+          _dueDate = days > 0 ? _date.add(Duration(days: days)) : _date;
           _supplierCtrl.text = data['supplier_name'] ?? "";
           _supInvNoCtrl.text = cleanInvoiceNo(data['sup_inv_no']?.toString() ?? '');
           _doneByCtrl.text = data['done_by'] ?? "";

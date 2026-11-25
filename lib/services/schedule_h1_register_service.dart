@@ -1,5 +1,6 @@
 import 'package:sqflite/sqflite.dart';
 import '../database/db_helper.dart';
+import '../models/erp_models.dart';
 
 class ScheduleH1Record {
   final int? id;
@@ -82,6 +83,36 @@ class ScheduleH1RegisterService {
     final db = await _db;
     await _ensureTable(db);
     return await db.insert('schedule_h1_logs', record.toMap());
+  }
+
+  /// Automatically inspects a sale and logs all Schedule H1 / Schedule X / NRx regulated medicines
+  Future<void> logSaleTransaction(SaleInvoice sale) async {
+    final db = await _db;
+    await _ensureTable(db);
+    for (var item in sale.items) {
+      final sched = item.product.schedule.toUpperCase().trim();
+      final bool isRegulated = sched.contains("H1") ||
+          sched.contains("X") ||
+          sched.contains("NRX") ||
+          sched.contains("NARCOTIC") ||
+          item.product.isControlled ||
+          item.product.isNrx;
+
+      if (isRegulated) {
+        final double totalQty = ((item.qty + item.fQty) * (item.packin > 0 ? item.packin : 1) + item.looseQty).toDouble();
+        await db.insert('schedule_h1_logs', {
+          'date': sale.date.toIso8601String().substring(0, 10),
+          'invoice_no': sale.entryNo,
+          'product_name': item.product.name,
+          'batch_number': item.product.batch,
+          'qty': totalQty,
+          'patient_name': sale.patient.isNotEmpty && sale.patient.toUpperCase() != "GENERAL" ? sale.patient : "Counter Patient",
+          'patient_contact': sale.mobile,
+          'doctor_name': sale.doctor.isNotEmpty ? sale.doctor : "Registered Practitioner",
+          'doctor_reg_no': sale.doctorRegNo,
+        });
+      }
+    }
   }
 
   /// Fetches Schedule H1 transactions for Drug Inspector audit

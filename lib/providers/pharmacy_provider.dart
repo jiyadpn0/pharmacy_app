@@ -2523,8 +2523,8 @@ class PharmacyProvider extends ChangeNotifier {
     }
   }
 
-  Future<String> getNextSaleEntryNo() async {
-    return _peekNextNo('sales_invoices', 'entry_no', _selectedFinancialYear, excludePrefix: 'SO-');
+  Future<String> getNextSaleEntryNo({String? prefix}) async {
+    return _peekNextNo('sales_invoices', 'entry_no', _selectedFinancialYear, excludePrefix: 'SO-', prefix: prefix);
   }
 
   Future<String> getNextSpecialOrderNo() async {
@@ -2993,6 +2993,37 @@ class PharmacyProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> reloadSuppliersFromDb() async {
+    if (kIsWeb) return;
+    try {
+      final db = await DbHelper.instance.database;
+      final List<Map<String, dynamic>> allSupMaps = await db.query(
+        'suppliers',
+        where: 'is_deleted = 0 OR is_deleted IS NULL',
+      );
+      _supplierMaster.clear();
+      _suppliers.clear();
+      for (var s in allSupMaps) {
+        String name = s['name']?.toString().trim() ?? "";
+        if (name.isNotEmpty) {
+          if (!_suppliers.contains(name)) _suppliers.add(name);
+          _supplierMaster.add(Supplier(
+            id: s['id']?.toString() ?? "SUP_${DateTime.now().millisecondsSinceEpoch}",
+            name: name,
+            address: s['address']?.toString() ?? "",
+            phone: s['phone']?.toString() ?? "",
+            gstIn: s['gst_in']?.toString() ?? "",
+            dlNumber: s['dl_number']?.toString() ?? "",
+            currentBalance: (s['current_balance'] as num?)?.toDouble() ?? 0.0,
+          ));
+        }
+      }
+      notifyListeners();
+    } catch (e) {
+      debugPrint("Error reloading suppliers: $e");
+    }
+  }
+
   // --- ACCOUNTS MANAGEMENT ---
   Future<void> fetchAccounts() async {
     final db = await DbHelper.instance.database;
@@ -3164,6 +3195,36 @@ class PharmacyProvider extends ChangeNotifier {
       _patients.remove(name);
     }
     notifyListeners();
+  }
+
+  Future<void> reloadPatientsFromDb() async {
+    if (kIsWeb) return;
+    try {
+      final db = await DbHelper.instance.database;
+      final List<Map<String, dynamic>> allPatMaps = await db.query(
+        'patients',
+        where: 'is_deleted = 0 OR is_deleted IS NULL',
+      );
+      _patientMaster.clear();
+      _patients.clear();
+      _patients.add("General");
+      for (var p in allPatMaps) {
+        String name = p['name']?.toString().trim() ?? "";
+        if (name.isNotEmpty) {
+          if (!_patients.contains(name)) _patients.add(name);
+          _patientMaster.add(Patient(
+            id: p['id']?.toString() ?? "PAT_${DateTime.now().millisecondsSinceEpoch}",
+            name: name,
+            mobile: p['mobile']?.toString() ?? "",
+            address: p['address']?.toString() ?? "",
+            currentBalance: (p['current_balance'] as num?)?.toDouble() ?? 0.0,
+          ));
+        }
+      }
+      notifyListeners();
+    } catch (e) {
+      debugPrint("Error reloading patients: $e");
+    }
   }
 
   Future<void> registerDoctor(Doctor d) async {
@@ -9040,9 +9101,14 @@ class PharmacyProvider extends ChangeNotifier {
 
           // 3. Revert Old Patient Balance
           if (existingOldHeader.isNotEmpty) {
-            double oldCredit = existingOldHeader.first['customer_acc'] != 'Cash' 
-                ? (((existingOldHeader.first['grand_total'] as num?)?.toDouble() ?? 0.0) - ((existingOldHeader.first['rcvd_amt'] as num?)?.toDouble() ?? 0.0))
-                : 0.0;
+            bool oldWasPaid = (existingOldHeader.first['is_paid'] as int? ?? 0) == 1 ||
+                existingOldHeader.first['customer_acc'] == 'Cash' ||
+                existingOldHeader.first['customer_acc'] == 'UPI' ||
+                existingOldHeader.first['customer_acc'] == 'Card';
+            double oldGrand = (existingOldHeader.first['grand_total'] as num?)?.toDouble() ?? 0.0;
+            double oldRcvd = (existingOldHeader.first['rcvd_amt'] as num?)?.toDouble() ?? 0.0;
+            double oldCredit = oldWasPaid ? 0.0 : (oldGrand - oldRcvd);
+            if (oldCredit < 0) oldCredit = 0.0;
             String oldPatient = existingOldHeader.first['patient']?.toString() ?? '';
             if (oldPatient.isNotEmpty && oldCredit > 0) {
               await txn.rawUpdate('UPDATE patients SET current_balance = current_balance - ? WHERE name = ? COLLATE NOCASE', [oldCredit, oldPatient]);
@@ -9191,7 +9257,9 @@ class PharmacyProvider extends ChangeNotifier {
           }
 
           // 6. Apply New Patient Balance
-          double newCredit = sale.customerAcc != "Cash" ? (sale.grandTotal - sale.rcvdAmt) : 0.0;
+          bool isPaid = sale.isPaid || sale.customerAcc == "Cash" || sale.customerAcc == "UPI" || sale.customerAcc == "Card";
+          double newCredit = isPaid ? 0.0 : (sale.grandTotal - sale.rcvdAmt);
+          if (newCredit < 0) newCredit = 0.0;
           if (sale.patient.isNotEmpty && newCredit > 0) {
             final int updatedRows = await txn.rawUpdate(
               'UPDATE patients SET current_balance = current_balance + ? WHERE name = ? COLLATE NOCASE', 
@@ -9543,8 +9611,14 @@ class PharmacyProvider extends ChangeNotifier {
 
           if (existingOldHeader.isNotEmpty) {
             double oldGrandTotal = (existingOldHeader.first['grand_total'] as num?)?.toDouble() ?? 0.0;
+            double oldPaidAmount = (existingOldHeader.first['paid_amount'] as num?)?.toDouble() ?? 0.0;
+            int oldPaymentStatus = (existingOldHeader.first['payment_status'] as int?) ?? 0;
+            double oldUnpaid = oldPaymentStatus == 1 ? 0.0 : (oldGrandTotal - oldPaidAmount);
+            if (oldUnpaid < 0) oldUnpaid = 0.0;
             String oldSup = existingOldHeader.first['supplier_name'].toString();
-            await txn.rawUpdate('UPDATE suppliers SET current_balance = current_balance - ? WHERE name = ? COLLATE NOCASE', [oldGrandTotal, oldSup]);
+            if (oldUnpaid > 0) {
+              await txn.rawUpdate('UPDATE suppliers SET current_balance = current_balance - ? WHERE name = ? COLLATE NOCASE', [oldUnpaid, oldSup]);
+            }
           }
 
           // ================================================================
@@ -9694,9 +9768,18 @@ class PharmacyProvider extends ChangeNotifier {
           // 1. DO NOT DELETE ZERO STOCK ROWS! (Commented out or removed)
           // await txn.rawDelete('DELETE FROM stock_batches WHERE current_stock = 0');
 
-          final int updatedRows = await txn.rawUpdate('UPDATE suppliers SET current_balance = current_balance + ? WHERE name = ? COLLATE NOCASE', [purchase.grandTotal, purchase.supplierName]);
-          if (updatedRows == 0) {
-            await txn.insert('suppliers', {'id': "SUP_${DateTime.now().millisecondsSinceEpoch}", 'name': purchase.supplierName, 'current_balance': purchase.grandTotal, 'phone': '', 'address': '', 'gst_in': '', 'dl_number': ''});
+          double newUnpaid = purchase.paymentStatus == 1 ? 0.0 : (purchase.grandTotal - purchase.paidAmount);
+          if (newUnpaid < 0) newUnpaid = 0.0;
+          if (newUnpaid > 0) {
+            final int updatedRows = await txn.rawUpdate('UPDATE suppliers SET current_balance = current_balance + ? WHERE name = ? COLLATE NOCASE', [newUnpaid, purchase.supplierName]);
+            if (updatedRows == 0) {
+              await txn.insert('suppliers', {'id': "SUP_${DateTime.now().millisecondsSinceEpoch}", 'name': purchase.supplierName, 'current_balance': newUnpaid, 'phone': '', 'address': '', 'gst_in': '', 'dl_number': ''});
+            }
+          } else {
+            final supCheck = await txn.query('suppliers', columns: ['id'], where: 'name = ? COLLATE NOCASE', whereArgs: [purchase.supplierName]);
+            if (supCheck.isEmpty) {
+              await txn.insert('suppliers', {'id': "SUP_${DateTime.now().millisecondsSinceEpoch}", 'name': purchase.supplierName, 'current_balance': 0.0, 'phone': '', 'address': '', 'gst_in': '', 'dl_number': ''});
+            }
           }
       });
 
@@ -9817,6 +9900,7 @@ class PharmacyProvider extends ChangeNotifier {
 
       await syncInventoryFromDb();
       await fetchAccounts();
+      await reloadSuppliersFromDb();
 
       // Trigger instant atomic push to Supabase Cloud when saving purchase
       unawaited(() async {
@@ -11839,6 +11923,7 @@ class PharmacyProvider extends ChangeNotifier {
       if (_purchaseReturns.length > 50) _purchaseReturns.removeLast();
 
       await syncInventoryFromDb();
+      await reloadSuppliersFromDb();
 
       // Queue in durable outbox for server-side atomic stock deduction
       final pretIdempKey = StockOutboxService.generateIdempotencyKey(
@@ -13876,7 +13961,7 @@ class PharmacyProvider extends ChangeNotifier {
     _autoRegisteredSupId = null; // Reset
 
     _supplierPayments.add(payment);
-    notifyListeners();
+    await reloadSuppliersFromDb();
   }
 
   Future<void> deleteSupplierPayment(String paymentId) async {
@@ -13897,7 +13982,7 @@ class PharmacyProvider extends ChangeNotifier {
       }
     }
     _supplierPayments.removeWhere((p) => p.id == paymentId);
-    notifyListeners();
+    await reloadSuppliersFromDb();
   }
 
   Future<void> updateSupplierPayment(SupplierPayment payment) async {
@@ -13916,7 +14001,7 @@ class PharmacyProvider extends ChangeNotifier {
     if (idx != -1) {
       _supplierPayments[idx] = payment;
     }
-    notifyListeners();
+    await reloadSuppliersFromDb();
   }
 
   // =========================================================================
@@ -14065,7 +14150,7 @@ class PharmacyProvider extends ChangeNotifier {
     }
 
     _supplierCreditNotes.add(cn);
-    notifyListeners();
+    await reloadSuppliersFromDb();
   }
 
   Future<void> deleteSupplierCreditNote(String id) async {
@@ -14085,7 +14170,7 @@ class PharmacyProvider extends ChangeNotifier {
       }
     }
     _supplierCreditNotes.removeWhere((p) => p.id == id);
-    notifyListeners();
+    await reloadSuppliersFromDb();
   }
 
   Future<void> updateSupplierCreditNote(SupplierCreditNote cn) async {
@@ -14103,7 +14188,7 @@ class PharmacyProvider extends ChangeNotifier {
     if (idx != -1) {
       _supplierCreditNotes[idx] = cn;
     }
-    notifyListeners();
+    await reloadSuppliersFromDb();
   }
 
   // SALES DRAFT / AUTOSAVE LOGIC

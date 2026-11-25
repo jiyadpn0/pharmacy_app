@@ -20,7 +20,10 @@ import '../services/delta_sync_service.dart';
 import '../services/app_notification_service.dart';
 import '../services/pure_cloud_service.dart';
 import '../services/stock_outbox_service.dart';
+import '../services/schedule_h1_register_service.dart';
+import '../services/clinical_interaction_service.dart';
 import '../widgets/live_system_counts_dialog.dart';
+import '../widgets/sync_health_badge.dart';
 import '../database/db_helper.dart';
 
 // Providers & Controllers
@@ -33,6 +36,7 @@ import '../utils/tax_calculator.dart';
 import '../utils/theme_constants.dart';
 import '../utils/app_dialogs.dart';
 import '../utils/app_formatters.dart';
+import '../utils/app_validators.dart';
 import '../utils/app_logger.dart';
 import '../widgets/app_date_picker.dart';
 import '../widgets/erp_tooltip.dart';
@@ -46,6 +50,7 @@ import '../utils/unsaved_handler.dart';
 // Widgets & Sub-components
 import '../widgets/pin_unlock_dialog.dart';
 import '../widgets/schedule_h1_compliance_dialog.dart';
+import '../widgets/sales/clinical_interaction_dialog.dart';
 import '../widgets/sales/wholesale_availability_dialog.dart';
 import '../widgets/sales/dynamic_upi_qr_dialog.dart';
 import '../widgets/erp_grid_text_field.dart';
@@ -313,14 +318,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   bool _isSelectingFromDropdown = false;
 
   DateTime _parseExpiry(String exp) {
-    String clean = exp.replaceAll('-', '/');
-    if (!clean.contains('/')) return DateTime(2099);
-    final parts = clean.split('/');
-    if (parts.length != 2) return DateTime(2099);
-    int m = int.tryParse(parts[0]) ?? 1;
-    int y = int.tryParse(parts[1]) ?? 99;
-    if (y < 100) y += 2000;
-    return DateTime(y, m + 1, 0);
+    return AppValidators.parseExpiryToDate(exp) ?? DateTime(2099);
   }
 
   String _cleanBatch(String batch) {
@@ -329,10 +327,13 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
   Color _getBatchBgColor(String expiryStr) {
     String trimmed = expiryStr.trim();
-    if (trimmed.isEmpty || trimmed == "--/--" || !trimmed.contains('/')) {
+    if (trimmed.isEmpty || trimmed == "--/--") {
       return Colors.white;
     }
-    DateTime expDate = _parseExpiry(expiryStr);
+    DateTime? expDate = AppValidators.parseExpiryToDate(expiryStr);
+    if (expDate == null) {
+      return Colors.white;
+    }
     DateTime ref = DateTime(_date.year, _date.month, _date.day);
 
     if (expDate.isBefore(ref)) {
@@ -352,10 +353,13 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
   Color _getBatchTextColor(String expiryStr) {
     String trimmed = expiryStr.trim();
-    if (trimmed.isEmpty || trimmed == "--/--" || !trimmed.contains('/')) {
+    if (trimmed.isEmpty || trimmed == "--/--") {
       return Colors.black;
     }
-    DateTime expDate = _parseExpiry(expiryStr);
+    DateTime? expDate = AppValidators.parseExpiryToDate(expiryStr);
+    if (expDate == null) {
+      return Colors.black;
+    }
     DateTime ref = DateTime(_date.year, _date.month, _date.day);
 
     if (expDate.isBefore(ref)) {
@@ -416,11 +420,12 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       });
     }
 
+    final String termPrefix = ServerConfigService.instance.terminalPrefix;
     String nextNo;
     if (ServerConfigService.instance.isPureCloud) {
-      nextNo = await PureCloudService.instance.getNextSequenceNumber('sales_invoices', p.selectedFinancialYear);
+      nextNo = await PureCloudService.instance.getNextSequenceNumber('sales_invoices', p.selectedFinancialYear, prefix: termPrefix);
     } else {
-      nextNo = await p.getNextSaleEntryNo();
+      nextNo = await p.getNextSaleEntryNo(prefix: termPrefix);
     }
 
     if (mounted && !_isExistingEntry) {
@@ -439,6 +444,33 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   void initState() {
     super.initState();
     UnsavedChangesRegistry.register("SALES ENTRY", this);
+
+    PrintSpoolerService.onPrintFailed = (failedJob) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: Colors.red.shade900,
+          duration: const Duration(seconds: 8),
+          content: Row(
+            children: [
+              const Icon(Icons.print_disabled_rounded, color: Colors.white, size: 20),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  "Printing failed: ${failedJob.title}. Please check printer cable or paper roll.",
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                ),
+              ),
+            ],
+          ),
+          action: SnackBarAction(
+            label: "REPRINT",
+            textColor: Colors.amberAccent,
+            onPressed: () => PrintSpoolerService.instance.retryJob(failedJob.id),
+          ),
+        ),
+      );
+    };
 
     _loadColumnWidths();
 
@@ -625,6 +657,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   @override
   void dispose() {
     _isDisposed = true;
+    PrintSpoolerService.onPrintFailed = null;
     _entryNoDebounceTimer?.cancel();
     _watchdogSub?.cancel();
     ServerConfigService.instance.removeListener(_onConfigChanged);
@@ -812,7 +845,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
 
   void _saveAndPrintBill() {
     if (_isSaving || _isLoading || _isDialogOpen) return;
-    _promptSave();
+    _promptSave(autoPrint: true);
   }
 
   void _processBarcode(String barcode) async {
@@ -1445,8 +1478,19 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       _mobileCtrl.text = item.mobile;
     } else if (item is Doctor) {
       ctrl.text = item.name.toUpperCase();
+      if (item.regNo.isNotEmpty) {
+        _doctorRegNoCtrl.text = item.regNo;
+      }
     } else if (item is String) {
       ctrl.text = item.toUpperCase();
+      final provider = Provider.of<PharmacyProvider>(context, listen: false);
+      final matchedDoc = provider.doctorMaster.firstWhere(
+        (d) => d.name.trim().toLowerCase() == item.trim().toLowerCase(),
+        orElse: () => Doctor(id: '', name: '', mobile: '', specialization: '', regNo: '', isActive: true),
+      );
+      if (matchedDoc.regNo.isNotEmpty) {
+        _doctorRegNoCtrl.text = matchedDoc.regNo;
+      }
     }
 
     list.value = [];
@@ -2744,23 +2788,36 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   }
 
   void _checkExpiryAndCommit(int row, Product product) async {
-    final expDate = _parseExpiry(product.expiry);
-    final now = DateTime.now();
-    if (expDate.isBefore(now)) {
-      await _showFastDialog(
-        title: "EXPIRED STOCK BLOCKED",
-        content: "Batch '${product.batch}' expired on ${product.expiry}. Expired inventory cannot be billed.",
-        isYesNo: false,
-        initialFocusIdx: 1,
-      );
-      return; // Strictly block selection
+    final now = DateTime(_date.year, _date.month, _date.day);
+    if (AppValidators.isExpired(product.expiry, asOf: now)) {
+      final p = Provider.of<PharmacyProvider>(context, listen: false);
+      bool allowOverride = false;
+      if (p.securityToggles['allow_expired_billing_override'] == true) {
+        allowOverride = await PinUnlockDialog.show(
+          context,
+          p,
+          title: "EXPIRED DRUG - SUPERVISOR OVERRIDE",
+          message: "Batch '${product.batch}' of '${product.name}' is EXPIRED (${product.expiry}). Enter Master PIN to override for testing/return billing.",
+        );
+      }
+
+      if (!allowOverride) {
+        await _showFastDialog(
+          title: "EXPIRED STOCK BLOCKED",
+          content: "Batch '${product.batch}' of '${product.name}' expired on ${product.expiry}. Statutory Drug Regulations prohibit dispensing expired medicines.",
+          isYesNo: false,
+          initialFocusIdx: 1,
+        );
+        return; // Strictly block selection
+      }
     }
 
-    final daysRemaining = expDate.difference(now).inDays;
-    if (daysRemaining <= 60 && daysRemaining > 0) {
+    if (AppValidators.isNearExpiry(product.expiry, thresholdDays: 60, asOf: now)) {
+      final expDate = AppValidators.parseExpiryToDate(product.expiry);
+      final daysRemaining = expDate != null ? expDate.difference(now).inDays : 0;
       bool? proceed = await _showFastDialog(
-        title: "NEAR EXPIRY WARNING",
-        content: "Batch '${product.batch}' expires in $daysRemaining days (${product.expiry}). Proceed with billing?",
+        title: "NEAR EXPIRY ALERT",
+        content: "Batch '${product.batch}' of '${product.name}' expires in $daysRemaining days (${product.expiry}). Proceed with billing?",
         isYesNo: true,
         initialFocusIdx: 2,
       );
@@ -3659,231 +3716,338 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     }
   }
 
-  void _promptSave() async {
+  void _promptSave({bool autoPrint = false}) async {
     if (_isSaving || _isLoading || _isDialogOpen) return;
 
-    // PRE-COMMIT HOOK: Validate mandatory fields before prompting for payment
-    final String currentAcc = _customerAccCtrl.text.trim().isNotEmpty ? _customerAccCtrl.text.trim() : _customerAcc.trim();
-    final String currentPatient = _patientCtrl.text.trim();
-    final String currentDoctor = _doctorCtrl.text.trim();
+    // PRE-COMMIT HOOK: Validate / Auto-populate fields before prompting for payment
+    String currentAcc = _customerAccCtrl.text.trim().isNotEmpty ? _customerAccCtrl.text.trim() : _customerAcc.trim();
+    String currentPatient = _patientCtrl.text.trim();
+    String currentDoctor = _doctorCtrl.text.trim();
 
     if (currentAcc.isEmpty) {
-      _customerAccFocus.requestFocus();
-      _showFastDialog(
-        title: "Validation Error",
-        content: "Account Name is mandatory. Please enter Account Name before saving.",
-      );
-      return;
+      currentAcc = "Cash";
+      _customerAccCtrl.text = "Cash";
+      _customerAcc = "Cash";
     }
     if (currentPatient.isEmpty) {
-      _patientFocus.requestFocus();
-      _showFastDialog(
-        title: "Validation Error",
-        content: "Patient Name is mandatory. Please enter Patient Name before saving.",
-      );
-      return;
+      currentPatient = "Counter Customer";
+      _patientCtrl.text = "Counter Customer";
     }
     if (currentDoctor.isEmpty) {
-      _doctorFocus.requestFocus();
-      _showFastDialog(
-        title: "Validation Error",
-        content: "Doctor Name is mandatory. Please enter Doctor Name before saving.",
-      );
-      return;
+      final hasRegulated = _items.any((it) {
+        String s = it.product.schedule.toUpperCase();
+        return s.contains("H1") || s.contains("X") || s.contains("NARCOTIC");
+      });
+      if (hasRegulated) {
+        _doctorFocus.requestFocus();
+        _showFastDialog(
+          title: "Doctor Name Required",
+          content: "This invoice contains Schedule H1 / Controlled medicines. Doctor Name is legally mandatory.",
+        );
+        return;
+      } else {
+        currentDoctor = "SELF / OTC";
+        _doctorCtrl.text = "SELF / OTC";
+      }
     }
 
-    // PRE-COMMIT HOOK: Force calculation of everything before asking for payment (Silent to avoid UI churn)
+    // PRE-COMMIT HOOK: Force calculation of everything before asking for payment
     for (var it in _items) {
       _recalculateItemSilent(it, isGstMode: _gstType == 1);
     }
     _calculateFooter();
 
     final double grandTotal = _netTotalNotifier.value;
-    String acc1 = _customerAcc; // Defaults to what is selected in the footer
+    String acc1 = currentAcc;
     String acc2 = "Bank";
 
-    // If account is Credit, received amount must default to 0.00
     final bool isCredit = acc1.toUpperCase() == "CREDIT";
     final TextEditingController amt1Ctrl = TextEditingController(
-      text: isCredit ? "0.00" : grandTotal.toStringAsFixed(2)
+      text: isCredit ? "0.00" : grandTotal.toStringAsFixed(2),
     );
     final TextEditingController amt2Ctrl = TextEditingController(text: "0.00");
+    final TextEditingController cashTenderedCtrl = TextEditingController(
+      text: grandTotal.toStringAsFixed(2),
+    );
 
     _isDialogOpen = true;
-    final res = await showDialog<bool>(
-        context: context,
-        barrierDismissible: false,
-        builder: (ctx) {
-          int focusedIdx = 1; // 1: Save, 2: Cancel
-          return StatefulBuilder(
-            builder: (context, setDialogState) {
-              return Focus(
-                autofocus: true,
-                onKeyEvent: (node, event) {
-                  if (event is KeyDownEvent) {
-                    if (event.logicalKey == LogicalKeyboardKey.enter || event.logicalKey == LogicalKeyboardKey.numpadEnter) {
-                      Navigator.of(ctx).pop(focusedIdx == 1);
-                      return KeyEventResult.handled;
-                    } else if (event.logicalKey == LogicalKeyboardKey.escape) {
-                      Navigator.of(ctx).pop(false);
-                      return KeyEventResult.handled;
-                    } else if (event.logicalKey == LogicalKeyboardKey.arrowLeft || event.logicalKey == LogicalKeyboardKey.arrowRight) {
-                      setDialogState(() => focusedIdx = (focusedIdx == 1 ? 2 : 1));
-                      return KeyEventResult.handled;
-                    }
-                  }
-                  return KeyEventResult.ignored;
-                },
-                child: AlertDialog(
-                  backgroundColor: const Color(0xFFF1F5F9), // Light grayish-blue background
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                  title: Row(
-                    children: [
-                      const Icon(Icons.save, color: Colors.blue),
-                      const SizedBox(width: 10),
-                      Text(_isExistingEntry ? "Update Sale?" : "Save Sale?", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
-                    ],
-                  ),
-                  content: SizedBox(
-                    width: 420,
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          _isExistingEntry
-                              ? "Do you want to update this existing Sales Entry?"
-                              : "Do you want to save this new Sales Entry?",
-                          style: const TextStyle(fontSize: 14, color: Colors.black),
-                        ),
-                        const SizedBox(height: 24),
+    final Map<String, dynamic>? res = await showDialog<Map<String, dynamic>>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        int focusedAction = autoPrint ? 2 : 1;
+        double cashTendered = grandTotal;
 
-                        // --- ROW 1 (Auto-filled with Grand Total) ---
-                        Row(
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            final double currentTendered = double.tryParse(cashTenderedCtrl.text) ?? grandTotal;
+            final double changeDue = currentTendered - grandTotal;
+
+            void addCash(double extra) {
+              setDialogState(() {
+                cashTendered = currentTendered + extra;
+                cashTenderedCtrl.text = cashTendered.toStringAsFixed(2);
+                amt1Ctrl.text = grandTotal.toStringAsFixed(2);
+              });
+            }
+
+            void setExactCash(double target) {
+              setDialogState(() {
+                cashTendered = target;
+                cashTenderedCtrl.text = cashTendered.toStringAsFixed(2);
+                amt1Ctrl.text = grandTotal.toStringAsFixed(2);
+              });
+            }
+
+            return Focus(
+              autofocus: true,
+              onKeyEvent: (node, event) {
+                if (event is KeyDownEvent) {
+                  if (event.logicalKey == LogicalKeyboardKey.f12) {
+                    Navigator.of(ctx).pop({'save': true, 'print': true});
+                    return KeyEventResult.handled;
+                  } else if (event.logicalKey == LogicalKeyboardKey.enter || event.logicalKey == LogicalKeyboardKey.numpadEnter) {
+                    if (focusedAction == 2) {
+                      Navigator.of(ctx).pop({'save': true, 'print': true});
+                    } else if (focusedAction == 1) {
+                      Navigator.of(ctx).pop({'save': true, 'print': false});
+                    } else {
+                      Navigator.of(ctx).pop(null);
+                    }
+                    return KeyEventResult.handled;
+                  } else if (event.logicalKey == LogicalKeyboardKey.escape) {
+                    Navigator.of(ctx).pop(null);
+                    return KeyEventResult.handled;
+                  }
+                }
+                return KeyEventResult.ignored;
+              },
+              child: AlertDialog(
+                backgroundColor: const Color(0xFF1E293B),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                title: Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF3B82F6).withValues(alpha: 0.2),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Icon(Icons.point_of_sale_rounded, color: Color(0xFF60A5FA), size: 22),
+                    ),
+                    const SizedBox(width: 10),
+                    Text(
+                      _isExistingEntry ? "Update & Settle Sale" : "Counter Billing Settlement",
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.white),
+                    ),
+                  ],
+                ),
+                content: SizedBox(
+                  width: 460,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // Total Highlight Box
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF0F172A),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: const Color(0xFF334155)),
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
                           children: [
-                            const SizedBox(width: 80, child: Text("Customer", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold))),
-                            Expanded(
-                              child: Container(
-                                height: 32,
-                                padding: const EdgeInsets.symmetric(horizontal: 8),
-                                decoration: BoxDecoration(color: Colors.grey.shade200, border: Border.all(color: Colors.grey.shade300), borderRadius: BorderRadius.circular(4)),
-                                child: DropdownButtonHideUnderline(
-                                    child: DropdownButton<String>(
-                                      value: acc1,
-                                      isExpanded: true,
-                                      isDense: true,
-                                      style: const TextStyle(fontSize: 12, color: Colors.black, fontWeight: FontWeight.bold),
-                                      items: ["Cash", "Credit", "Card", "UPI"].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
-                                      onChanged: (v) {
-                                        setDialogState(() {
-                                          acc1 = v!;
-                                          if (acc1.toUpperCase() == "CREDIT") {
-                                            amt1Ctrl.text = "0.00";
-                                            amt2Ctrl.text = "0.00";
-                                          } else {
-                                            amt1Ctrl.text = grandTotal.toStringAsFixed(2);
-                                          }
-                                        });
-                                      },
-                                    )
+                            const Text("NET GRAND TOTAL", style: TextStyle(color: Color(0xFF94A3B8), fontSize: 13, fontWeight: FontWeight.bold)),
+                            Text(
+                              "₹ ${grandTotal.toStringAsFixed(2)}",
+                              style: const TextStyle(color: Color(0xFF4ADE80), fontSize: 24, fontWeight: FontWeight.bold),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+
+                      // Payment Mode Row
+                      Row(
+                        children: [
+                          const SizedBox(width: 100, child: Text("Payment Mode", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white70))),
+                          Expanded(
+                            child: Container(
+                              height: 34,
+                              padding: const EdgeInsets.symmetric(horizontal: 10),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF0F172A),
+                                border: Border.all(color: const Color(0xFF334155)),
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: DropdownButtonHideUnderline(
+                                child: DropdownButton<String>(
+                                  value: acc1,
+                                  dropdownColor: const Color(0xFF1E293B),
+                                  isExpanded: true,
+                                  isDense: true,
+                                  style: const TextStyle(fontSize: 12, color: Colors.white, fontWeight: FontWeight.bold),
+                                  items: ["Cash", "UPI", "Card", "Credit"].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
+                                  onChanged: (v) {
+                                    setDialogState(() {
+                                      acc1 = v!;
+                                      if (acc1.toUpperCase() == "CREDIT") {
+                                        amt1Ctrl.text = "0.00";
+                                        amt2Ctrl.text = "0.00";
+                                      } else {
+                                        amt1Ctrl.text = grandTotal.toStringAsFixed(2);
+                                        cashTenderedCtrl.text = grandTotal.toStringAsFixed(2);
+                                      }
+                                    });
+                                  },
                                 ),
                               ),
                             ),
-                            const SizedBox(width: 12),
-                            Container(
-                              width: 90,
-                              height: 32,
-                              decoration: BoxDecoration(color: Colors.white, border: Border.all(color: Colors.blue.shade400, width: 1.5), borderRadius: BorderRadius.circular(4)),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+
+                      // Cash Tender & Change Calculator (When Cash mode is selected)
+                      if (acc1.toUpperCase() == "CASH") ...[
+                        Row(
+                          children: [
+                            const SizedBox(width: 100, child: Text("Cash Received", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white70))),
+                            Expanded(
                               child: TextField(
-                                controller: amt1Ctrl,
+                                controller: cashTenderedCtrl,
+                                autofocus: true,
+                                keyboardType: const TextInputType.numberWithOptions(decimal: true),
                                 textAlign: TextAlign.right,
-                                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.black),
-                                decoration: const InputDecoration(border: InputBorder.none, isDense: true, contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 10)),
-                                onChanged: (v) {
-                                  // Optional Magic: If they type a smaller amount in Box 1, Box 2 auto-calculates the rest!
-                                  double entered = double.tryParse(v) ?? 0.0;
-                                  if (entered <= grandTotal) {
-                                    amt2Ctrl.text = (grandTotal - entered).toStringAsFixed(2);
-                                  }
-                                },
+                                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.amberAccent),
+                                decoration: InputDecoration(
+                                  filled: true,
+                                  fillColor: const Color(0xFF0F172A),
+                                  prefixText: "₹ ",
+                                  prefixStyle: const TextStyle(color: Colors.amberAccent, fontWeight: FontWeight.bold),
+                                  contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: const BorderSide(color: Color(0xFF3B82F6))),
+                                ),
+                                onChanged: (v) => setDialogState(() {}),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+
+                        // Quick Cash Buttons
+                        Row(
+                          children: [
+                            const SizedBox(width: 100),
+                            Expanded(
+                              child: Wrap(
+                                spacing: 6,
+                                runSpacing: 4,
+                                children: [
+                                  ActionChip(
+                                    label: const Text("Exact", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white)),
+                                    backgroundColor: const Color(0xFF334155),
+                                    onPressed: () => setExactCash(grandTotal),
+                                  ),
+                                  ActionChip(
+                                    label: const Text("+₹50", style: TextStyle(fontSize: 11, color: Colors.white70)),
+                                    backgroundColor: const Color(0xFF334155),
+                                    onPressed: () => addCash(50),
+                                  ),
+                                  ActionChip(
+                                    label: const Text("+₹100", style: TextStyle(fontSize: 11, color: Colors.white70)),
+                                    backgroundColor: const Color(0xFF334155),
+                                    onPressed: () => addCash(100),
+                                  ),
+                                  ActionChip(
+                                    label: const Text("₹500", style: TextStyle(fontSize: 11, color: Colors.white70)),
+                                    backgroundColor: const Color(0xFF334155),
+                                    onPressed: () => setExactCash(500),
+                                  ),
+                                  ActionChip(
+                                    label: const Text("₹1000", style: TextStyle(fontSize: 11, color: Colors.white70)),
+                                    backgroundColor: const Color(0xFF334155),
+                                    onPressed: () => setExactCash(1000),
+                                  ),
+                                ],
                               ),
                             ),
                           ],
                         ),
                         const SizedBox(height: 12),
 
-                        // --- ROW 2 (Bank / Secondary Payment) ---
-                        Row(
-                          children: [
-                            const SizedBox(width: 80, child: Text("Bank", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold))),
-                            Expanded(
-                              child: Container(
-                                height: 32,
-                                padding: const EdgeInsets.symmetric(horizontal: 8),
-                                decoration: BoxDecoration(color: Colors.grey.shade200, border: Border.all(color: Colors.grey.shade300), borderRadius: BorderRadius.circular(4)),
-                                child: DropdownButtonHideUnderline(
-                                    child: DropdownButton<String>(
-                                      value: acc2,
-                                      isExpanded: true,
-                                      isDense: true,
-                                      style: const TextStyle(fontSize: 12, color: Colors.black, fontWeight: FontWeight.bold),
-                                      items: ["Bank", "Card", "UPI", "Cash"].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
-                                      onChanged: (v) => setDialogState(() => acc2 = v!),
-                                    )
+                        // Change Due Display Banner
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                          decoration: BoxDecoration(
+                            color: changeDue >= 0 ? const Color(0xFF064E3B) : const Color(0xFF7F1D1D),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: changeDue >= 0 ? const Color(0xFF10B981) : const Color(0xFFEF4444)),
+                          ),
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Text(
+                                changeDue >= 0 ? "CHANGE TO RETURN:" : "SHORT AMOUNT:",
+                                style: const TextStyle(color: Colors.white70, fontSize: 11.5, fontWeight: FontWeight.bold),
+                              ),
+                              Text(
+                                "₹ ${(changeDue >= 0 ? changeDue : -changeDue).toStringAsFixed(2)}",
+                                style: TextStyle(
+                                  color: changeDue >= 0 ? const Color(0xFF6EE7B7) : const Color(0xFFFCA5A5),
+                                  fontSize: 17,
+                                  fontWeight: FontWeight.bold,
                                 ),
                               ),
-                            ),
-                            const SizedBox(width: 12),
-                            Container(
-                              width: 90,
-                              height: 32,
-                              decoration: BoxDecoration(color: Colors.grey.shade100, border: Border.all(color: Colors.grey.shade300), borderRadius: BorderRadius.circular(4)),
-                              child: TextField(
-                                controller: amt2Ctrl,
-                                textAlign: TextAlign.right,
-                                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.black),
-                                decoration: const InputDecoration(border: InputBorder.none, isDense: true, contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 10)),
-                              ),
-                            ),
-                          ],
+                            ],
+                          ),
                         ),
                       ],
-                    ),
+                    ],
                   ),
-                  actionsPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
-                  actions: [
-                    TextButton.icon(
-                      onPressed: () => Navigator.pop(ctx, false),
-                      style: TextButton.styleFrom(
-                        backgroundColor: focusedIdx == 2 ? Colors.red.shade50 : null,
-                        side: focusedIdx == 2 ? BorderSide(color: Colors.red.shade200, width: 2) : null,
-                      ),
-                      icon: const Icon(Icons.close, color: Colors.red, size: 16),
-                      label: const Text("CANCEL (ESC)", style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold)),
-                    ),
-                    ElevatedButton.icon(
-                      onPressed: () => Navigator.pop(ctx, true),
-                      style: ElevatedButton.styleFrom(
-                          backgroundColor: focusedIdx == 1 ? Colors.blue.shade700 : Colors.grey.shade300,
-                          foregroundColor: focusedIdx == 1 ? Colors.white : Colors.black54,
-                          side: focusedIdx == 1 ? const BorderSide(color: Colors.black26, width: 2) : null,
-                          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6))
-                      ),
-                      icon: const Icon(Icons.check_circle_outline, size: 18),
-                      label: const Text("SAVE (ENTER)", style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 0.5)),
-                    ),
-                  ],
                 ),
-              );
-            },
-          );
-        }
+                actionsPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+                actions: [
+                  TextButton.icon(
+                    onPressed: () => Navigator.pop(ctx, null),
+                    icon: const Icon(Icons.close, color: Colors.redAccent, size: 16),
+                    label: const Text("CANCEL (ESC)", style: TextStyle(color: Color(0xFF94A3B8), fontWeight: FontWeight.bold, fontSize: 12)),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: () => Navigator.pop(ctx, {'save': true, 'print': false}),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFF93C5FD),
+                      side: const BorderSide(color: Color(0xFF3B82F6)),
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                    ),
+                    icon: const Icon(Icons.save_outlined, size: 16),
+                    label: const Text("SAVE ONLY (Enter)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                  ),
+                  ElevatedButton.icon(
+                    onPressed: () => Navigator.pop(ctx, {'save': true, 'print': true}),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF10B981),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+                    ),
+                    icon: const Icon(Icons.print_rounded, size: 16),
+                    label: const Text("SAVE & PRINT (F12)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
     );
     if (mounted) setState(() => _isDialogOpen = false);
 
-    if (res == true) {
+    if (res != null && res['save'] == true) {
       final double p1Amt = double.tryParse(amt1Ctrl.text) ?? 0.0;
       final double p2Amt = double.tryParse(amt2Ctrl.text) ?? 0.0;
+      final bool shouldPrint = res['print'] == true;
 
       _saveSale(
         isEdit: _isExistingEntry,
@@ -3891,6 +4055,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         primaryAmt: p1Amt,
         secondaryAcc: p2Amt > 0 ? acc2 : "",
         secondaryAmt: p2Amt,
+        autoPrint: shouldPrint,
       );
     } else {
       _rcvdAmtFocus.requestFocus();
@@ -4102,10 +4267,13 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
   }
 
   void handleBackgroundPrint(SaleInvoice invoice, CompanyProfile company) {
-    PrintSpoolerService.enqueuePrintTask(() async {
-      // Offload formatting and raw socket dispatch completely to background queue
-      await PrinterService.printPdfInvoice(invoice: invoice, companyProfile: company, directPrint: true);
-    });
+    PrintSpoolerService.enqueuePrintTask(
+      () async {
+        // Offload formatting and raw socket dispatch completely to background queue
+        await PrinterService.printPdfInvoice(invoice: invoice, companyProfile: company, directPrint: true);
+      },
+      title: "Invoice #${invoice.entryNo}",
+    );
     
     // Cashier is instantly freed to begin the next bill without waiting for physical printing
   }
@@ -4495,6 +4663,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     double? primaryAmt,
     String? secondaryAcc,
     double? secondaryAmt,
+    bool autoPrint = false,
   }) async {
     AppLogger.instance.info("USER_ACTION", "[SAVE_CLICKED] Save button clicked for Sales Entry #${formatSaleDisplayNo(_entryNo)} ($_entryNo) [IsEdit: $isEdit]");
 
@@ -4600,6 +4769,23 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     }
 
     if (!mounted) return;
+
+    // --- Statutory Clinical Drug-Drug Interaction Safety Guard ---
+    final interactions = ClinicalInteractionService.instance.evaluateInteractions(validItems);
+    if (interactions.isNotEmpty) {
+      final bool hasSevere = interactions.any((w) => w.severity == InteractionSeverity.severe);
+      if (hasSevere) {
+        _isSaving = false;
+        if (mounted) setState(() {});
+        final proceed = await ClinicalInteractionDialog.show(context, warnings: interactions);
+        if (!mounted) return;
+        if (!proceed) {
+          return; // Pharmacist opted to cancel and modify cart
+        }
+        _isSaving = true;
+        if (mounted) setState(() {});
+      }
+    }
 
     // 1. Single O(N) pass for stock usage & pure math (no redundant UI controller writes)
     double sub = 0.0;
@@ -4801,17 +4987,12 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       }
 
       String exp = it.product.expiry.trim();
-      if (exp.isEmpty || exp == "--/--" || !exp.contains('/')) {
+      if (!AppValidators.isValidExpiry(exp)) {
         _errorCells.putIfAbsent(i, () => {}).add(4); // Column 4: Expiry
-        validationErrors.add("Row ${i + 1}: Expiry date must follow MM/YY format (e.g., 06/28).");
-      } else {
-        final parts = exp.split('/');
-        int? month = int.tryParse(parts[0]);
-        int? year = int.tryParse(parts[1]);
-        if (month == null || month < 1 || month > 12 || year == null) {
-          _errorCells.putIfAbsent(i, () => {}).add(4);
-          validationErrors.add("Row ${i + 1}: Invalid expiry month ($exp). Must be between 01 and 12.");
-        }
+        validationErrors.add("Row ${i + 1}: Expiry date must follow MM/YY or YYYY-MM format (e.g., 06/28).");
+      } else if (AppValidators.isExpired(exp, asOf: _date)) {
+        _errorCells.putIfAbsent(i, () => {}).add(4); // Column 4: Expiry
+        validationErrors.add("Row ${i + 1}: '${it.product.name}' (Batch: ${it.product.batch}) is EXPIRED ($exp). Statutory regulations strictly prohibit dispensing expired medicines.");
       }
 
       // 3. Verify Quantity Constraint
@@ -5064,6 +5245,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
       // Save to database
       try {
         await p.saveSaleOnlineFirst(sale, isEditMode: isEdit);
+        unawaited(ScheduleH1RegisterService.instance.logSaleTransaction(sale));
       } catch (e) {
         if (!mounted) return;
         await AppDialogs.showFastDialog(
@@ -5163,6 +5345,20 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         }());
       }
 
+      final savedInvoiceSnapshot = SaleInvoice(
+        entryNo: finalEntryNo,
+        date: _date,
+        customerAcc: chosenPrimaryAcc,
+        patient: chosenPatient,
+        doctor: chosenDoctor,
+        mobile: _mobileCtrl.text.trim(),
+        items: List<SaleItem>.from(validItems),
+        subTotal: sub,
+        discount: discAmt,
+        grandTotal: finalGrandTotal,
+        taxType: _gstType == 1 ? "Gst" : "Non Gst",
+      );
+
       if (mounted) {
         _isDirty = false;
         final messenger = ScaffoldMessenger.of(context);
@@ -5172,13 +5368,22 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
         if (!mounted) return;
         messenger.showSnackBar(
           SnackBar(
-            content: const Text("Entry Saved", style: TextStyle(fontWeight: FontWeight.bold)),
+            content: Text(autoPrint ? "Entry Saved & Printing..." : "Entry Saved", style: const TextStyle(fontWeight: FontWeight.bold)),
             backgroundColor: Colors.green.shade800,
             behavior: SnackBarBehavior.floating,
             margin: const EdgeInsets.only(bottom: 50, left: 10, right: 1000),
             duration: const Duration(seconds: 2),
           ),
         );
+      }
+
+      if (autoPrint) {
+        unawaited(() async {
+          await PrinterService.directSilentThermalPrint(
+            invoice: savedInvoiceSnapshot,
+            companyProfile: p.companyProfile,
+          );
+        }());
       }
     } catch (e) {
       if (mounted) {
@@ -6011,10 +6216,12 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     return ListenableBuilder(
       listenable: ServerConfigService.instance,
       builder: (_, __) {
+        final bool isPureCloud = ServerConfigService.instance.isPureCloud;
         final bool isConnected = ServerConfigService.instance.isConnected;
-        bool canSave = isConnected && !_isDeleted && !_isImported && !_isExistingEntry;
-        bool canEdit = isConnected && _isExistingEntry && !_isDeleted && !_isImported;
-        bool canDelete = isConnected && _isExistingEntry && !_isDeleted && !_isImported;
+        final bool canOperate = !isPureCloud || isConnected;
+        bool canSave = canOperate && !_isDeleted && !_isImported && !_isExistingEntry;
+        bool canEdit = canOperate && _isExistingEntry && !_isDeleted && !_isImported;
+        bool canDelete = canOperate && _isExistingEntry && !_isDeleted && !_isImported;
 
         final c = AppColors.of(context);
         return Container(
@@ -6124,7 +6331,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                       onTap: _showFindDialog,
                     ),
                     _topActionBtn(Icons.storefront_rounded, "Wholesale (F3)", const Color(0xFF3F51B5), onTap: _openWholesaleAvailability),
-                    _topActionBtn(Icons.print_rounded, "Print (F12)", const Color(0xFF607D8B), onTap: _printSale),
+                    _topActionBtn(Icons.print_rounded, "Print (F12)", const Color(0xFF607D8B), onTap: _isExistingEntry ? _printSale : _saveAndPrintBill),
                     _topActionBtn(
                       Icons.delete_forever_rounded,
                       "Del",
@@ -6136,6 +6343,8 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
                         );
                       },
                     ),
+                    const SyncHealthBadge(),
+                    const SizedBox(width: 4),
                     _topActionBtn(Icons.sync_rounded, "Sync Settings", Colors.teal, onTap: _showSyncSettingsDialog),
                     _topActionBtn(Icons.info_outline_rounded, "Info & Guide", Colors.indigo, onTap: _showSalesManualAndLegendDialog),
                     const SizedBox(width: 4),
@@ -7526,12 +7735,13 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     _isCheckingEntryNo = true;
     try {
       final p = Provider.of<PharmacyProvider>(context, listen: false);
+      final String termPrefix = ServerConfigService.instance.terminalPrefix;
       final bool currentTaken = ServerConfigService.instance.isPureCloud
           ? false
           : await p.isEntryTaken('sales_invoices', _entryNo);
       final String freshNext = ServerConfigService.instance.isPureCloud
-          ? await PureCloudService.instance.getNextSequenceNumber('sales_invoices', p.selectedFinancialYear)
-          : await p.getNextSaleEntryNo();
+          ? await PureCloudService.instance.getNextSequenceNumber('sales_invoices', p.selectedFinancialYear, prefix: termPrefix)
+          : await p.getNextSaleEntryNo(prefix: termPrefix);
 
       if (!mounted || _isExistingEntry || _items.isNotEmpty || _isDirty || _isDisposed) return;
 
@@ -8902,6 +9112,13 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
             }
           } else {
             _doctorCtrl.text = selection;
+            final doc = provider.doctors.cast<Doctor?>().firstWhere(
+              (d) => d?.name.trim().toLowerCase() == selection.trim().toLowerCase(),
+              orElse: () => null,
+            );
+            if (doc != null && doc.regNo.isNotEmpty) {
+              _doctorRegNoCtrl.text = doc.regNo;
+            }
           }
           _moveFocus(-1, 3); // Jump to Days
           _syncToGlobalSession();
@@ -11239,7 +11456,7 @@ class _SalesScreenState extends State<SalesScreen> implements UnsavedHandler {
     Offset dialogOffset = Offset.zero;
 
     // Filter and Sort states
-    bool showZeroStock = false;
+    bool showZeroStock = true; // Default to TRUE so registered medicines never vanish from cashier lookup
     String selectedCategory = "ALL";
     String sortColumn = ""; // "name", "generic", "category", "cutStrip", "rack", "batch", "expiry", "stock", "mrp", "rate"
     bool sortAscending = true;

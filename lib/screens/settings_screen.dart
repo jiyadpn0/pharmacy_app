@@ -35,6 +35,8 @@ class _SettingsScreenState extends State<SettingsScreen> with WatchdogMixin<Sett
   late TextEditingController _addressCtrl;
   late TextEditingController _phoneCtrl;
   late TextEditingController _gstCtrl;
+  late TextEditingController _dlCtrl;
+  late TextEditingController _taglineCtrl;
   late TextEditingController _githubRepoCtrl;
   late TextEditingController _githubTokenCtrl;
   int _minExpiryMonths = 6;
@@ -68,6 +70,8 @@ class _SettingsScreenState extends State<SettingsScreen> with WatchdogMixin<Sett
     _addressCtrl = TextEditingController(text: profile.address);
     _phoneCtrl = TextEditingController(text: profile.phone);
     _gstCtrl = TextEditingController(text: profile.gstIn);
+    _dlCtrl = TextEditingController(text: profile.dlNumber);
+    _taglineCtrl = TextEditingController(text: profile.tagline);
     _githubRepoCtrl = TextEditingController(text: "jiyadpn0/pharmacy_app");
     _githubTokenCtrl = TextEditingController();
     _loadGitHubRepoSetting();
@@ -97,6 +101,8 @@ class _SettingsScreenState extends State<SettingsScreen> with WatchdogMixin<Sett
     _addressCtrl.dispose();
     _phoneCtrl.dispose();
     _gstCtrl.dispose();
+    _dlCtrl.dispose();
+    _taglineCtrl.dispose();
     _githubRepoCtrl.dispose();
     _githubTokenCtrl.dispose();
     super.dispose();
@@ -262,6 +268,8 @@ class _SettingsScreenState extends State<SettingsScreen> with WatchdogMixin<Sett
           _buildTextField("Pharmacy Name*", _nameCtrl, isCyan: true),
           const SizedBox(height: 24),
           _buildTextField("Full Address", _addressCtrl, maxLines: 3),
+          const SizedBox(height: 24),
+          _buildTextField("Invoice Tagline / Slogan", _taglineCtrl),
         ]),
         const SizedBox(height: 32),
         _buildSectionHeader("Legal & Tax", "Mandatory information for government compliance."),
@@ -274,6 +282,8 @@ class _SettingsScreenState extends State<SettingsScreen> with WatchdogMixin<Sett
               Expanded(child: _buildTextField("GSTIN Number", _gstCtrl)),
             ],
           ),
+          const SizedBox(height: 24),
+          _buildTextField("Drug License No. (Form 20/21)*", _dlCtrl),
         ]),
         _buildSystemUpdateSection(),
       ],
@@ -1814,8 +1824,8 @@ class _SettingsScreenState extends State<SettingsScreen> with WatchdogMixin<Sett
       address: _addressCtrl.text.trim(),
       phone: _phoneCtrl.text.trim(),
       gstIn: _gstCtrl.text.trim(),
-      dlNumber: provider.companyProfile.dlNumber,
-      tagline: provider.companyProfile.tagline,
+      dlNumber: _dlCtrl.text.trim(),
+      tagline: _taglineCtrl.text.trim(),
     );
     await provider.saveCompanyProfile(updatedProfile);
 

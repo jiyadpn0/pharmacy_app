@@ -14,6 +14,7 @@ import '../widgets/erp_tooltip.dart';
 import '../utils/app_formatters.dart';
 import '../utils/app_dialogs.dart';
 import '../services/gst_export_service.dart';
+import '../services/gst_report_service.dart';
 import '../services/gstr2b_reconciliation_service.dart';
 import '../utils/theme_constants.dart';
 
@@ -32,6 +33,9 @@ class _GstReportScreenState extends State<GstReportScreen> {
   bool _isAuthorized = false;
 
   List<Map<String, dynamic>> _reportData = [];
+  List<GstHsnRow> _hsnData = [];
+  Gstr3bSummary? _gstr3bSummary;
+
   int? _selectedIndex;
   int? _lastTapIndex;
   DateTime? _lastTapTime;
@@ -88,6 +92,8 @@ class _GstReportScreenState extends State<GstReportScreen> {
     setState(() {
       _isLoading = true;
       _reportData = [];
+      _hsnData = [];
+      _gstr3bSummary = null;
       _offset = 0;
       _hasMore = true;
     });
@@ -96,17 +102,59 @@ class _GstReportScreenState extends State<GstReportScreen> {
 
   Future<void> _fetchData(int offset) async {
     final p = Provider.of<PharmacyProvider>(context, listen: false);
+
+    if (_reportType == 'HSN_SUMMARY') {
+      final hsnList = await GstReportService.instance.fetchHsnSummary(_fromDate, _toDate);
+      if (mounted) {
+        setState(() {
+          _hsnData = hsnList;
+          _isLoading = false;
+          _hasMore = false;
+        });
+      }
+      return;
+    }
+
+    if (_reportType == 'GSTR_3B') {
+      final summary = await GstReportService.instance.computeGstr3bSummary(
+        _fromDate,
+        _toDate,
+        companyGstin: p.companyProfile.gstIn,
+      );
+      if (mounted) {
+        setState(() {
+          _gstr3bSummary = summary;
+          _isLoading = false;
+          _hasMore = false;
+        });
+      }
+      return;
+    }
+
     List<Map<String, dynamic>> data = [];
     int batchCount = 0;
 
-    if (_reportType == 'B2C_SALES' || _reportType == 'B2B_SALES' || _reportType == 'HSN_SUMMARY' || _reportType == 'GSTR_3B') {
+    if (_reportType == 'B2C_SALES' || _reportType == 'B2B_SALES') {
       final allInRange = await p.fetchSalesInDateRange(_fromDate, _toDate, loadItems: true, limit: _pageSize, offset: offset);
       batchCount = allInRange.length;
       final sales = allInRange.where((s) => !s.isDeleted).toList();
 
       for (var s in sales) {
-        bool isB2B = (s.customerAcc.toUpperCase() == "CREDIT" && s.mobile.length >= 10);
-        if ((_reportType == 'B2C_SALES' && !isB2B) || (_reportType == 'B2B_SALES' && isB2B) || _reportType == 'HSN_SUMMARY' || _reportType == 'GSTR_3B') {
+        String detectedGstin = "URD";
+        if (TaxCalculator.isValidGstin(s.mobile)) {
+          detectedGstin = s.mobile.trim().toUpperCase();
+        } else if (TaxCalculator.isValidGstin(s.patient)) {
+          detectedGstin = s.patient.trim().toUpperCase();
+        }
+
+        bool isB2B = TaxCalculator.isValidGstin(detectedGstin) ||
+            (s.customerAcc.toUpperCase() == "CREDIT" && s.mobile.length >= 10);
+
+        if (isB2B && detectedGstin == "URD") {
+          detectedGstin = "URD-B2B";
+        }
+
+        if ((_reportType == 'B2C_SALES' && !isB2B) || (_reportType == 'B2B_SALES' && isB2B)) {
           int totalTaxable = 0;
           int totalCgst = 0;
           int totalSgst = 0;
@@ -118,13 +166,13 @@ class _GstReportScreenState extends State<GstReportScreen> {
             int itemTaxable = totalP - gstP;
             if (itemTaxable < 0) itemTaxable = 0;
 
-            totalTaxable += itemTaxable.toInt();
-            totalCgst += item.cgstAmtPaise.toInt();
-            totalSgst += item.sgstAmtPaise.toInt();
-            totalIgst += item.igstAmtPaise.toInt();
+            totalTaxable += itemTaxable;
+            totalCgst += item.cgstAmtPaise;
+            totalSgst += item.sgstAmtPaise;
+            totalIgst += item.igstAmtPaise;
           }
 
-          int totalTaxAmt = (totalCgst + totalSgst + totalIgst).toInt();
+          int totalTaxAmt = totalCgst + totalSgst + totalIgst;
           int preAdjustTotal = totalTaxable + totalTaxAmt;
           if (preAdjustTotal > 0 && (s.discount > 0 || s.salesReturn > 0)) {
             double netGrandTotal = (s.grandTotalPaise - s.roundOffPaise).toDouble();
@@ -135,29 +183,24 @@ class _GstReportScreenState extends State<GstReportScreen> {
             totalIgst = (totalIgst * ratio).round().toInt();
           }
 
-          int taxablePaiseInt = totalTaxable;
-          int cgstPaiseInt = totalCgst;
-          int sgstPaiseInt = totalSgst;
-          int igstPaiseInt = totalIgst;
-
           int grandTotalPaise = s.grandTotalPaise;
-          int totalTaxPaise = cgstPaiseInt + sgstPaiseInt + igstPaiseInt;
+          int totalTaxPaise = totalCgst + totalSgst + totalIgst;
 
           data.add({
             'date': DateFormat('dd/MM/yyyy').format(s.date),
             'invoice_no': s.entryNo,
             'party_name': s.patient.toUpperCase() == "GENERAL" ? s.customerAcc : s.patient,
-            'gstin': isB2B ? "URD-B2B" : "URD",
-            'taxable_paise': taxablePaiseInt,
-            'cgst_paise': cgstPaiseInt,
-            'sgst_paise': sgstPaiseInt,
-            'igst_paise': igstPaiseInt,
+            'gstin': detectedGstin,
+            'taxable_paise': totalTaxable,
+            'cgst_paise': totalCgst,
+            'sgst_paise': totalSgst,
+            'igst_paise': totalIgst,
             'total_tax_paise': totalTaxPaise,
             'invoice_total_paise': grandTotalPaise,
-            'taxable_value': taxablePaiseInt.toRupees(),
-            'cgst': cgstPaiseInt.toRupees(),
-            'sgst': sgstPaiseInt.toRupees(),
-            'igst': igstPaiseInt.toRupees(),
+            'taxable_value': totalTaxable.toRupees(),
+            'cgst': totalCgst.toRupees(),
+            'sgst': totalSgst.toRupees(),
+            'igst': totalIgst.toRupees(),
             'total_tax': totalTaxPaise.toRupees(),
             'invoice_total': grandTotalPaise.toRupees(),
           });
@@ -181,9 +224,9 @@ class _GstReportScreenState extends State<GstReportScreen> {
         bool isInterstate = pur.taxType == 'Interstate' || (gstin != "URD" && TaxCalculator.isInterstate(p.companyProfile.gstIn, gstin));
 
         for (var item in pur.items) {
-          totalTaxablePaise += item.netPaise.toInt();
+          totalTaxablePaise += item.netPaise;
           if (isInterstate) {
-            totalIgstPaise += item.gstAmtPaise.toInt();
+            totalIgstPaise += item.gstAmtPaise;
           } else {
             int halfGstPaise = (item.gstAmtPaise / 2.0).round();
             totalCgstPaise += halfGstPaise;
@@ -232,7 +275,10 @@ class _GstReportScreenState extends State<GstReportScreen> {
   }
 
   void _exportToExcel() async {
-    if (_reportData.isEmpty) return;
+    if (_reportType == 'HSN_SUMMARY' && _hsnData.isEmpty) return;
+    if (_reportType == 'GSTR_3B' && _gstr3bSummary == null) return;
+    if ((_reportType != 'HSN_SUMMARY' && _reportType != 'GSTR_3B') && _reportData.isEmpty) return;
+
     final String defaultFileName = "GSTR_Report_${_reportType}_${DateFormat('MMM_yyyy').format(_fromDate)}.xlsx";
     String? outputFile = await FilePicker.saveFile(
       dialogTitle: 'Save Statutory GST Report (Excel)',
@@ -246,39 +292,140 @@ class _GstReportScreenState extends State<GstReportScreen> {
       final sheet = excel['GST Report'];
       excel.delete('Sheet1');
 
-      sheet.appendRow([
-        ex.TextCellValue("Date"),
-        ex.TextCellValue("Invoice No"),
-        ex.TextCellValue("Party Name"),
-        ex.TextCellValue("GSTIN"),
-        ex.TextCellValue("Taxable Base (₹)"),
-        ex.TextCellValue("CGST (₹)"),
-        ex.TextCellValue("SGST (₹)"),
-        ex.TextCellValue("IGST (₹)"),
-        ex.TextCellValue("Total Tax (₹)"),
-        ex.TextCellValue("Grand Total (₹)"),
-      ]);
-
-      for (var r in _reportData) {
-        int taxableP = r['taxable_paise'] as int? ?? 0;
-        int cgstP = r['cgst_paise'] as int? ?? 0;
-        int sgstP = r['sgst_paise'] as int? ?? 0;
-        int igstP = r['igst_paise'] as int? ?? 0;
-        int totalTaxP = r['total_tax_paise'] as int? ?? 0;
-        int invTotalP = r['invoice_total_paise'] as int? ?? 0;
-
+      if (_reportType == 'HSN_SUMMARY') {
         sheet.appendRow([
-          ex.TextCellValue(r['date']?.toString() ?? ''),
-          ex.TextCellValue(r['invoice_no']?.toString() ?? ''),
-          ex.TextCellValue(r['party_name']?.toString() ?? ''),
-          ex.TextCellValue(r['gstin']?.toString() ?? ''),
-          ex.DoubleCellValue(taxableP.toRupees()),
-          ex.DoubleCellValue(cgstP.toRupees()),
-          ex.DoubleCellValue(sgstP.toRupees()),
-          ex.DoubleCellValue(igstP.toRupees()),
-          ex.DoubleCellValue(totalTaxP.toRupees()),
-          ex.DoubleCellValue(invTotalP.toRupees()),
+          ex.TextCellValue("HSN Code"),
+          ex.TextCellValue("Description"),
+          ex.TextCellValue("UQC"),
+          ex.TextCellValue("Total Quantity"),
+          ex.TextCellValue("Total Value (₹)"),
+          ex.TextCellValue("Taxable Value (₹)"),
+          ex.TextCellValue("CGST Amount (₹)"),
+          ex.TextCellValue("SGST Amount (₹)"),
+          ex.TextCellValue("IGST Amount (₹)"),
+          ex.TextCellValue("Total Tax (₹)"),
         ]);
+
+        for (var h in _hsnData) {
+          sheet.appendRow([
+            ex.TextCellValue(h.hsnCode),
+            ex.TextCellValue(h.description),
+            ex.TextCellValue(h.uqc),
+            ex.DoubleCellValue(h.totalQty),
+            ex.DoubleCellValue(h.totalValue),
+            ex.DoubleCellValue(h.taxableValue),
+            ex.DoubleCellValue(h.cgstAmount),
+            ex.DoubleCellValue(h.sgstAmount),
+            ex.DoubleCellValue(h.igstAmount),
+            ex.DoubleCellValue(h.totalTax),
+          ]);
+        }
+      } else if (_reportType == 'GSTR_3B') {
+        final s = _gstr3bSummary!;
+        sheet.appendRow([ex.TextCellValue("GSTR-3B STATUTORY TAX RETURN SUMMARY")]);
+        sheet.appendRow([ex.TextCellValue("Period: ${DateFormat('dd/MM/yyyy').format(_fromDate)} to ${DateFormat('dd/MM/yyyy').format(_toDate)}")]);
+        sheet.appendRow([ex.TextCellValue("")]);
+
+        sheet.appendRow([ex.TextCellValue("TABLE 3.1: OUTWARD TAXABLE SUPPLIES")]);
+        sheet.appendRow([
+          ex.TextCellValue("Nature of Supplies"),
+          ex.TextCellValue("Taxable Value (₹)"),
+          ex.TextCellValue("IGST (₹)"),
+          ex.TextCellValue("CGST (₹)"),
+          ex.TextCellValue("SGST (₹)"),
+          ex.TextCellValue("Total Tax (₹)"),
+        ]);
+        sheet.appendRow([
+          ex.TextCellValue("Outward taxable supplies"),
+          ex.DoubleCellValue(s.outwardTaxable),
+          ex.DoubleCellValue(s.outwardIgst),
+          ex.DoubleCellValue(s.outwardCgst),
+          ex.DoubleCellValue(s.outwardSgst),
+          ex.DoubleCellValue(s.outwardTotalTax),
+        ]);
+
+        sheet.appendRow([ex.TextCellValue("")]);
+        sheet.appendRow([ex.TextCellValue("TABLE 4: ELIGIBLE INPUT TAX CREDIT (ITC)")]);
+        sheet.appendRow([
+          ex.TextCellValue("Details"),
+          ex.TextCellValue("IGST (₹)"),
+          ex.TextCellValue("CGST (₹)"),
+          ex.TextCellValue("SGST (₹)"),
+          ex.TextCellValue("Total Tax (₹)"),
+        ]);
+        sheet.appendRow([
+          ex.TextCellValue("(A) Inward supplies eligible for ITC"),
+          ex.DoubleCellValue(s.itcIgst),
+          ex.DoubleCellValue(s.itcCgst),
+          ex.DoubleCellValue(s.itcSgst),
+          ex.DoubleCellValue(s.itcTotalTax),
+        ]);
+        sheet.appendRow([
+          ex.TextCellValue("(B) ITC Reversed (Purchase Returns)"),
+          ex.DoubleCellValue(s.itcReversalsIgst),
+          ex.DoubleCellValue(s.itcReversalsCgst),
+          ex.DoubleCellValue(s.itcReversalsSgst),
+          ex.DoubleCellValue(s.itcReversalsCgst + s.itcReversalsSgst + s.itcReversalsIgst),
+        ]);
+        sheet.appendRow([
+          ex.TextCellValue("(C) Net ITC Available (A - B)"),
+          ex.DoubleCellValue(s.netItcIgst),
+          ex.DoubleCellValue(s.netItcCgst),
+          ex.DoubleCellValue(s.netItcSgst),
+          ex.DoubleCellValue(s.netItcCgst + s.netItcSgst + s.netItcIgst),
+        ]);
+
+        sheet.appendRow([ex.TextCellValue("")]);
+        sheet.appendRow([ex.TextCellValue("TABLE 5: NET TAX PAYABLE IN CASH")]);
+        sheet.appendRow([
+          ex.TextCellValue("Description"),
+          ex.TextCellValue("IGST Payable (₹)"),
+          ex.TextCellValue("CGST Payable (₹)"),
+          ex.TextCellValue("SGST Payable (₹)"),
+          ex.TextCellValue("Total Net Payable (₹)"),
+        ]);
+        sheet.appendRow([
+          ex.TextCellValue("Tax payable in cash"),
+          ex.DoubleCellValue(s.payableIgst),
+          ex.DoubleCellValue(s.payableCgst),
+          ex.DoubleCellValue(s.payableSgst),
+          ex.DoubleCellValue(s.totalNetPayable),
+        ]);
+      } else {
+        sheet.appendRow([
+          ex.TextCellValue("Date"),
+          ex.TextCellValue("Invoice No"),
+          ex.TextCellValue("Party Name"),
+          ex.TextCellValue("GSTIN"),
+          ex.TextCellValue("Taxable Base (₹)"),
+          ex.TextCellValue("CGST (₹)"),
+          ex.TextCellValue("SGST (₹)"),
+          ex.TextCellValue("IGST (₹)"),
+          ex.TextCellValue("Total Tax (₹)"),
+          ex.TextCellValue("Grand Total (₹)"),
+        ]);
+
+        for (var r in _reportData) {
+          int taxableP = r['taxable_paise'] as int? ?? 0;
+          int cgstP = r['cgst_paise'] as int? ?? 0;
+          int sgstP = r['sgst_paise'] as int? ?? 0;
+          int igstP = r['igst_paise'] as int? ?? 0;
+          int totalTaxP = r['total_tax_paise'] as int? ?? 0;
+          int invTotalP = r['invoice_total_paise'] as int? ?? 0;
+
+          sheet.appendRow([
+            ex.TextCellValue(r['date']?.toString() ?? ''),
+            ex.TextCellValue(r['invoice_no']?.toString() ?? ''),
+            ex.TextCellValue(r['party_name']?.toString() ?? ''),
+            ex.TextCellValue(r['gstin']?.toString() ?? ''),
+            ex.DoubleCellValue(taxableP.toRupees()),
+            ex.DoubleCellValue(cgstP.toRupees()),
+            ex.DoubleCellValue(sgstP.toRupees()),
+            ex.DoubleCellValue(igstP.toRupees()),
+            ex.DoubleCellValue(totalTaxP.toRupees()),
+            ex.DoubleCellValue(invTotalP.toRupees()),
+          ]);
+        }
       }
 
       final bytes = excel.encode();
@@ -324,7 +471,10 @@ class _GstReportScreenState extends State<GstReportScreen> {
   }
 
   void _exportToCsv() async {
-    if (_reportData.isEmpty) return;
+    if (_reportType == 'HSN_SUMMARY' && _hsnData.isEmpty) return;
+    if (_reportType == 'GSTR_3B' && _gstr3bSummary == null) return;
+    if ((_reportType != 'HSN_SUMMARY' && _reportType != 'GSTR_3B') && _reportData.isEmpty) return;
+
     final String defaultFileName = "GSTR_${_reportType}_${DateFormat('MMM_yyyy').format(_fromDate)}.csv";
     String? outputFile = await FilePicker.saveFile(
       dialogTitle: 'Export CA CSV File',
@@ -335,21 +485,54 @@ class _GstReportScreenState extends State<GstReportScreen> {
 
     if (outputFile != null) {
       final StringBuffer sb = StringBuffer();
-      sb.writeln("Date,Invoice No,Party Name,GSTIN,Taxable Value (Rupees),CGST (Rupees),SGST (Rupees),IGST (Rupees),Total Tax (Rupees),Grand Total (Rupees)");
 
-      for (var r in _reportData) {
-        sb.writeln([
-          '"${r['date']}"',
-          '"${r['invoice_no']}"',
-          '"${r['party_name']}"',
-          '"${r['gstin']}"',
-          (r['taxable_paise'] as int).toRupeesString(),
-          (r['cgst_paise'] as int).toRupeesString(),
-          (r['sgst_paise'] as int).toRupeesString(),
-          (r['igst_paise'] as int).toRupeesString(),
-          (r['total_tax_paise'] as int).toRupeesString(),
-          (r['invoice_total_paise'] as int).toRupeesString(),
-        ].join(','));
+      if (_reportType == 'HSN_SUMMARY') {
+        sb.writeln("HSN Code,Description,UQC,Total Qty,Total Value,Taxable Value,CGST,SGST,IGST,Total Tax");
+        for (var h in _hsnData) {
+          sb.writeln([
+            '"${h.hsnCode}"',
+            '"${h.description}"',
+            '"${h.uqc}"',
+            h.totalQty.toStringAsFixed(2),
+            h.totalValue.toStringAsFixed(2),
+            h.taxableValue.toStringAsFixed(2),
+            h.cgstAmount.toStringAsFixed(2),
+            h.sgstAmount.toStringAsFixed(2),
+            h.igstAmount.toStringAsFixed(2),
+            h.totalTax.toStringAsFixed(2),
+          ].join(','));
+        }
+      } else if (_reportType == 'GSTR_3B') {
+        final s = _gstr3bSummary!;
+        sb.writeln("GSTR-3B Tax Return Computation");
+        sb.writeln("Period,${DateFormat('dd/MM/yyyy').format(_fromDate)} to ${DateFormat('dd/MM/yyyy').format(_toDate)}");
+        sb.writeln("");
+        sb.writeln("Table 3.1 Outward Taxable Supplies,Taxable Value,IGST,CGST,SGST,Total Tax");
+        sb.writeln("Outward taxable supplies,${s.outwardTaxable.toStringAsFixed(2)},${s.outwardIgst.toStringAsFixed(2)},${s.outwardCgst.toStringAsFixed(2)},${s.outwardSgst.toStringAsFixed(2)},${s.outwardTotalTax.toStringAsFixed(2)}");
+        sb.writeln("");
+        sb.writeln("Table 4 Eligible ITC,Details,IGST,CGST,SGST,Total Tax");
+        sb.writeln("Inward supplies eligible for ITC,${s.itcIgst.toStringAsFixed(2)},${s.itcCgst.toStringAsFixed(2)},${s.itcSgst.toStringAsFixed(2)},${s.itcTotalTax.toStringAsFixed(2)}");
+        sb.writeln("ITC Reversed (Purchase Returns),${s.itcReversalsIgst.toStringAsFixed(2)},${s.itcReversalsCgst.toStringAsFixed(2)},${s.itcReversalsSgst.toStringAsFixed(2)},${(s.itcReversalsCgst + s.itcReversalsSgst + s.itcReversalsIgst).toStringAsFixed(2)}");
+        sb.writeln("Net Available ITC,${s.netItcIgst.toStringAsFixed(2)},${s.netItcCgst.toStringAsFixed(2)},${s.netItcSgst.toStringAsFixed(2)},${(s.netItcCgst + s.netItcSgst + s.netItcIgst).toStringAsFixed(2)}");
+        sb.writeln("");
+        sb.writeln("Table 5 Net Tax Payable in Cash,Description,IGST,CGST,SGST,Total Net Payable");
+        sb.writeln("Tax payable in cash,${s.payableIgst.toStringAsFixed(2)},${s.payableCgst.toStringAsFixed(2)},${s.payableSgst.toStringAsFixed(2)},${s.totalNetPayable.toStringAsFixed(2)}");
+      } else {
+        sb.writeln("Date,Invoice No,Party Name,GSTIN,Taxable Value (Rupees),CGST (Rupees),SGST (Rupees),IGST (Rupees),Total Tax (Rupees),Grand Total (Rupees)");
+        for (var r in _reportData) {
+          sb.writeln([
+            '"${r['date']}"',
+            '"${r['invoice_no']}"',
+            '"${r['party_name']}"',
+            '"${r['gstin']}"',
+            (r['taxable_paise'] as int).toRupeesString(),
+            (r['cgst_paise'] as int).toRupeesString(),
+            (r['sgst_paise'] as int).toRupeesString(),
+            (r['igst_paise'] as int).toRupeesString(),
+            (r['total_tax_paise'] as int).toRupeesString(),
+            (r['invoice_total_paise'] as int).toRupeesString(),
+          ].join(','));
+        }
       }
 
       await File(outputFile).writeAsString(sb.toString());
@@ -645,6 +828,14 @@ class _GstReportScreenState extends State<GstReportScreen> {
   Widget _buildDataGrid() {
     if (_isLoading) return const Center(child: CircularProgressIndicator());
 
+    if (_reportType == 'HSN_SUMMARY') {
+      return _buildHsnSummaryTable();
+    }
+
+    if (_reportType == 'GSTR_3B') {
+      return _buildGstr3bDashboard();
+    }
+
     int totalTaxableP = _reportData.fold(0, (int s, r) => s + (r['taxable_paise'] as int? ?? 0));
     int totalTaxP = _reportData.fold(0, (int s, r) => s + (r['total_tax_paise'] as int? ?? 0));
     int totalInvP = _reportData.fold(0, (int s, r) => s + (r['invoice_total_paise'] as int? ?? 0));
@@ -756,6 +947,359 @@ class _GstReportScreenState extends State<GstReportScreen> {
     );
   }
 
+  Widget _buildHsnSummaryTable() {
+    double grandQty = 0.0;
+    double grandTaxable = 0.0;
+    double grandCgst = 0.0;
+    double grandSgst = 0.0;
+    double grandIgst = 0.0;
+    double grandTax = 0.0;
+    double grandValue = 0.0;
+
+    for (var r in _hsnData) {
+      grandQty += r.totalQty;
+      grandTaxable += r.taxableValue;
+      grandCgst += r.cgstAmount;
+      grandSgst += r.sgstAmount;
+      grandIgst += r.igstAmount;
+      grandTax += r.totalTax;
+      grandValue += r.totalValue;
+    }
+
+    List<GstHsnRow> displayHsn = List.from(_hsnData);
+    if (_sortKey != null) {
+      displayHsn.sort((a, b) {
+        int comp = 0;
+        if (_sortKey == 'hsn') comp = a.hsnCode.compareTo(b.hsnCode);
+        if (_sortKey == 'qty') comp = a.totalQty.compareTo(b.totalQty);
+        if (_sortKey == 'taxable') comp = a.taxableValue.compareTo(b.taxableValue);
+        if (_sortKey == 'tax') comp = a.totalTax.compareTo(b.totalTax);
+        if (_sortKey == 'total') comp = a.totalValue.compareTo(b.totalValue);
+        return _isAscending ? comp : -comp;
+      });
+    }
+
+    return Column(
+      children: [
+        Container(
+          height: 35,
+          color: const Color(0xFF334155),
+          child: Row(
+            children: [
+              _Hdr("HSN / SAC", 'hsn', flex: 2, isSorted: _sortKey == 'hsn', isAscending: _isAscending, onSortTap: () => _onColumnHeaderTap('hsn')),
+              const _Hdr("DESCRIPTION", 'desc', flex: 4),
+              const _Hdr("UQC", 'uqc', flex: 1),
+              _Hdr("QTY", 'qty', flex: 2, align: TextAlign.right, isSorted: _sortKey == 'qty', isAscending: _isAscending, onSortTap: () => _onColumnHeaderTap('qty')),
+              _Hdr("TAXABLE (₹)", 'taxable', flex: 3, align: TextAlign.right, isSorted: _sortKey == 'taxable', isAscending: _isAscending, onSortTap: () => _onColumnHeaderTap('taxable')),
+              const _Hdr("CGST (₹)", 'cgst', flex: 2, align: TextAlign.right),
+              const _Hdr("SGST (₹)", 'sgst', flex: 2, align: TextAlign.right),
+              const _Hdr("IGST (₹)", 'igst', flex: 2, align: TextAlign.right),
+              _Hdr("TOTAL TAX (₹)", 'tax', flex: 3, align: TextAlign.right, isSorted: _sortKey == 'tax', isAscending: _isAscending, onSortTap: () => _onColumnHeaderTap('tax')),
+              _Hdr("TOTAL VAL (₹)", 'total', flex: 3, align: TextAlign.right, isSorted: _sortKey == 'total', isAscending: _isAscending, onSortTap: () => _onColumnHeaderTap('total')),
+            ],
+          ),
+        ),
+        Expanded(
+          child: displayHsn.isEmpty
+              ? const Center(child: Text("No HSN summary data found for selected period.", style: TextStyle(color: Colors.grey)))
+              : ListView.builder(
+                  itemCount: displayHsn.length,
+                  itemBuilder: (ctx, i) {
+                    final row = displayHsn[i];
+                    final bool isSelected = (i == _selectedIndex);
+
+                    return InkWell(
+                      onTap: () => setState(() => _selectedIndex = i),
+                      child: Container(
+                        height: 32,
+                        decoration: BoxDecoration(
+                          color: isSelected ? const Color(0xFFBAE6FD) : (i % 2 == 0 ? Colors.white : const Color(0xFFF8FAFC)),
+                          border: Border(bottom: BorderSide(color: isSelected ? Colors.blue.shade300 : Colors.grey.shade200)),
+                        ),
+                        child: Row(
+                          children: [
+                            _Cell(row.hsnCode, flex: 2, isBold: true, color: Colors.blue.shade900),
+                            _Cell(row.description, flex: 4),
+                            _Cell(row.uqc, flex: 1, color: Colors.blueGrey),
+                            _Cell(row.totalQty.toStringAsFixed(0), flex: 2, align: TextAlign.right),
+                            _Cell(row.taxableValue.toStringAsFixed(2), flex: 3, align: TextAlign.right),
+                            _Cell(row.cgstAmount.toStringAsFixed(2), flex: 2, align: TextAlign.right),
+                            _Cell(row.sgstAmount.toStringAsFixed(2), flex: 2, align: TextAlign.right),
+                            _Cell(row.igstAmount.toStringAsFixed(2), flex: 2, align: TextAlign.right),
+                            _Cell(row.totalTax.toStringAsFixed(2), flex: 3, align: TextAlign.right, color: Colors.red.shade700),
+                            _Cell(row.totalValue.toStringAsFixed(2), flex: 3, align: TextAlign.right, isBold: true, color: Colors.green.shade800),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+        Container(
+          height: 36,
+          color: Colors.blueGrey.shade100,
+          child: Row(
+            children: [
+              const Expanded(flex: 7, child: Padding(padding: EdgeInsets.only(left: 12), child: Text("TABLE 12 TOTALS", style: TextStyle(fontWeight: FontWeight.w900, fontSize: 11)))),
+              _footerInteractiveCell(grandQty.toStringAsFixed(0), flex: 2, isBold: true),
+              _footerInteractiveCell(grandTaxable.toStringAsFixed(2), flex: 3, isBold: true),
+              _footerInteractiveCell(grandCgst.toStringAsFixed(2), flex: 2),
+              _footerInteractiveCell(grandSgst.toStringAsFixed(2), flex: 2),
+              _footerInteractiveCell(grandIgst.toStringAsFixed(2), flex: 2),
+              _footerInteractiveCell(grandTax.toStringAsFixed(2), flex: 3, isBold: true, color: Colors.red.shade900),
+              _footerInteractiveCell(grandValue.toStringAsFixed(2), flex: 3, isBold: true, color: Colors.green.shade900),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildGstr3bDashboard() {
+    final s = _gstr3bSummary;
+    if (s == null) {
+      return const Center(child: Text("Click Filing Type to calculate GSTR-3B summary.", style: TextStyle(color: Colors.grey)));
+    }
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.blue.shade50,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.blue.shade200),
+            ),
+            child: Row(
+              children: [
+                Icon(Icons.verified_rounded, color: Colors.blue.shade700, size: 28),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        "GSTR-3B Return Summary (${DateFormat('MMMM yyyy').format(_fromDate)})",
+                        style: TextStyle(fontWeight: FontWeight.w900, fontSize: 15, color: Colors.blue.shade900),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        "Summary computation of outward tax liabilities, eligible input tax credits (ITC), and net payable cash liability calculated as per GST Statutory Rules.",
+                        style: TextStyle(fontSize: 12, color: Colors.blueGrey.shade800),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 24),
+
+          // Table 3.1: Outward Supplies
+          _buildGstrCard(
+            title: "3.1 Details of Outward Supplies and Inward Supplies Liable to Reverse Charge",
+            icon: Icons.upload_rounded,
+            iconColor: Colors.deepOrange,
+            child: Table(
+              border: TableBorder.all(color: Colors.grey.shade300),
+              columnWidths: const {
+                0: FlexColumnWidth(4),
+                1: FlexColumnWidth(2),
+                2: FlexColumnWidth(2),
+                3: FlexColumnWidth(2),
+                4: FlexColumnWidth(2),
+                5: FlexColumnWidth(2),
+              },
+              children: [
+                TableRow(
+                  decoration: BoxDecoration(color: Colors.grey.shade100),
+                  children: const [
+                    _TableHdrCell("Nature of Supplies"),
+                    _TableHdrCell("Taxable (₹)", align: TextAlign.right),
+                    _TableHdrCell("IGST (₹)", align: TextAlign.right),
+                    _TableHdrCell("CGST (₹)", align: TextAlign.right),
+                    _TableHdrCell("SGST (₹)", align: TextAlign.right),
+                    _TableHdrCell("Total Tax (₹)", align: TextAlign.right),
+                  ],
+                ),
+                TableRow(
+                  children: [
+                    const _TableBodyCell("(a) Outward taxable supplies"),
+                    _TableBodyCell(s.outwardTaxable.toStringAsFixed(2), align: TextAlign.right, isBold: true),
+                    _TableBodyCell(s.outwardIgst.toStringAsFixed(2), align: TextAlign.right),
+                    _TableBodyCell(s.outwardCgst.toStringAsFixed(2), align: TextAlign.right),
+                    _TableBodyCell(s.outwardSgst.toStringAsFixed(2), align: TextAlign.right),
+                    _TableBodyCell(s.outwardTotalTax.toStringAsFixed(2), align: TextAlign.right, isBold: true, textColor: Colors.deepOrange.shade800),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 20),
+
+          // Table 4: Eligible ITC
+          _buildGstrCard(
+            title: "4. Eligible Input Tax Credit (ITC)",
+            icon: Icons.download_rounded,
+            iconColor: Colors.indigo,
+            child: Table(
+              border: TableBorder.all(color: Colors.grey.shade300),
+              columnWidths: const {
+                0: FlexColumnWidth(4),
+                1: FlexColumnWidth(2),
+                2: FlexColumnWidth(2),
+                3: FlexColumnWidth(2),
+                4: FlexColumnWidth(2),
+              },
+              children: [
+                TableRow(
+                  decoration: BoxDecoration(color: Colors.grey.shade100),
+                  children: const [
+                    _TableHdrCell("Details"),
+                    _TableHdrCell("IGST (₹)", align: TextAlign.right),
+                    _TableHdrCell("CGST (₹)", align: TextAlign.right),
+                    _TableHdrCell("SGST (₹)", align: TextAlign.right),
+                    _TableHdrCell("Total Tax (₹)", align: TextAlign.right),
+                  ],
+                ),
+                TableRow(
+                  children: [
+                    const _TableBodyCell("(A) ITC Available (Inward Supplies / Purchases)"),
+                    _TableBodyCell(s.itcIgst.toStringAsFixed(2), align: TextAlign.right),
+                    _TableBodyCell(s.itcCgst.toStringAsFixed(2), align: TextAlign.right),
+                    _TableBodyCell(s.itcSgst.toStringAsFixed(2), align: TextAlign.right),
+                    _TableBodyCell(s.itcTotalTax.toStringAsFixed(2), align: TextAlign.right, isBold: true),
+                  ],
+                ),
+                TableRow(
+                  children: [
+                    const _TableBodyCell("(B) ITC Reversed (Purchase Returns / Debit Notes)"),
+                    _TableBodyCell(s.itcReversalsIgst.toStringAsFixed(2), align: TextAlign.right, textColor: Colors.red.shade700),
+                    _TableBodyCell(s.itcReversalsCgst.toStringAsFixed(2), align: TextAlign.right, textColor: Colors.red.shade700),
+                    _TableBodyCell(s.itcReversalsSgst.toStringAsFixed(2), align: TextAlign.right, textColor: Colors.red.shade700),
+                    _TableBodyCell((s.itcReversalsCgst + s.itcReversalsSgst + s.itcReversalsIgst).toStringAsFixed(2), align: TextAlign.right, isBold: true, textColor: Colors.red.shade700),
+                  ],
+                ),
+                TableRow(
+                  decoration: BoxDecoration(color: Colors.indigo.shade50),
+                  children: [
+                    const _TableBodyCell("(C) Net ITC Available (A - B)", isBold: true),
+                    _TableBodyCell(s.netItcIgst.toStringAsFixed(2), align: TextAlign.right, isBold: true),
+                    _TableBodyCell(s.netItcCgst.toStringAsFixed(2), align: TextAlign.right, isBold: true),
+                    _TableBodyCell(s.netItcSgst.toStringAsFixed(2), align: TextAlign.right, isBold: true),
+                    _TableBodyCell((s.netItcCgst + s.netItcSgst + s.netItcIgst).toStringAsFixed(2), align: TextAlign.right, isBold: true, textColor: Colors.indigo.shade900),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 20),
+
+          // Table 5: Net Tax Payable
+          _buildGstrCard(
+            title: "5. Net Tax Payable in Cash (Liability After ITC Offset)",
+            icon: Icons.payments_rounded,
+            iconColor: const Color(0xFF059669),
+            child: Column(
+              children: [
+                Table(
+                  border: TableBorder.all(color: Colors.grey.shade300),
+                  columnWidths: const {
+                    0: FlexColumnWidth(4),
+                    1: FlexColumnWidth(2),
+                    2: FlexColumnWidth(2),
+                    3: FlexColumnWidth(2),
+                    4: FlexColumnWidth(2),
+                  },
+                  children: [
+                    TableRow(
+                      decoration: BoxDecoration(color: Colors.grey.shade100),
+                      children: const [
+                        _TableHdrCell("Description"),
+                        _TableHdrCell("IGST (₹)", align: TextAlign.right),
+                        _TableHdrCell("CGST (₹)", align: TextAlign.right),
+                        _TableHdrCell("SGST (₹)", align: TextAlign.right),
+                        _TableHdrCell("Net Cash Payable (₹)", align: TextAlign.right),
+                      ],
+                    ),
+                    TableRow(
+                      children: [
+                        const _TableBodyCell("Tax Payable through Cash Ledger"),
+                        _TableBodyCell(s.payableIgst.toStringAsFixed(2), align: TextAlign.right),
+                        _TableBodyCell(s.payableCgst.toStringAsFixed(2), align: TextAlign.right),
+                        _TableBodyCell(s.payableSgst.toStringAsFixed(2), align: TextAlign.right),
+                        _TableBodyCell(s.totalNetPayable.toStringAsFixed(2), align: TextAlign.right, isBold: true, textColor: const Color(0xFF065F46)),
+                      ],
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFECFDF5),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFFA7F3D0)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text("TOTAL NET TAX PAYABLE IN CASH", style: TextStyle(fontWeight: FontWeight.w900, fontSize: 13, color: Color(0xFF059669))),
+                          Text("Outward Liabilities offset with verified Input Tax Credit", style: TextStyle(fontSize: 11, color: Colors.blueGrey)),
+                        ],
+                      ),
+                      const Spacer(),
+                      Text(
+                        "₹${s.totalNetPayable.toStringAsFixed(2)}",
+                        style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 22, color: Color(0xFF065F46)),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildGstrCard({required String title, required IconData icon, required Color iconColor, required Widget child}) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.grey.shade300),
+        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.02), blurRadius: 4, offset: const Offset(0, 2))],
+      ),
+      padding: const EdgeInsets.all(18),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, color: iconColor, size: 20),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  title,
+                  style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 13, color: Color(0xFF1E293B)),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          child,
+        ],
+      ),
+    );
+  }
+
   Widget _footerInteractiveCell(String text, {int flex = 1, bool isBold = false, Color? color}) {
     return Expanded(
       flex: flex,
@@ -821,6 +1365,48 @@ class _GstReportScreenState extends State<GstReportScreen> {
   }
 }
 
+class _TableHdrCell extends StatelessWidget {
+  final String text;
+  final TextAlign align;
+  const _TableHdrCell(this.text, {this.align = TextAlign.left});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      child: Text(
+        text,
+        textAlign: align,
+        style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 11, color: Color(0xFF334155)),
+      ),
+    );
+  }
+}
+
+class _TableBodyCell extends StatelessWidget {
+  final String text;
+  final TextAlign align;
+  final bool isBold;
+  final Color? textColor;
+  const _TableBodyCell(this.text, {this.align = TextAlign.left, this.isBold = false, this.textColor});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      child: Text(
+        text,
+        textAlign: align,
+        style: TextStyle(
+          fontWeight: isBold ? FontWeight.bold : FontWeight.w500,
+          fontSize: 11,
+          color: textColor ?? Colors.black87,
+        ),
+      ),
+    );
+  }
+}
+
 class _Hdr extends StatelessWidget {
   final String title;
   final String colKey;
@@ -880,15 +1466,26 @@ class _Hdr extends StatelessWidget {
 }
 
 class _Cell extends StatelessWidget {
-  final String text; final int flex; final TextAlign align; final Color? color; final bool isBold;
+  final String text;
+  final int flex;
+  final TextAlign align;
+  final Color? color;
+  final bool isBold;
+
   const _Cell(this.text, {required this.flex, this.align = TextAlign.left, this.color, this.isBold = false});
-  @override Widget build(BuildContext context) {
+
+  @override
+  Widget build(BuildContext context) {
     return Expanded(
       flex: flex,
       child: Container(
         alignment: align == TextAlign.left ? Alignment.centerLeft : Alignment.centerRight,
         padding: const EdgeInsets.symmetric(horizontal: 10),
-        child: Text(text, style: TextStyle(fontSize: 11, color: color ?? Colors.black87, fontWeight: isBold ? FontWeight.bold : FontWeight.w500), overflow: TextOverflow.ellipsis),
+        child: Text(
+          text,
+          style: TextStyle(fontSize: 11, color: color ?? Colors.black87, fontWeight: isBold ? FontWeight.bold : FontWeight.w500),
+          overflow: TextOverflow.ellipsis,
+        ),
       ),
     );
   }

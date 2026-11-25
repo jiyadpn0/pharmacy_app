@@ -37,6 +37,7 @@ import 'services/supabase_sync_service.dart';
 import 'services/supabase_realtime_service.dart';
 import 'services/delta_sync_service.dart';
 import 'services/lan_sync_service.dart';
+import 'services/database_maintenance_service.dart';
 
 bool _isIpcServerSet = false;
 
@@ -129,8 +130,9 @@ void main(List<String> args) async {
   unawaited(DbHelper.instance.autoBackupDatabase().catchError((e, s) => debugPrint("AutoBackup init error: $e")));
   try {
     DeltaSyncService.instance.startPeriodicSync();
+    DatabaseMaintenanceService.instance.startPeriodicMaintenance();
   } catch (e) {
-    AppLogger.instance.error("SYSTEM", "Periodic sync start error: $e");
+    AppLogger.instance.error("SYSTEM", "Periodic background service start error: $e");
   }
 
   // Handle all unhandled asynchronous / Future platform errors
@@ -499,8 +501,9 @@ class ERPWindowListener extends WindowListener {
     AppCloseHandler.isClosing = true;
 
     try {
-      // Stop periodic sync and realtime subscriptions before backing up & closing
+      // Stop periodic sync, maintenance, and realtime subscriptions before backing up & closing
       DeltaSyncService.instance.stopPeriodicSync();
+      DatabaseMaintenanceService.instance.stopPeriodicMaintenance();
       SupabaseRealtimeService.instance.disposeAll();
       LanSyncService.instance.dispose();
 

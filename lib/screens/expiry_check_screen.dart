@@ -305,6 +305,13 @@ class _ExpiryCheckScreenState extends State<ExpiryCheckScreen> {
           _buildRangeTab(12),
           const Spacer(),
           _actionBtn("PRINT REPORT", Icons.print_rounded, AppColors.primary, onTap: () => _printExpiryList(filteredItems)),
+          const SizedBox(height: 10),
+          _actionBtn(
+            "SUPPLIER DEBIT CLAIMS",
+            Icons.receipt_long_rounded,
+            Colors.teal.shade800,
+            onTap: () => Provider.of<AppProvider>(context, listen: false).openSupplierExpiryReturn(),
+          ),
           if (_selectedStatus == "Expired" && filteredItems.isNotEmpty) ...[
             const SizedBox(height: 10),
             _actionBtn(

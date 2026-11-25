@@ -6,6 +6,7 @@ import 'package:intl/intl.dart';
 import '../providers/pharmacy_provider.dart';
 import '../providers/app_provider.dart';
 import '../services/server_config_service.dart';
+import '../services/customer_ledger_service.dart';
 import '../services/sync_event_bus.dart';
 import '../widgets/app_date_picker.dart';
 import '../widgets/erp_tooltip.dart';
@@ -79,13 +80,12 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
     super.dispose();
   }
 
-  void _recomputePatientCache() {
+  void _recomputePatientCache() async {
     if (!mounted) return;
     final provider = Provider.of<PharmacyProvider>(context, listen: false);
 
-    final Map<String, double> bal = {
-      for (var p in provider.patientMaster) p.name: p.currentBalance
-    };
+    final bal = await CustomerLedgerService.instance.fetchAllPatientBalances();
+    if (!mounted) return;
 
     final Map<String, bool> active = {};
     for (var p in provider.patients) {
@@ -114,19 +114,18 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
   void _fetchLedgerData() async {
     if (_selectedPatient == null || !mounted) return;
     setState(() => _isLoadingLedger = true);
-    final p = Provider.of<PharmacyProvider>(context, listen: false);
-    final data = await p.fetchPatientLedger(_selectedPatient!);
+    final data = await CustomerLedgerService.instance.fetchPatientLedger(_selectedPatient!);
     if (!mounted) return;
     setState(() {
       _ledgerData = data.map((m) => _LedgerRowData(
         date: m['date'],
-        reference: m['reference'],
-        debit: m['debit'],
-        credit: m['credit'],
-        type: m['type'],
-        method: m['method'],
-        invoice: m['invoice'],
-        remarks: m['remarks'],
+        reference: m['reference'] ?? '',
+        debit: (m['debit'] as num?)?.toDouble() ?? 0.0,
+        credit: (m['credit'] as num?)?.toDouble() ?? 0.0,
+        type: m['type'] ?? '',
+        method: m['method'] ?? '',
+        invoice: m['invoice'] ?? '',
+        remarks: m['remarks'] ?? '',
       )).toList();
       _isLoadingLedger = false;
     });

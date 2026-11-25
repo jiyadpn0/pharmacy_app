@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../../providers/pharmacy_provider.dart';
 import '../../utils/app_dialogs.dart';
+import '../../utils/app_validators.dart';
 import '../../utils/theme_constants.dart';
 
 class UpperCaseTextFormatter extends TextInputFormatter {
@@ -49,6 +50,38 @@ class _LedgerRegistrationScreenState extends State<LedgerRegistrationScreen> {
     if (_nameCtrl.text.trim().isEmpty) {
       AppDialogs.showFastDialog(context: context, title: "Required", content: "Account Name is required.");
       return;
+    }
+
+    final phone = _phoneCtrl.text.trim();
+    if (phone.isNotEmpty && !AppValidators.isValidPhone(phone)) {
+      AppDialogs.showFastDialog(
+        context: context,
+        title: "Invalid Phone",
+        content: "Please enter a valid 10-digit Indian mobile number.",
+      );
+      return;
+    }
+
+    if (_type == "Supplier") {
+      final gst = _gstCtrl.text.trim();
+      if (gst.isNotEmpty && !AppValidators.isValidGstin(gst)) {
+        AppDialogs.showFastDialog(
+          context: context,
+          title: "Invalid GSTIN",
+          content: "Please enter a valid 15-character Indian GSTIN (e.g. 32AAAAA0000A1Z5) or leave blank if unregistered.",
+        );
+        return;
+      }
+
+      final dl = _dlCtrl.text.trim();
+      if (dl.isNotEmpty && !AppValidators.isValidDrugLicense(dl)) {
+        AppDialogs.showFastDialog(
+          context: context,
+          title: "Invalid Drug License",
+          content: "Please enter a valid Drug License number (e.g. Form 20/21) or leave blank.",
+        );
+        return;
+      }
     }
 
     final provider = Provider.of<PharmacyProvider>(context, listen: false);

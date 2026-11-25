@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import 'package:sqflite/sqflite.dart';
 import '../database/db_helper.dart';
+import 'backup_service.dart';
 import 'server_config_service.dart';
 import 'sync_event_bus.dart';
 
@@ -74,6 +75,14 @@ class DailySnapshotService extends ChangeNotifier {
       debugPrint("[DailySnapshot] 🕛 Midnight snapshot trigger activated!");
       try {
         await generateAndPushTodaySnapshot();
+
+        // Automated Nightly Physical Backup & USB Mirroring Trigger
+        try {
+          debugPrint("[DailySnapshot] 🛡️ Triggering Automated Nightly Physical & USB Backup...");
+          await BackupService.createDatabaseBackup(mirrorToSecondary: true);
+        } catch (bErr) {
+          debugPrint("[DailySnapshot] Nightly physical backup notice: $bErr");
+        }
       } catch (e, stack) {
         debugPrint("[DailySnapshot] Error in midnight snapshot execution: $e\n$stack");
       }
@@ -434,9 +443,15 @@ class DailySnapshotService extends ChangeNotifier {
     return null;
   }
 
+  /// Stops background midnight scheduler
+  void stopMidnightScheduler() {
+    _midnightTimer?.cancel();
+    _midnightTimer = null;
+  }
+
   @override
   void dispose() {
-    _midnightTimer?.cancel();
+    stopMidnightScheduler();
     super.dispose();
   }
 }

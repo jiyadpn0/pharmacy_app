@@ -1,4 +1,5 @@
 import 'dart:math';
+import 'app_validators.dart';
 
 class TaxResult {
   final double taxableAmount;
@@ -71,6 +72,9 @@ class TaxCalculator {
     }
     return false;
   }
+
+  /// Validates standard 15-character Indian GSTIN format (e.g. "32AAAAA0000A1Z5")
+  static bool isValidGstin(String? gstin) => AppValidators.isValidGstin(gstin);
 
   /// Converts rupees (double) to integer paise cleanly
   static int toPaise(double rupees) => (rupees * 100).round();

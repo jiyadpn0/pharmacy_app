@@ -36,6 +36,8 @@ import 'package:window_manager/window_manager.dart';
 import '../widgets/live_system_counts_dialog.dart';
 import '../services/daily_snapshot_service.dart';
 import '../widgets/owner_mobile_pulse_dialog.dart';
+import '../widgets/first_run_wizard_dialog.dart';
+import '../widgets/sync_health_badge.dart';
 
 class MainShell extends StatefulWidget {
   const MainShell({super.key});
@@ -50,6 +52,7 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
   Timer? _backupTimer;
   Timer? _cloudSyncTimer;
   Timer? _hourlySyncTimer;
+  Timer? _startupHealthTimer;
   bool _wasConnected = ServerConfigService.instance.isConnected;
   Future<int>? _unsyncedCountFuture;
   StreamSubscription? _syncBusSubscription;
@@ -126,6 +129,9 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
           if (autoUpdateEnabled && mounted) {
             UpdateCheckerService.checkForUpdates(context, silent: true);
           }
+          if (mounted) {
+            FirstRunWizardDialog.checkAndShow(context);
+          }
         } catch (e) {
           debugPrint("Silent update check failed: $e");
         }
@@ -169,7 +175,7 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
     // Staggered startup cloud sync on app opening to allow connection health check to stabilize
     WidgetsBinding.instance.addPostFrameCallback((_) {
       // Automatic Unseeded Cloud Database Health Check
-      Future.delayed(const Duration(seconds: 4), () async {
+      _startupHealthTimer = Timer(const Duration(seconds: 4), () async {
         if (!mounted) return;
         try {
           final config = ServerConfigService.instance;
@@ -394,6 +400,9 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
     _backupTimer?.cancel();
     _cloudSyncTimer?.cancel();
     _hourlySyncTimer?.cancel();
+    _startupHealthTimer?.cancel();
+    DailySnapshotService.instance.stopMidnightScheduler();
+    LanSyncService.instance.dispose();
     _syncBusSubscription?.cancel();
     _tabScrollController.dispose();
     windowManager.removeListener(this);
@@ -695,6 +704,14 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
             _buildLogConsoleHeaderButton(context, app),
             const SizedBox(width: 8),
             _buildFinancialYearSelector(context),
+            const SizedBox(width: 4),
+            IconButton(
+              icon: const Icon(Icons.point_of_sale_rounded, color: Color(0xFF10B981), size: 16),
+              onPressed: () => app.openDayClosing(),
+              tooltip: "Day-End Shift Closing & Cash Tally",
+              constraints: const BoxConstraints(maxHeight: 28, maxWidth: 28),
+              padding: const EdgeInsets.all(4),
+            ),
             const SizedBox(width: 4),
             IconButton(
               icon: const Icon(Icons.security_outlined, color: Colors.white70, size: 16),
@@ -1128,11 +1145,14 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
           _CompactDropdownMenu(title: "TRANSACTION", actions: [
             _MenuAction("Sales Entry", () => app.openSales()),
             _MenuAction("Purchase Entry", () => app.openPurchase()),
+            _MenuAction("Opening Stock Entry", () => app.openOpeningStock()),
             _MenuAction("Purchase Return", () => app.openPurchaseReturn()),
             _MenuAction("Sales Return", () => app.openSalesReturn()),
             _MenuAction("Damage & Expiry Entry", () => app.openDamageEntry()),
+            _MenuAction("Day-End Shift Closing", () => app.openDayClosing()),
           ]),
           _CompactDropdownMenu(title: "STOCK", actions: [
+            _MenuAction("Opening Stock Entry", () => app.openOpeningStock()),
             _MenuAction("Product Profile", () {
               Provider.of<MdiController>(context, listen: false).openWindow(
                 MdiWindow(
@@ -1173,6 +1193,7 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
             _MenuAction("Stock Adjustment (Batch)", () => app.openStockAdjustmentBatch()),
             _MenuAction("Damage & Expiry Entry", () => app.openDamageEntry()),
             _MenuAction("Expiry / Non Moving", () => app.openExpiryList()),
+            _MenuAction("Supplier Expiry Claims (Debit Notes)", () => app.openSupplierExpiryReturn()),
           ]),
           _CompactDropdownMenu(title: "ORDER", actions: [
             _MenuAction("Order Book", () => app.openOrderBook()),
@@ -1189,7 +1210,9 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
             _MenuAction("GST Filing Report", () => app.openGstReport()),
             _MenuAction("Purchase Analysis", () => app.openPurchaseReport()),
             _MenuAction("Purchase Return Analysis", () => app.openPurchaseReturnReport()),
+            _MenuAction("Supplier Expiry Return Register", () => app.openSupplierExpiryReturn()),
             _MenuAction("Stock Adjustment Report", () => app.openStockAdjustmentBatchReport()),
+            _MenuAction("Day-End Shift Settlement", () => app.openDayClosing()),
           ]),
           _CompactDropdownMenu(title: "ACCOUNTS", actions: [
             _MenuAction("Ledger Registration", null, children: [
@@ -1200,6 +1223,7 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
             ]),
             _MenuAction("Receipt Entry", () => app.openReceipt()),
             _MenuAction("Daily Report", () => app.openDailyReport()),
+            _MenuAction("Day-End Shift Closing", () => app.openDayClosing()),
           ]),
           _CompactDropdownMenu(title: "ANALYSIS", actions: [
             _MenuAction("Sales Analysis", () => app.openSalesReport()),
@@ -1834,6 +1858,10 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
         return Row(
           mainAxisSize: MainAxisSize.min,
           children: [
+            // 0. LIVE CLOUD & LAN SYNC SENTINEL BADGE
+            const SyncHealthBadge(isDark: true),
+            const SizedBox(width: 4),
+
             // 1. LIVE PC vs CLOUD STOCK COMPARISON BUTTON
             InkWell(
               onTap: () => LiveSystemCountsDialog.show(context),
