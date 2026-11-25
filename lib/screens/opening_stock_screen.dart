@@ -484,57 +484,70 @@ AZITHROMYCIN 500MG,AZM-505,11/27,3,30,0,72.00,115.00,105.00,C1,12,3004
                     ),
                   ],
                 ),
-                const Spacer(),
-                // Summary Pills
-                _buildSummaryPill("Items Staged", "$totalItems", Colors.cyanAccent),
-                const SizedBox(width: 10),
-                _buildSummaryPill("Total Loose Units", "$totalUnits", Colors.amberAccent),
-                const SizedBox(width: 10),
-                _buildSummaryPill("Purchase Valuation", "₹ ${totalPurVal.toStringAsFixed(2)}", Colors.lightGreenAccent),
-                const SizedBox(width: 10),
-                _buildSummaryPill("MRP Valuation", "₹ ${totalMrpVal.toStringAsFixed(2)}", Colors.white),
-                const SizedBox(width: 10),
-                _buildSummaryPill(
-                  "Est. Margin",
-                  "${totalMrpVal > 0 ? (((totalMrpVal - totalPurVal) / totalMrpVal) * 100).toStringAsFixed(1) : '0.0'}%",
-                  Colors.purpleAccent,
-                ),
                 const SizedBox(width: 16),
-                OutlinedButton.icon(
-                  onPressed: _downloadTemplate,
-                  icon: const Icon(Icons.download_rounded, size: 16),
-                  label: const Text("Sample Template", style: TextStyle(fontSize: 12)),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: const Color(0xFFE2E8F0),
-                    side: const BorderSide(color: Color(0xFF64748B)),
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                OutlinedButton.icon(
-                  onPressed: _importSpreadsheet,
-                  icon: const Icon(Icons.file_upload_outlined, size: 16),
-                  label: const Text("Import Excel/CSV", style: TextStyle(fontSize: 12)),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: const Color(0xFF93C5FD),
-                    side: const BorderSide(color: Color(0xFF3B82F6)),
-                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                  ),
-                ),
-                const SizedBox(width: 10),
-                ElevatedButton.icon(
-                  onPressed: _isCommitting ? null : _commitAllStock,
-                  icon: _isCommitting
-                      ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                      : const Icon(Icons.save_rounded, size: 16),
-                  label: Text(
-                    _isCommitting ? "Committing..." : "Commit Stock to Inventory",
-                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
-                  ),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF10B981),
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+                Expanded(
+                  child: Align(
+                    alignment: Alignment.centerRight,
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          // Summary Pills
+                          _buildSummaryPill("Items Staged", "$totalItems", Colors.cyanAccent),
+                          const SizedBox(width: 10),
+                          _buildSummaryPill("Total Loose Units", "$totalUnits", Colors.amberAccent),
+                          const SizedBox(width: 10),
+                          _buildSummaryPill("Purchase Valuation", "₹ ${totalPurVal.toStringAsFixed(2)}", Colors.lightGreenAccent),
+                          const SizedBox(width: 10),
+                          _buildSummaryPill("MRP Valuation", "₹ ${totalMrpVal.toStringAsFixed(2)}", Colors.white),
+                          const SizedBox(width: 10),
+                          _buildSummaryPill(
+                            "Est. Margin",
+                            "${totalMrpVal > 0 ? (((totalMrpVal - totalPurVal) / totalMrpVal) * 100).toStringAsFixed(1) : '0.0'}%",
+                            Colors.purpleAccent,
+                          ),
+                          const SizedBox(width: 16),
+                          OutlinedButton.icon(
+                            onPressed: _downloadTemplate,
+                            icon: const Icon(Icons.download_rounded, size: 16),
+                            label: const Text("Sample Template", style: TextStyle(fontSize: 12)),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: const Color(0xFFE2E8F0),
+                              side: const BorderSide(color: Color(0xFF64748B)),
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          OutlinedButton.icon(
+                            onPressed: _importSpreadsheet,
+                            icon: const Icon(Icons.file_upload_outlined, size: 16),
+                            label: const Text("Import Excel/CSV", style: TextStyle(fontSize: 12)),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: const Color(0xFF93C5FD),
+                              side: const BorderSide(color: Color(0xFF3B82F6)),
+                              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          ElevatedButton.icon(
+                            onPressed: _isCommitting ? null : _commitAllStock,
+                            icon: _isCommitting
+                                ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                                : const Icon(Icons.save_rounded, size: 16),
+                            label: Text(
+                              _isCommitting ? "Committing..." : "Commit Stock to Inventory",
+                              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                            ),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF10B981),
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
               ],
