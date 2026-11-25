@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
@@ -8,12 +9,31 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../utils/theme_constants.dart';
 import 'app_notification_service.dart';
+import 'server_config_service.dart';
 import 'supabase_sync_service.dart';
+
+class RemoteVersionInfo {
+  final String latestVersion;
+  final String minSupportedVersion;
+  final String releaseName;
+  final String releaseNotes;
+  final String directZipUrl;
+  final bool isMandatory;
+
+  RemoteVersionInfo({
+    required this.latestVersion,
+    required this.minSupportedVersion,
+    required this.releaseName,
+    required this.releaseNotes,
+    required this.directZipUrl,
+    required this.isMandatory,
+  });
+}
 
 class UpdateCheckerService {
   static const String _defaultRepoOwner = 'jiyadpn0';
   static const String _defaultRepoName = 'pharmacy_app';
-  static const String defaultCodeVersion = '4.2.2';
+  static const String defaultCodeVersion = '4.2.3';
 
   static String _activeVersion = defaultCodeVersion;
 
@@ -85,7 +105,38 @@ class UpdateCheckerService {
     return compareSemver(latestTag, currentVersion) > 0;
   }
 
-  /// Checks GitHub Releases for updates.
+  /// Queries the remote Supabase `app_versions` table for version policies and mandatory minimums.
+  static Future<RemoteVersionInfo?> fetchSupabaseVersionPolicy() async {
+    final config = ServerConfigService.instance;
+    final url = ServerConfigService.cleanServerUrl(config.supabaseUrl);
+    final key = config.supabaseAnonKey.trim();
+    if (url.isEmpty || key.isEmpty) return null;
+
+    try {
+      final uri = Uri.parse('$url/rest/v1/app_versions?select=*&order=created_at.desc&limit=1');
+      final res = await http.get(uri, headers: config.restHeaders).timeout(const Duration(seconds: 5));
+      if (res.statusCode == 200) {
+        final List list = jsonDecode(res.body);
+        if (list.isNotEmpty) {
+          final row = list.first;
+          final String latestVer = (row['version'] ?? '').toString().trim();
+          final String minVer = (row['min_supported_version'] ?? '1.0.0').toString().trim();
+          final bool isMandatory = row['is_mandatory'] == true || compareSemver(minVer, currentVersion) > 0;
+          return RemoteVersionInfo(
+            latestVersion: latestVer,
+            minSupportedVersion: minVer,
+            releaseName: (row['release_name'] ?? 'PharmaPro ERP Update').toString(),
+            releaseNotes: (row['release_notes'] ?? '').toString(),
+            directZipUrl: (row['download_url'] ?? '').toString(),
+            isMandatory: isMandatory,
+          );
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Checks GitHub Releases or Supabase for updates.
   static Future<void> checkForUpdates(BuildContext context, {bool silent = false, String? repoPath}) async {
     if (kDebugMode && silent) return;
 
@@ -113,7 +164,7 @@ class UpdateCheckerService {
                   height: 38,
                   child: Center(
                     child: Text(
-                      "Checking GitHub Releases ($targetRepo)...",
+                      "Checking for Updates ($targetRepo)...",
                       textAlign: TextAlign.center,
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
@@ -129,6 +180,12 @@ class UpdateCheckerService {
     }
 
     try {
+      // 1. Check Supabase remote version control policy in parallel
+      RemoteVersionInfo? cloudPolicy;
+      try {
+        cloudPolicy = await fetchSupabaseVersionPolicy();
+      } catch (_) {}
+
       final client = HttpClient();
       final url = Uri.parse('https://api.github.com/repos/$targetRepo/releases/latest');
       final request = await client.getUrl(url);
@@ -169,11 +226,13 @@ class UpdateCheckerService {
         }
 
         final cleanLatest = tagName.replaceAll(RegExp(r'^[vV]'), '').trim();
+        final bool isMandatory = (cloudPolicy != null && cloudPolicy.isMandatory) ||
+            (cloudPolicy != null && compareSemver(cloudPolicy.minSupportedVersion, currentVersion) > 0);
 
         if (cleanLatest.isNotEmpty && isVersionNewer(cleanLatest, currentVersion)) {
           AppNotificationService.instance.addNotification(
-            title: "Software Update Available",
-            message: "New version v$cleanLatest ($releaseName) is available to download.",
+            title: isMandatory ? "CRITICAL SOFTWARE UPDATE REQUIRED" : "Software Update Available",
+            message: "New version v$cleanLatest ($releaseName) is available to install.",
             type: NotificationType.security,
             actionRoute: "server",
           );
@@ -186,6 +245,7 @@ class UpdateCheckerService {
               directZipUrl: directZipUrl,
               body: body,
               publishedAt: publishedAt,
+              isMandatory: isMandatory,
             );
           }
         } else if (!silent && context.mounted) {
@@ -195,6 +255,22 @@ class UpdateCheckerService {
               backgroundColor: Colors.green.shade800,
               behavior: SnackBarBehavior.floating,
             ),
+          );
+        }
+      } else if (cloudPolicy != null && isVersionNewer(cloudPolicy.latestVersion, currentVersion)) {
+        // Fallback: If GitHub API had rate limiting or error, but Supabase Cloud Policy has newer version
+        if (context.mounted) {
+          _showUpdateAvailableDialog(
+            context: context,
+            latestVersion: 'v${cloudPolicy.latestVersion}',
+            releaseName: cloudPolicy.releaseName,
+            htmlUrl: 'https://github.com/$targetRepo/releases',
+            directZipUrl: cloudPolicy.directZipUrl.isNotEmpty
+                ? cloudPolicy.directZipUrl
+                : 'https://github.com/$targetRepo/releases/download/v${cloudPolicy.latestVersion}/PharmacyERP_v${cloudPolicy.latestVersion}_Portable.zip',
+            body: cloudPolicy.releaseNotes,
+            publishedAt: '',
+            isMandatory: cloudPolicy.isMandatory,
           );
         }
       } else if (!silent && context.mounted) {
@@ -224,6 +300,7 @@ class UpdateCheckerService {
     required String directZipUrl,
     required String body,
     required String publishedAt,
+    bool isMandatory = false,
   }) {
     String formattedDate = publishedAt;
     try {
@@ -235,109 +312,153 @@ class UpdateCheckerService {
 
     showDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.all(8),
-              decoration: BoxDecoration(color: Colors.blue.withValues(alpha: 0.1), borderRadius: BorderRadius.circular(8)),
-              child: const Icon(Icons.system_update_rounded, color: Colors.blue),
-            ),
-            const SizedBox(width: 12),
-            const Expanded(
-              child: Text("New Update Available!", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-            ),
-          ],
-        ),
-        content: SizedBox(
-          width: 520,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
+      barrierDismissible: !isMandatory,
+      builder: (ctx) => PopScope(
+        canPop: !isMandatory,
+        child: AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: Row(
             children: [
               Container(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.all(8),
                 decoration: BoxDecoration(
-                  color: Colors.blue.shade50,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.blue.shade200),
+                  color: isMandatory ? Colors.red.withValues(alpha: 0.1) : Colors.blue.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(8),
                 ),
-                child: Row(
-                  children: [
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text("Current: v$currentVersion", style: const TextStyle(fontWeight: FontWeight.w600, color: Colors.blueGrey)),
-                        const SizedBox(height: 4),
-                        Text("Latest: $latestVersion", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.blue.shade900)),
-                      ],
-                    ),
-                    const Spacer(),
-                    if (formattedDate.isNotEmpty)
-                      Chip(
-                        avatar: const Icon(Icons.calendar_today_rounded, size: 14),
-                        label: Text(formattedDate, style: const TextStyle(fontSize: 11)),
-                      ),
-                  ],
+                child: Icon(
+                  isMandatory ? Icons.warning_rounded : Icons.system_update_rounded,
+                  color: isMandatory ? Colors.red.shade700 : Colors.blue,
                 ),
               ),
-              const SizedBox(height: 16),
-              Text(releaseName, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-              const SizedBox(height: 8),
-              const Text("RELEASE NOTES:", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.grey)),
-              const SizedBox(height: 6),
-              Container(
-                constraints: const BoxConstraints(maxHeight: 180),
-                width: double.infinity,
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: AppColors.background,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: AppColors.border),
-                ),
-                child: SingleChildScrollView(
-                  child: Text(
-                    body.isEmpty ? "No release details provided." : body,
-                    style: const TextStyle(fontSize: 12, height: 1.4),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  isMandatory ? "Critical Update Required" : "New Update Available!",
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                    color: isMandatory ? Colors.red.shade900 : Colors.black87,
                   ),
                 ),
               ),
             ],
           ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text("LATER", style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold)),
+          content: SizedBox(
+            width: 520,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (isMandatory) ...[
+                  Container(
+                    margin: const EdgeInsets.only(bottom: 12),
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.red.shade50,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.red.shade200),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(Icons.lock_clock_rounded, color: Colors.red.shade700, size: 20),
+                        const SizedBox(width: 8),
+                        const Expanded(
+                          child: Text(
+                            "This update includes essential database and sync fixes. Updating is mandatory to prevent data conflicts between PCs.",
+                            style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.red),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: isMandatory ? Colors.red.shade50 : Colors.blue.shade50,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: isMandatory ? Colors.red.shade200 : Colors.blue.shade200),
+                  ),
+                  child: Row(
+                    children: [
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text("Current: v$currentVersion", style: const TextStyle(fontWeight: FontWeight.w600, color: Colors.blueGrey)),
+                          const SizedBox(height: 4),
+                          Text("Latest: $latestVersion", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: isMandatory ? Colors.red.shade900 : Colors.blue.shade900)),
+                        ],
+                      ),
+                      const Spacer(),
+                      if (formattedDate.isNotEmpty)
+                        Chip(
+                          avatar: const Icon(Icons.calendar_today_rounded, size: 14),
+                          label: Text(formattedDate, style: const TextStyle(fontSize: 11)),
+                        ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Text(releaseName, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                const SizedBox(height: 8),
+                const Text("RELEASE NOTES:", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.grey)),
+                const SizedBox(height: 6),
+                Container(
+                  constraints: const BoxConstraints(maxHeight: 180),
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: AppColors.background,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: AppColors.border),
+                  ),
+                  child: SingleChildScrollView(
+                    child: Text(
+                      body.isEmpty ? "No release details provided." : body,
+                      style: const TextStyle(fontSize: 12, height: 1.4),
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
-          if (htmlUrl.isNotEmpty)
-            OutlinedButton.icon(
-              onPressed: () async {
+          actions: [
+            if (!isMandatory)
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text("LATER", style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold)),
+              ),
+            if (htmlUrl.isNotEmpty)
+              OutlinedButton.icon(
+                onPressed: () async {
+                  if (!isMandatory) Navigator.pop(ctx);
+                  final Uri uri = Uri.parse(htmlUrl);
+                  if (await canLaunchUrl(uri)) {
+                    await launchUrl(uri, mode: LaunchMode.externalApplication);
+                  }
+                },
+                icon: const Icon(Icons.open_in_new_rounded, size: 14),
+                label: const Text("Open in Browser", style: TextStyle(fontSize: 12)),
+              ),
+            ElevatedButton.icon(
+              onPressed: () {
                 Navigator.pop(ctx);
-                final Uri uri = Uri.parse(htmlUrl);
-                if (await canLaunchUrl(uri)) {
-                  await launchUrl(uri, mode: LaunchMode.externalApplication);
-                }
+                performDirectInAppUpdate(context, directZipUrl, latestVersion);
               },
-              icon: const Icon(Icons.open_in_new_rounded, size: 14),
-              label: const Text("Open in Browser", style: TextStyle(fontSize: 12)),
+              icon: const Icon(Icons.download_rounded, size: 16),
+              label: Text(
+                isMandatory ? "UPDATE NOW (MANDATORY)" : "UPDATE DIRECTLY IN APP",
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: isMandatory ? Colors.red.shade800 : Colors.blue.shade800,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              ),
             ),
-          ElevatedButton.icon(
-            onPressed: () {
-              Navigator.pop(ctx);
-              performDirectInAppUpdate(context, directZipUrl, latestVersion);
-            },
-            icon: const Icon(Icons.download_rounded, size: 16),
-            label: const Text("UPDATE DIRECTLY IN APP", style: TextStyle(fontWeight: FontWeight.bold)),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.blue.shade800,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-            ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -493,7 +614,7 @@ class UpdateCheckerService {
         await Future.delayed(const Duration(milliseconds: 500));
       } catch (_) {}
 
-      // Write version.json into the source update directory so xcopy transfers it along with binaries
+      // Write version.json into the source update directory so robocopy transfers it along with binaries
       try {
         final sourceVersionFile = File('$sourceFolderPath${Platform.pathSeparator}version.json');
         await sourceVersionFile.writeAsString(jsonEncode({'version': cleanVer}));
@@ -505,6 +626,25 @@ class UpdateCheckerService {
       final exeName = appExeFile.uri.pathSegments.last;
 
       if (Platform.isWindows) {
+        // 1. Check if dedicated updater.exe is available in the extracted package or local app directory
+        final localUpdater = File('$appDir${Platform.pathSeparator}updater.exe');
+        final extractedUpdater = File('$sourceFolderPath${Platform.pathSeparator}updater.exe');
+        final updaterToUse = extractedUpdater.existsSync() ? extractedUpdater : (localUpdater.existsSync() ? localUpdater : null);
+
+        if (updaterToUse != null) {
+          // Copy updater to temp so it is not in either source or destination folder
+          final tempUpdater = File('${tempDir.path}${Platform.pathSeparator}PharmaPro_Updater.exe');
+          await updaterToUse.copy(tempUpdater.path);
+
+          await Process.start(
+            tempUpdater.path,
+            ['--source', sourceFolderPath, '--target', appDir, '--exe', appExePath],
+            mode: ProcessStartMode.detached,
+          );
+          exit(0);
+        }
+
+        // 2. Fallback to resilient robocopy batch script
         final scriptFile = File('${tempDir.path}${Platform.pathSeparator}apply_pharmacy_update.bat');
         final scriptContent = '''
 @echo off

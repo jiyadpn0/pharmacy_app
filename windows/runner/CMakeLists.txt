@@ -16,6 +16,14 @@ add_executable(${BINARY_NAME} WIN32
   "runner.exe.manifest"
 )
 
+# Dedicated Standalone Updater Executable
+add_executable(updater WIN32
+  "updater.cpp"
+)
+apply_standard_settings(updater)
+target_link_libraries(updater PRIVATE "shlwapi.lib" "shell32.lib")
+add_dependencies(${BINARY_NAME} updater)
+
 # Apply the standard set of build settings. This can be removed for applications
 # that need different build settings.
 apply_standard_settings(${BINARY_NAME})
