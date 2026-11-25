@@ -60,6 +60,37 @@ class LanSyncService {
   final List<void Function(Map<String, dynamic> event)> _listeners = [];
   final LinkedHashSet<String> _processedEvents = LinkedHashSet<String>();
 
+  // Active Peer Reset Locks: Map of terminal_id -> lock expiry timestamp
+  final Map<String, DateTime> _peerResetLocks = {};
+
+  bool isTerminalInResetLock(String terminalId) {
+    final clean = terminalId.toLowerCase().trim();
+    final expiry = _peerResetLocks[clean];
+    if (expiry == null) return false;
+    if (DateTime.now().isAfter(expiry)) {
+      _peerResetLocks.remove(clean);
+      return false;
+    }
+    return true;
+  }
+
+  /// Broadcasts a network-wide wipe lock so all peers pause syncing to this machine
+  void broadcastResetLock({int durationSeconds = 60}) {
+    broadcastEvent('LAN_RESET_LOCK', {
+      'terminal_id': ServerConfigService.instance.terminalId,
+      'duration_seconds': durationSeconds,
+      'timestamp': DateTime.now().toIso8601String(),
+    });
+  }
+
+  /// Broadcasts a network-wide wipe release so peers resume normal sync
+  void broadcastResetRelease() {
+    broadcastEvent('LAN_RESET_RELEASE', {
+      'terminal_id': ServerConfigService.instance.terminalId,
+      'timestamp': DateTime.now().toIso8601String(),
+    });
+  }
+
   // Plug-and-Play Peer Discovery Registry
   final Map<String, DiscoveredTerminalPeer> _discoveredPeers = {};
   final StreamController<List<DiscoveredTerminalPeer>> _peersStreamCtrl = StreamController<List<DiscoveredTerminalPeer>>.broadcast();
@@ -260,6 +291,28 @@ class LanSyncService {
                   return;
                 }
 
+                // Handle network-wide peer wipe locks
+                if (action == 'LAN_RESET_LOCK') {
+                  final term = (map['terminal_id']?.toString() ?? senderId).toLowerCase().trim();
+                  final duration = (map['duration_seconds'] as num?)?.toInt() ?? 60;
+                  _peerResetLocks[term] = DateTime.now().add(Duration(seconds: duration));
+                  debugPrint('🔒 [LAN SYNC]: Peer $term is performing a database reset. Muting sync to it for ${duration}s.');
+                  return;
+                }
+
+                if (action == 'LAN_RESET_RELEASE') {
+                  final term = (map['terminal_id']?.toString() ?? senderId).toLowerCase().trim();
+                  _peerResetLocks.remove(term);
+                  debugPrint('🔓 [LAN SYNC]: Peer $term has finished reset. Resuming sync.');
+                  return;
+                }
+
+                // If this machine is currently in wiping state, ignore all incoming sync mutations
+                if (ServerConfigService.instance.isWiping) {
+                  debugPrint('⚡ [LAN SYNC]: Dropping incoming $action because this terminal is in RESET/WIPE mode.');
+                  return;
+                }
+
                 // Ignore empty sender IDs or packets sent by this exact computer to prevent self-looping
                 if (senderId.isEmpty || senderId == _deviceId) {
                   return;
@@ -297,8 +350,16 @@ class LanSyncService {
               try {
                 final map = jsonDecode(line) as Map<String, dynamic>;
                 final senderId = (map['sender_id']?.toString() ?? '').toLowerCase().trim();
+                final action = map['action']?.toString() ?? '';
+
+                // If this terminal is currently wiping, drop all incoming sync writes
+                if (ServerConfigService.instance.isWiping) {
+                  debugPrint('⚡ [LAN TCP SYNC]: Dropping incoming $action because this terminal is in RESET/WIPE mode.');
+                  return;
+                }
+
                 if (senderId.isNotEmpty && senderId != _deviceId) {
-                  debugPrint('⚡ [LAN TCP Event]: ${map['action']} from $senderId');
+                  debugPrint('⚡ [LAN TCP Event]: $action from $senderId');
                   for (var listener in _listeners) {
                     try {
                       listener(map);

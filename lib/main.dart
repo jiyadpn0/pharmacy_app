@@ -108,32 +108,45 @@ void main(List<String> args) async {
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
   }
+  // Initialize essential core local services
   unawaited(RemoteLoggerService.instance.init().catchError((e, s) => debugPrint("RemoteLogger init error: $e")));
   unawaited(UpdateCheckerService.init().catchError((e, s) => debugPrint("UpdateChecker init error: $e")));
-  unawaited(ServerConfigService.instance.init().then((_) {
-    if (args.any((a) => a.contains('--secondary') || a.contains('--pos2') || a.contains('POS-02'))) {
-      ServerConfigService.instance.overrideTerminalId('POS-02');
-    } else {
-      for (var arg in args) {
-        if (arg.startsWith('--terminal=')) {
-          final term = arg.split('=').last.trim();
-          if (term.isNotEmpty) {
-            ServerConfigService.instance.overrideTerminalId(term);
+
+  // Cold Boot Sequencing: Ensure SQLite database and server configurations are ready before starting periodic sync
+  unawaited(() async {
+    try {
+      // 1. Await local database handle and migrations
+      await DbHelper.instance.database;
+
+      // 2. Initialize server configuration with CLI terminal override
+      await ServerConfigService.instance.init();
+      if (args.any((a) => a.contains('--secondary') || a.contains('--pos2') || a.contains('POS-02'))) {
+        ServerConfigService.instance.overrideTerminalId('POS-02');
+      } else {
+        for (var arg in args) {
+          if (arg.startsWith('--terminal=')) {
+            final term = arg.split('=').last.trim();
+            if (term.isNotEmpty) {
+              ServerConfigService.instance.overrideTerminalId(term);
+            }
           }
         }
       }
+
+      // 3. Initialize Supabase cloud sync engine
+      await SupabaseSyncService.instance.init();
+
+      // 4. Safe automatic local backup
+      unawaited(DbHelper.instance.autoBackupDatabase().catchError((e, s) => debugPrint("AutoBackup init error: $e")));
+
+      // 5. Start periodic sync and maintenance ONLY after SQLite engine is confirmed ready
+      DeltaSyncService.instance.startPeriodicSync();
+      DatabaseMaintenanceService.instance.startPeriodicMaintenance();
+      debugPrint("⚡ [System Boot Sequence]: Database, ServerConfig, and Sync services successfully sequenced.");
+    } catch (e, stack) {
+      AppLogger.instance.error("SYSTEM", "Cold boot sequencing error: $e", stackTrace: stack);
     }
-  }).catchError((e, s) {
-    debugPrint("ServerConfig init error: $e");
-  }));
-  unawaited(SupabaseSyncService.instance.init().catchError((e, s) => debugPrint("SupabaseSync init error: $e")));
-  unawaited(DbHelper.instance.autoBackupDatabase().catchError((e, s) => debugPrint("AutoBackup init error: $e")));
-  try {
-    DeltaSyncService.instance.startPeriodicSync();
-    DatabaseMaintenanceService.instance.startPeriodicMaintenance();
-  } catch (e) {
-    AppLogger.instance.error("SYSTEM", "Periodic background service start error: $e");
-  }
+  }());
 
   // Handle all unhandled asynchronous / Future platform errors
   PlatformDispatcher.instance.onError = (error, stack) {

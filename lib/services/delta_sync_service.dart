@@ -10,6 +10,7 @@ import '../utils/app_formatters.dart';
 import 'supabase_sync_service.dart';
 import 'server_config_service.dart';
 import 'stock_outbox_service.dart';
+import 'lan_sync_service.dart';
 
 /// Non-blocking, incremental background sync engine (Delta Sync).
 /// Periodically syncs unsynced local invoices and fetches changed products/stock
@@ -102,6 +103,11 @@ class DeltaSyncService {
 
     final config = ServerConfigService.instance;
     if (config.isWiping || SupabaseSyncService.instance.isWiping || SupabaseSyncService.instance.isSyncing || DbHelper.isBillingActive) {
+      return true;
+    }
+    // Also skip delta sync if any peer on LAN is performing a database reset
+    if (LanSyncService.instance.isTerminalInResetLock(config.terminalId)) {
+      debugPrint("DeltaSyncService: Cycle skipped because terminal reset lock is active on network.");
       return true;
     }
     if (!config.isServerModeEnabled || !config.isConnected || !config.autoSyncEnabled) {

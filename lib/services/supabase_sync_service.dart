@@ -17,6 +17,7 @@ import 'remote_logger_service.dart';
 import 'server_config_service.dart';
 import 'supabase_realtime_service.dart';
 import 'stock_outbox_service.dart';
+import 'lan_sync_service.dart';
 
 enum CategorySyncState { queued, transferring, completed, error }
 
@@ -2116,6 +2117,11 @@ class SupabaseSyncService extends ChangeNotifier {
     _cancelRequested = true;
     ServerConfigService.instance.setWiping(true);
 
+    // Broadcast LAN reset lock so other local network PCs pause syncing mutations to this machine
+    try {
+      LanSyncService.instance.broadcastResetLock(durationSeconds: 90);
+    } catch (_) {}
+
     // Stop background periodic delta sync and realtime listeners during reset to eliminate SQLite lock contention
     DeltaSyncService.instance.stopPeriodicSync();
     SupabaseRealtimeService.instance.disposeAll();
@@ -2282,6 +2288,11 @@ class SupabaseSyncService extends ChangeNotifier {
       _isWiping = false;
       _cancelRequested = false;
       ServerConfigService.instance.setWiping(false);
+
+      // Release network wipe lock so peers resume normal communication
+      try {
+        LanSyncService.instance.broadcastResetRelease();
+      } catch (_) {}
 
       if (ServerConfigService.instance.isServerModeEnabled && ServerConfigService.instance.isConnected) {
         if (ServerConfigService.instance.autoSyncEnabled) {
