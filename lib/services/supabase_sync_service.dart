@@ -997,26 +997,32 @@ class SupabaseSyncService extends ChangeNotifier {
         LEFT JOIN product_master pm ON sb.product_id = pm.id
       ''');
 
-      await db.transaction((txn) async {
-        final batch = txn.batch();
-        for (var bRow in allBatches) {
-          int rowId = (bRow['rowid'] as num).toInt();
-          String pId = bRow['product_id']?.toString() ?? '';
-          String pName = (bRow['master_name']?.toString() ?? '').trim().toLowerCase();
-          String bNo = (bRow['batch_number']?.toString() ?? '').trim().toLowerCase();
-          String keyId = "$pId|$bNo";
-          String keyName = "$pName|$bNo";
+      // Chunk updates so SQLite never holds an indefinite exclusive lock and the event loop can breathe
+      const int batchChunkSize = 500;
+      for (int i = 0; i < allBatches.length; i += batchChunkSize) {
+        final chunk = allBatches.sublist(i, (i + batchChunkSize > allBatches.length) ? allBatches.length : i + batchChunkSize);
+        await db.transaction((txn) async {
+          final batch = txn.batch();
+          for (var bRow in chunk) {
+            int rowId = (bRow['rowid'] as num).toInt();
+            String pId = bRow['product_id']?.toString() ?? '';
+            String pName = (bRow['master_name']?.toString() ?? '').trim().toLowerCase();
+            String bNo = (bRow['batch_number']?.toString() ?? '').trim().toLowerCase();
+            String keyId = "$pId|$bNo";
+            String keyName = "$pName|$bNo";
 
-          int? trueStock = calculatedStockMap[keyId] ?? nameBatchStockMap[keyName];
+            int? trueStock = calculatedStockMap[keyId] ?? nameBatchStockMap[keyName];
 
-          if (trueStock != null) {
-            batch.rawUpdate('UPDATE stock_batches SET current_stock = ? WHERE rowid = ?', [trueStock, rowId]);
-          } else {
-            batch.rawUpdate('UPDATE stock_batches SET current_stock = 0 WHERE rowid = ?', [rowId]);
+            if (trueStock != null) {
+              batch.rawUpdate('UPDATE stock_batches SET current_stock = ? WHERE rowid = ?', [trueStock, rowId]);
+            } else {
+              batch.rawUpdate('UPDATE stock_batches SET current_stock = 0 WHERE rowid = ?', [rowId]);
+            }
           }
-        }
-        await batch.commit(noResult: true);
-      });
+          await batch.commit(noResult: true);
+        });
+        await Future.delayed(const Duration(milliseconds: 2));
+      }
     } catch (e) {
       debugPrint("_recalculateStockFromLedgerDirect error: $e");
     }
@@ -1858,6 +1864,12 @@ class SupabaseSyncService extends ChangeNotifier {
       } catch (_) {}
 
       final localProdCount = (await db.rawQuery('SELECT COUNT(*) as cnt FROM product_master')).first['cnt'] as int? ?? 0;
+
+      // If local already has full catalog, skip downloading all 52,805 records on every single startup!
+      if (localProdCount > 1000) {
+        debugPrint('⚡ ensureMasterCatalogDownloaded: Local catalog already populated ($localProdCount items). Skipping redundant startup re-download.');
+        return true;
+      }
 
       final remoteProducts = await fetchAllRows('product_master');
 

@@ -218,7 +218,8 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
       SupabaseSyncService.instance.onDataPulled = () async {
         if (mounted) {
           final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
-          await pharmacy.loadFromDatabase();
+          // Lightweight refresh without re-reading the 52k master catalog from disk
+          pharmacy.scheduleDebouncedInventorySync();
           await pharmacy.fetchAccounts();
         }
       };
@@ -226,7 +227,7 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
       Timer? eventDebounceTimer;
       void triggerDebouncedSync() {
         eventDebounceTimer?.cancel();
-        eventDebounceTimer = Timer(const Duration(milliseconds: 800), () async {
+        eventDebounceTimer = Timer(const Duration(milliseconds: 400), () async {
           if (!mounted) return;
           if (!ServerConfigService.instance.isWiping) {
             final pharmacy = Provider.of<PharmacyProvider>(context, listen: false);
@@ -236,13 +237,17 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
               if (pulled && mounted) {
                 pharmacy.scheduleDebouncedInventorySync();
               }
+            } else {
+              // Even if Supabase sync is running, reflect local changes immediately!
+              pharmacy.scheduleDebouncedInventorySync();
             }
           }
         });
       }
 
-      // Immediate startup initialization of LAN and Supabase Realtime Sync Listeners
-      Future.microtask(() async {
+      // Staggered startup initialization of LAN and Supabase Realtime Sync Listeners
+      // Delaying by 3 seconds guarantees the UI is completely mounted and rendered without blocking Win32 message pump
+      Future.delayed(const Duration(seconds: 3), () async {
         if (!mounted) return;
         
         // 1. Initialize Ultra-fast LAN Socket Listener (1ms LAN Sync)
@@ -262,6 +267,19 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
                     switch (action) {
                       case 'SALE_SAVED':
                       case 'SALE_COMPLETED':
+                        if (payload is Map<String, dynamic>) {
+                          final inner = (payload['payload'] is Map<String, dynamic>)
+                              ? payload['payload'] as Map<String, dynamic>
+                              : payload;
+                          final header = inner['header'];
+                          final items = inner['items'];
+                          if (header is Map<String, dynamic>) {
+                            await pharmacy.applyRemoteRealtimeUpdate('sales_invoices', 'INSERT', [header]);
+                          }
+                          if (items is List && items.isNotEmpty) {
+                            await pharmacy.applyRemoteRealtimeUpdate('sales_items', 'INSERT', items);
+                          }
+                        }
                         if (payload is Map<String, dynamic> && payload.containsKey('batch_deductions')) {
                           final deductions = payload['batch_deductions'] as List;
                           for (final item in deductions) {
@@ -348,6 +366,10 @@ class _MainShellState extends State<MainShell> with WindowListener, WidgetsBindi
                         if (!mounted) return;
                         LanSyncService.instance.handleIncomingEventsBatch(rows, (validRows) async {
                           await pharmacy.applyRemoteRealtimeUpdate(tableName, eventType, validRows);
+                          // Instantly refresh recent documents so new bills appear on screen in real time
+                          if (tableName == 'purchase_entries' || tableName == 'sales_invoices') {
+                            pharmacy.scheduleDebouncedInventorySync();
+                          }
                         });
                       });
                     }

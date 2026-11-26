@@ -724,7 +724,8 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> implements Un
       }
     }
 
-    if (!_isExistingEntry && _items.isEmpty && !_isDirty) {
+    // Only re-check sequence if empty and NOT already holding a valid sequence number
+    if (!_isExistingEntry && _items.isEmpty && !_isDirty && _entryNoCtrl.text.trim().isEmpty) {
       _checkAndRefreshEntryNo();
     }
   }
@@ -797,7 +798,10 @@ class _LocalPurchaseScreenState extends State<LocalPurchaseScreen> implements Un
       }
 
       final curEntry = _entryNoCtrl.text.trim();
-      if (_isExistingEntry && curEntry.isNotEmpty) {
+      // Only show banner if user has already loaded an existing saved entry from database,
+      // it matches the remote update, AND the user has unsaved modifications on screen.
+      // For blank / new entries, do NOT show any banner.
+      if (_isExistingEntry && _isDirty && curEntry.isNotEmpty) {
         final bool matchesCurrentEntry = notif.message.contains('#$curEntry') ||
             (notif.actionPayload != null &&
                 notif.actionPayload!['entryNo'].toString().trim() == curEntry);

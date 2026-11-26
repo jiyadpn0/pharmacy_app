@@ -253,7 +253,13 @@ class PharmacyProvider extends ChangeNotifier {
         });
       }
 
-      await recalculateAllStockFromLedgerInternal(db);
+      // Stock ledger reconciliation is deferred to background so UI is never blocked
+      Future.delayed(const Duration(seconds: 4), () async {
+        try {
+          final liveDb = await DbHelper.instance.database;
+          await recalculateAllStockFromLedgerInternal(liveDb);
+        } catch (_) {}
+      });
 
       final List<Map<String, dynamic>> masterResults = await db.query('product_master');
       final Map<String, Product> masterMap = {};
@@ -1955,8 +1961,13 @@ class PharmacyProvider extends ChangeNotifier {
         }
       }
 
-      // 1.5 Auto-reconcile stock ledgers & create missing batches from purchase entries
-      await recalculateAllStockFromLedgerInternal(db);
+      // 1.5 Auto-reconcile stock ledgers in deferred background so app opens instantly without freezing
+      Future.delayed(const Duration(seconds: 4), () async {
+        try {
+          final liveDb = await DbHelper.instance.database;
+          await recalculateAllStockFromLedgerInternal(liveDb);
+        } catch (_) {}
+      });
 
       // 2. INVENTORY LOAD: Parse all batches into local temporary list
       final List<Map<String, dynamic>> batchResults = await db.rawQuery('''
@@ -9983,6 +9994,14 @@ class PharmacyProvider extends ChangeNotifier {
             },
             idempotencyKey: purIdempKey,
           );
+          // Direct high-speed 1ms LAN broadcast to other counter PCs
+          LanSyncService.instance.broadcastEvent('PURCHASE_SAVED', {
+            'action': 'PURCHASE_SAVED',
+            'terminal_id': ServerConfigService.instance.terminalId,
+            'entry_no': finalEntryNo,
+            'header': headerMap,
+            'items': itemsMap,
+          });
         } catch (e) {
           debugPrint('Instant purchase sync error: $e');
         }
