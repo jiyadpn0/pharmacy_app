@@ -192,6 +192,7 @@ class PureCloudService {
     required String direction,
     String? fy,
     String? prefix,
+    bool? isExistingEntry,
   }) async {
     final activeFy = (fy != null && fy.isNotEmpty) ? fy : '';
     final List<String> keys = await _getNavKeys(table, activeFy, prefix: prefix);
@@ -221,7 +222,18 @@ class PureCloudService {
         targetKey = keys.last;
         break;
       case 'prev':
-        if (curIdx > 0) {
+        if (isExistingEntry == false) {
+          // If on an unsaved new entry, navigate back to the latest saved entry
+          if (curNum > 0) {
+            for (int i = keys.length - 1; i >= 0; i--) {
+              if (extractNum(keys[i]) < curNum) {
+                targetKey = keys[i];
+                break;
+              }
+            }
+          }
+          targetKey ??= keys.last;
+        } else if (curIdx > 0) {
           if (curNum > 0) {
             for (int i = curIdx - 1; i >= 0; i--) {
               if (extractNum(keys[i]) < curNum) {

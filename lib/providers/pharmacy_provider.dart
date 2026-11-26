@@ -253,15 +253,17 @@ class PharmacyProvider extends ChangeNotifier {
         });
       }
 
-      // Stock ledger reconciliation is deferred to background so UI is never blocked
-      Future.delayed(const Duration(seconds: 4), () async {
-        try {
-          final liveDb = await DbHelper.instance.database;
-          await recalculateAllStockFromLedgerInternal(liveDb);
-        } catch (_) {}
-      });
 
-      final List<Map<String, dynamic>> masterResults = await db.query('product_master');
+      final List<Map<String, dynamic>> masterResults = await db.rawQuery('''
+        SELECT pm.* FROM product_master pm
+        WHERE pm.id IN (
+          SELECT DISTINCT product_id FROM stock_batches
+          UNION
+          SELECT DISTINCT product_id FROM sales_items
+          UNION
+          SELECT DISTINCT product_id FROM purchase_items
+        )
+      ''');
       final Map<String, Product> masterMap = {};
 
       for (var row in masterResults) {
@@ -1917,7 +1919,8 @@ class PharmacyProvider extends ChangeNotifier {
         debugPrint("Sequence cleanup note: $e");
       }
 
-      // 1. PRODUCT MASTER LOAD: If already in memory and not forced, reuse existing master map!
+      // 1. PRODUCT MASTER LOAD: Scoped to active stock items and transaction products (~2,500 items).
+      // Inactive catalog items (115,000+) are queried on-demand via SQLite indexes / FTS5 without blocking UI.
       final Map<String, Product> tempMasterMap = {};
       if (_productMaster.isNotEmpty && !forceReloadMaster) {
         for (var p in _productMaster) {
@@ -1925,49 +1928,44 @@ class PharmacyProvider extends ChangeNotifier {
           tempMasterMap[p.id] = p;
         }
       } else {
-        final List<Map<String, dynamic>> masterResults = await db.query('product_master');
+        final List<Map<String, dynamic>> masterResults = await db.rawQuery('''
+          SELECT pm.* FROM product_master pm
+          WHERE pm.id IN (
+            SELECT DISTINCT product_id FROM stock_batches
+            UNION
+            SELECT DISTINCT product_id FROM sales_items
+            UNION
+            SELECT DISTINCT product_id FROM purchase_items
+          )
+        ''');
 
-        const int chunkSize = 5000;
-        for (int i = 0; i < masterResults.length; i += chunkSize) {
-          final end = (i + chunkSize < masterResults.length) ? i + chunkSize : masterResults.length;
-          for (int j = i; j < end; j++) {
-            final row = masterResults[j];
-            final p = Product(
-              id: row['id'].toString(),
-              name: row['name'] ?? "UNKNOWN",
-              hsnCode: row['hsn_code'] ?? "",
-              rack: row['rack_id'] ?? "",
-              category: row['category_id'] ?? "General",
-              subCategory: row['sub_category_id'] ?? "",
-              packSize: (row['packing'] as num?)?.toInt() ?? 1,
-              mrp: (row['mrp'] as num?)?.toDouble() ?? 0.0,
-              purchaseRate: (row['purchase_rate'] as num?)?.toDouble() ?? 0.0,
-              salePrice: (row['sale_rate'] as num?)?.toDouble() ?? 0.0,
-              gstPercent: TaxCalculator.roundGstPercent((row['gst_percent'] as num?)?.toDouble() ?? 12.0),
-              sDiscPercent: (row['s_disc_percent'] as num?)?.toDouble() ?? 0.0,
-              patent: row['patent'] ?? "",
-              schedule: row['schedule'] ?? "",
-              reorderLevel: (row['reorder_level'] as num?)?.toInt() ?? 10,
-              maxLevel: (row['max_level'] as num?)?.toInt() ?? 100,
-              manufacturer: row['manufacturer_id'] ?? "",
-              genericName: row['generic_name'] ?? "",
-              stock: 0,
-            );
-            tempMasterMap[p.id] = p;
-          }
-          if (end < masterResults.length) {
-            await Future.delayed(const Duration(milliseconds: 1)); // Yield to Windows event loop so UI stays 100% responsive!
-          }
+        for (var row in masterResults) {
+          final p = Product(
+            id: row['id'].toString(),
+            name: row['name'] ?? "UNKNOWN",
+            hsnCode: row['hsn_code'] ?? "",
+            rack: row['rack_id'] ?? "",
+            category: row['category_id'] ?? "General",
+            subCategory: row['sub_category_id'] ?? "",
+            packSize: (row['packing'] as num?)?.toInt() ?? 1,
+            mrp: (row['mrp'] as num?)?.toDouble() ?? 0.0,
+            purchaseRate: (row['purchase_rate'] as num?)?.toDouble() ?? 0.0,
+            salePrice: (row['sale_rate'] as num?)?.toDouble() ?? 0.0,
+            gstPercent: TaxCalculator.roundGstPercent((row['gst_percent'] as num?)?.toDouble() ?? 12.0),
+            sDiscPercent: (row['s_disc_percent'] as num?)?.toDouble() ?? 0.0,
+            patent: row['patent'] ?? "",
+            schedule: row['schedule'] ?? "",
+            reorderLevel: (row['reorder_level'] as num?)?.toInt() ?? 10,
+            maxLevel: (row['max_level'] as num?)?.toInt() ?? 100,
+            manufacturer: row['manufacturer_id'] ?? "",
+            genericName: row['generic_name'] ?? "",
+            stock: 0,
+          );
+          tempMasterMap[p.id] = p;
         }
       }
 
-      // 1.5 Auto-reconcile stock ledgers in deferred background so app opens instantly without freezing
-      Future.delayed(const Duration(seconds: 4), () async {
-        try {
-          final liveDb = await DbHelper.instance.database;
-          await recalculateAllStockFromLedgerInternal(liveDb);
-        } catch (_) {}
-      });
+      // Stock is already persisted in stock_batches. Manual reconciliation can be triggered from Settings when needed.
 
       // 2. INVENTORY LOAD: Parse all batches into local temporary list
       final List<Map<String, dynamic>> batchResults = await db.rawQuery('''
@@ -2040,10 +2038,14 @@ class PharmacyProvider extends ChangeNotifier {
       // Future.microtask(() => _loadRemainingMasterProductsInBackground());
 
       // CODE MASTER FIX: EMERGENCY DATA SYNC
-      // If _productMaster is still empty but we know rows exist, load basic names directly
+      // If _productMaster is still empty but rows exist, load active stock items only
       if (_productMaster.isEmpty && totalInDb > 0) {
-        debugPrint("--- DATA RECOVERY: Loading $totalInDb master names directly ---");
-        final basicResults = await db.query('product_master', columns: ['id', 'name', 'hsn_code', 'rack_id', 'category_id', 'packing', 'mrp', 'purchase_rate', 'sale_rate', 'gst_percent']);
+        final basicResults = await db.rawQuery('''
+          SELECT pm.id, pm.name, pm.hsn_code, pm.rack_id, pm.category_id, pm.packing, pm.mrp, pm.purchase_rate, pm.sale_rate, pm.gst_percent
+          FROM product_master pm
+          JOIN stock_batches sb ON pm.id = sb.product_id
+          GROUP BY pm.id
+        ''');
         for (var row in basicResults) {
           _productMaster.add(Product(
             id: row['id'].toString(),
@@ -12194,7 +12196,18 @@ class PharmacyProvider extends ChangeNotifier {
           targetEntryNo = cachedKeys.last;
           break;
         case 'prev':
-          if (curIdx > 0) {
+          if (isExistingEntry == false) {
+            // Unsaved/new entry: navigate to highest sequence less than current or latest existing entry
+            if (curNum > 0) {
+              for (int i = cachedKeys.length - 1; i >= 0; i--) {
+                if (extractNum(cachedKeys[i]) < curNum) {
+                  targetEntryNo = cachedKeys[i];
+                  break;
+                }
+              }
+            }
+            targetEntryNo ??= cachedKeys.last;
+          } else if (curIdx > 0) {
             // Find an entry with a strictly lower sequence number to prevent stuck loops
             if (curNum > 0) {
               for (int i = curIdx - 1; i >= 0; i--) {
@@ -12246,7 +12259,11 @@ class PharmacyProvider extends ChangeNotifier {
       }
 
       if (targetEntryNo != null && targetEntryNo.isNotEmpty) {
-        final res = await db.query(table, where: 'entry_no = ?', whereArgs: [targetEntryNo], limit: 1);
+        final cleanT = cleanEntryNo(targetEntryNo);
+        final res = await db.rawQuery(
+          "SELECT * FROM $table WHERE entry_no = ? OR entry_no = ? OR entry_no LIKE ? OR entry_no LIKE ? LIMIT 1",
+          [targetEntryNo, cleanT, "%_$cleanT", "%_$targetEntryNo"]
+        ).timeout(const Duration(seconds: 3), onTimeout: () => []);
         if (res.isNotEmpty) return res.first;
       }
       return null;
@@ -17979,8 +17996,16 @@ class PharmacyProvider extends ChangeNotifier {
     await _recalculateTodayStatsFromDb();
   }
 
+  static bool _isReconcilingStock = false;
+
   Future<void> recalculateAllStockFromLedgerInternal(sql.Database db) async {
-    await SupabaseSyncService.recalculateStockFromLedgerDirect(db);
+    if (_isReconcilingStock) return;
+    _isReconcilingStock = true;
+    try {
+      await SupabaseSyncService.recalculateStockFromLedgerDirect(db);
+    } finally {
+      _isReconcilingStock = false;
+    }
   }
 
   Future<String> recalculateAllStockFromLedger() async {

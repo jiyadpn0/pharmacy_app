@@ -1917,8 +1917,14 @@ class DbHelper {
 
   Future<void> _migrateLegacyBatchesToBatchMaster(Database db) async {
     try {
+      final prefs = await SharedPreferences.getInstance();
+      if (prefs.getBool('legacy_batches_to_batch_master_done') == true) return;
+
       final existingLegacy = await db.rawQuery('SELECT * FROM stock_batches');
-      if (existingLegacy.isEmpty) return;
+      if (existingLegacy.isEmpty) {
+        await prefs.setBool('legacy_batches_to_batch_master_done', true);
+        return;
+      }
 
       int index = 0;
       for (var row in existingLegacy) {
@@ -1958,7 +1964,7 @@ class DbHelper {
             'rack': row['rack']?.toString() ?? '',
             'created_at': DateTime.now().toIso8601String(),
             'is_active': (row['is_active'] as num?)?.toInt() ?? 1,
-          });
+          }, conflictAlgorithm: ConflictAlgorithm.ignore);
         }
 
         if (batchId.isNotEmpty && currentStock > 0) {
@@ -1985,6 +1991,7 @@ class DbHelper {
           }
         }
       }
+      await prefs.setBool('legacy_batches_to_batch_master_done', true);
     } catch (e) {
       debugPrint("Legacy batch migration note: $e");
     }

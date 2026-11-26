@@ -920,7 +920,16 @@ class SupabaseSyncService extends ChangeNotifier {
         GROUP BY swo.product_id, LOWER(TRIM(swo.batch_number))
       ''');
 
-      final List<Map<String, dynamic>> pmList = await db.rawQuery('SELECT id, name FROM product_master');
+      final List<Map<String, dynamic>> pmList = await db.rawQuery('''
+        SELECT id, name FROM product_master
+        WHERE id IN (
+          SELECT DISTINCT product_id FROM stock_batches WHERE product_id IS NOT NULL AND product_id != ''
+          UNION
+          SELECT DISTINCT product_id FROM purchase_items WHERE product_id IS NOT NULL AND product_id != ''
+          UNION
+          SELECT DISTINCT product_id FROM sales_items WHERE product_id IS NOT NULL AND product_id != ''
+        )
+      ''');
       final Map<String, String> nameToIdMap = {};
       for (var pm in pmList) {
         final String id = pm['id']?.toString() ?? '';
@@ -4189,14 +4198,9 @@ class SupabaseSyncService extends ChangeNotifier {
       final db = await DbHelper.instance.database;
       final totalInDb = (await db.rawQuery('SELECT COUNT(*) as cnt FROM product_master')).first['cnt'] as int? ?? 0;
 
+      // Only perform a full table upload if explicitly requested via forceFull (e.g. manual Push in Settings).
+      // Automatic background sync cycles must ONLY push unsynced dirty records to avoid freezing UI and saturating bandwidth.
       bool pushAll = forceFull;
-      if (!pushAll && totalInDb > 0) {
-        final remoteCount = await fetchRemoteCount('product_master');
-        if (remoteCount < totalInDb) {
-          pushAll = true;
-          debugPrint('⚡ Auto-Discrepancy Push: Cloud product_master count ($remoteCount) is less than local PC ($totalInDb). Pushing all local products...');
-        }
-      }
 
       final products = pushAll
           ? await db.query('product_master')
@@ -4421,14 +4425,9 @@ class SupabaseSyncService extends ChangeNotifier {
       final db = await DbHelper.instance.database;
       final totalInDb = (await db.rawQuery('SELECT COUNT(*) as cnt FROM stock_batches')).first['cnt'] as int? ?? 0;
 
+      // Only perform a full batches upload if explicitly requested via forceFull.
+      // Automatic background sync cycles must ONLY push unsynced dirty records.
       bool pushAll = forceFull;
-      if (!pushAll && totalInDb > 0) {
-        final remoteCount = await fetchRemoteCount('stock_batches');
-        if (remoteCount < totalInDb) {
-          pushAll = true;
-          debugPrint('⚡ Auto-Discrepancy Push: Cloud stock_batches count ($remoteCount) is less than local PC ($totalInDb). Pushing all local batches...');
-        }
-      }
 
       final batches = pushAll
           ? await db.query('stock_batches')
@@ -5430,8 +5429,9 @@ class SupabaseSyncService extends ChangeNotifier {
         return {
           'product_id': l['product_id']?.toString() ?? '',
           'batch_number': l['batch_number']?.toString() ?? '',
+          'operation_type': l['operation_type']?.toString() ?? l['voucher_type']?.toString() ?? 'MOVEMENT',
           'transaction_type': l['transaction_type']?.toString() ?? 'MOVEMENT',
-          'reference_no': l['reference_no']?.toString() ?? '',
+          'reference_no': l['reference_no']?.toString() ?? l['voucher_no']?.toString() ?? '',
           'qty_in': _toInt(l['qty_in'], 0),
           'qty_out': _toInt(l['qty_out'], 0),
           'closing_balance': _toInt(l['closing_balance'], 0),

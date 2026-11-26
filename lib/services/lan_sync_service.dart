@@ -96,9 +96,27 @@ class LanSyncService {
   final StreamController<List<DiscoveredTerminalPeer>> _peersStreamCtrl = StreamController<List<DiscoveredTerminalPeer>>.broadcast();
   Timer? _discoveryTimer;
 
+  // Rate-limiting and caching guards to prevent main thread freezing
+  int _cachedProductCount = 0;
+  DateTime? _lastProductCountCheck;
+  final Map<String, DateTime> _lastPongSentToIp = {};
+
   bool get isListening => _isListening;
   Map<String, DiscoveredTerminalPeer> get discoveredPeers => Map.unmodifiable(_discoveredPeers);
   Stream<List<DiscoveredTerminalPeer>> get peersStream => _peersStreamCtrl.stream;
+
+  Future<int> _getCachedProductCount() async {
+    final now = DateTime.now();
+    if (_lastProductCountCheck != null && now.difference(_lastProductCountCheck!).inMinutes < 5 && _cachedProductCount > 0) {
+      return _cachedProductCount;
+    }
+    try {
+      final db = await DbHelper.instance.database;
+      _cachedProductCount = Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM product_master;')) ?? 0;
+      _lastProductCountCheck = now;
+    } catch (_) {}
+    return _cachedProductCount;
+  }
 
   /// Starts periodic LAN auto-discovery broadcast every 20 seconds
   void startAutoDiscovery() {
@@ -142,11 +160,7 @@ class LanSyncService {
   Future<void> broadcastDiscoveryPing({bool isPong = false}) async {
     if (!ServerConfigService.instance.isLanSyncEnabled) return;
 
-    int pCount = 0;
-    try {
-      final db = await DbHelper.instance.database;
-      pCount = Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM product_master;')) ?? 0;
-    } catch (_) {}
+    final int pCount = await _getCachedProductCount();
 
     final config = ServerConfigService.instance;
     final action = isPong ? 'LAN_DISCOVERY_PONG' : 'LAN_DISCOVERY_PING';
@@ -280,6 +294,11 @@ class LanSyncService {
                 final senderId = (map['sender_id']?.toString() ?? '').toLowerCase().trim();
                 final action = map['action']?.toString() ?? '';
 
+                // Ignore empty sender IDs or packets sent by this exact computer to prevent self-looping
+                if (senderId.isEmpty || senderId == _deviceId) {
+                  return;
+                }
+
                 // Handle Plug-and-Play Discovery Packets
                 if (action == 'LAN_DISCOVERY_PING' || action == 'LAN_DISCOVERY_PONG') {
                   _handleDiscoveryPacket(map, datagram.address.address, action == 'LAN_DISCOVERY_PING');
@@ -310,11 +329,6 @@ class LanSyncService {
                 // If this machine is currently in wiping state, ignore all incoming sync mutations
                 if (ServerConfigService.instance.isWiping) {
                   debugPrint('⚡ [LAN SYNC]: Dropping incoming $action because this terminal is in RESET/WIPE mode.');
-                  return;
-                }
-
-                // Ignore empty sender IDs or packets sent by this exact computer to prevent self-looping
-                if (senderId.isEmpty || senderId == _deviceId) {
                   return;
                 }
 
@@ -438,8 +452,13 @@ class LanSyncService {
         }
 
         // If received ping, reply with pong so sender immediately discovers this machine
+        // Throttle PONG replies to the same IP to once every 10s to eliminate ping-pong flooding
         if (requiresPong) {
-          unawaited(broadcastDiscoveryPing(isPong: true));
+          final lastPong = _lastPongSentToIp[senderIp];
+          if (lastPong == null || DateTime.now().difference(lastPong).inSeconds >= 10) {
+            _lastPongSentToIp[senderIp] = DateTime.now();
+            unawaited(broadcastDiscoveryPing(isPong: true));
+          }
         }
       }
     } catch (e) {

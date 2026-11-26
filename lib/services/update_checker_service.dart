@@ -33,7 +33,7 @@ class RemoteVersionInfo {
 class UpdateCheckerService {
   static const String _defaultRepoOwner = 'jiyadpn0';
   static const String _defaultRepoName = 'pharmacy_app';
-  static const String defaultCodeVersion = '4.2.5';
+  static const String defaultCodeVersion = '4.2.6';
 
   static String _activeVersion = defaultCodeVersion;
 

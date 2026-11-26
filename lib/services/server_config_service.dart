@@ -533,12 +533,20 @@ class ServerConfigService extends ChangeNotifier {
 
   Timer? _reconnectWatchdogTimer;
   Future<bool>? _inFlightCheck;
+  DateTime? _lastSuccessfulProbeTime;
 
   /// Fast manual / on-demand probe that checks connection immediately without waiting for watchdog
   Future<bool> checkConnectionNow({Duration timeout = const Duration(seconds: 3)}) async {
     if (_isWiping) return false;
     if (!isPureCloud && !_isServerModeEnabled) return false;
     if (_supabaseUrl.isEmpty || _supabaseAnonKey.isEmpty) return false;
+
+    // Cooldown guard: if already connected and probed successfully within the last 5s, reuse status
+    if (_status == ServerConnectionStatus.connected && _lastSuccessfulProbeTime != null) {
+      if (DateTime.now().difference(_lastSuccessfulProbeTime!).inSeconds < 5) {
+        return true;
+      }
+    }
 
     if (_inFlightCheck != null) {
       return _inFlightCheck!;
@@ -556,6 +564,7 @@ class ServerConfigService extends ChangeNotifier {
     final wasConnected = _status == ServerConnectionStatus.connected;
     final isAlive = await testConnection(_supabaseUrl, _supabaseAnonKey, timeout: timeout);
     if (isAlive) {
+      _lastSuccessfulProbeTime = DateTime.now();
       if (!wasConnected) {
         _status = ServerConnectionStatus.connected;
         _lastErrorMessage = '';
@@ -587,12 +596,12 @@ class ServerConfigService extends ChangeNotifier {
     // is back, the app recovers in ~1.5s instead of waiting 6-10s!
     // Once connected, relax to 6 seconds to avoid unnecessary network overhead.
     final Duration interval = (_status == ServerConnectionStatus.connected)
-        ? const Duration(seconds: 6)
-        : const Duration(milliseconds: 1500);
+        ? const Duration(seconds: 25)
+        : const Duration(seconds: 3);
 
     _reconnectWatchdogTimer = Timer(interval, () async {
       final probeTimeout = (_status == ServerConnectionStatus.connected)
-          ? const Duration(seconds: 4)
+          ? const Duration(seconds: 3)
           : const Duration(milliseconds: 2000);
       await checkConnectionNow(timeout: probeTimeout);
     });
